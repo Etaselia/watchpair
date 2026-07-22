@@ -14,7 +14,7 @@ import ffmpegStaticPath from "ffmpeg-static";
 import ffprobeStatic from "ffprobe-static";
 import WebTorrent from "webtorrent";
 import { isSupportedMagnet } from "./torrent-input.mjs";
-import { installWebTorrentSafetyGuards, normalizedTorrentFileProgress } from "./webtorrent-safety.mjs";
+import { installWebTorrentSafetyGuards, normalizedTorrentFileProgress, stabilizeTorrentPieceState } from "./webtorrent-safety.mjs";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.WATCHPAIR_AGENT_PORT || 41735);
@@ -458,6 +458,7 @@ function startTorrent(job) {
   job.torrent = torrent;
 
   torrent.on("metadata", () => {
+    stabilizeTorrentPieceState(torrent);
     const videos = torrent.files
       .map((file, index) => ({ index, size: file.length, video: VIDEO_EXTENSIONS.test(file.name) }))
       .sort((a, b) => Number(b.video) - Number(a.video) || b.size - a.size);
@@ -690,7 +691,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/health") {
       sendJson(response, 200, {
         ok: true,
-        version: "0.2.3",
+        version: "0.2.4",
         downloadDirectory: DOWNLOAD_DIR,
         jobs: jobs.size,
       }, headers);

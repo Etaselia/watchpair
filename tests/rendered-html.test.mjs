@@ -137,6 +137,7 @@ test("packages the pairable magnet and subtitle companion", async () => {
   assert.match(bundledAgent, /subtitleFile/);
   assert.match(bundledAgent, /installWebTorrentSafetyGuards/);
   assert.match(bundledSafetyGuard, /if \(!this\.pieces\?\.\[index\]\) return false/);
+  assert.match(bundledSafetyGuard, /pieces\[index\] === null/);
   assert.match(companionPackage, /"webtorrent": "3\.0\.11"/);
   assert.match(installer, /\$Releases = Invoke-RestMethod/);
   assert.match(installer, /\$Release = \(\$Releases \| Where-Object/);

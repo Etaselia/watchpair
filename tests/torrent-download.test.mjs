@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import WebTorrent from "webtorrent";
 import Torrent from "webtorrent/lib/torrent.js";
-import { installWebTorrentSafetyGuards, normalizedTorrentFileProgress } from "../agent/webtorrent-safety.mjs";
+import { installWebTorrentSafetyGuards, normalizedTorrentFileProgress, stabilizeTorrentPieceState } from "../agent/webtorrent-safety.mjs";
 
 installWebTorrentSafetyGuards();
 
@@ -18,6 +18,14 @@ test("scheduler guard skips a stale completed piece instead of terminating", () 
   assert.equal(torrent._request({ requests: [] }, 0, false), false);
   assert.equal(normalizedTorrentFileProgress({ done: true, progress: 0.992 }), 1);
   assert.equal(normalizedTorrentFileProgress({ done: false, progress: 0.5 }), 0.5);
+
+  const staleState = { pieces: [null, { missing: 8 }], bitfield: { get: () => false } };
+  stabilizeTorrentPieceState(staleState);
+  stabilizeTorrentPieceState(staleState);
+  const slowRank = (index) =>
+    staleState.bitfield.get(index) ? true : staleState.pieces[index].missing > 0;
+  assert.equal(slowRank(0), true);
+  assert.equal(slowRank(1), true);
 });
 
 test("downloads and verifies missing pieces when resuming a partial file", { timeout: 30_000 }, async () => {
@@ -43,11 +51,17 @@ test("downloads and verifies missing pieces when resuming a partial file", { tim
 
     const torrent = leecher.add(seeded.torrentFile, { path: downloadDirectory });
     torrent.once("metadata", () => {
+      stabilizeTorrentPieceState(torrent);
       torrent.files.forEach((file) => file.deselect());
       torrent.files[0].select(10);
     });
 
     let downloaded = 0;
+    let usedSlowPeerRanking = false;
+    torrent.on("wire", (wire) => {
+      wire.downloadSpeed = () => 1;
+      usedSlowPeerRanking = true;
+    });
     torrent.on("download", (bytes) => {
       downloaded += bytes;
     });
@@ -57,6 +71,7 @@ test("downloads and verifies missing pieces when resuming a partial file", { tim
     torrent.addPeer(`127.0.0.1:${seeder.torrentPort}`);
     await completed;
 
+    assert.ok(usedSlowPeerRanking, "Expected a connected wire to use slow-peer ranking");
     assert.ok(downloaded > 0, "Expected missing pieces to be transferred");
     assert.equal(Buffer.compare(await readFile(downloadPath), contents), 0);
   } finally {
