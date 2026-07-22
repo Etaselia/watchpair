@@ -1,34 +1,68 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import WebTorrent from "webtorrent";
 import Torrent from "webtorrent/lib/torrent.js";
-import { installWebTorrentSafetyGuards, monotonicTorrentFileProgress, normalizedTorrentFileProgress, stabilizeTorrentPieceState } from "../agent/webtorrent-safety.mjs";
+import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, stabilizeWireBitfieldWrites, verifiedTorrentFileProgress } from "../agent/webtorrent-safety.mjs";
 
 installWebTorrentSafetyGuards();
 
-test("scheduler guard skips a stale completed piece instead of terminating", () => {
+test("torrent guards preserve verified state and skip stale requests", () => {
   installWebTorrentSafetyGuards();
 
   const torrent = Object.create(Torrent.prototype);
   torrent.pieces = [null];
   assert.equal(torrent._request({ requests: [] }, 0, false), false);
-  assert.equal(normalizedTorrentFileProgress({ done: true, progress: 0.992 }), 1);
-  assert.equal(normalizedTorrentFileProgress({ done: false, progress: 0.5 }), 0.5);
-  assert.equal(normalizedTorrentFileProgress({ done: false, progress: 1 }), 0.999);
-  assert.equal(monotonicTorrentFileProgress({ done: false, progress: 0.75 }, 0.85), 0.85);
-  assert.equal(monotonicTorrentFileProgress({ done: true, progress: 0.75 }, 0.85), 1);
 
-  const staleState = { pieces: [null, { missing: 8 }], bitfield: { get: () => false } };
-  stabilizeTorrentPieceState(staleState);
-  stabilizeTorrentPieceState(staleState);
-  const slowRank = (index) =>
-    staleState.bitfield.get(index) ? true : staleState.pieces[index].missing > 0;
-  assert.equal(slowRank(0), true);
-  assert.equal(slowRank(1), true);
+  const sourceBitfield = { buffer: new Uint8Array([0xa5]) };
+  const wire = { bitfield: (bytes) => bytes.fill(0) };
+  stabilizeWireBitfieldWrites(wire);
+  stabilizeWireBitfieldWrites(wire);
+  wire.bitfield(sourceBitfield);
+  assert.equal(sourceBitfield.buffer[0], 0xa5, "encrypted wire writes must not mutate the torrent bitfield");
+
+  const verifiedFile = {
+    _torrent: {
+      bitfield: { buffer: new Uint8Array([0xa0]) },
+      pieceLength: 10,
+      lastPieceLength: 5,
+      pieces: [null, {}, null],
+    },
+    _startPiece: 0,
+    _endPiece: 2,
+    offset: 0,
+    length: 25,
+    done: false,
+  };
+  assert.equal(verifiedTorrentFileProgress(verifiedFile), 0.6);
+});
+
+test("piece recovery rewinds the selected file", () => {
+  const torrent = new EventEmitter();
+  const invalidated = [];
+  torrent._markUnverified = (index) => invalidated.push(index);
+  const calls = [];
+  const file = {
+    done: false,
+    deselect: () => calls.push("deselect"),
+    select: (priority) => calls.push("select:" + priority),
+  };
+  const recoveries = [];
+
+  installTorrentPieceRecovery(torrent, () => file, (event) => recoveries.push(event));
+  torrent._markUnverified(4);
+  torrent.emit("warning", new Error("Piece 8 failed verification"));
+
+  assert.deepEqual(invalidated, [4]);
+  assert.deepEqual(calls, ["deselect", "select:10", "deselect", "select:10"]);
+  assert.deepEqual(recoveries.map((event) => [event.index, event.reason]), [
+    [4, "disk-verification"],
+    [8, "peer-verification"],
+  ]);
 });
 
 test("downloads and verifies missing pieces when resuming a partial file", { timeout: 30_000 }, async () => {
@@ -54,7 +88,6 @@ test("downloads and verifies missing pieces when resuming a partial file", { tim
 
     const torrent = leecher.add(seeded.torrentFile, { path: downloadDirectory });
     torrent.once("metadata", () => {
-      stabilizeTorrentPieceState(torrent);
       torrent.files.forEach((file) => file.deselect());
       torrent.files[0].select(10);
     });

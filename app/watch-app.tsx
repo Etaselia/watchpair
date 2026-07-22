@@ -124,6 +124,7 @@ export default function WatchApp() {
   const sessionRef = useRef<WatchSession | null>(null);
   const selectionSentRef = useRef("");
   const loadedSubtitleRef = useRef("");
+  const initializedMediaTracksRef = useRef("");
   const pairingTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -439,6 +440,7 @@ export default function WatchApp() {
     setSubtitleCues([]);
     setLocalSubtitleName("");
     loadedSubtitleRef.current = "";
+    initializedMediaTracksRef.current = "";
     const controller = new AbortController();
     const initial: LocalReadiness = {
       ...emptyReadiness(),
@@ -622,6 +624,41 @@ export default function WatchApp() {
   const selectedMediaTrackKey =
     session?.selectedMedia?.fingerprint ||
     (session?.selectedMedia ? session.selectedMedia.name + ":" + session.selectedMedia.size : "");
+
+  useEffect(() => {
+    const sourceId = session?.source?.id;
+    if (!sourceId || !selectedMediaTrackKey || agentJob?.subtitleStatus !== "ready") return;
+    const initializationKey = sourceId + ":" + selectedMediaTrackKey;
+    if (initializedMediaTracksRef.current === initializationKey) return;
+    const defaultSubtitle = embeddedSubtitles.find((track) => track.default && track.supported);
+    if (!defaultSubtitle || session.player.subtitleLanguage !== "off") {
+      initializedMediaTracksRef.current = initializationKey;
+      return;
+    }
+
+    initializedMediaTracksRef.current = initializationKey;
+    const timer = window.setTimeout(() => {
+      void sendAction("player", {
+        player: {
+          ...session.player,
+          subtitleLanguage: "embedded:" + defaultSubtitle.id,
+        },
+      });
+    }, 0);
+    return () => {
+      window.clearTimeout(timer);
+      if (initializedMediaTracksRef.current === initializationKey) {
+        initializedMediaTracksRef.current = "";
+      }
+    };
+  }, [
+    agentJob?.subtitleStatus,
+    embeddedSubtitles,
+    selectedMediaTrackKey,
+    sendAction,
+    session?.player,
+    session?.source?.id,
+  ]);
 
   useEffect(() => {
     const selection = requestedSubtitleSelection;
@@ -1187,12 +1224,13 @@ function SyncedPlayer({
       : hasRequestedSubtitle
         ? session.player.subtitleLanguage
         : "off";
+  const playbackAudioTrack = requestedAudioTrack || defaultAudioTrack;
   const playbackUrl = useMemo(() => {
-    if (!requestedAudioTrack) return mediaUrl;
+    if (!playbackAudioTrack) return mediaUrl;
     const url = new URL(mediaUrl);
-    url.searchParams.set("audio", requestedAudioTrack.id);
+    url.searchParams.set("audio", playbackAudioTrack.id);
     return url.toString();
-  }, [mediaUrl, requestedAudioTrack]);
+  }, [mediaUrl, playbackAudioTrack]);
 
   const send = useCallback(
     (values: Partial<PlayerState>) => {

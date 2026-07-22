@@ -14,7 +14,7 @@ import ffmpegStaticPath from "ffmpeg-static";
 import ffprobeStatic from "ffprobe-static";
 import WebTorrent from "webtorrent";
 import { isSupportedMagnet } from "./torrent-input.mjs";
-import { installWebTorrentSafetyGuards, monotonicTorrentFileProgress, stabilizeTorrentPieceState } from "./webtorrent-safety.mjs";
+import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, verifiedTorrentFileProgress } from "./webtorrent-safety.mjs";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.WATCHPAIR_AGENT_PORT || 41735);
@@ -304,6 +304,7 @@ function selectTorrentFile(job, index) {
   job.selectedIndex = index;
   job.audioTracks = [];
   job.subtitleTracks = [];
+  job.videoCodec = null;
   job.subtitleStatus = "waiting";
   job.subtitleError = null;
   job.subtitleProbeKey = null;
@@ -367,6 +368,8 @@ async function probeSubtitleTracks(job) {
     if (!isStillSelected()) return;
 
     const metadata = JSON.parse(result.stdout || "{}");
+    const videoStream = (metadata.streams || []).find((stream) => stream.codec_type === "video");
+    job.videoCodec = String(videoStream?.codec_name || "unknown");
     job.audioTracks = (metadata.streams || [])
       .filter((stream) => stream.codec_type === "audio")
       .map((stream) => ({
@@ -453,8 +456,7 @@ async function subtitleFile(job, trackId) {
 function torrentFiles(job) {
   if (!job.torrent) return [];
   return job.torrent.files.map((file, index) => {
-    const progress = monotonicTorrentFileProgress(file, job.fileProgress.get(index));
-    job.fileProgress.set(index, progress);
+    const progress = verifiedTorrentFileProgress(file);
     return {
       index,
       name: file.path || file.name,
@@ -497,6 +499,11 @@ function snapshot(job) {
     subtitleError: job.subtitleError,
     audioTracks: job.audioTracks || [],
     subtitles: job.subtitleTracks || [],
+    verification: {
+      diskInvalidations: job.diskInvalidations,
+      peerFailures: job.peerFailures,
+      peersRejected: job.peersRejected,
+    },
     files,
     updatedAt: job.updatedAt,
   };
@@ -514,13 +521,36 @@ function startTorrent(job) {
     return;
   }
   job.torrent = torrent;
+  installTorrentPieceRecovery(
+    torrent,
+    () => torrent.files?.[job.selectedIndex],
+    ({ reason, disconnected }) => {
+      job.status = "downloading";
+      if (reason === "disk-verification") job.diskInvalidations += 1;
+      if (reason === "peer-verification") {
+        job.peerFailures += 1;
+        job.peersRejected += disconnected;
+        job.warning = disconnected
+          ? "Rejected a peer that supplied corrupt torrent data; retrying the piece."
+          : "A torrent piece failed verification; retrying it from another peer.";
+      }
+      job.updatedAt = Date.now();
+    }
+  );
 
   torrent.on("metadata", () => {
-    stabilizeTorrentPieceState(torrent);
     const videos = torrent.files
       .map((file, index) => ({ index, size: file.length, video: VIDEO_EXTENSIONS.test(file.name) }))
       .sort((a, b) => Number(b.video) - Number(a.video) || b.size - a.size);
     if (videos[0]) selectTorrentFile(job, videos[0].index);
+    torrent.files.forEach((file, index) => {
+      file.on("done", () => {
+        if (job.selectedIndex !== index) return;
+        job.status = "ready";
+        job.updatedAt = Date.now();
+        void queueSubtitleProbe(job);
+      });
+    });
     job.status = torrent.files[job.selectedIndex]?.done ? "ready" : "downloading";
     job.updatedAt = Date.now();
   });
@@ -618,12 +648,15 @@ async function addDownload(source) {
     file: null,
     audioTracks: [],
     subtitleTracks: [],
+    videoCodec: null,
     subtitleStatus: "waiting",
     subtitleError: null,
     subtitleProbeKey: null,
     subtitleProbePromise: null,
     subtitleProbePromiseKey: null,
-    fileProgress: new Map(),
+    diskInvalidations: 0,
+    peerFailures: 0,
+    peersRejected: 0,
     audioRenderPromises: new Map(),
     updatedAt: Date.now(),
   };
@@ -649,7 +682,7 @@ function contentType(fileName, fallback = "application/octet-stream") {
 async function renderAudioPlayback(job, fileIndex, track) {
   const media = jobFile(job, fileIndex);
   const directory = path.join(DOWNLOAD_DIR, ".watchpair-media", job.id);
-  const output = path.join(directory, String(fileIndex) + "-audio-" + track.id + ".mp4");
+  const output = path.join(directory, String(fileIndex) + "-browser-v2-audio-" + track.id + ".mp4");
   const partial = output + ".partial.mp4";
   await mkdir(directory, { recursive: true });
 
@@ -662,12 +695,15 @@ async function renderAudioPlayback(job, fileIndex, track) {
 
   await rm(partial, { force: true });
   try {
+    const videoArgs = job.videoCodec === "h264"
+      ? ["-c:v", "copy"]
+      : ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"];
     await runFile(
       FFMPEG_PATH,
       [
         "-v", "error", "-y", "-i", media.path,
         "-map", "0:v:0", "-map", "0:" + track.streamIndex,
-        "-sn", "-dn", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        "-sn", "-dn", ...videoArgs, "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart", partial,
       ],
       { maxBuffer: 8 * 1024 * 1024 }
@@ -818,7 +854,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/health") {
       sendJson(response, 200, {
         ok: true,
-        version: "0.2.5",
+        version: "0.2.6",
         downloadDirectory: DOWNLOAD_DIR,
         jobs: jobs.size,
       }, headers);

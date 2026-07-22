@@ -176,9 +176,10 @@ test("packages the pairable magnet and subtitle companion", async () => {
   assert.match(bundledAgent, /subtitleFile/);
   assert.match(bundledAgent, /renderAudioPlayback/);
   assert.match(bundledAgent, /installWebTorrentSafetyGuards/);
-  assert.match(bundledSafetyGuard, /if \(!this\.pieces\?\.\[index\]\) return false/);
-  assert.match(bundledSafetyGuard, /pieces\[index\] === null/);
-  assert.match(bundledSafetyGuard, /monotonicTorrentFileProgress/);
+  assert.match(bundledSafetyGuard, /const piece = this\.pieces\?\.\[index\]/);
+  assert.match(bundledSafetyGuard, /stabilizeWireBitfieldWrites/);
+  assert.match(bundledSafetyGuard, /new Uint8Array\(bytes\)/);
+  assert.match(bundledSafetyGuard, /verifiedTorrentFileProgress/);
   assert.match(companionPackage, /"webtorrent": "3\.0\.11"/);
   assert.match(installer, /\$Releases = Invoke-RestMethod/);
   assert.match(installer, /\$Release = \(\$Releases \| Where-Object/);

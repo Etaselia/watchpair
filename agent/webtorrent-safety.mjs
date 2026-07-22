@@ -1,47 +1,122 @@
 import Torrent from "webtorrent/lib/torrent.js";
 
 const PATCH_MARKER = Symbol.for("watchpair.webtorrent.scheduler-guard");
-const BITFIELD_MARKER = Symbol.for("watchpair.webtorrent.bitfield-guard");
+const RECOVERY_MARKER = Symbol.for("watchpair.webtorrent.piece-recovery");
+const PIECE_TRACKING_MARKER = Symbol.for("watchpair.webtorrent.piece-source-tracking");
+const PIECE_SOURCES = Symbol.for("watchpair.webtorrent.piece-sources");
+const PEER_STRIKES = Symbol.for("watchpair.webtorrent.peer-strikes");
+const WIRE_PATCH_MARKER = Symbol.for("watchpair.webtorrent.wire-buffer-copy");
 
-export function stabilizeTorrentPieceState(torrent) {
-  const bitfield = torrent?.bitfield;
-  if (!bitfield || bitfield[BITFIELD_MARKER]) return;
+export function verifiedTorrentFileProgress(file) {
+  const torrent = file?._torrent;
+  if (!torrent?.bitfield || !file?.length) return file?.done ? 1 : 0;
 
-  const get = bitfield.get.bind(bitfield);
-  bitfield.get = function getConsistentPieceState(index) {
-    const pieces = torrent.pieces;
-    if (Number.isInteger(index) && index >= 0 && index < pieces.length && pieces[index] === null) {
-      return true;
+  const fileStart = file.offset;
+  const fileEnd = fileStart + file.length;
+  let verified = 0;
+  for (let index = file._startPiece; index <= file._endPiece; index += 1) {
+    const mask = 0x80 >> (index % 8);
+    if (!(torrent.bitfield.buffer[index >> 3] & mask)) continue;
+    const pieceStart = index * torrent.pieceLength;
+    const pieceLength = index === torrent.pieces.length - 1
+      ? torrent.lastPieceLength
+      : torrent.pieceLength;
+    const pieceEnd = pieceStart + pieceLength;
+    verified += Math.max(0, Math.min(fileEnd, pieceEnd) - Math.max(fileStart, pieceStart));
+  }
+  return Math.min(1, verified / file.length);
+}
+
+function rewindSelectedFile(getSelectedFile) {
+  const file = getSelectedFile?.();
+  if (!file || file.done) return;
+  file.deselect();
+  file.select(10);
+}
+
+function rememberPieceSources(torrent, index, piece) {
+  if (!piece || piece[PIECE_TRACKING_MARKER]) return;
+  const flush = piece.flush.bind(piece);
+  piece.flush = function flushWithSources() {
+    const sources = Array.isArray(piece.sources) ? [...piece.sources] : [];
+    const buffer = flush();
+    if (buffer) {
+      torrent[PIECE_SOURCES] ??= new Map();
+      torrent[PIECE_SOURCES].set(index, sources);
     }
-    return get(index);
+    return buffer;
+  };
+  Object.defineProperty(piece, PIECE_TRACKING_MARKER, { value: true });
+}
+
+function rejectFailedPieceSources(torrent, index) {
+  const sourceMap = torrent[PIECE_SOURCES];
+  const sources = sourceMap?.get(index) || [];
+  sourceMap?.delete(index);
+  torrent[PEER_STRIKES] ??= new Map();
+
+  let disconnected = 0;
+  for (const wire of sources) {
+    const strikes = (torrent[PEER_STRIKES].get(wire) || 0) + 1;
+    torrent[PEER_STRIKES].set(wire, strikes);
+    if (sources.length === 1 || strikes >= 2) {
+      wire.destroy();
+      torrent[PEER_STRIKES].delete(wire);
+      disconnected += 1;
+    }
+  }
+  return { sources: sources.length, disconnected };
+}
+
+export function installTorrentPieceRecovery(torrent, getSelectedFile, onRecovery) {
+  if (!torrent || torrent[RECOVERY_MARKER]) return;
+
+  const markUnverified = torrent._markUnverified.bind(torrent);
+  torrent._markUnverified = function markUnverifiedAndRewind(index) {
+    markUnverified(index);
+    rewindSelectedFile(getSelectedFile);
+    onRecovery?.({ index, reason: "disk-verification", sources: 0, disconnected: 0 });
   };
 
-  Object.defineProperty(bitfield, BITFIELD_MARKER, {
-    configurable: false,
-    value: true,
+  torrent.on("warning", (error) => {
+    const match = /^Piece (\d+) failed verification$/.exec(error?.message || "");
+    if (!match) return;
+    const index = Number(match[1]);
+    const result = rejectFailedPieceSources(torrent, index);
+    rewindSelectedFile(getSelectedFile);
+    onRecovery?.({ index, reason: "peer-verification", ...result });
   });
+
+  Object.defineProperty(torrent, RECOVERY_MARKER, { value: true });
 }
 
-export function normalizedTorrentFileProgress(file) {
-  if (file?.done) return 1;
-  const measured = Number(file?.progress || 0);
-  const progress = Number.isFinite(measured) ? Math.max(0, measured) : 0;
-  return Math.min(0.999, progress);
-}
-
-export function monotonicTorrentFileProgress(file, previous = 0) {
-  return Math.max(normalizedTorrentFileProgress(file), Math.max(0, Math.min(1, Number(previous) || 0)));
+export function stabilizeWireBitfieldWrites(wire) {
+  if (!wire || wire[WIRE_PATCH_MARKER]) return;
+  const sendBitfield = wire.bitfield.bind(wire);
+  wire.bitfield = function sendBitfieldCopy(bitfield) {
+    const bytes = ArrayBuffer.isView(bitfield) ? bitfield : bitfield.buffer;
+    return sendBitfield(new Uint8Array(bytes));
+  };
+  Object.defineProperty(wire, WIRE_PATCH_MARKER, { value: true });
 }
 
 export function installWebTorrentSafetyGuards() {
   const prototype = Torrent.prototype;
   if (prototype[PATCH_MARKER]) return;
 
+  const onWire = prototype._onWire;
+  prototype._onWire = function onWireWithBufferCopies(wire, ...args) {
+    stabilizeWireBitfieldWrites(wire);
+    return onWire.call(this, wire, ...args);
+  };
+
   const request = prototype._request;
   prototype._request = function requestAvailablePiece(wire, index, hotswap) {
     // Resume verification can leave a stale selection pointing at a null piece.
     // Treat it as unavailable so the scheduler can collect it on the next tick.
-    if (!this.pieces?.[index]) return false;
+    const piece = this.pieces?.[index];
+    if (!piece) return false;
+    rememberPieceSources(this, index, piece);
     return request.call(this, wire, index, hotswap);
   };
 
