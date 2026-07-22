@@ -9,6 +9,7 @@ const folder = "WatchPair Companion";
 
 const inputs = [
   ["server.mjs", resolve(root, "agent", "server.mjs")],
+  ["hls-playback.mjs", resolve(root, "agent", "hls-playback.mjs")],
   ["torrent-input.mjs", resolve(root, "agent", "torrent-input.mjs")],
   ["webtorrent-safety.mjs", resolve(root, "agent", "webtorrent-safety.mjs")],
   ["package.json", resolve(root, "companion", "package.json")],

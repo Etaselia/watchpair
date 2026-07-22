@@ -1,5 +1,7 @@
 "use client";
 
+import type Hls from "hls.js";
+import type { ErrorData } from "hls.js";
 import {
   ArrowLeft,
   Check,
@@ -809,7 +811,7 @@ export default function WatchApp() {
         const becameReady = isReady && !readinessRef.current.ready;
         readinessRef.current = next;
         setReadiness(next);
-        if (isReady) setMediaUrl(target.streamUrl);
+        if (isReady) setMediaUrl(target.hlsUrl || target.streamUrl);
         else setMediaUrl("");
         if (becameReady) await sendAction("heartbeat", { readiness: next });
       } catch {
@@ -1441,6 +1443,11 @@ interface SyncedPlayerProps {
   onSend: (player: PlayerState) => Promise<void>;
 }
 
+function mediaDuration(video: HTMLVideoElement) {
+  if (Number.isFinite(video.duration)) return video.duration;
+  return video.seekable.length ? video.seekable.end(video.seekable.length - 1) : 0;
+}
+
 function SyncedPlayer({
   session,
   mediaUrl,
@@ -1453,6 +1460,8 @@ function SyncedPlayer({
 }: SyncedPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const playerRef = useRef<HTMLDivElement>(null);
+  const hlsRef = useRef<Hls | null>(null);
+  const hlsRecoveryRef = useRef(false);
   const lastSeqRef = useRef(-1);
   const controlsHideTimerRef = useRef<number | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
@@ -1462,6 +1471,7 @@ function SyncedPlayer({
   const [needsGesture, setNeedsGesture] = useState(false);
   const [mediaLoading, setMediaLoading] = useState(true);
   const [mediaError, setMediaError] = useState("");
+  const [hlsAudioRevision, setHlsAudioRevision] = useState(0);
   const [subtitleText, setSubtitleText] = useState("");
   const [controlsVisible, setControlsVisible] = useState(true);
   const [captionSettingsOpen, setCaptionSettingsOpen] = useState(false);
@@ -1484,12 +1494,16 @@ function SyncedPlayer({
         ? session.player.subtitleLanguage
         : "off";
   const playbackAudioTrack = requestedAudioTrack || defaultAudioTrack;
+  const desiredAudioTrackIndex = playbackAudioTrack
+    ? audioTracks.findIndex((track) => track.id === playbackAudioTrack.id)
+    : -1;
+  const isHlsPlayback = mediaUrl.includes("/hls/") && mediaUrl.includes(".m3u8");
   const playbackUrl = useMemo(() => {
-    if (!playbackAudioTrack) return mediaUrl;
+    if (isHlsPlayback || !playbackAudioTrack) return mediaUrl;
     const url = new URL(mediaUrl);
     url.searchParams.set("audio", playbackAudioTrack.id);
     return url.toString();
-  }, [mediaUrl, playbackAudioTrack]);
+  }, [isHlsPlayback, mediaUrl, playbackAudioTrack]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setSubtitleAppearance(readSubtitleAppearance()), 0);
@@ -1544,7 +1558,7 @@ function SyncedPlayer({
         setMediaLoading(false);
         setMediaError(
           mediaUrl.startsWith(AGENT_URL)
-            ? "The companion video stream could not be opened. Return to the lobby and reconnect it."
+            ? "The companion could not prepare this video for browser playback."
             : "This video could not be prepared for browser playback."
         );
       }
@@ -1552,6 +1566,99 @@ function SyncedPlayer({
     },
     [mediaUrl, pinControls]
   );
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    setMediaLoading(true);
+    setMediaError("");
+    setNeedsGesture(false);
+    hlsRecoveryRef.current = false;
+
+    const fail = (message: string) => {
+      setMediaLoading(false);
+      setNeedsGesture(false);
+      setMediaError(message);
+      pinControls();
+    };
+
+    if (!isHlsPlayback) {
+      video.src = playbackUrl;
+      video.load();
+      return () => {
+        video.removeAttribute("src");
+      };
+    }
+
+    let active = true;
+    let instance: Hls | null = null;
+    void import("hls.js")
+      .then(({ default: HlsRuntime, ErrorTypes, Events }) => {
+        if (!active) return;
+        if (HlsRuntime.isSupported()) {
+          const hls = new HlsRuntime({
+            enableWorker: true,
+            backBufferLength: 90,
+            maxBufferLength: 60,
+            manifestLoadingTimeOut: 65_000,
+            levelLoadingTimeOut: 65_000,
+          });
+          instance = hls;
+          hlsRef.current = hls;
+          hls.on(Events.AUDIO_TRACKS_UPDATED, () => {
+            setHlsAudioRevision((revision) => revision + 1);
+          });
+          hls.on(Events.ERROR, (_event, data: ErrorData) => {
+            if (!data.fatal) return;
+            if (data.type === ErrorTypes.MEDIA_ERROR && !hlsRecoveryRef.current) {
+              hlsRecoveryRef.current = true;
+              hls.recoverMediaError();
+              return;
+            }
+
+            const detail = data.error?.message ? ` ${data.error.message}` : "";
+            fail(
+              data.type === ErrorTypes.NETWORK_ERROR
+                ? "The companion could not create browser-ready video segments." + detail
+                : "Chromium could not decode the prepared video segments." + detail
+            );
+          });
+          hls.loadSource(playbackUrl);
+          hls.attachMedia(video);
+          return;
+        }
+
+        if (video.canPlayType("application/vnd.apple.mpegurl")) {
+          video.src = playbackUrl;
+          video.load();
+          return;
+        }
+
+        fail("This browser does not support progressive HLS playback.");
+      })
+      .catch((caught) => {
+        if (active) {
+          fail(caught instanceof Error ? caught.message : "The streaming player could not be loaded.");
+        }
+      });
+
+    return () => {
+      active = false;
+      if (hlsRef.current === instance) hlsRef.current = null;
+      instance?.destroy();
+      video.removeAttribute("src");
+    };
+  }, [isHlsPlayback, pinControls, playbackUrl]);
+
+  useEffect(() => {
+    const hls = hlsRef.current;
+    if (!hls || desiredAudioTrackIndex < 0) return;
+    if (hls.audioTracks.length <= desiredAudioTrackIndex) return;
+    if (hls.audioTrack !== desiredAudioTrackIndex) {
+      hls.audioTrack = desiredAudioTrackIndex;
+    }
+  }, [desiredAudioTrackIndex, hlsAudioRevision]);
 
   const updateSubtitleAppearance = (values: Partial<SubtitleAppearance>) => {
     const next = { ...subtitleAppearance, ...values };
@@ -1632,7 +1739,7 @@ function SyncedPlayer({
       const video = videoRef.current;
       if (!video) return;
       setCurrentTime(video.currentTime);
-      setDuration(video.duration || 0);
+      setDuration(mediaDuration(video));
 
       if (session.player.subtitleLanguage === "off" || !subtitleCues.length) {
         setSubtitleText("");
@@ -1762,7 +1869,6 @@ function SyncedPlayer({
     >
       <video
         ref={videoRef}
-        src={playbackUrl}
         playsInline
         onLoadStart={() => {
           setMediaLoading(true);
@@ -1770,7 +1876,7 @@ function SyncedPlayer({
         }}
         onLoadedMetadata={(event) => {
           const video = event.currentTarget;
-          setDuration(video.duration);
+          setDuration(mediaDuration(video));
           setMediaLoading(false);
           setMediaError("");
           const expected = session.player.paused
@@ -1782,10 +1888,11 @@ function SyncedPlayer({
         onPlaying={() => setMediaLoading(false)}
         onWaiting={() => setMediaLoading(true)}
         onError={() => {
+          if (hlsRef.current) return;
           setMediaLoading(false);
           setMediaError(
             mediaUrl.startsWith(AGENT_URL)
-              ? "The companion video stream could not be opened. Return to the lobby and reconnect it."
+              ? "The companion could not prepare this video for browser playback."
               : "This video format could not be opened by the browser."
           );
           pinControls();
@@ -1824,7 +1931,7 @@ function SyncedPlayer({
       {(mediaLoading || mediaError) && !needsGesture && (
         <div className={"media-state-overlay" + (mediaError ? " error" : "")} role={mediaError ? "alert" : "status"}>
           {mediaError ? <X /> : <LoaderCircle className="spin" />}
-          <strong>{mediaError || "Preparing video for this browser"}</strong>
+          <strong>{mediaError || (isHlsPlayback ? "Preparing first video segments" : "Preparing video for this browser")}</strong>
           {mediaError && (
             <button type="button" onClick={onBack}>
               <ArrowLeft />

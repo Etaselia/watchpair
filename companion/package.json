@@ -1,6 +1,6 @@
 {
   "name": "watchpair-companion",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "packageManager": "pnpm@10.34.5",
   "private": true,
   "type": "module",

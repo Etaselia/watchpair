@@ -108,8 +108,10 @@ npm run lint
 ## Operational notes
 
 - Browsers may require one click before a remote play command can start media.
-- Alternate embedded audio tracks are remuxed to MP4 with AAC on first selection.
-  The video stream is copied, so its codec must still be supported by the browser.
+- Browser-incompatible files are prepared as progressive HLS. Playback starts from the first
+  four-second segments while the remaining video is encoded in the background.
+- Video is encoded once and embedded audio languages are exposed as separate AAC renditions.
+  Prepared segments are cached under `downloads/.watchpair-hls` for later watches.
 - MKV text subtitles such as SRT, ASS, and WebVTT are extracted by the companion.
   Image-based PGS/VobSub tracks cannot be rendered as browser text. Video and
   audio codec support still depends on the browser; remux or transcode releases

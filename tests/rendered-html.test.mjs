@@ -150,6 +150,8 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /Character edge/);
   assert.match(app, /applySession/);
   assert.match(app, /Preparing video for this browser/);
+  assert.match(app, /HlsRuntime\.isSupported/);
+  assert.match(app, /AUDIO_TRACKS_UPDATED/);
   assert.match(route, /action === "heartbeat"/);
   assert.match(route, /action === "player"/);
   assert.match(route, /action === "select-media"/);
@@ -172,6 +174,7 @@ test("packages the pairable magnet and subtitle companion", async () => {
   );
   const expected = [
     "WatchPair Companion/server.mjs",
+    "WatchPair Companion/hls-playback.mjs",
     "WatchPair Companion/torrent-input.mjs",
     "WatchPair Companion/webtorrent-safety.mjs",
     "WatchPair Companion/package.json",
@@ -183,6 +186,7 @@ test("packages the pairable magnet and subtitle companion", async () => {
   for (const path of expected) assert.ok(archive[path], `Missing ${path}`);
 
   const bundledAgent = strFromU8(archive["WatchPair Companion/server.mjs"]);
+  const bundledHls = strFromU8(archive["WatchPair Companion/hls-playback.mjs"]);
   const bundledSafetyGuard = strFromU8(archive["WatchPair Companion/webtorrent-safety.mjs"]);
   const companionPackage = strFromU8(archive["WatchPair Companion/package.json"]);
   const installer = strFromU8(archive["WatchPair Companion/install-runtime.ps1"]);
@@ -192,7 +196,10 @@ test("packages the pairable magnet and subtitle companion", async () => {
   assert.match(bundledAgent, /url\.pathname === "\/resolve"/);
   assert.match(bundledAgent, /FFPROBE_PATH/);
   assert.match(bundledAgent, /subtitleFile/);
-  assert.match(bundledAgent, /renderAudioPlayback/);
+  assert.match(bundledAgent, /createHlsPlaybackManager/);
+  assert.match(bundledAgent, /window\.close/);
+  assert.match(bundledHls, /hls_playlist_type/);
+  assert.match(bundledHls, /watchpair-audio/);
   assert.match(bundledAgent, /installWebTorrentSafetyGuards/);
   assert.match(bundledSafetyGuard, /const piece = this\.pieces\?\.\[index\]/);
   assert.match(bundledSafetyGuard, /stabilizeWireBitfieldWrites/);

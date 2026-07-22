@@ -13,6 +13,7 @@ import { load } from "cheerio";
 import ffmpegStaticPath from "ffmpeg-static";
 import ffprobeStatic from "ffprobe-static";
 import WebTorrent from "webtorrent";
+import { createHlsPlaybackManager, streamHlsAsset } from "./hls-playback.mjs";
 import { isSupportedMagnet } from "./torrent-input.mjs";
 import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, verifiedTorrentFileProgress } from "./webtorrent-safety.mjs";
 
@@ -48,6 +49,10 @@ const pairingNonces = new Map();
 const jobs = new Map();
 installWebTorrentSafetyGuards();
 const client = new WebTorrent({ utp: false });
+const hlsPlayback = createHlsPlaybackManager({
+  ffmpegPath: FFMPEG_PATH,
+  cacheRoot: path.join(DOWNLOAD_DIR, ".watchpair-hls"),
+});
 client.on("error", (error) => console.error(`WebTorrent client error: ${error.message}`));
 
 await mkdir(DOWNLOAD_DIR, { recursive: true });
@@ -86,7 +91,7 @@ function sendHtml(response, statusCode, html) {
   response.writeHead(statusCode, {
     "content-type": "text/html; charset=utf-8",
     "cache-control": "no-store",
-    "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+    "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
   });
   response.end(html);
 }
@@ -119,9 +124,9 @@ async function persistOrigins() {
 function pairingPage(origin, nonce, paired = false) {
   const safeOrigin = escapeHtml(origin);
   const content = paired
-    ? "<h1>Companion connected</h1><p>" + safeOrigin + " can now start downloads and read embedded subtitles.</p><a href=\"" + safeOrigin + "\">Return to WatchPair</a>"
+    ? "<h1>Companion connected</h1><p>" + safeOrigin + " can now start downloads and prepare browser-ready video.</p><p>This tab will close automatically.</p><button type=\"button\" onclick=\"window.close()\">Close tab</button><script>window.setTimeout(function(){window.close()},150)</script>"
     : "<p class=\"eyebrow\">WatchPair Companion</p><h1>Connect this website?</h1><p><strong>" + safeOrigin + "</strong> will be allowed to send download requests to this computer.</p><form method=\"post\" action=\"/pair\"><input type=\"hidden\" name=\"origin\" value=\"" + safeOrigin + "\"><input type=\"hidden\" name=\"nonce\" value=\"" + escapeHtml(nonce) + "\"><button type=\"submit\">Connect companion</button></form>";
-  return "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>WatchPair Companion</title><style>body{margin:0;background:#10130f;color:#f4f3ed;font:16px system-ui;display:grid;min-height:100vh;place-items:center}main{width:min(520px,calc(100% - 40px));border-top:4px solid #c8ff32;padding:32px 0}h1{font-size:38px;margin:8px 0 16px}p{color:#b9bdb3;line-height:1.55}strong{color:#fff;word-break:break-all}.eyebrow{color:#c8ff32;text-transform:uppercase;font-size:12px;font-weight:800}button,a{display:inline-block;margin-top:20px;background:#c8ff32;color:#10130f;border:0;padding:13px 18px;font-weight:800;text-decoration:none;cursor:pointer}</style><main>" + content + "</main></html>";
+  return "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>WatchPair Companion</title><style>body{margin:0;background:#10130f;color:#f4f3ed;font:16px system-ui;display:grid;min-height:100vh;place-items:center}main{width:min(520px,calc(100% - 40px));border-top:4px solid #c8ff32;padding:32px 0}h1{font-size:38px;margin:8px 0 16px}p{color:#b9bdb3;line-height:1.55}strong{color:#fff;word-break:break-all}.eyebrow{color:#c8ff32;text-transform:uppercase;font-size:12px;font-weight:800}button{display:inline-block;margin-top:20px;background:#c8ff32;color:#10130f;border:0;padding:13px 18px;font-weight:800;cursor:pointer}</style><main>" + content + "</main></html>";
 }
 
 function safeName(value) {
@@ -453,6 +458,28 @@ async function subtitleFile(job, trackId) {
   return output;
 }
 
+function needsHlsPlayback(job, fileName) {
+  const extension = path.extname(fileName).toLowerCase();
+  const audioTracks = job.audioTracks || [];
+  if (
+    [".mp4", ".m4v", ".mov"].includes(extension) &&
+    job.videoCodec === "h264" &&
+    audioTracks.length <= 1 &&
+    (!audioTracks[0] || ["aac", "mp3", "opus"].includes(audioTracks[0].codec))
+  ) {
+    return false;
+  }
+  if (
+    extension === ".webm" &&
+    ["av1", "vp8", "vp9"].includes(job.videoCodec) &&
+    audioTracks.length <= 1 &&
+    (!audioTracks[0] || ["opus", "vorbis"].includes(audioTracks[0].codec))
+  ) {
+    return false;
+  }
+  return true;
+}
+
 function torrentFiles(job) {
   if (!job.torrent) return [];
   return job.torrent.files.map((file, index) => {
@@ -466,6 +493,9 @@ function torrentFiles(job) {
       ready: Boolean(file.done),
       selected: index === job.selectedIndex,
       streamUrl: `http://${HOST}:${PORT}/stream/${encodeURIComponent(job.id)}/${index}`,
+      hlsUrl: needsHlsPlayback(job, file.path || file.name)
+        ? `http://${HOST}:${PORT}/hls/${encodeURIComponent(job.id)}/${index}/master.m3u8`
+        : null,
     };
   });
 }
@@ -484,6 +514,9 @@ function snapshot(job) {
             ready: job.status === "ready" && job.downloaded === job.file.size,
             selected: true,
             streamUrl: `http://${HOST}:${PORT}/stream/${encodeURIComponent(job.id)}/0`,
+            hlsUrl: needsHlsPlayback(job, job.file.name)
+              ? `http://${HOST}:${PORT}/hls/${encodeURIComponent(job.id)}/0/master.m3u8`
+              : null,
           }]
         : [];
 
@@ -739,6 +772,24 @@ async function preparedAudioFile(job, fileIndex, trackId) {
   }
 }
 
+async function hlsDescriptor(job, fileIndex) {
+  if (job.selectedIndex !== fileIndex) throw new Error("That media file is no longer selected.");
+  const ready = job.kind === "magnet"
+    ? Boolean(job.torrent?.files[fileIndex]?.done)
+    : job.status === "ready";
+  if (!ready) throw new Error("The selected media file is not ready.");
+  await queueSubtitleProbe(job);
+  const media = jobFile(job, fileIndex);
+  return {
+    jobId: job.id,
+    fileIndex,
+    fileSize: media.size,
+    inputPath: media.path,
+    videoCodec: job.videoCodec,
+    audioTracks: job.audioTracks,
+  };
+}
+
 async function streamFile(request, response, job, fileIndex, headers, audioTrackId) {
   let fileName;
   let size;
@@ -854,7 +905,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/health") {
       sendJson(response, 200, {
         ok: true,
-        version: "0.2.8",
+        version: "0.2.9",
         downloadDirectory: DOWNLOAD_DIR,
         jobs: jobs.size,
       }, headers);
@@ -912,6 +963,16 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    const hlsMatch = /^\/hls\/([a-zA-Z0-9-]{8,80})\/(\d+)\/(.+)$/.exec(url.pathname);
+    if (request.method === "GET" && hlsMatch) {
+      const job = jobs.get(hlsMatch[1]);
+      if (!job) throw new Error("Download not found.");
+      const descriptor = await hlsDescriptor(job, Number(hlsMatch[2]));
+      const asset = await hlsPlayback.getAsset(descriptor, hlsMatch[3]);
+      await streamHlsAsset(response, asset, headers);
+      return;
+    }
+
     const streamMatch = /^\/stream\/([a-zA-Z0-9-]{8,80})\/(\d+)$/.exec(url.pathname);
     if (request.method === "GET" && streamMatch) {
       const job = jobs.get(streamMatch[1]);
@@ -934,9 +995,18 @@ server.listen(PORT, HOST, () => {
   console.log(`Allowed origins: ${Array.from(ALLOWED_ORIGINS).join(", ")}`);
 });
 
-const shutdown = () => {
-  server.close();
-  client.destroy();
+let shuttingDown = false;
+const shutdown = async () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  hlsPlayback.shutdown();
+  await Promise.all([
+    new Promise((resolve) => server.close(resolve)),
+    new Promise((resolve) => {
+      if (client.destroyed) resolve();
+      else client.destroy(resolve);
+    }),
+  ]);
 };
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+process.on("SIGINT", () => void shutdown());
+process.on("SIGTERM", () => void shutdown());

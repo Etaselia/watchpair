@@ -25,6 +25,7 @@ export interface AgentFile {
   ready: boolean;
   selected: boolean;
   streamUrl: string;
+  hlsUrl?: string | null;
 }
 
 export interface AgentAudioTrack {
