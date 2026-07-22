@@ -14,6 +14,7 @@ import ffmpegStaticPath from "ffmpeg-static";
 import ffprobeStatic from "ffprobe-static";
 import WebTorrent from "webtorrent";
 import { isSupportedMagnet } from "./torrent-input.mjs";
+import { installWebTorrentSafetyGuards, normalizedTorrentFileProgress } from "./webtorrent-safety.mjs";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.WATCHPAIR_AGENT_PORT || 41735);
@@ -45,7 +46,8 @@ PRIVATE_NETWORKS.addSubnet("fc00::", 7, "ipv6");
 PRIVATE_NETWORKS.addSubnet("fe80::", 10, "ipv6");
 const pairingNonces = new Map();
 const jobs = new Map();
-const client = new WebTorrent();
+installWebTorrentSafetyGuards();
+const client = new WebTorrent({ utp: false });
 client.on("error", (error) => console.error(`WebTorrent client error: ${error.message}`));
 
 await mkdir(DOWNLOAD_DIR, { recursive: true });
@@ -397,7 +399,7 @@ async function subtitleFile(job, trackId) {
 function torrentFiles(job) {
   if (!job.torrent) return [];
   return job.torrent.files.map((file, index) => {
-    const progress = Number(file.progress || 0);
+    const progress = normalizedTorrentFileProgress(file);
     return {
       index,
       name: file.path || file.name,
@@ -464,7 +466,7 @@ function startTorrent(job) {
     job.updatedAt = Date.now();
   });
   torrent.on("download", () => {
-    job.status = "downloading";
+    if (job.status !== "ready") job.status = "downloading";
     job.updatedAt = Date.now();
   });
   torrent.on("done", () => {
@@ -688,7 +690,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/health") {
       sendJson(response, 200, {
         ok: true,
-        version: "0.2.2",
+        version: "0.2.3",
         downloadDirectory: DOWNLOAD_DIR,
         jobs: jobs.size,
       }, headers);

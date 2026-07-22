@@ -10,6 +10,7 @@ const folder = "WatchPair Companion";
 const inputs = [
   ["server.mjs", resolve(root, "agent", "server.mjs")],
   ["torrent-input.mjs", resolve(root, "agent", "torrent-input.mjs")],
+  ["webtorrent-safety.mjs", resolve(root, "agent", "webtorrent-safety.mjs")],
   ["package.json", resolve(root, "companion", "package.json")],
   ["pnpm-lock.yaml", resolve(root, "companion", "pnpm-lock.yaml")],
   ["pnpm-workspace.yaml", resolve(root, "companion", "pnpm-workspace.yaml")],
