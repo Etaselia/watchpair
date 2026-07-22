@@ -14,6 +14,7 @@ import ffmpegStaticPath from "ffmpeg-static";
 import ffprobeStatic from "ffprobe-static";
 import WebTorrent from "webtorrent";
 import { createHlsPlaybackManager, streamHlsAsset } from "./hls-playback.mjs";
+import { publicTranscoder, selectTranscodeRuntime } from "./hardware-acceleration.mjs";
 import { isSupportedMagnet } from "./torrent-input.mjs";
 import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, verifiedTorrentFileProgress } from "./webtorrent-safety.mjs";
 
@@ -23,7 +24,9 @@ const DOWNLOAD_DIR = path.resolve(process.env.WATCHPAIR_DOWNLOAD_DIR || "./downl
 const CONFIG_PATH = path.resolve(
   process.env.WATCHPAIR_CONFIG_PATH || path.join(homedir(), ".watchpair", "companion.json")
 );
-const FFMPEG_PATH = process.env.WATCHPAIR_FFMPEG_PATH || ffmpegStaticPath;
+const TRANSCODE_RUNTIME = await selectTranscodeRuntime({ bundledPath: ffmpegStaticPath });
+const FFMPEG_PATH = TRANSCODE_RUNTIME.ffmpegPath;
+const TRANSCODER = publicTranscoder(TRANSCODE_RUNTIME);
 const ALLOW_PRIVATE_DOWNLOADS = process.env.WATCHPAIR_ALLOW_PRIVATE_DOWNLOADS === "1";
 const FFPROBE_PATH = process.env.WATCHPAIR_FFPROBE_PATH || ffprobeStatic.path;
 const runFile = promisify(execFile);
@@ -47,10 +50,13 @@ PRIVATE_NETWORKS.addSubnet("fc00::", 7, "ipv6");
 PRIVATE_NETWORKS.addSubnet("fe80::", 10, "ipv6");
 const pairingNonces = new Map();
 const jobs = new Map();
+const preparationQueue = [];
+let preparationWorker = null;
 installWebTorrentSafetyGuards();
 const client = new WebTorrent({ utp: false });
 const hlsPlayback = createHlsPlaybackManager({
   ffmpegPath: FFMPEG_PATH,
+  encoder: TRANSCODE_RUNTIME.encoder,
   cacheRoot: path.join(DOWNLOAD_DIR, ".watchpair-hls"),
 });
 client.on("error", (error) => console.error(`WebTorrent client error: ${error.message}`));
@@ -245,7 +251,7 @@ async function resolveSource(rawValue) {
     headers: {
       accept: "text/html,application/xhtml+xml,application/x-bittorrent,video/*;q=0.9,*/*;q=0.5",
       "accept-language": "en-US,en;q=0.8",
-      "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) WatchPairCompanion/0.2",
+      "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) WatchPairCompanion/0.3",
     },
   });
   if (!response.ok) throw new Error("The page returned " + response.status + ".");
@@ -304,8 +310,11 @@ function selectedFileKey(job) {
 function selectTorrentFile(job, index) {
   const file = job.torrent?.files[index];
   if (!file) throw new Error("Torrent file not found.");
-  job.torrent.files.forEach((item) => item.deselect());
-  file.select(10);
+  job.torrent.files.forEach((item) => {
+    if (item === file) item.select(10);
+    else if (VIDEO_EXTENSIONS.test(item.name)) item.select(1);
+    else item.deselect();
+  });
   job.selectedIndex = index;
   job.audioTracks = [];
   job.subtitleTracks = [];
@@ -313,9 +322,13 @@ function selectTorrentFile(job, index) {
   job.subtitleStatus = "waiting";
   job.subtitleError = null;
   job.subtitleProbeKey = null;
+  job.preparation = { status: "waiting", error: null, encoder: null, fallback: false };
   job.status = file.done ? "ready" : "downloading";
   job.updatedAt = Date.now();
-  if (file.done) void queueSubtitleProbe(job);
+  if (file.done) {
+    void queueSubtitleProbe(job);
+    queueBackgroundPreparation(job);
+  }
 }
 
 function jobFile(job, index) {
@@ -532,6 +545,8 @@ function snapshot(job) {
     subtitleError: job.subtitleError,
     audioTracks: job.audioTracks || [],
     subtitles: job.subtitleTracks || [],
+    preparation: job.preparation,
+    transcoder: TRANSCODER,
     verification: {
       diskInvalidations: job.diskInvalidations,
       peerFailures: job.peerFailures,
@@ -582,6 +597,7 @@ function startTorrent(job) {
         job.status = "ready";
         job.updatedAt = Date.now();
         void queueSubtitleProbe(job);
+        queueBackgroundPreparation(job);
       });
     });
     job.status = torrent.files[job.selectedIndex]?.done ? "ready" : "downloading";
@@ -595,6 +611,7 @@ function startTorrent(job) {
     job.status = "ready";
     job.updatedAt = Date.now();
     void queueSubtitleProbe(job);
+    queueBackgroundPreparation(job);
   });
   torrent.on("warning", (error) => {
     job.warning = error.message;
@@ -645,6 +662,7 @@ async function startDirect(job) {
     job.status = "ready";
     job.updatedAt = Date.now();
     await queueSubtitleProbe(job);
+    queueBackgroundPreparation(job);
   } catch (error) {
     job.status = "error";
     job.error = error instanceof Error ? error.message : "Direct download failed.";
@@ -691,6 +709,7 @@ async function addDownload(source) {
     peerFailures: 0,
     peersRejected: 0,
     audioRenderPromises: new Map(),
+    preparation: { status: "waiting", error: null, encoder: null, fallback: false },
     updatedAt: Date.now(),
   };
   jobs.set(id, job);
@@ -788,6 +807,72 @@ async function hlsDescriptor(job, fileIndex) {
     videoCodec: job.videoCodec,
     audioTracks: job.audioTracks,
   };
+}
+
+async function prepareQueuedJob(job) {
+  if (job.selectedIndex === null) return;
+  const selectionKey = selectedFileKey(job);
+  const isStillSelected = () => {
+    try {
+      return selectedFileKey(job) === selectionKey;
+    } catch {
+      return false;
+    }
+  };
+
+  try {
+    job.preparation = { status: "preparing", error: null, encoder: null, fallback: false };
+    job.updatedAt = Date.now();
+    await queueSubtitleProbe(job);
+    if (!isStillSelected()) return;
+    const media = selectedJobFile(job);
+    if (!needsHlsPlayback(job, media.name)) {
+      job.preparation = {
+        status: "direct",
+        error: null,
+        encoder: { id: "copy", label: "Direct browser playback", hardware: false },
+        fallback: false,
+      };
+      return;
+    }
+
+    const result = await hlsPlayback.prepare(await hlsDescriptor(job, job.selectedIndex));
+    if (isStillSelected()) job.preparation = { ...result, error: null };
+  } catch (error) {
+    if (!isStillSelected()) return;
+    job.preparation = {
+      status: "error",
+      error: error instanceof Error ? error.message : "Browser preparation failed.",
+      encoder: null,
+      fallback: false,
+    };
+  } finally {
+    job.updatedAt = Date.now();
+  }
+}
+
+async function drainPreparationQueue() {
+  while (preparationQueue.length) {
+    const job = preparationQueue.shift();
+    if (!job || job.preparation.status !== "queued") continue;
+    await prepareQueuedJob(job);
+  }
+}
+
+function startPreparationWorker() {
+  if (preparationWorker) return;
+  preparationWorker = drainPreparationQueue().finally(() => {
+    preparationWorker = null;
+    if (preparationQueue.length) startPreparationWorker();
+  });
+}
+
+function queueBackgroundPreparation(job) {
+  if (job.selectedIndex === null || !["waiting", "error"].includes(job.preparation.status)) return;
+  job.preparation = { status: "queued", error: null, encoder: null, fallback: false };
+  job.updatedAt = Date.now();
+  preparationQueue.push(job);
+  startPreparationWorker();
 }
 
 async function streamFile(request, response, job, fileIndex, headers, audioTrackId) {
@@ -905,9 +990,10 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/health") {
       sendJson(response, 200, {
         ok: true,
-        version: "0.2.9",
+        version: "0.3.0",
         downloadDirectory: DOWNLOAD_DIR,
         jobs: jobs.size,
+        transcoder: TRANSCODER,
       }, headers);
       return;
     }
@@ -992,6 +1078,7 @@ const server = createServer(async (request, response) => {
 server.listen(PORT, HOST, () => {
   console.log(`WatchPair agent listening on http://${HOST}:${PORT}`);
   console.log(`Downloads: ${DOWNLOAD_DIR}`);
+  console.log(`Transcoder: ${TRANSCODER.label} via ${TRANSCODER.ffmpegSource} FFmpeg`);
   console.log(`Allowed origins: ${Array.from(ALLOWED_ORIGINS).join(", ")}`);
 });
 

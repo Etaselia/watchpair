@@ -10,6 +10,8 @@ export interface SharedSource {
 }
 
 export interface SelectedMedia {
+  sourceId?: string;
+  fileIndex?: number;
   name: string;
   size: number;
   fingerprint?: string;
@@ -26,21 +28,27 @@ export interface PlayerState {
   actorId: string;
 }
 
-export interface ParticipantState {
-  deviceId: string;
-  name: string;
+export interface QueueReadiness {
   ready: boolean;
   progress: number;
   status: string;
   fileName: string | null;
   fileSize: number | null;
   fingerprint: string | null;
+  preparation: "waiting" | "queued" | "preparing" | "ready" | "direct" | "error";
+}
+
+export interface ParticipantState extends QueueReadiness {
+  deviceId: string;
+  name: string;
+  queue: Record<string, QueueReadiness>;
   updatedAt: number;
 }
 
 export interface WatchSession {
   token: string;
   hostId: string;
+  sources: SharedSource[];
   source: SharedSource | null;
   selectedMedia: SelectedMedia | null;
   player: PlayerState;
@@ -52,13 +60,8 @@ export interface WatchSession {
   participants: ParticipantState[];
 }
 
-export interface LocalReadiness {
-  ready: boolean;
-  progress: number;
-  status: string;
-  fileName: string | null;
-  fileSize: number | null;
-  fingerprint: string | null;
+export interface LocalReadiness extends QueueReadiness {
+  queue: Record<string, QueueReadiness>;
 }
 
 export const initialPlayerState = (now = Date.now()): PlayerState => ({

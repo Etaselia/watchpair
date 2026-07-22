@@ -681,6 +681,107 @@ svg {
   font-size: 10px;
 }
 
+.queue-list {
+  display: grid;
+  margin-top: 16px;
+  border-bottom: 1px solid #cfd2c8;
+}
+
+.queue-item {
+  min-width: 0;
+  border-top: 1px solid #cfd2c8;
+  padding: 14px 0;
+}
+
+.queue-item.selected {
+  background: #f4f8e9;
+  box-shadow: -4px 0 0 var(--lime);
+  padding-right: 12px;
+  padding-left: 12px;
+}
+
+.queue-item-main {
+  display: grid;
+  grid-template-columns: 28px 42px minmax(0, 1fr) 80px auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.queue-index {
+  color: #858a7e;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.queue-item .source-details > div {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.source-badge.subtle {
+  flex: none;
+  padding: 3px 6px;
+  font-size: 8px;
+}
+
+.queue-item .progress-track {
+  width: min(100%, 430px);
+  margin-top: 4px;
+}
+
+.queue-item-status {
+  display: grid;
+  justify-items: end;
+  gap: 2px;
+}
+
+.queue-item-status strong {
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.queue-item-status span {
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.queue-item .compact-button.selected {
+  border-color: #72901e;
+  background: #e9f5c7;
+}
+
+.queue-preparation {
+  min-height: 25px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 7px 0 0 82px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.queue-preparation svg {
+  width: 13px;
+  height: 13px;
+}
+
+.queue-preparation strong {
+  border-radius: 3px;
+  background: #d8f5e3;
+  color: #19623b;
+  padding: 2px 5px;
+  font-family: var(--font-mono);
+  font-size: 8px;
+}
+
+.queue-item .agent-files {
+  margin-left: 82px;
+}
+
 .drop-zone {
   width: 100%;
   min-height: 78px;
@@ -1633,6 +1734,36 @@ svg {
   .source-current {
     align-items: flex-start;
     flex-wrap: wrap;
+  }
+
+  .queue-item.selected {
+    padding-right: 8px;
+    padding-left: 8px;
+  }
+
+  .queue-item-main {
+    grid-template-columns: 24px 36px minmax(0, 1fr) auto;
+    align-items: start;
+    gap: 8px;
+  }
+
+  .queue-item .file-icon {
+    width: 36px;
+    height: 36px;
+  }
+
+  .queue-item-status {
+    display: none;
+  }
+
+  .queue-item .compact-button {
+    grid-column: 3 / -1;
+    width: 100%;
+  }
+
+  .queue-preparation,
+  .queue-item .agent-files {
+    margin-left: 68px;
   }
 
   .source-details {

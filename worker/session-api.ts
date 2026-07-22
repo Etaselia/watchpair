@@ -3,6 +3,7 @@ import {
   type LocalReadiness,
   type ParticipantState,
   type PlayerState,
+  type QueueReadiness,
   type SelectedMedia,
   type SharedSource,
   type WatchSession,
@@ -80,7 +81,7 @@ function makeToken() {
   return `${token.slice(0, 4)}-${token.slice(4)}`;
 }
 
-function defaultReadiness(): LocalReadiness {
+function defaultQueueReadiness(): QueueReadiness {
   return {
     ready: false,
     progress: 0,
@@ -88,10 +89,20 @@ function defaultReadiness(): LocalReadiness {
     fileName: null,
     fileSize: null,
     fingerprint: null,
+    preparation: "waiting",
   };
 }
 
-function sanitizeReadiness(value: Partial<LocalReadiness> | undefined): LocalReadiness {
+function defaultReadiness(): LocalReadiness {
+  return { ...defaultQueueReadiness(), queue: {} };
+}
+
+function sanitizeQueueReadiness(value: Partial<QueueReadiness> | undefined): QueueReadiness {
+  const preparation = ["waiting", "queued", "preparing", "ready", "direct", "error"].includes(
+    String(value?.preparation)
+  )
+    ? value?.preparation as QueueReadiness["preparation"]
+    : "waiting";
   return {
     ready: Boolean(value?.ready),
     progress: Math.max(0, Math.min(100, Number(value?.progress) || 0)),
@@ -99,7 +110,30 @@ function sanitizeReadiness(value: Partial<LocalReadiness> | undefined): LocalRea
     fileName: value?.fileName ? String(value.fileName).slice(0, 260) : null,
     fileSize: Number.isFinite(value?.fileSize) ? Number(value?.fileSize) : null,
     fingerprint: value?.fingerprint ? String(value.fingerprint).slice(0, 128) : null,
+    preparation,
   };
+}
+
+function sanitizeReadiness(value: Partial<LocalReadiness> | undefined): LocalReadiness {
+  const queue = Object.fromEntries(
+    Object.entries(value?.queue || {})
+      .filter(([id]) => /^[a-zA-Z0-9-]{8,80}$/.test(id))
+      .slice(0, 30)
+      .map(([id, state]) => [id, sanitizeQueueReadiness(state)])
+  );
+  return { ...sanitizeQueueReadiness(value), queue };
+}
+
+function normalizeSources(value: string | null): SharedSource[] {
+  const stored = json<SharedSource | SharedSource[] | null>(value, null);
+  if (!stored) return [];
+  return (Array.isArray(stored) ? stored : [stored]).filter(
+    (item) => item && typeof item.id === "string" && typeof item.value === "string"
+  );
+}
+
+function activeSource(sources: SharedSource[], selectedMedia: SelectedMedia | null) {
+  return sources.find((item) => item.id === selectedMedia?.sourceId) || sources[0] || null;
 }
 
 function stableParticipants(participants: ParticipantState[], hostId: string) {
@@ -159,17 +193,20 @@ class D1SessionStore implements SessionStore {
       participantRows.results.map((participant) => ({
         deviceId: participant.device_id,
         name: participant.name,
-        ...json<LocalReadiness>(participant.state_json, defaultReadiness()),
+        ...sanitizeReadiness(json<LocalReadiness>(participant.state_json, defaultReadiness())),
         updatedAt: participant.updated_at,
       })),
       row.host_id
     );
 
+    const sources = normalizeSources(row.source_json);
+    const selectedMedia = json<SelectedMedia | null>(row.selected_media_json, null);
     return {
       token: row.token,
       hostId: row.host_id,
-      source: json<SharedSource | null>(row.source_json, null),
-      selectedMedia: json<SelectedMedia | null>(row.selected_media_json, null),
+      sources,
+      source: activeSource(sources, selectedMedia),
+      selectedMedia,
       player: json<PlayerState>(row.player_json, initialPlayerState(row.updated_at)),
       seq: row.seq,
       createdAt: row.created_at,
@@ -208,17 +245,18 @@ class D1SessionStore implements SessionStore {
   }
 
   async setSource(token: string, source: SharedSource, now: number) {
+    const serialized = JSON.stringify(source);
     await this.db
       .prepare(`UPDATE watch_sessions SET
-        source_json = ?, selected_media_json = NULL, player_json = ?, seq = seq + 1, updated_at = ?
+        source_json = CASE
+          WHEN source_json IS NULL OR NOT json_valid(source_json) THEN json_array(json(?))
+          WHEN json_type(source_json) = 'array' THEN json_insert(source_json, '$[#]', json(?))
+          ELSE json_array(json(source_json), json(?))
+        END,
+        seq = seq + 1,
+        updated_at = ?
         WHERE token = ?`)
-      .bind(JSON.stringify(source), JSON.stringify(initialPlayerState(now)), now, token)
-      .run();
-    await this.db
-      .prepare(
-        "UPDATE watch_participants SET state_json = ?, updated_at = ? WHERE session_token = ? AND updated_at >= ?"
-      )
-      .bind(JSON.stringify(defaultReadiness()), now, token, now - PARTICIPANT_ACTIVE_MS)
+      .bind(serialized, serialized, serialized, now, token)
       .run();
   }
 
@@ -240,7 +278,7 @@ class D1SessionStore implements SessionStore {
 interface MemorySession {
   token: string;
   hostId: string;
-  source: SharedSource | null;
+  sources: SharedSource[];
   selectedMedia: SelectedMedia | null;
   player: PlayerState;
   seq: number;
@@ -266,7 +304,8 @@ class MemorySessionStore implements SessionStore {
     return {
       token: record.token,
       hostId: record.hostId,
-      source: record.source,
+      sources: record.sources,
+      source: activeSource(record.sources, record.selectedMedia),
       selectedMedia: record.selectedMedia,
       player: record.player,
       seq: record.seq,
@@ -287,7 +326,7 @@ class MemorySessionStore implements SessionStore {
     memorySessions.set(token, {
       token,
       hostId,
-      source: null,
+      sources: [],
       selectedMedia: null,
       player: initialPlayerState(now),
       seq: 0,
@@ -318,21 +357,9 @@ class MemorySessionStore implements SessionStore {
   async setSource(token: string, source: SharedSource, now: number) {
     const record = memorySessions.get(token);
     if (!record) return;
-    record.source = source;
-    record.selectedMedia = null;
-    record.player = initialPlayerState(now);
+    record.sources.push(source);
     record.seq += 1;
     record.updatedAt = now;
-    for (const [deviceId, participant] of record.participants) {
-      if (participant.updatedAt >= now - PARTICIPANT_ACTIVE_MS) {
-        record.participants.set(deviceId, {
-          deviceId,
-          name: participant.name,
-          ...defaultReadiness(),
-          updatedAt: now,
-        });
-      }
-    }
   }
 
   async setSelectedMedia(token: string, media: SelectedMedia, now: number) {
@@ -389,7 +416,8 @@ async function handlePost(request: Request, store: SessionStore) {
   }
 
   const token = normalizeToken(body.token);
-  if (!token || !(await store.get(token))) {
+  const currentSession = token ? await store.get(token) : null;
+  if (!token || !currentSession) {
     return Response.json({ error: "Session not found or expired" }, { status: 404 });
   }
 
@@ -402,6 +430,9 @@ async function handlePost(request: Request, store: SessionStore) {
       now
     );
   } else if (action === "source") {
+    if (currentSession.sources.length >= 30) {
+      return Response.json({ error: "A session can queue up to 30 downloads." }, { status: 400 });
+    }
     const candidate = body.source as Partial<SharedSource> | null;
     if (!candidate?.value || !["magnet", "direct"].includes(String(candidate.kind))) {
       return Response.json({ error: "A supported source is required" }, { status: 400 });
@@ -423,9 +454,18 @@ async function handlePost(request: Request, store: SessionStore) {
     if (!candidate?.name || !Number.isFinite(candidate.size)) {
       return Response.json({ error: "A media file is required" }, { status: 400 });
     }
+    const sourceId = candidate.sourceId ? String(candidate.sourceId).slice(0, 80) : undefined;
+    if (sourceId && !currentSession.sources.some((source) => source.id === sourceId)) {
+      return Response.json({ error: "That queued source was not found." }, { status: 400 });
+    }
+    if (candidate.fileIndex !== undefined && (!Number.isInteger(candidate.fileIndex) || Number(candidate.fileIndex) < 0)) {
+      return Response.json({ error: "A valid media file index is required." }, { status: 400 });
+    }
     await store.setSelectedMedia(
       token,
       {
+        sourceId,
+        fileIndex: Number.isInteger(candidate.fileIndex) ? Number(candidate.fileIndex) : undefined,
         name: String(candidate.name).slice(0, 260),
         size: Number(candidate.size),
         fingerprint: candidate.fingerprint ? String(candidate.fingerprint).slice(0, 128) : undefined,

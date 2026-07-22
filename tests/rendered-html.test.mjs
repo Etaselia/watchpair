@@ -78,6 +78,29 @@ test("production session API supports join-in-progress state", async () => {
   });
   assert.equal(joinedResponse.status, 200);
 
+  const queuedSources = [
+    { kind: "magnet", value: "magnet:?xt=urn:btih:1111111111111111111111111111111111111111", label: "Episode 1" },
+    { kind: "magnet", value: "magnet:?xt=urn:btih:2222222222222222222222222222222222222222", label: "Episode 2" },
+  ];
+  let queueSession;
+  for (const source of queuedSources) {
+    const sourceResponse = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        action: "source",
+        token: created.session.token,
+        deviceId: "test-host",
+        name: "Host",
+        source,
+      }),
+    });
+    assert.equal(sourceResponse.status, 200);
+    queueSession = (await sourceResponse.json()).session;
+  }
+  assert.equal(queueSession.sources.length, 2);
+  assert.deepEqual(queueSession.sources.map((source) => source.label), ["Episode 1", "Episode 2"]);
+
   const playerResponse = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -106,7 +129,13 @@ test("production session API supports join-in-progress state", async () => {
       token: created.session.token,
       deviceId: "test-host",
       name: "Host",
-      media: { name: "episode-2.mkv", size: 2048, fingerprint: "episode-2" },
+      media: {
+        sourceId: queueSession.sources[1].id,
+        fileIndex: 0,
+        name: "episode-2.mkv",
+        size: 2048,
+        fingerprint: "episode-2",
+      },
     }),
   });
   assert.equal(selectedResponse.status, 200);
@@ -121,6 +150,9 @@ test("production session API supports join-in-progress state", async () => {
   assert.equal(snapshotResponse.status, 200);
   const snapshot = await snapshotResponse.json();
   assert.equal(snapshot.session.participants.length, 2);
+  assert.equal(snapshot.session.sources.length, 2);
+  assert.equal(snapshot.session.source.id, queueSession.sources[1].id);
+  assert.equal(snapshot.session.selectedMedia.sourceId, queueSession.sources[1].id);
   assert.deepEqual(
     snapshot.session.participants.map((participant) => participant.deviceId),
     ["test-host", "test-guest"],
@@ -141,6 +173,9 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /Watch together/);
   assert.match(app, /action: "create",\s+deviceId,\s+name: displayName/);
   assert.match(app, /getAgentDownload/);
+  assert.match(app, /Download queue/);
+  assert.match(app, /watchpair-companion\.zip\?v=0\.3\.0/);
+  assert.match(app, /queueReadinessForJob/);
   assert.match(app, /subtitleOffset/);
   assert.match(app, /autoOpenedMediaRef/);
   assert.match(app, /window\.setInterval\(keepAlive, 8_000\)/);
@@ -155,6 +190,7 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(route, /action === "heartbeat"/);
   assert.match(route, /action === "player"/);
   assert.match(route, /action === "select-media"/);
+  assert.match(route, /normalizeSources/);
   assert.match(route, /stableParticipants/);
   assert.match(agent, /new WebTorrent/);
   assert.match(agent, /content-range/);
@@ -175,6 +211,7 @@ test("packages the pairable magnet and subtitle companion", async () => {
   const expected = [
     "WatchPair Companion/server.mjs",
     "WatchPair Companion/hls-playback.mjs",
+    "WatchPair Companion/hardware-acceleration.mjs",
     "WatchPair Companion/torrent-input.mjs",
     "WatchPair Companion/webtorrent-safety.mjs",
     "WatchPair Companion/package.json",
@@ -187,6 +224,7 @@ test("packages the pairable magnet and subtitle companion", async () => {
 
   const bundledAgent = strFromU8(archive["WatchPair Companion/server.mjs"]);
   const bundledHls = strFromU8(archive["WatchPair Companion/hls-playback.mjs"]);
+  const bundledHardware = strFromU8(archive["WatchPair Companion/hardware-acceleration.mjs"]);
   const bundledSafetyGuard = strFromU8(archive["WatchPair Companion/webtorrent-safety.mjs"]);
   const companionPackage = strFromU8(archive["WatchPair Companion/package.json"]);
   const installer = strFromU8(archive["WatchPair Companion/install-runtime.ps1"]);
@@ -200,6 +238,14 @@ test("packages the pairable magnet and subtitle companion", async () => {
   assert.match(bundledAgent, /window\.close/);
   assert.match(bundledHls, /hls_playlist_type/);
   assert.match(bundledHls, /watchpair-audio/);
+  assert.match(bundledHls, /videoEncoderArguments/);
+  assert.match(bundledHardware, /h264_nvenc/);
+  assert.match(bundledHardware, /h264_qsv/);
+  assert.match(bundledHardware, /h264_vaapi/);
+  assert.match(bundledHardware, /h264_amf/);
+  assert.match(bundledHardware, /testEncoder/);
+  assert.match(bundledAgent, /queueBackgroundPreparation/);
+  assert.match(bundledAgent, /TRANSCODER/);
   assert.match(bundledAgent, /installWebTorrentSafetyGuards/);
   assert.match(bundledSafetyGuard, /const piece = this\.pieces\?\.\[index\]/);
   assert.match(bundledSafetyGuard, /stabilizeWireBitfieldWrites/);

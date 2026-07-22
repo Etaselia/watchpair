@@ -1,8 +1,8 @@
 # WatchPair
 
 WatchPair is a private two-person watch room for videos that remain on each
-participant's own computer. A session keeps source selection, download
-readiness, play/pause, seeks, playback speed, audio language, subtitles, and
+participant's own computer. A session keeps an ordered download queue, active
+file selection, per-item readiness, play/pause, seeks, playback speed, audio language, subtitles, and
 subtitle timing synchronized.
 
 ## What works
@@ -13,15 +13,16 @@ subtitle timing synchronized.
 - Automatic direct downloads through the local companion, with an OPFS browser
   fallback for CORS-enabled URLs
 - Magnet-first page resolution through the local companion, including encoded links
-- Automatic magnet and `.torrent` downloads through the local companion using WebTorrent
-- Torrent file selection and synchronized selected-file priority
+- Concurrent queued magnet, `.torrent`, and direct downloads through the local companion
+- Synchronized queue and torrent file selection with background download priority
 - Per-device progress and a both-ready gate before shared playback
 - Server-authoritative play, pause, seek, speed, language, subtitle, and offset
   state
 - Drift correction and reconnect recovery in the player
 - Local SRT and WebVTT subtitle parsing
 - Per-file audio and subtitle discovery for MKV and other containers with FFprobe
-- On-demand WebVTT extraction and cached browser-compatible alternate-audio remuxes with FFmpeg
+- Background WebVTT discovery and cached progressive HLS preparation with FFmpeg
+- Automatic NVENC, Quick Sync, VAAPI, AMF, and VideoToolbox detection with CPU fallback
 - Byte-range streaming from the companion so the browser can seek efficiently
 
 ## Architecture
@@ -77,6 +78,10 @@ npm run agent
 - `WATCHPAIR_ORIGINS` pre-approves a comma-separated list of coordinator origins.
   Normal users approve the current website through the local pairing page instead.
 - `WATCHPAIR_AGENT_PORT` changes the localhost port.
+- `WATCHPAIR_FFMPEG_PATH` selects a specific GPU-capable FFmpeg executable.
+- `WATCHPAIR_TRANSCODER` accepts `auto`, `cpu`, `nvenc`, `qsv`, `vaapi`,
+  `amf`, or `videotoolbox`. The companion validates the requested encoder with
+  a tiny real encode and falls back to CPU when it is unavailable.
 
 For a VPS-hosted coordinator, every participant runs the companion locally and
 uses the website **Connect** action to approve that public HTTPS origin. Current
@@ -110,7 +115,9 @@ npm run lint
 - Browsers may require one click before a remote play command can start media.
 - Browser-incompatible files are prepared as progressive HLS. Playback starts from the first
   four-second segments while the remaining video is encoded in the background.
+- Completed queue items are prepared one at a time in the background while all downloads continue.
 - Video is encoded once and embedded audio languages are exposed as separate AAC renditions.
+  A working system GPU encoder is preferred; the bundled FFmpeg provides the universal CPU fallback.
   Prepared segments are cached under `downloads/.watchpair-hls` for later watches.
 - MKV text subtitles such as SRT, ASS, and WebVTT are extracted by the companion.
   Image-based PGS/VobSub tracks cannot be rendered as browser text. Video and

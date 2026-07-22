@@ -16,7 +16,26 @@ Install Node.js 22.13 or newer, then run:
   chmod +x install-and-start.sh
   ./install-and-start.sh
 
-Downloads are saved in the downloads folder by default. The companion listens
-only on 127.0.0.1:41735. Websites cannot use it until you explicitly approve
-their origin on the local pairing page. Approved origins are stored in
-~/.watchpair/companion.json.
+GPU TRANSCODING
+
+At startup the companion checks a system FFmpeg first, then uses its bundled
+CPU-only FFmpeg as a fallback. Install a GPU-enabled FFmpeg in PATH, or set
+WATCHPAIR_FFMPEG_PATH to its full path before launching the companion.
+
+Supported encoders:
+- NVIDIA: h264_nvenc
+- Intel: h264_qsv
+- AMD on Linux: h264_vaapi
+- AMD on Windows: h264_amf
+- macOS: h264_videotoolbox
+
+The companion runs a tiny test encode before selecting an encoder. Its startup
+log and the WatchPair queue show the selected transcoder. Set
+WATCHPAIR_TRANSCODER to auto, cpu, nvenc, qsv, vaapi, amf, or videotoolbox to
+override automatic selection. A failed GPU encode retries with CPU encoding.
+
+Downloads are saved in the downloads folder by default. Queued downloads run
+concurrently; completed videos are prepared for browser playback one at a time
+in the background. The companion listens only on 127.0.0.1:41735. Websites
+cannot use it until you explicitly approve their origin on the local pairing
+page. Approved origins are stored in ~/.watchpair/companion.json.

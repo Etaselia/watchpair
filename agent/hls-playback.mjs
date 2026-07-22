@@ -2,8 +2,9 @@ import { spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
 import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { CPU_ENCODER, videoEncoderArguments } from "./hardware-acceleration.mjs";
 
-const CACHE_VERSION = "hls-v1";
+const CACHE_VERSION = "hls-v2";
 const DEFAULT_SEGMENT_SECONDS = 4;
 const PLAYLIST_WAIT_MS = 60_000;
 
@@ -90,6 +91,7 @@ function pipelineError(label, code, stderr) {
 export function createHlsPlaybackManager({
   ffmpegPath,
   cacheRoot,
+  encoder = CPU_ENCODER,
   segmentSeconds = DEFAULT_SEGMENT_SECONDS,
   playlistWaitMs = PLAYLIST_WAIT_MS,
 }) {
@@ -121,7 +123,7 @@ export function createHlsPlaybackManager({
     ).then((values) => values.every(Boolean));
   }
 
-  function launch(state, label, args, errorKey) {
+  function launch(state, label, args) {
     const child = spawn(ffmpegPath, args, {
       windowsHide: true,
       stdio: ["ignore", "ignore", "pipe"],
@@ -133,7 +135,7 @@ export function createHlsPlaybackManager({
       stderr = (stderr + chunk.toString()).slice(-16_384);
     });
 
-    const done = new Promise((resolve, reject) => {
+    return new Promise((resolve, reject) => {
       child.once("error", reject);
       child.once("close", (code) => {
         state.children.delete(child);
@@ -144,12 +146,6 @@ export function createHlsPlaybackManager({
         reject(pipelineError(label, code, stderr));
       });
     });
-
-    void done.catch((error) => {
-      state.errors.set(errorKey, error);
-      console.error(`WatchPair ${error.message}`);
-    });
-    return done;
   }
 
   async function initialize(descriptor) {
@@ -159,9 +155,15 @@ export function createHlsPlaybackManager({
       children: new Set(),
       errors: new Map(),
       done: null,
+      status: "preparing",
+      encoder: descriptor.videoCodec === "h264"
+        ? { id: "copy", label: "Direct stream copy", hardware: false }
+        : encoder,
+      fallback: false,
     };
 
     if (await cacheIsComplete(directory, descriptor.audioTracks)) {
+      state.status = "ready";
       state.done = Promise.resolve();
       return state;
     }
@@ -178,31 +180,42 @@ export function createHlsPlaybackManager({
       "-hide_banner", "-loglevel", "error", "-y",
       "-i", descriptor.inputPath,
     ];
-    const videoCodecArguments = descriptor.videoCodec === "h264"
-      ? ["-c:v", "copy"]
-      : [
-          "-c:v", "libx264",
-          "-preset", "veryfast",
-          "-crf", "23",
-          "-pix_fmt", "yuv420p",
-          "-sc_threshold", "0",
-          "-force_key_frames", `expr:gte(t,n_forced*${segmentSeconds})`,
-        ];
 
-    const tasks = [
-      launch(
+    const launchVideo = async () => {
+      const argumentsFor = (selectedEncoder) => descriptor.videoCodec === "h264"
+        ? ["-c:v", "copy"]
+        : videoEncoderArguments(selectedEncoder, segmentSeconds);
+      const run = () => launch(
         state,
         "video",
         [
           ...baseArguments,
           "-map", "0:v:0",
           "-an", "-sn", "-dn",
-          ...videoCodecArguments,
+          ...argumentsFor(state.encoder),
           "-max_muxing_queue_size", "4096",
           ...playlistArguments(videoDirectory, segmentSeconds),
-        ],
-        "video"
-      ),
+        ]
+      );
+
+      try {
+        await run();
+      } catch (error) {
+        if (descriptor.videoCodec === "h264" || !state.encoder.hardware) throw error;
+        console.warn(`WatchPair ${state.encoder.label} failed for this file; retrying with CPU encoding.`);
+        state.encoder = CPU_ENCODER;
+        state.fallback = true;
+        await rm(videoDirectory, { recursive: true, force: true });
+        await mkdir(videoDirectory, { recursive: true });
+        await run();
+      }
+    };
+
+    const tasks = [
+      launchVideo().catch((error) => {
+        state.errors.set("video", error);
+        throw error;
+      }),
       ...descriptor.audioTracks.map((track) => {
         const id = trackDirectory(track);
         const audioDirectory = path.join(directory, "audio", id);
@@ -217,13 +230,24 @@ export function createHlsPlaybackManager({
             "-b:a", "192k",
             "-af", "aresample=async=1:first_pts=0",
             ...playlistArguments(audioDirectory, segmentSeconds),
-          ],
-          `audio:${id}`
-        );
+          ]
+        ).catch((error) => {
+          state.errors.set(`audio:${id}`, error);
+          throw error;
+        });
       }),
     ];
 
-    state.done = Promise.allSettled(tasks).then(() => undefined);
+    state.done = Promise.all(tasks)
+      .then(() => {
+        state.status = "ready";
+      })
+      .catch((error) => {
+        state.status = "error";
+        console.error(`WatchPair ${error.message}`);
+        throw error;
+      });
+    void state.done.catch(() => {});
     return state;
   }
 
@@ -280,6 +304,30 @@ export function createHlsPlaybackManager({
     };
   }
 
+  async function prepare(descriptor) {
+    const state = await ensure(descriptor);
+    await state.done;
+    return preparationState(state);
+  }
+
+  async function getPreparation(descriptor) {
+    const pending = sessions.get(cacheKey(descriptor));
+    if (!pending) return { status: "waiting", encoder: null, fallback: false };
+    return preparationState(await pending);
+  }
+
+  function preparationState(state) {
+    return {
+      status: state.status,
+      encoder: {
+        id: state.encoder.id,
+        label: state.encoder.label,
+        hardware: Boolean(state.encoder.hardware),
+      },
+      fallback: state.fallback,
+    };
+  }
+
   function shutdown() {
     for (const pending of sessions.values()) {
       void pending.then((state) => {
@@ -288,7 +336,7 @@ export function createHlsPlaybackManager({
     }
   }
 
-  return { getAsset, shutdown };
+  return { getAsset, getPreparation, prepare, shutdown };
 }
 
 async function readStableAsset(filePath) {

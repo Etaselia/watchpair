@@ -74,6 +74,13 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
     const manager = createHlsPlaybackManager({
       ffmpegPath,
       cacheRoot,
+      encoder: {
+        id: "test-gpu",
+        codec: "test_gpu",
+        label: "Test GPU",
+        hardware: true,
+        arguments: ["-c:v", "watchpair_missing_encoder"],
+      },
       segmentSeconds: 2,
       playlistWaitMs: 15_000,
     });
@@ -111,6 +118,11 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
       if (attempt === 199) assert.fail("HLS preparation did not finish");
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
+    const preparation = await manager.prepare(descriptor);
+    assert.equal(preparation.status, "ready");
+    assert.equal(preparation.encoder.id, "cpu");
+    assert.equal(preparation.fallback, true);
+
     const probe = JSON.parse(
       (
         await runFile(ffprobeStatic.path, [

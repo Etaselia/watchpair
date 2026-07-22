@@ -50,6 +50,21 @@ export interface AgentSubtitleTrack {
   url: string;
 }
 
+export interface AgentTranscoder {
+  encoder: string;
+  label: string;
+  hardware: boolean;
+  ffmpegSource: "configured" | "system" | "bundled";
+  preference?: string;
+}
+
+export interface AgentPreparation {
+  status: "waiting" | "queued" | "preparing" | "ready" | "direct" | "error";
+  error: string | null;
+  encoder: { id: string; label: string; hardware: boolean } | null;
+  fallback: boolean;
+}
+
 export interface AgentJob {
   id: string;
   kind: "magnet" | "direct";
@@ -61,6 +76,8 @@ export interface AgentJob {
   subtitleError: string | null;
   audioTracks: AgentAudioTrack[];
   subtitles: AgentSubtitleTrack[];
+  preparation: AgentPreparation;
+  transcoder: AgentTranscoder;
   files: AgentFile[];
   updatedAt: number;
 }

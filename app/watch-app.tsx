@@ -6,6 +6,7 @@ import {
   ArrowLeft,
   Check,
   Copy,
+  Cpu,
   Download,
   Expand,
   FileVideo2,
@@ -68,9 +69,13 @@ import {
 } from "../lib/media";
 import {
   type LocalReadiness,
+  type QueueReadiness,
   type PlayerState,
   type WatchSession,
 } from "../lib/session-types";
+
+const EMPTY_AUDIO_TRACKS: AgentAudioTrack[] = [];
+const EMPTY_SUBTITLE_TRACKS: AgentSubtitleTrack[] = [];
 
 const emptyReadiness = (): LocalReadiness => ({
   ready: false,
@@ -79,6 +84,8 @@ const emptyReadiness = (): LocalReadiness => ({
   fileName: null,
   fileSize: null,
   fingerprint: null,
+  preparation: "waiting",
+  queue: {},
 });
 
 async function sessionRequest(payload: Record<string, unknown>) {
@@ -98,8 +105,68 @@ function sameSelectedFile(session: WatchSession, readiness: LocalReadiness) {
   if (!session.selectedMedia || !readiness.fileName) return true;
   return (
     session.selectedMedia.name === readiness.fileName &&
-    session.selectedMedia.size === readiness.fileSize
+    session.selectedMedia.size === readiness.fileSize &&
+    (!session.selectedMedia.fingerprint ||
+      !readiness.fingerprint ||
+      session.selectedMedia.fingerprint === readiness.fingerprint)
   );
+}
+
+function preferredAgentFile(job: AgentJob, selectedMedia?: WatchSession["selectedMedia"]) {
+  const selected = selectedMedia?.sourceId === job.id
+    ? job.files.find((file) =>
+        (selectedMedia.fileIndex === undefined || file.index === selectedMedia.fileIndex) &&
+        file.name === selectedMedia.name &&
+        file.size === selectedMedia.size
+      )
+    : null;
+  return selected
+    || job.files.find((file) => file.selected)
+    || [...job.files].sort(
+      (left, right) =>
+        Number(/\.(mp4|m4v|webm|ogv|mov|mkv)$/i.test(right.name)) -
+          Number(/\.(mp4|m4v|webm|ogv|mov|mkv)$/i.test(left.name))
+        || right.size - left.size
+    )[0]
+    || null;
+}
+
+function queueReadinessForJob(job: AgentJob, file: AgentFile | null): QueueReadiness {
+  const preparation = job.preparation?.status || "waiting";
+  if (!file) {
+    return {
+      ready: false,
+      progress: 0,
+      status: job.status === "metadata" ? "Reading torrent metadata" : "Starting download",
+      fileName: null,
+      fileSize: null,
+      fingerprint: null,
+      preparation,
+    };
+  }
+
+  const fingerprint = `${job.infoHash || job.id}:${file.index}:${file.size}`;
+  const status = job.status === "error"
+    ? job.error || "Download failed"
+    : !file.ready
+      ? job.status === "metadata" ? "Reading torrent metadata" : "Downloading locally"
+      : preparation === "queued"
+        ? "Queued for browser preparation"
+        : preparation === "preparing"
+          ? "Preparing browser video"
+          : preparation === "error"
+            ? job.preparation.error || "Browser preparation failed"
+            : "Ready to watch";
+
+  return {
+    ready: file.ready,
+    progress: file.progress,
+    status,
+    fileName: file.name,
+    fileSize: file.size,
+    fingerprint,
+    preparation,
+  };
 }
 
 type SubtitleFont =
@@ -251,9 +318,7 @@ export default function WatchApp() {
   const [agentAvailable, setAgentAvailable] = useState(false);
   const [agentPermission, setAgentPermission] = useState<AgentPermissionState | "checking">("checking");
   const [agentPairing, setAgentPairing] = useState(false);
-  const [agentJob, setAgentJob] = useState<AgentJob | null>(null);
-  const [embeddedAudioTracks, setEmbeddedAudioTracks] = useState<AgentAudioTrack[]>([]);
-  const [embeddedSubtitles, setEmbeddedSubtitles] = useState<AgentSubtitleTrack[]>([]);
+  const [agentJobs, setAgentJobs] = useState<Record<string, AgentJob>>({});
   const [connection, setConnection] = useState<"syncing" | "online" | "offline">("syncing");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const subtitleInputRef = useRef<HTMLInputElement>(null);
@@ -266,6 +331,16 @@ export default function WatchApp() {
   const initializedMediaTracksRef = useRef("");
   const autoOpenedMediaRef = useRef("");
   const pairingTimerRef = useRef<number | null>(null);
+  const sources = session?.sources?.length ? session.sources : session?.source ? [session.source] : [];
+  const activeSource = sources.find((source) => source.id === session?.selectedMedia?.sourceId)
+    || sources[0]
+    || null;
+  const activeSourceId = activeSource?.id || "";
+  const activeSourceKind = activeSource?.kind || "";
+  const agentJob = activeSource ? agentJobs[activeSource.id] || null : null;
+  const embeddedAudioTracks = agentJob?.audioTracks || EMPTY_AUDIO_TRACKS;
+  const embeddedSubtitles = agentJob?.subtitles || EMPTY_SUBTITLE_TRACKS;
+  const sourcesKey = sources.map((source) => source.id).join(":");
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -546,12 +621,10 @@ export default function WatchApp() {
   }, [applySession, deviceId, displayName, joined, roomToken]);
 
   const attachLocalFile = useCallback(
-    async (file: File, preferredName = file.name) => {
+    async (file: File, preferredName = file.name, sourceId?: string) => {
       setBusy("file");
       setError("");
       try {
-        setEmbeddedAudioTracks([]);
-        setEmbeddedSubtitles([]);
         const playableFile =
           preferredName === file.name ? file : new File([file], preferredName, { type: file.type });
         const fingerprint = await fingerprintFile(playableFile);
@@ -559,19 +632,28 @@ export default function WatchApp() {
         if (mediaUrlRef.current.startsWith("blob:")) URL.revokeObjectURL(mediaUrlRef.current);
         setMediaUrl(url);
 
-        const nextReadiness: LocalReadiness = {
+        const itemReadiness: QueueReadiness = {
           ready: true,
           progress: 100,
           status: "Ready to watch",
           fileName: preferredName,
           fileSize: playableFile.size,
           fingerprint,
+          preparation: "direct",
+        };
+        const nextReadiness: LocalReadiness = {
+          ...itemReadiness,
+          queue: sourceId
+            ? { ...readinessRef.current.queue, [sourceId]: itemReadiness }
+            : readinessRef.current.queue,
         };
         setReadiness(nextReadiness);
         readinessRef.current = nextReadiness;
         await sendAction("heartbeat", { readiness: nextReadiness });
         await sendAction("select-media", {
           media: {
+            sourceId,
+            fileIndex: 0,
             name: preferredName,
             size: playableFile.size,
             fingerprint,
@@ -589,7 +671,7 @@ export default function WatchApp() {
   const onChooseFile = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     event.target.value = "";
-    if (file) await attachLocalFile(file);
+    if (file) await attachLocalFile(file, file.name, activeSource?.id);
   };
 
   const onChooseSubtitle = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -624,11 +706,6 @@ export default function WatchApp() {
         : await resolveSharedSource(sourceInput);
       await sendAction("source", { source: resolved });
       setSourceInput("");
-      setReadiness(emptyReadiness());
-      setMediaUrl((current) => {
-        if (current.startsWith("blob:")) URL.revokeObjectURL(current);
-        return "";
-      });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not add that source.");
     } finally {
@@ -636,216 +713,207 @@ export default function WatchApp() {
     }
   };
 
-  const canHandleSource = session?.source?.kind !== "magnet" || agentAvailable;
-
   useEffect(() => {
-    const source = session?.source;
-    if (!joined || !source || !canHandleSource || handledSourceRef.current === source.id) return;
+    if (!joined || agentAvailable || activeSourceKind !== "direct" || !activeSourceId) return;
+    if (handledSourceRef.current === activeSourceId) return;
 
+    const currentSession = sessionRef.current;
+    const source = currentSession?.sources?.find((item) => item.id === activeSourceId)
+      || (currentSession?.source?.id === activeSourceId ? currentSession.source : null);
+    if (!source) return;
     handledSourceRef.current = source.id;
-    selectionSentRef.current = "";
-    setAgentJob(null);
-    setEmbeddedAudioTracks([]);
-    setEmbeddedSubtitles([]);
-    setSubtitleCues([]);
-    setLocalSubtitleName("");
-    loadedSubtitleRef.current = "";
-    initializedMediaTracksRef.current = "";
-    autoOpenedMediaRef.current = "";
     const controller = new AbortController();
-    const initial: LocalReadiness = {
-      ...emptyReadiness(),
-      status: "Starting local download",
+    const updateItem = (item: QueueReadiness) => {
+      const next: LocalReadiness = {
+        ...item,
+        queue: { ...readinessRef.current.queue, [source.id]: item },
+      };
+      readinessRef.current = next;
+      setReadiness(next);
     };
-    setReadiness(initial);
-    readinessRef.current = initial;
+    updateItem({
+      ready: false,
+      progress: 0,
+      status: "Starting browser download",
+      fileName: null,
+      fileSize: null,
+      fingerprint: null,
+      preparation: "waiting",
+    });
     setBusy("download");
 
-    const startDownload = async () => {
-      if (source.kind === "magnet") {
-        try {
-          const job = await addAgentDownload(source);
-          if (controller.signal.aborted) return;
-          setAgentJob(job);
-          setEmbeddedAudioTracks(job.audioTracks || []);
-          setEmbeddedSubtitles(job.subtitles || []);
-          setBusy(null);
-          return;
-        } catch {
-          setAgentAvailable(false);
-          handledSourceRef.current = "";
-          const next: LocalReadiness = {
-            ...emptyReadiness(),
-            status: "Connect the companion to start this torrent",
-          };
-          readinessRef.current = next;
-          setReadiness(next);
-          setBusy(null);
-          return;
-        }
-      }
-
-      try {
-        const file = await downloadDirectFile(
-          source,
-          (progress) => {
-            const next: LocalReadiness = {
-              ...readinessRef.current,
-              ready: false,
-              progress: Math.round(progress),
-              status: progress >= 100 ? "Verifying file" : "Downloading locally",
-            };
-            readinessRef.current = next;
-            setReadiness(next);
-          },
-          controller.signal
-        );
-        if (!controller.signal.aborted) await attachLocalFile(file, source.label);
-      } catch (caught) {
+    void downloadDirectFile(
+      source,
+      (progress) => updateItem({
+        ready: false,
+        progress: Math.round(progress),
+        status: progress >= 100 ? "Verifying file" : "Downloading in this browser",
+        fileName: source.label,
+        fileSize: null,
+        fingerprint: null,
+        preparation: "waiting",
+      }),
+      controller.signal
+    )
+      .then((file) => {
+        if (!controller.signal.aborted) return attachLocalFile(file, source.label, source.id);
+      })
+      .catch((caught) => {
         if (controller.signal.aborted) return;
-        const next: LocalReadiness = {
-          ...emptyReadiness(),
+        handledSourceRef.current = "";
+        updateItem({
+          ready: false,
+          progress: 0,
           status: "Choose the downloaded file",
-        };
-        readinessRef.current = next;
-        setReadiness(next);
+          fileName: null,
+          fileSize: null,
+          fingerprint: null,
+          preparation: "waiting",
+        });
         setError(
           caught instanceof Error
             ? `Automatic download was blocked. Choose the local file when it is ready. ${caught.message}`
             : "Automatic download was blocked. Choose the local file when it is ready."
         );
-      } finally {
-        setBusy(null);
-      }
-    };
+      })
+      .finally(() => setBusy(null));
 
-    void startDownload();
     return () => controller.abort();
-  }, [attachLocalFile, canHandleSource, joined, session?.source]);
+  }, [activeSourceId, activeSourceKind, agentAvailable, attachLocalFile, joined]);
 
   useEffect(() => {
-    const source = session?.source;
-    if (!joined || !source || !agentAvailable) return;
+    if (!joined || !agentAvailable || !sourcesKey) return;
 
     let active = true;
     const refresh = async () => {
-      try {
-        let job: AgentJob;
-        try {
-          job = await getAgentDownload(source.id);
-        } catch {
-          job = await addAgentDownload(source);
+      const currentSession = sessionRef.current;
+      const queueSources = currentSession?.sources?.length
+        ? currentSession.sources
+        : currentSession?.source ? [currentSession.source] : [];
+      if (!queueSources.length) return;
+
+      const entries = await Promise.all(
+        queueSources.map(async (source) => {
+          try {
+            let job: AgentJob;
+            try {
+              job = await getAgentDownload(source.id);
+            } catch {
+              job = await addAgentDownload(source);
+            }
+            return [source.id, job] as const;
+          } catch {
+            return [source.id, null] as const;
+          }
+        })
+      );
+      if (!active) return;
+
+      const jobsById = Object.fromEntries(
+        entries.filter((entry): entry is readonly [string, AgentJob] => Boolean(entry[1]))
+      );
+      setAgentJobs((current) => ({ ...current, ...jobsById }));
+
+      let selectedMedia = currentSession?.selectedMedia || null;
+      if (selectedMedia?.sourceId) {
+        const selectedJob = jobsById[selectedMedia.sourceId];
+        let selectedFile = selectedJob ? preferredAgentFile(selectedJob, selectedMedia) : null;
+        if (selectedJob?.kind === "magnet" && selectedFile && !selectedFile.selected) {
+          try {
+            const updated = await selectAgentFile(selectedJob.id, selectedFile.index);
+            jobsById[selectedJob.id] = updated;
+            selectedFile = preferredAgentFile(updated, selectedMedia);
+            if (active) setAgentJobs((current) => ({ ...current, [updated.id]: updated }));
+          } catch {
+            // The next poll retries a transient companion selection failure.
+          }
         }
-        if (!active) return;
-        setAgentJob(job);
-        setEmbeddedAudioTracks(job.audioTracks || []);
-        setEmbeddedSubtitles(job.subtitles || []);
+      }
 
-        if (job.status === "error") {
-          const next = {
-            ...emptyReadiness(),
-            status: job.error || "Local download failed",
-          };
-          readinessRef.current = next;
-          setReadiness(next);
-          return;
-        }
-
-        const currentSession = sessionRef.current;
-        let target = currentSession?.selectedMedia
-          ? job.files.find(
-              (file) =>
-                file.name === currentSession.selectedMedia?.name &&
-                file.size === currentSession.selectedMedia.size
-            )
-          : job.files.find((file) => file.selected);
-
-        if (!target && job.files.length) {
-          target = [...job.files].sort(
-            (left, right) =>
-              Number(/\.(mp4|m4v|webm|ogv|mov|mkv)$/i.test(right.name)) -
-                Number(/\.(mp4|m4v|webm|ogv|mov|mkv)$/i.test(left.name)) ||
-              right.size - left.size
-          )[0];
-        }
-
-        if (!target) {
-          const next = {
-            ...emptyReadiness(),
-            status: job.status === "metadata" ? "Reading torrent metadata" : "Preparing download",
-          };
-          readinessRef.current = next;
-          setReadiness(next);
-          return;
-        }
-
-        const selectionKey = `${source.id}:${target.index}`;
-        if (job.kind === "magnet" && !target.selected) {
-          job = await selectAgentFile(source.id, target.index);
-          setAgentJob(job);
-          setEmbeddedAudioTracks(job.audioTracks || []);
-          setEmbeddedSubtitles(job.subtitles || []);
-          target = job.files.find((file) => file.index === target?.index) || target;
-        }
-
-        if (!currentSession?.selectedMedia && selectionSentRef.current !== selectionKey) {
+      if (!selectedMedia) {
+        for (const source of queueSources) {
+          const job = jobsById[source.id];
+          const target = job ? preferredAgentFile(job) : null;
+          if (!job || !target) continue;
+          const selectionKey = `${source.id}:${target.index}`;
+          if (selectionSentRef.current === selectionKey) break;
           selectionSentRef.current = selectionKey;
-          await sendAction("select-media", {
+          const nextSession = await sendAction("select-media", {
             media: {
+              sourceId: source.id,
+              fileIndex: target.index,
               name: target.name,
               size: target.size,
               fingerprint: `${job.infoHash || source.id}:${target.index}:${target.size}`,
             },
           });
+          selectedMedia = nextSession.selectedMedia;
+          break;
         }
-
-        const isReady = target.ready;
-        const next: LocalReadiness = {
-          ready: isReady,
-          progress: target.progress,
-          status: isReady ? "Ready to watch" : job.status === "metadata" ? "Reading torrent metadata" : "Downloading locally",
-          fileName: target.name,
-          fileSize: target.size,
-          fingerprint: `${job.infoHash || source.id}:${target.index}:${target.size}`,
-        };
-        const becameReady = isReady && !readinessRef.current.ready;
-        readinessRef.current = next;
-        setReadiness(next);
-        if (isReady) setMediaUrl(target.hlsUrl || target.streamUrl);
-        else setMediaUrl("");
-        if (becameReady) await sendAction("heartbeat", { readiness: next });
-      } catch {
-        // The keepalive retries transient companion failures without stopping this poller.
       }
+
+      const queue: Record<string, QueueReadiness> = {};
+      for (const source of queueSources) {
+        const job = jobsById[source.id];
+        queue[source.id] = job
+          ? queueReadinessForJob(job, preferredAgentFile(job, selectedMedia))
+          : {
+              ready: false,
+              progress: 0,
+              status: "Waiting for companion",
+              fileName: null,
+              fileSize: null,
+              fingerprint: null,
+              preparation: "waiting",
+            };
+      }
+
+      const activeSourceId = selectedMedia?.sourceId || queueSources[0]?.id;
+      const activeJob = activeSourceId ? jobsById[activeSourceId] : null;
+      const activeFile = activeJob ? preferredAgentFile(activeJob, selectedMedia) : null;
+      const activeItem = activeSourceId ? queue[activeSourceId] : null;
+      if (!activeItem) return;
+
+      const next: LocalReadiness = { ...activeItem, queue };
+      const previous = readinessRef.current;
+      const becameReady = next.ready && (!previous.ready || previous.fingerprint !== next.fingerprint);
+      readinessRef.current = next;
+      setReadiness(next);
+      if (activeFile?.ready) setMediaUrl(activeFile.hlsUrl || activeFile.streamUrl);
+      else if (mediaUrlRef.current.startsWith(AGENT_URL)) setMediaUrl("");
+      if (becameReady) await sendAction("heartbeat", { readiness: next });
     };
 
     void refresh();
-    const timer = window.setInterval(refresh, 1_000);
+    const timer = window.setInterval(() => void refresh(), 1_000);
     return () => {
       active = false;
       window.clearInterval(timer);
     };
-  }, [agentAvailable, joined, sendAction, session?.source]);
+  }, [agentAvailable, joined, sendAction, sourcesKey]);
 
   useEffect(() => {
-    const source = session?.source;
-    if (!joined || source?.kind !== "magnet" || agentAvailable || !agentJob) return;
+    if (!joined || agentAvailable || !activeSourceId || !agentJobs[activeSourceId]) return;
     const timer = window.setTimeout(() => {
       if (mediaUrlRef.current.startsWith(AGENT_URL)) setMediaUrl("");
-      const next: LocalReadiness = {
-        ...readinessRef.current,
+      const item: QueueReadiness = {
+        ...(readinessRef.current.queue[activeSourceId] || emptyReadiness()),
         ready: false,
         status:
           agentPermission === "denied"
             ? "Allow local network access, then reconnect"
             : "Companion disconnected; reconnecting",
       };
+      const next: LocalReadiness = {
+        ...item,
+        queue: { ...readinessRef.current.queue, [activeSourceId]: item },
+      };
       readinessRef.current = next;
       setReadiness(next);
       void sendAction("heartbeat", { readiness: next });
     }, 0);
     return () => window.clearTimeout(timer);
-  }, [agentAvailable, agentJob, agentPermission, joined, sendAction, session?.source]);
+  }, [activeSourceId, agentAvailable, agentJobs, agentPermission, joined, sendAction]);
 
   const requestedSubtitleSelection = session?.player.subtitleLanguage || "off";
   const requestedSubtitleTrackId = requestedSubtitleSelection.startsWith("embedded:")
@@ -861,12 +929,13 @@ export default function WatchApp() {
     (session?.selectedMedia ? session.selectedMedia.name + ":" + session.selectedMedia.size : "");
 
   useEffect(() => {
-    const sourceId = session?.source?.id;
-    if (!sourceId || !selectedMediaTrackKey || agentJob?.subtitleStatus !== "ready") return;
+    const sourceId = activeSourceId;
+    const player = sessionRef.current?.player;
+    if (!player || !sourceId || !selectedMediaTrackKey || agentJob?.subtitleStatus !== "ready") return;
     const initializationKey = sourceId + ":" + selectedMediaTrackKey;
     if (initializedMediaTracksRef.current === initializationKey) return;
     const defaultSubtitle = embeddedSubtitles.find((track) => track.default && track.supported);
-    if (!defaultSubtitle || session.player.subtitleLanguage !== "off") {
+    if (!defaultSubtitle || requestedSubtitleSelection !== "off") {
       initializedMediaTracksRef.current = initializationKey;
       return;
     }
@@ -875,7 +944,7 @@ export default function WatchApp() {
     const timer = window.setTimeout(() => {
       void sendAction("player", {
         player: {
-          ...session.player,
+          ...player,
           subtitleLanguage: "embedded:" + defaultSubtitle.id,
         },
       });
@@ -891,13 +960,13 @@ export default function WatchApp() {
     embeddedSubtitles,
     selectedMediaTrackKey,
     sendAction,
-    session?.player,
-    session?.source?.id,
+    requestedSubtitleSelection,
+    activeSourceId,
   ]);
 
   useEffect(() => {
     const selection = requestedSubtitleSelection;
-    const sourceId = session?.source?.id;
+    const sourceId = activeSourceId;
     if (!selection.startsWith("embedded:")) {
       loadedSubtitleRef.current = "";
       return;
@@ -939,38 +1008,37 @@ export default function WatchApp() {
     requestedSubtitleTrackId,
     requestedSubtitleTrackSupported,
     selectedMediaTrackKey,
-    session?.source?.id,
+    activeSourceId,
   ]);
 
-  const chooseAgentMedia = async (file: AgentFile) => {
-    const source = session?.source;
-    if (!source || !agentJob) return;
+  const chooseAgentMedia = async (sourceId: string, job: AgentJob, file: AgentFile) => {
     setBusy("file");
     setError("");
     try {
       setMediaUrl("");
       setSubtitleCues([]);
-      if (agentJob.kind === "magnet") {
-        const nextJob = await selectAgentFile(source.id, file.index);
-        setAgentJob(nextJob);
-        setEmbeddedAudioTracks(nextJob.audioTracks || []);
-        setEmbeddedSubtitles(nextJob.subtitles || []);
+      let selectedJob = job;
+      if (job.kind === "magnet" && !file.selected) {
+        selectedJob = await selectAgentFile(sourceId, file.index);
+        setAgentJobs((current) => ({ ...current, [sourceId]: selectedJob }));
       }
-      selectionSentRef.current = `${source.id}:${file.index}`;
+      selectionSentRef.current = `${sourceId}:${file.index}`;
       await sendAction("select-media", {
         media: {
+          sourceId,
+          fileIndex: file.index,
           name: file.name,
           size: file.size,
-          fingerprint: `${agentJob.infoHash || source.id}:${file.index}:${file.size}`,
+          fingerprint: `${selectedJob.infoHash || sourceId}:${file.index}:${file.size}`,
         },
       });
-      const next = {
-        ...emptyReadiness(),
-        progress: file.progress,
-        status: "Downloading selected file",
-        fileName: file.name,
-        fileSize: file.size,
-        fingerprint: `${agentJob.infoHash || source.id}:${file.index}:${file.size}`,
+      const item = queueReadinessForJob(
+        selectedJob,
+        selectedJob.files.find((candidate) => candidate.index === file.index) || file
+      );
+      const next: LocalReadiness = {
+        ...item,
+        queue: { ...readinessRef.current.queue, [sourceId]: item },
       };
       readinessRef.current = next;
       setReadiness(next);
@@ -1039,7 +1107,7 @@ export default function WatchApp() {
     !hasMismatch;
   const invitePending = Boolean(roomToken && !joined);
   const playerMediaKey = session?.selectedMedia
-    ? (session.source?.id || "local") + ":" +
+    ? (activeSource?.id || "local") + ":" +
       (session.selectedMedia.fingerprint || session.selectedMedia.name + ":" + session.selectedMedia.size)
     : "";
 
@@ -1181,10 +1249,10 @@ export default function WatchApp() {
           <div className="section-heading">
             <div>
               <span className="step-number">01</span>
-              <h2 id="source-title">Choose what to watch</h2>
+              <h2 id="source-title">Download queue</h2>
             </div>
-            {session?.source && (
-              <span className="source-badge">{sourceKindLabel(session.source.kind)}</span>
+            {sources.length > 0 && (
+              <span className="source-badge">{sources.length} queued</span>
             )}
           </div>
 
@@ -1223,7 +1291,7 @@ export default function WatchApp() {
                   {agentPairing ? <LoaderCircle className="spin" /> : <Plug />}
                   {agentPairing ? "Waiting for approval" : "Connect"}
                 </button>
-                <a className="secondary-button" href="/watchpair-companion.zip" download>
+                <a className="secondary-button" href="/watchpair-companion.zip?v=0.3.0" download>
                   <PackageOpen />
                   Get companion
                 </a>
@@ -1231,56 +1299,101 @@ export default function WatchApp() {
             </div>
           )}
 
-          {session?.source ? (
-            <>
-              <div className="source-current">
-                <div className="file-icon"><Download /></div>
-                <div className="source-details">
-                  <strong>{session.source.label}</strong>
-                  <span>
-                    {agentAvailable
-                      ? `Companion connected: ${agentJob?.status || "starting"}`
-                      : session.source.kind === "direct"
-                        ? "Downloading in this browser"
-                        : "Connect the companion to start this torrent"}
-                  </span>
-                </div>
-                {session.source.kind === "magnet" && !agentAvailable ? (
-                  <button className="secondary-button compact-button" type="button" onClick={connectCompanion}>
-                    <Plug />
-                    Connect
-                  </button>
-                ) : agentAvailable ? (
-                  <span className="agent-chip"><Radio /> Local agent</span>
-                ) : null}
-              </div>
+          {sources.length ? (
+            <div className="queue-list" aria-label="Synchronized download queue">
+              {sources.map((source, queueIndex) => {
+                const job = agentJobs[source.id];
+                const target = job ? preferredAgentFile(job, session?.selectedMedia) : null;
+                const localState = readiness.queue[source.id];
+                const selected = activeSource?.id === source.id;
+                const readyCount = session?.participants.filter(
+                  (participant) => participant.queue?.[source.id]?.ready
+                ).length || 0;
+                const preparationLabel = job?.preparation.status === "ready"
+                  ? job.preparation.encoder?.label || "Browser ready"
+                  : job?.preparation.status === "direct"
+                    ? "Direct playback"
+                    : job?.preparation.status === "preparing"
+                      ? `Preparing with ${job.transcoder.label}`
+                      : job?.preparation.status === "queued"
+                        ? "Preparation queued"
+                        : job?.preparation.status === "error"
+                          ? "Preparation failed"
+                          : "Waiting for download";
 
-              {agentJob && agentJob.files.length > 1 && (
-                <div className="agent-files" aria-label="Files in download">
-                  {agentJob.files.slice(0, 8).map((file) => {
-                    const selected =
-                      file.selected ||
-                      (session.selectedMedia?.name === file.name &&
-                        session.selectedMedia.size === file.size);
-                    return (
-                      <button
-                        className={selected ? "selected" : ""}
-                        type="button"
-                        key={file.index}
-                        onClick={() => void chooseAgentMedia(file)}
-                      >
-                        <FileVideo2 />
-                        <span>
-                          <strong>{file.name}</strong>
-                          <small>{formatBytes(file.size)} / {Math.round(file.progress)}%</small>
-                        </span>
-                        {selected && <Check />}
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
-            </>
+                return (
+                  <article className={`queue-item ${selected ? "selected" : ""}`} key={source.id}>
+                    <div className="queue-item-main">
+                      <span className="queue-index">{String(queueIndex + 1).padStart(2, "0")}</span>
+                      <div className="file-icon"><Download /></div>
+                      <div className="source-details">
+                        <div>
+                          <strong>{source.label}</strong>
+                          <span className="source-badge subtle">{sourceKindLabel(source.kind)}</span>
+                        </div>
+                        <span>{localState?.status || (agentAvailable ? "Starting companion job" : "Waiting for companion")}</span>
+                        <div className="progress-track" aria-label={`${Math.round(localState?.progress || 0)}% complete`}>
+                          <span style={{ width: `${localState?.progress || 0}%` }} />
+                        </div>
+                      </div>
+                      <div className="queue-item-status">
+                        <strong>{Math.round(localState?.progress || 0)}%</strong>
+                        <span>{readyCount}/{Math.max(2, session?.participants.length || 0)} ready</span>
+                      </div>
+                      {target && job && (
+                        <button
+                          className={selected ? "secondary-button compact-button selected" : "secondary-button compact-button"}
+                          type="button"
+                          onClick={() => void chooseAgentMedia(source.id, job, target)}
+                          title={selected ? "Currently selected" : "Select for playback"}
+                        >
+                          {selected ? <Check /> : <Play />}
+                          {selected ? "Selected" : "Select"}
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="queue-preparation">
+                      <Cpu />
+                      <span>{preparationLabel}</span>
+                      {(job?.preparation.encoder?.hardware ||
+                        (["queued", "preparing"].includes(job?.preparation.status || "") && job?.transcoder.hardware)) &&
+                        <strong>GPU</strong>}
+                    </div>
+
+                    {job && job.files.length > 1 && (
+                      <div className="agent-files" aria-label={`Files in ${source.label}`}>
+                        {job.files
+                          .filter((file) => /\.(mp4|m4v|webm|ogv|mov|mkv|avi|ts)$/i.test(file.name))
+                          .slice(0, 12)
+                          .map((file) => {
+                            const fileSelected =
+                              selected &&
+                              (session?.selectedMedia?.fileIndex === file.index ||
+                                (session?.selectedMedia?.name === file.name &&
+                                  session.selectedMedia.size === file.size));
+                            return (
+                              <button
+                                className={fileSelected ? "selected" : ""}
+                                type="button"
+                                key={file.index}
+                                onClick={() => void chooseAgentMedia(source.id, job, file)}
+                              >
+                                <FileVideo2 />
+                                <span>
+                                  <strong>{file.name}</strong>
+                                  <small>{formatBytes(file.size)} / {Math.round(file.progress)}%</small>
+                                </span>
+                                {fileSelected && <Check />}
+                              </button>
+                            );
+                          })}
+                      </div>
+                    )}
+                  </article>
+                );
+              })}
+            </div>
           ) : (
             <button className="drop-zone" type="button" onClick={() => fileInputRef.current?.click()}>
               <Upload />
