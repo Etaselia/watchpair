@@ -115,6 +115,8 @@ test("packages the pairable magnet and subtitle companion", async () => {
   );
   const expected = [
     "WatchPair Companion/server.mjs",
+    "WatchPair Companion/torrent-input.mjs",
+    "WatchPair Companion/package.json",
     "WatchPair Companion/install-and-start.cmd",
     "WatchPair Companion/install-runtime.ps1",
     "WatchPair Companion/pnpm-lock.yaml",
@@ -123,6 +125,7 @@ test("packages the pairable magnet and subtitle companion", async () => {
   for (const path of expected) assert.ok(archive[path], `Missing ${path}`);
 
   const bundledAgent = strFromU8(archive["WatchPair Companion/server.mjs"]);
+  const companionPackage = strFromU8(archive["WatchPair Companion/package.json"]);
   const installer = strFromU8(archive["WatchPair Companion/install-runtime.ps1"]);
   const windowsLauncher = strFromU8(archive["WatchPair Companion/install-and-start.cmd"]);
   const buildPolicy = strFromU8(archive["WatchPair Companion/pnpm-workspace.yaml"]);
@@ -130,6 +133,7 @@ test("packages the pairable magnet and subtitle companion", async () => {
   assert.match(bundledAgent, /url\.pathname === "\/resolve"/);
   assert.match(bundledAgent, /FFPROBE_PATH/);
   assert.match(bundledAgent, /subtitleFile/);
+  assert.match(companionPackage, /"webtorrent": "3\.0\.11"/);
   assert.match(installer, /\$Releases = Invoke-RestMethod/);
   assert.match(installer, /\$Release = \(\$Releases \| Where-Object/);
   assert.match(installer, /\$Version = \[string\]\$Release\.version/);

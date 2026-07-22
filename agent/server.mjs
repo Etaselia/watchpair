@@ -13,6 +13,7 @@ import { load } from "cheerio";
 import ffmpegStaticPath from "ffmpeg-static";
 import ffprobeStatic from "ffprobe-static";
 import WebTorrent from "webtorrent";
+import { isSupportedMagnet } from "./torrent-input.mjs";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.WATCHPAIR_AGENT_PORT || 41735);
@@ -45,6 +46,7 @@ PRIVATE_NETWORKS.addSubnet("fe80::", 10, "ipv6");
 const pairingNonces = new Map();
 const jobs = new Map();
 const client = new WebTorrent();
+client.on("error", (error) => console.error(`WebTorrent client error: ${error.message}`));
 
 await mkdir(DOWNLOAD_DIR, { recursive: true });
 await mkdir(path.dirname(CONFIG_PATH), { recursive: true });
@@ -188,7 +190,8 @@ function decodedCandidates(rawValue) {
 function magnetFromCandidate(rawValue) {
   for (const value of decodedCandidates(rawValue)) {
     const match = value.match(/magnet:\?[^\s"\x27<>]+/i);
-    if (match) return match[0].replace(/[),.;]+$/, "");
+    const magnet = match?.[0].replace(/[),.;]+$/, "");
+    if (magnet && isSupportedMagnet(magnet)) return magnet;
   }
   return null;
 }
@@ -219,7 +222,10 @@ async function readLimitedResponse(response, limit = 2_000_000) {
 
 async function resolveSource(rawValue) {
   const value = String(rawValue || "").trim();
-  if (value.startsWith("magnet:?")) {
+  if (/^magnet:\?/i.test(value)) {
+    if (!isSupportedMagnet(value)) {
+      throw new Error("Magnet link needs a valid BitTorrent v1 info hash (BTIH).");
+    }
     return { kind: "magnet", value, label: sourceLabel(value) };
   }
 
@@ -438,7 +444,15 @@ function snapshot(job) {
 
 function startTorrent(job) {
   job.status = "metadata";
-  const torrent = client.add(job.value, { path: path.join(DOWNLOAD_DIR, job.id) });
+  let torrent;
+  try {
+    torrent = client.add(job.value, { path: path.join(DOWNLOAD_DIR, job.id) });
+  } catch (error) {
+    job.status = "error";
+    job.error = error instanceof Error ? error.message : "Torrent could not be started.";
+    job.updatedAt = Date.now();
+    return;
+  }
   job.torrent = torrent;
 
   torrent.on("metadata", () => {
@@ -520,9 +534,14 @@ async function addDownload(source) {
   if (jobs.has(id)) return jobs.get(id);
 
   const kind = source.kind === "magnet" ? "magnet" : "direct";
-  const value = String(source.value || "");
-  if (kind === "magnet" && !value.startsWith("magnet:?") && !/^https?:\/\//i.test(value)) {
-    throw new Error("Invalid magnet or torrent source.");
+  const value = String(source.value || "").trim();
+  if (kind === "magnet") {
+    if (/^magnet:\?/i.test(value) && !isSupportedMagnet(value)) {
+      throw new Error("Magnet link needs a valid BitTorrent v1 info hash (BTIH).");
+    }
+    if (!/^magnet:\?/i.test(value) && !/^https?:\/\//i.test(value)) {
+      throw new Error("Invalid magnet or torrent source.");
+    }
   }
 
   const job = {
@@ -669,7 +688,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/health") {
       sendJson(response, 200, {
         ok: true,
-        version: "0.2.1",
+        version: "0.2.2",
         downloadDirectory: DOWNLOAD_DIR,
         jobs: jobs.size,
       }, headers);
