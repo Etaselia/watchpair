@@ -9,8 +9,8 @@
   --blue: #77b7ff;
   --success: #2c8755;
   --danger: #bc352d;
-  --font-sans: var(--font-geist-sans), Arial, sans-serif;
-  --font-mono: var(--font-geist-mono), monospace;
+  --font-sans: Arial, Helvetica, sans-serif;
+  --font-mono: Consolas, "Liberation Mono", monospace;
 }
 
 * {
@@ -1088,6 +1088,57 @@ svg {
   font-size: calc(24px * var(--subtitle-font-scale));
   line-height: 1.32;
   text-shadow: var(--subtitle-edge);
+}
+
+.media-state-overlay {
+  position: absolute;
+  z-index: 4;
+  inset: 0;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 12px;
+  background: rgba(5, 5, 5, 0.34);
+  color: var(--white);
+  padding: 24px;
+  pointer-events: none;
+  text-align: center;
+}
+
+.media-state-overlay.error {
+  pointer-events: auto;
+}
+
+.media-state-overlay > svg {
+  width: 30px;
+  height: 30px;
+  color: var(--acid);
+}
+
+.media-state-overlay.error > svg {
+  color: var(--coral);
+}
+
+.media-state-overlay strong {
+  max-width: 560px;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.media-state-overlay button {
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 4px;
+  background: rgba(5, 5, 5, 0.82);
+  color: var(--white);
+  padding: 0 12px;
+}
+
+.media-state-overlay button:hover {
+  background: rgba(255, 255, 255, 0.14);
 }
 
 .gesture-overlay {

@@ -2,6 +2,20 @@ import type { SharedSource } from "./session-types";
 
 export const AGENT_URL = "http://127.0.0.1:41735";
 
+export type AgentPermissionState = PermissionState | "unsupported";
+
+export async function getAgentPermissionState(): Promise<AgentPermissionState> {
+  if (!("permissions" in navigator)) return "unsupported";
+  for (const name of ["loopback-network", "local-network-access"]) {
+    try {
+      return (await navigator.permissions.query({ name: name as PermissionName })).state;
+    } catch {
+      // Try the permission name used by the previous Chrome generation.
+    }
+  }
+  return "unsupported";
+}
+
 export interface AgentFile {
   index: number;
   name: string;

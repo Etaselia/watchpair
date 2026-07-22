@@ -102,6 +102,15 @@ function sanitizeReadiness(value: Partial<LocalReadiness> | undefined): LocalRea
   };
 }
 
+function stableParticipants(participants: ParticipantState[], hostId: string) {
+  return participants.sort(
+    (left, right) =>
+      Number(right.deviceId === hostId) - Number(left.deviceId === hostId) ||
+      left.name.localeCompare(right.name) ||
+      left.deviceId.localeCompare(right.deviceId)
+  );
+}
+
 class D1SessionStore implements SessionStore {
   constructor(private readonly db: D1Database) {}
 
@@ -146,12 +155,15 @@ class D1SessionStore implements SessionStore {
       )
       .bind(token, now - PARTICIPANT_ACTIVE_MS)
       .all<ParticipantRow>();
-    const participants: ParticipantState[] = participantRows.results.map((participant) => ({
-      deviceId: participant.device_id,
-      name: participant.name,
-      ...json<LocalReadiness>(participant.state_json, defaultReadiness()),
-      updatedAt: participant.updated_at,
-    }));
+    const participants = stableParticipants(
+      participantRows.results.map((participant) => ({
+        deviceId: participant.device_id,
+        name: participant.name,
+        ...json<LocalReadiness>(participant.state_json, defaultReadiness()),
+        updatedAt: participant.updated_at,
+      })),
+      row.host_id
+    );
 
     return {
       token: row.token,
@@ -262,9 +274,12 @@ class MemorySessionStore implements SessionStore {
       expiresAt: record.expiresAt,
       updatedAt: record.updatedAt,
       serverTime: now,
-      participants: Array.from(record.participants.values())
-        .filter((participant) => participant.updatedAt >= now - PARTICIPANT_ACTIVE_MS)
-        .sort((left, right) => right.updatedAt - left.updatedAt),
+      participants: stableParticipants(
+        Array.from(record.participants.values()).filter(
+          (participant) => participant.updatedAt >= now - PARTICIPANT_ACTIVE_MS
+        ),
+        record.hostId
+      ),
     };
   }
 

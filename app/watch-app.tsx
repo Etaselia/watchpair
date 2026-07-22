@@ -38,15 +38,18 @@ import {
   useState,
 } from "react";
 import {
+  AGENT_URL,
   addAgentDownload,
   detectAgent,
   getAgentDownload,
+  getAgentPermissionState,
   getAgentPairingUrl,
   getAgentSubtitle,
   resolveAgentSource,
   selectAgentFile,
   type AgentAudioTrack,
   type AgentFile,
+  type AgentPermissionState,
   type AgentJob,
   type AgentSubtitleTrack,
 } from "../lib/agent-client";
@@ -244,6 +247,7 @@ export default function WatchApp() {
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
   const [agentAvailable, setAgentAvailable] = useState(false);
+  const [agentPermission, setAgentPermission] = useState<AgentPermissionState | "checking">("checking");
   const [agentPairing, setAgentPairing] = useState(false);
   const [agentJob, setAgentJob] = useState<AgentJob | null>(null);
   const [embeddedAudioTracks, setEmbeddedAudioTracks] = useState<AgentAudioTrack[]>([]);
@@ -290,6 +294,18 @@ export default function WatchApp() {
 
   useEffect(() => {
     let active = true;
+    void getAgentPermissionState().then((permission) => {
+      if (active) setAgentPermission(permission);
+    });
+    return () => {
+      active = false;
+      if (pairingTimerRef.current !== null) window.clearInterval(pairingTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (agentPermission !== "granted" && agentPermission !== "unsupported") return;
+    let active = true;
     let failures = 0;
     const keepAlive = async () => {
       try {
@@ -309,19 +325,51 @@ export default function WatchApp() {
     return () => {
       active = false;
       window.clearInterval(timer);
-      if (pairingTimerRef.current !== null) window.clearInterval(pairingTimerRef.current);
     };
-  }, []);
+  }, [agentPermission]);
 
-  const connectCompanion = () => {
+  const connectCompanion = async () => {
     if (agentPairing) return;
-    const pairingWindow = window.open(getAgentPairingUrl(), "_blank");
+    const pairingWindow = window.open("about:blank", "watchpair-companion");
     if (!pairingWindow) {
       setError("Allow the pairing window, then try connecting the companion again.");
       return;
     }
 
+    const stopPairing = (message?: string) => {
+      pairingWindow.close();
+      setAgentPairing(false);
+      if (message) setError(message);
+    };
+
     setAgentPairing(true);
+    setError("");
+    let permission = await getAgentPermissionState();
+    setAgentPermission(permission);
+    if (permission === "denied") {
+      stopPairing("Local network access is blocked. Allow it for this site in the browser's site settings, then connect again.");
+      return;
+    }
+
+    try {
+      const available = await detectAgent();
+      permission = await getAgentPermissionState();
+      setAgentPermission(permission);
+      if (available) {
+        setAgentAvailable(true);
+        stopPairing();
+        return;
+      }
+    } catch {
+      permission = await getAgentPermissionState();
+      setAgentPermission(permission);
+      if (permission === "denied") {
+        stopPairing("Local network access was declined. Allow it for this site in the browser's site settings, then connect again.");
+        return;
+      }
+    }
+
+    pairingWindow.location.replace(getAgentPairingUrl());
     let attempts = 0;
     if (pairingTimerRef.current !== null) window.clearInterval(pairingTimerRef.current);
     pairingTimerRef.current = window.setInterval(() => {
@@ -330,13 +378,16 @@ export default function WatchApp() {
         .then((available) => {
           if (!available) return;
           setAgentAvailable(true);
+          setAgentPermission("granted");
           setAgentPairing(false);
+          pairingWindow.close();
           if (pairingTimerRef.current !== null) window.clearInterval(pairingTimerRef.current);
           pairingTimerRef.current = null;
         })
         .catch(() => {
           if (attempts < 120) return;
           setAgentPairing(false);
+          setError("The companion did not answer. Make sure it is running, then connect again.");
           if (pairingTimerRef.current !== null) window.clearInterval(pairingTimerRef.current);
           pairingTimerRef.current = null;
         });
@@ -353,8 +404,20 @@ export default function WatchApp() {
     };
   }, []);
 
-  const enterSession = useCallback((nextSession: WatchSession) => {
+  const applySession = useCallback((nextSession: WatchSession) => {
+    const current = sessionRef.current;
+    const older =
+      current?.token === nextSession.token &&
+      (nextSession.seq < current.seq ||
+        (nextSession.seq === current.seq && nextSession.serverTime < current.serverTime));
+    if (older) return false;
+    sessionRef.current = nextSession;
     setSession(nextSession);
+    return true;
+  }, []);
+
+  const enterSession = useCallback((nextSession: WatchSession) => {
+    applySession(nextSession);
     setRoomToken(nextSession.token);
     setJoined(true);
     setError("");
@@ -362,7 +425,7 @@ export default function WatchApp() {
     const url = new URL(window.location.href);
     url.searchParams.set("room", nextSession.token);
     window.history.replaceState({}, "", url);
-  }, []);
+  }, [applySession]);
 
   const createSession = async () => {
     if (!deviceId) return;
@@ -421,11 +484,11 @@ export default function WatchApp() {
         name: displayName,
         ...values,
       });
-      setSession(nextSession);
+      applySession(nextSession);
       setConnection("online");
       return nextSession;
     },
-    [deviceId, displayName, roomToken]
+    [applySession, deviceId, displayName, roomToken]
   );
 
   useEffect(() => {
@@ -439,7 +502,7 @@ export default function WatchApp() {
         });
         const data = (await response.json()) as { session?: WatchSession };
         if (active && response.ok && data.session) {
-          setSession(data.session);
+          applySession(data.session);
           setConnection("online");
         } else if (active) {
           setConnection("offline");
@@ -455,7 +518,7 @@ export default function WatchApp() {
       active = false;
       window.clearInterval(poll);
     };
-  }, [joined, roomToken]);
+  }, [applySession, joined, roomToken]);
 
   useEffect(() => {
     if (!joined || !roomToken || !deviceId) return;
@@ -469,7 +532,7 @@ export default function WatchApp() {
         readiness: readinessRef.current,
       })
         .then((nextSession) => {
-          setSession(nextSession);
+          applySession(nextSession);
           setConnection("online");
         })
         .catch(() => setConnection("offline"));
@@ -478,7 +541,7 @@ export default function WatchApp() {
     heartbeat();
     const timer = window.setInterval(heartbeat, 4_000);
     return () => window.clearInterval(timer);
-  }, [deviceId, displayName, joined, roomToken]);
+  }, [applySession, deviceId, displayName, joined, roomToken]);
 
   const attachLocalFile = useCallback(
     async (file: File, preferredName = file.name) => {
@@ -554,16 +617,9 @@ export default function WatchApp() {
     setBusy("source");
     setError("");
     try {
-      let resolved;
-      try {
-        resolved = await resolveAgentSource(sourceInput);
-        setAgentAvailable(true);
-      } catch (agentError) {
-        const companionOnline = await detectAgent().catch(() => false);
-        setAgentAvailable(companionOnline);
-        if (companionOnline) throw agentError;
-        resolved = await resolveSharedSource(sourceInput);
-      }
+      const resolved = agentAvailable
+        ? await resolveAgentSource(sourceInput)
+        : await resolveSharedSource(sourceInput);
       await sendAction("source", { source: resolved });
       setSourceInput("");
       setReadiness(emptyReadiness());
@@ -578,9 +634,11 @@ export default function WatchApp() {
     }
   };
 
+  const canHandleSource = session?.source?.kind !== "magnet" || agentAvailable;
+
   useEffect(() => {
     const source = session?.source;
-    if (!joined || !source || handledSourceRef.current === source.id) return;
+    if (!joined || !source || !canHandleSource || handledSourceRef.current === source.id) return;
 
     handledSourceRef.current = source.id;
     selectionSentRef.current = "";
@@ -602,28 +660,27 @@ export default function WatchApp() {
     setBusy("download");
 
     const startDownload = async () => {
-      try {
-        const job = await addAgentDownload(source);
-        if (controller.signal.aborted) return;
-        setAgentAvailable(true);
-        setAgentJob(job);
-        setEmbeddedAudioTracks(job.audioTracks || []);
-        setEmbeddedSubtitles(job.subtitles || []);
-        setBusy(null);
-        return;
-      } catch {
-        setAgentAvailable(false);
-      }
-
       if (source.kind === "magnet") {
-        const next: LocalReadiness = {
-          ...emptyReadiness(),
-          status: "Connect the companion to start this torrent",
-        };
-        readinessRef.current = next;
-        setReadiness(next);
-        setBusy(null);
-        return;
+        try {
+          const job = await addAgentDownload(source);
+          if (controller.signal.aborted) return;
+          setAgentJob(job);
+          setEmbeddedAudioTracks(job.audioTracks || []);
+          setEmbeddedSubtitles(job.subtitles || []);
+          setBusy(null);
+          return;
+        } catch {
+          setAgentAvailable(false);
+          handledSourceRef.current = "";
+          const next: LocalReadiness = {
+            ...emptyReadiness(),
+            status: "Connect the companion to start this torrent",
+          };
+          readinessRef.current = next;
+          setReadiness(next);
+          setBusy(null);
+          return;
+        }
       }
 
       try {
@@ -662,7 +719,7 @@ export default function WatchApp() {
 
     void startDownload();
     return () => controller.abort();
-  }, [attachLocalFile, joined, session?.source]);
+  }, [attachLocalFile, canHandleSource, joined, session?.source]);
 
   useEffect(() => {
     const source = session?.source;
@@ -721,6 +778,14 @@ export default function WatchApp() {
         }
 
         const selectionKey = `${source.id}:${target.index}`;
+        if (job.kind === "magnet" && !target.selected) {
+          job = await selectAgentFile(source.id, target.index);
+          setAgentJob(job);
+          setEmbeddedAudioTracks(job.audioTracks || []);
+          setEmbeddedSubtitles(job.subtitles || []);
+          target = job.files.find((file) => file.index === target?.index) || target;
+        }
+
         if (!currentSession?.selectedMedia && selectionSentRef.current !== selectionKey) {
           selectionSentRef.current = selectionKey;
           await sendAction("select-media", {
@@ -730,14 +795,6 @@ export default function WatchApp() {
               fingerprint: `${job.infoHash || source.id}:${target.index}:${target.size}`,
             },
           });
-        }
-
-        if (job.kind === "magnet" && !target.selected) {
-          job = await selectAgentFile(source.id, target.index);
-          setAgentJob(job);
-          setEmbeddedAudioTracks(job.audioTracks || []);
-          setEmbeddedSubtitles(job.subtitles || []);
-          target = job.files.find((file) => file.index === target?.index) || target;
         }
 
         const isReady = target.ready;
@@ -767,6 +824,26 @@ export default function WatchApp() {
       window.clearInterval(timer);
     };
   }, [agentAvailable, joined, sendAction, session?.source]);
+
+  useEffect(() => {
+    const source = session?.source;
+    if (!joined || source?.kind !== "magnet" || agentAvailable || !agentJob) return;
+    const timer = window.setTimeout(() => {
+      if (mediaUrlRef.current.startsWith(AGENT_URL)) setMediaUrl("");
+      const next: LocalReadiness = {
+        ...readinessRef.current,
+        ready: false,
+        status:
+          agentPermission === "denied"
+            ? "Allow local network access, then reconnect"
+            : "Companion disconnected; reconnecting",
+      };
+      readinessRef.current = next;
+      setReadiness(next);
+      void sendAction("heartbeat", { readiness: next });
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [agentAvailable, agentJob, agentPermission, joined, sendAction, session?.source]);
 
   const requestedSubtitleSelection = session?.player.subtitleLanguage || "off";
   const requestedSubtitleTrackId = requestedSubtitleSelection.startsWith("embedded:")
@@ -929,6 +1006,7 @@ export default function WatchApp() {
 
   const leaveSession = () => {
     setJoined(false);
+    sessionRef.current = null;
     setSession(null);
     setRoomToken("");
     setTokenInput("");
@@ -954,6 +1032,7 @@ export default function WatchApp() {
   const everyoneReady =
     Boolean(session) &&
     session!.participants.length >= 2 &&
+    readiness.ready &&
     session!.participants.every((participant) => participant.ready) &&
     !hasMismatch;
   const invitePending = Boolean(roomToken && !joined);
@@ -1178,8 +1257,9 @@ export default function WatchApp() {
                 <div className="agent-files" aria-label="Files in download">
                   {agentJob.files.slice(0, 8).map((file) => {
                     const selected =
-                      session.selectedMedia?.name === file.name &&
-                      session.selectedMedia.size === file.size;
+                      file.selected ||
+                      (session.selectedMedia?.name === file.name &&
+                        session.selectedMedia.size === file.size);
                     return (
                       <button
                         className={selected ? "selected" : ""}
@@ -1380,6 +1460,8 @@ function SyncedPlayer({
   const [volume, setVolume] = useState(1);
   const [muted, setMuted] = useState(false);
   const [needsGesture, setNeedsGesture] = useState(false);
+  const [mediaLoading, setMediaLoading] = useState(true);
+  const [mediaError, setMediaError] = useState("");
   const [subtitleText, setSubtitleText] = useState("");
   const [controlsVisible, setControlsVisible] = useState(true);
   const [captionSettingsOpen, setCaptionSettingsOpen] = useState(false);
@@ -1452,6 +1534,25 @@ function SyncedPlayer({
 
   useEffect(() => () => clearControlsTimer(), [clearControlsTimer]);
 
+  const handlePlaybackFailure = useCallback(
+    (caught: unknown) => {
+      const autoplayBlocked = caught instanceof DOMException && caught.name === "NotAllowedError";
+      if (autoplayBlocked) {
+        setNeedsGesture(true);
+      } else {
+        setNeedsGesture(false);
+        setMediaLoading(false);
+        setMediaError(
+          mediaUrl.startsWith(AGENT_URL)
+            ? "The companion video stream could not be opened. Return to the lobby and reconnect it."
+            : "This video could not be prepared for browser playback."
+        );
+      }
+      pinControls();
+    },
+    [mediaUrl, pinControls]
+  );
+
   const updateSubtitleAppearance = (values: Partial<SubtitleAppearance>) => {
     const next = { ...subtitleAppearance, ...values };
     setSubtitleAppearance(next);
@@ -1521,13 +1622,10 @@ function SyncedPlayer({
       void video
         .play()
         .then(() => setNeedsGesture(false))
-        .catch(() => {
-          setNeedsGesture(true);
-          pinControls();
-        });
+        .catch(handlePlaybackFailure);
     }
 
-  }, [session.player, session.seq]);
+  }, [handlePlaybackFailure, session.player, session.seq]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -1581,9 +1679,14 @@ function SyncedPlayer({
     const video = videoRef.current;
     if (!video) return;
     if (video.paused) {
-      await video.play();
-      setNeedsGesture(false);
-      await send({ paused: false, position: video.currentTime });
+      try {
+        await video.play();
+        setNeedsGesture(false);
+        setMediaError("");
+        await send({ paused: false, position: video.currentTime });
+      } catch (caught) {
+        handlePlaybackFailure(caught);
+      }
     } else {
       video.pause();
       await send({ paused: true, position: video.currentTime });
@@ -1661,13 +1764,31 @@ function SyncedPlayer({
         ref={videoRef}
         src={playbackUrl}
         playsInline
+        onLoadStart={() => {
+          setMediaLoading(true);
+          setMediaError("");
+        }}
         onLoadedMetadata={(event) => {
           const video = event.currentTarget;
           setDuration(video.duration);
+          setMediaLoading(false);
+          setMediaError("");
           const expected = session.player.paused
             ? session.player.position
             : session.player.position + ((Date.now() - session.player.changedAt) / 1000) * session.player.playbackRate;
           video.currentTime = Math.max(0, expected);
+        }}
+        onCanPlay={() => setMediaLoading(false)}
+        onPlaying={() => setMediaLoading(false)}
+        onWaiting={() => setMediaLoading(true)}
+        onError={() => {
+          setMediaLoading(false);
+          setMediaError(
+            mediaUrl.startsWith(AGENT_URL)
+              ? "The companion video stream could not be opened. Return to the lobby and reconnect it."
+              : "This video format could not be opened by the browser."
+          );
+          pinControls();
         }}
         onEnded={() => void send({ paused: true, position: duration })}
         onPlay={revealControls}
@@ -1697,6 +1818,19 @@ function SyncedPlayer({
           <div className="subtitle-window" style={subtitleStyle}>
             {subtitleText.split("\n").map((line, index) => <span key={`${line}-${index}`}>{line}</span>)}
           </div>
+        </div>
+      )}
+
+      {(mediaLoading || mediaError) && !needsGesture && (
+        <div className={"media-state-overlay" + (mediaError ? " error" : "")} role={mediaError ? "alert" : "status"}>
+          {mediaError ? <X /> : <LoaderCircle className="spin" />}
+          <strong>{mediaError || "Preparing video for this browser"}</strong>
+          {mediaError && (
+            <button type="button" onClick={onBack}>
+              <ArrowLeft />
+              Back to lobby
+            </button>
+          )}
         </div>
       )}
 

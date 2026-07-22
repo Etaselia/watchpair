@@ -854,7 +854,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/health") {
       sendJson(response, 200, {
         ok: true,
-        version: "0.2.7",
+        version: "0.2.8",
         downloadDirectory: DOWNLOAD_DIR,
         jobs: jobs.size,
       }, headers);

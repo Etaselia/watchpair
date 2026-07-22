@@ -121,15 +121,21 @@ test("production session API supports join-in-progress state", async () => {
   assert.equal(snapshotResponse.status, 200);
   const snapshot = await snapshotResponse.json();
   assert.equal(snapshot.session.participants.length, 2);
+  assert.deepEqual(
+    snapshot.session.participants.map((participant) => participant.deviceId),
+    ["test-host", "test-guest"],
+  );
 });
 
 test("ships the coordination and companion surfaces", async () => {
-  const [app, route, agent, media, packageJson] = await Promise.all([
+  const [app, route, agent, agentClient, media, packageJson, layout] = await Promise.all([
     readFile(new URL("../app/watch-app.tsx", import.meta.url), "utf8"),
     readFile(new URL("../worker/session-api.ts", import.meta.url), "utf8"),
     readFile(new URL("../agent/server.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../lib/agent-client.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/media.ts", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
+    readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
   ]);
 
   assert.match(app, /Watch together/);
@@ -142,15 +148,21 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /Caption options/);
   assert.match(app, /Background opacity/);
   assert.match(app, /Character edge/);
+  assert.match(app, /applySession/);
+  assert.match(app, /Preparing video for this browser/);
   assert.match(route, /action === "heartbeat"/);
   assert.match(route, /action === "player"/);
   assert.match(route, /action === "select-media"/);
+  assert.match(route, /stableParticipants/);
   assert.match(agent, /new WebTorrent/);
   assert.match(agent, /content-range/);
   assert.match(agent, /audioTracks/);
   assert.match(agent, /renderAudioPlayback/);
+  assert.match(agentClient, /loopback-network/);
+  assert.match(agentClient, /getAgentPermissionState/);
   assert.match(media, /fingerprintFile/);
   assert.match(packageJson, /"agent": "node agent\/server\.mjs"/);
+  assert.doesNotMatch(layout, /next\/font/);
   await assert.rejects(access(new URL("../app/_sites-preview", import.meta.url)));
 });
 
