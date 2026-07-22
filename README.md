@@ -12,13 +12,15 @@ subtitle timing synchronized.
 - Local video selection with sampled SHA-256 file matching
 - Automatic direct downloads through the local companion, with an OPFS browser
   fallback for CORS-enabled URLs
-- Automatic magnet downloads through the local companion using WebTorrent
+- Magnet-first page resolution through the local companion, including encoded links
+- Automatic magnet and `.torrent` downloads through the local companion using WebTorrent
 - Torrent file selection and synchronized selected-file priority
 - Per-device progress and a both-ready gate before shared playback
 - Server-authoritative play, pause, seek, speed, language, subtitle, and offset
   state
 - Drift correction and reconnect recovery in the player
 - Local SRT and WebVTT subtitle parsing
+- Embedded MKV text-subtitle discovery and on-demand WebVTT extraction with FFmpeg
 - Byte-range streaming from the companion so the browser can seek efficiently
 
 ## Architecture
@@ -48,16 +50,19 @@ npm run dev
 
 The coordinator opens at [http://localhost:3000](http://localhost:3000).
 
-For automatic magnet downloads and unrestricted direct downloads, each watcher
-also runs the companion in a second terminal:
+For magnet pages, torrent downloads, and embedded MKV subtitles, each watcher
+also runs the companion. During development it can be started in a second terminal:
 
 ```bash
 npm run agent
 ```
 
 The companion listens only on `127.0.0.1:41735` and downloads into
-`./downloads`. Without it, users can still choose matching local videos and
-CORS-enabled direct links can use the browser download fallback.
+`./downloads`. The website offers `watchpair-companion.zip`; on Windows, extract
+it and double-click `install-and-start.cmd`, then press **Connect** in WatchPair
+and approve the displayed website. No port forwarding is needed. Without the
+companion, users can still choose matching local videos and CORS-enabled direct
+links can use the browser download fallback.
 
 ## Companion settings
 
@@ -68,13 +73,14 @@ npm run agent
 ```
 
 - `WATCHPAIR_DOWNLOAD_DIR` changes the local download folder.
-- `WATCHPAIR_ORIGINS` is a comma-separated allowlist for coordinator origins.
+- `WATCHPAIR_ORIGINS` pre-approves a comma-separated list of coordinator origins.
+  Normal users approve the current website through the local pairing page instead.
 - `WATCHPAIR_AGENT_PORT` changes the localhost port.
 
 For a VPS-hosted coordinator, every participant runs the companion locally and
-adds the public HTTPS origin to `WATCHPAIR_ORIGINS`. Current Chromium browsers
-are the primary target because localhost private-network permissions and media
-codec support vary between browsers.
+uses the website **Connect** action to approve that public HTTPS origin. Current
+Chromium browsers are the primary target because localhost private-network
+permissions and media codec support vary between browsers.
 
 ## VPS / Docker
 
@@ -104,8 +110,10 @@ npm run lint
 - Embedded audio-track switching depends on the container and browser. The
   synchronized language preference is retained even when a particular browser
   cannot expose alternate tracks.
-- MKV, HEVC, DTS, ASS, and PGS support varies. Remux or transcode incompatible
-  releases to browser-friendly MP4/WebM for this version.
+- MKV text subtitles such as SRT, ASS, and WebVTT are extracted by the companion.
+  Image-based PGS/VobSub tracks cannot be rendered as browser text. Video and
+  audio codec support still depends on the browser; remux or transcode releases
+  that use unsupported codecs.
 - Magnet use exposes each downloader to the torrent swarm. Use content you have
   the legal right to download and share.
 - The companion blocks obvious private-network direct-download targets and

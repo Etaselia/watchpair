@@ -75,38 +75,15 @@ export async function resolveSharedSource(rawValue: string): Promise<Pick<Shared
     throw new Error("Only magnet, HTTP, and HTTPS sources are supported.");
   }
 
-  const isDirectMedia = /\.(mp4|m4v|webm|ogv|mov|mkv)(?:$|[?#])/i.test(value);
-  if (isDirectMedia) {
-    return { kind: "direct", value, label: sourceLabel(value) };
+  const path = url.pathname.toLowerCase();
+  if (path.endsWith(".torrent")) {
+    return { kind: "magnet", value: url.href, label: sourceLabel(url.href) };
+  }
+  if ([".mp4", ".m4v", ".webm", ".ogv", ".mov", ".mkv", ".avi", ".ts"].some((extension) => path.endsWith(extension))) {
+    return { kind: "direct", value: url.href, label: sourceLabel(url.href) };
   }
 
-  try {
-    const response = await fetch(value, { headers: { Accept: "text/html,video/*" } });
-    if (!response.ok) throw new Error(`The page returned ${response.status}.`);
-
-    const contentType = response.headers.get("content-type") ?? "";
-    if (contentType.startsWith("video/")) {
-      return { kind: "direct", value, label: sourceLabel(value) };
-    }
-
-    const html = (await response.text()).slice(0, 2_000_000);
-    const magnetMatch = html.match(/magnet:\?[^"'<>\s]+/i);
-    if (magnetMatch) {
-      const magnet = magnetMatch[0].replaceAll("&amp;", "&");
-      return { kind: "magnet", value: magnet, label: sourceLabel(magnet) };
-    }
-
-    const mediaMatch = html.match(/https?:\/\/[^"'<>\s]+\.(?:mp4|m4v|webm|ogv)(?:\?[^"'<>\s]*)?/i);
-    if (mediaMatch) {
-      const mediaUrl = mediaMatch[0].replaceAll("&amp;", "&");
-      return { kind: "direct", value: mediaUrl, label: sourceLabel(mediaUrl) };
-    }
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : "The page could not be read.";
-    throw new Error(`Could not resolve that page in the browser. Paste its magnet or direct video link instead. ${reason}`);
-  }
-
-  throw new Error("No magnet or playable video link was found on that page.");
+  throw new Error("Connect the WatchPair Companion to resolve pages containing magnet links.");
 }
 
 interface StorageWithDirectory {

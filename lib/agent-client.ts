@@ -12,6 +12,18 @@ export interface AgentFile {
   streamUrl: string;
 }
 
+export interface AgentSubtitleTrack {
+  id: string;
+  streamIndex: number;
+  language: string;
+  label: string;
+  codec: string;
+  supported: boolean;
+  default: boolean;
+  forced: boolean;
+  url: string;
+}
+
 export interface AgentJob {
   id: string;
   kind: "magnet" | "direct";
@@ -19,18 +31,17 @@ export interface AgentJob {
   progress: number;
   infoHash: string | null;
   error: string | null;
+  subtitleStatus: "waiting" | "probing" | "ready" | "error";
+  subtitleError: string | null;
+  subtitles: AgentSubtitleTrack[];
   files: AgentFile[];
   updatedAt: number;
 }
 
 async function agentFetch<T>(path: string, init?: RequestInit) {
-  const response = await fetch(`${AGENT_URL}${path}`, {
-    ...init,
-    headers: {
-      "content-type": "application/json",
-      ...init?.headers,
-    },
-  });
+  const headers = new Headers(init?.headers);
+  if (init?.body && !headers.has("content-type")) headers.set("content-type", "application/json");
+  const response = await fetch(AGENT_URL + path, { ...init, headers });
   const data = (await response.json()) as T & { error?: string };
   if (!response.ok) throw new Error(data.error || "The local agent rejected the request.");
   return data;
@@ -45,6 +56,30 @@ export async function detectAgent() {
   } finally {
     window.clearTimeout(timeout);
   }
+}
+
+export function getAgentPairingUrl() {
+  return AGENT_URL + "/pair?origin=" + encodeURIComponent(window.location.origin);
+}
+
+export async function resolveAgentSource(value: string) {
+  const result = await agentFetch<{ source: Pick<SharedSource, "kind" | "value" | "label"> }>(
+    "/resolve",
+    { method: "POST", body: JSON.stringify({ value }) }
+  );
+  return result.source;
+}
+
+export async function getAgentSubtitle(sourceId: string, trackId: string) {
+  const response = await fetch(
+    AGENT_URL + "/downloads/" + encodeURIComponent(sourceId) + "/subtitles/" + encodeURIComponent(trackId) + ".vtt",
+    { cache: "force-cache" }
+  );
+  if (!response.ok) {
+    const data = (await response.json().catch(() => null)) as { error?: string } | null;
+    throw new Error(data?.error || "Could not extract embedded subtitles.");
+  }
+  return response.text();
 }
 
 export async function addAgentDownload(source: SharedSource) {

@@ -12,8 +12,10 @@ import {
   LoaderCircle,
   Minus,
   MonitorUp,
+  PackageOpen,
   Pause,
   Play,
+  Plug,
   Plus,
   Radio,
   Subtitles,
@@ -35,9 +37,13 @@ import {
   addAgentDownload,
   detectAgent,
   getAgentDownload,
+  getAgentPairingUrl,
+  getAgentSubtitle,
+  resolveAgentSource,
   selectAgentFile,
   type AgentFile,
   type AgentJob,
+  type AgentSubtitleTrack,
 } from "../lib/agent-client";
 import {
   downloadDirectFile,
@@ -98,12 +104,14 @@ export default function WatchApp() {
   const [readiness, setReadiness] = useState<LocalReadiness>(emptyReadiness);
   const [mediaUrl, setMediaUrl] = useState("");
   const [subtitleCues, setSubtitleCues] = useState<SubtitleCue[]>([]);
-  const [subtitleName, setSubtitleName] = useState("");
+  const [localSubtitleName, setLocalSubtitleName] = useState("");
   const [busy, setBusy] = useState<"create" | "join" | "source" | "file" | "download" | null>(null);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
   const [agentAvailable, setAgentAvailable] = useState(false);
+  const [agentPairing, setAgentPairing] = useState(false);
   const [agentJob, setAgentJob] = useState<AgentJob | null>(null);
+  const [embeddedSubtitles, setEmbeddedSubtitles] = useState<AgentSubtitleTrack[]>([]);
   const [connection, setConnection] = useState<"syncing" | "online" | "offline">("syncing");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const subtitleInputRef = useRef<HTMLInputElement>(null);
@@ -112,6 +120,8 @@ export default function WatchApp() {
   const mediaUrlRef = useRef("");
   const sessionRef = useRef<WatchSession | null>(null);
   const selectionSentRef = useRef("");
+  const loadedSubtitleRef = useRef("");
+  const pairingTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -144,7 +154,40 @@ export default function WatchApp() {
     void detectAgent()
       .then(setAgentAvailable)
       .catch(() => setAgentAvailable(false));
+    return () => {
+      if (pairingTimerRef.current !== null) window.clearInterval(pairingTimerRef.current);
+    };
   }, []);
+
+  const connectCompanion = () => {
+    if (agentPairing) return;
+    const pairingWindow = window.open(getAgentPairingUrl(), "_blank");
+    if (!pairingWindow) {
+      setError("Allow the pairing window, then try connecting the companion again.");
+      return;
+    }
+
+    setAgentPairing(true);
+    let attempts = 0;
+    if (pairingTimerRef.current !== null) window.clearInterval(pairingTimerRef.current);
+    pairingTimerRef.current = window.setInterval(() => {
+      attempts += 1;
+      void detectAgent()
+        .then((available) => {
+          if (!available) return;
+          setAgentAvailable(true);
+          setAgentPairing(false);
+          if (pairingTimerRef.current !== null) window.clearInterval(pairingTimerRef.current);
+          pairingTimerRef.current = null;
+        })
+        .catch(() => {
+          if (attempts < 120) return;
+          setAgentPairing(false);
+          if (pairingTimerRef.current !== null) window.clearInterval(pairingTimerRef.current);
+          pairingTimerRef.current = null;
+        });
+    }, 1_000);
+  };
 
   useEffect(() => {
     mediaUrlRef.current = mediaUrl;
@@ -337,7 +380,7 @@ export default function WatchApp() {
       const cues = parseSubtitles(await file.text());
       if (!cues.length) throw new Error("No subtitle cues were found in that file.");
       setSubtitleCues(cues);
-      setSubtitleName(file.name);
+      setLocalSubtitleName(file.name);
       if (session) {
         await sendAction("player", {
           player: { ...session.player, subtitleLanguage: "local" },
@@ -355,7 +398,16 @@ export default function WatchApp() {
     setBusy("source");
     setError("");
     try {
-      const resolved = await resolveSharedSource(sourceInput);
+      let resolved;
+      try {
+        resolved = await resolveAgentSource(sourceInput);
+        setAgentAvailable(true);
+      } catch (agentError) {
+        const companionOnline = await detectAgent().catch(() => false);
+        setAgentAvailable(companionOnline);
+        if (companionOnline) throw agentError;
+        resolved = await resolveSharedSource(sourceInput);
+      }
       await sendAction("source", { source: resolved });
       setSourceInput("");
       setReadiness(emptyReadiness());
@@ -377,6 +429,10 @@ export default function WatchApp() {
     handledSourceRef.current = source.id;
     selectionSentRef.current = "";
     setAgentJob(null);
+    setEmbeddedSubtitles([]);
+    setSubtitleCues([]);
+    setLocalSubtitleName("");
+    loadedSubtitleRef.current = "";
     const controller = new AbortController();
     const initial: LocalReadiness = {
       ...emptyReadiness(),
@@ -392,6 +448,7 @@ export default function WatchApp() {
         if (controller.signal.aborted) return;
         setAgentAvailable(true);
         setAgentJob(job);
+        setEmbeddedSubtitles((job.subtitles || []).filter((track) => track.supported));
         setBusy(null);
         return;
       } catch {
@@ -401,7 +458,7 @@ export default function WatchApp() {
       if (source.kind === "magnet") {
         const next: LocalReadiness = {
           ...emptyReadiness(),
-          status: "Open the magnet or start the companion",
+          status: "Connect the companion to start this torrent",
         };
         readinessRef.current = next;
         setReadiness(next);
@@ -457,6 +514,7 @@ export default function WatchApp() {
         let job = await getAgentDownload(source.id);
         if (!active) return;
         setAgentJob(job);
+        setEmbeddedSubtitles((job.subtitles || []).filter((track) => track.supported));
 
         if (job.status === "error") {
           const next = {
@@ -511,6 +569,7 @@ export default function WatchApp() {
         if (job.kind === "magnet" && !target.selected) {
           job = await selectAgentFile(source.id, target.index);
           setAgentJob(job);
+          setEmbeddedSubtitles((job.subtitles || []).filter((track) => track.supported));
           target = job.files.find((file) => file.index === target?.index) || target;
         }
 
@@ -541,6 +600,51 @@ export default function WatchApp() {
     };
   }, [agentAvailable, joined, sendAction, session?.source]);
 
+  const requestedSubtitleSelection = session?.player.subtitleLanguage || "off";
+  const requestedSubtitleTrackId = requestedSubtitleSelection.startsWith("embedded:")
+    ? requestedSubtitleSelection.slice("embedded:".length)
+    : "";
+  const requestedSubtitleTrack = embeddedSubtitles.find(
+    (track) => track.id === requestedSubtitleTrackId
+  );
+  const requestedSubtitleTrackSupported = Boolean(requestedSubtitleTrack?.supported);
+
+  useEffect(() => {
+    const selection = requestedSubtitleSelection;
+    const sourceId = session?.source?.id;
+    if (!selection.startsWith("embedded:") || !sourceId) {
+      loadedSubtitleRef.current = "";
+      return;
+    }
+
+    const trackId = requestedSubtitleTrackId;
+    const loadKey = sourceId + ":" + trackId;
+    if (!requestedSubtitleTrackSupported || loadedSubtitleRef.current === loadKey) return;
+    loadedSubtitleRef.current = loadKey;
+
+    let active = true;
+    void getAgentSubtitle(sourceId, trackId)
+      .then((contents) => {
+        if (!active) return;
+        const cues = parseSubtitles(contents);
+        if (!cues.length) throw new Error("No cues were extracted from that embedded track.");
+        setSubtitleCues(cues);
+      })
+      .catch((caught) => {
+        if (!active) return;
+        setError(caught instanceof Error ? caught.message : "Could not load embedded subtitles.");
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [
+    requestedSubtitleSelection,
+    requestedSubtitleTrackId,
+    requestedSubtitleTrackSupported,
+    session?.source?.id,
+  ]);
+
   const chooseAgentMedia = async (file: AgentFile) => {
     const source = session?.source;
     if (!source || !agentJob) return;
@@ -550,6 +654,7 @@ export default function WatchApp() {
       if (agentJob.kind === "magnet") {
         const nextJob = await selectAgentFile(source.id, file.index);
         setAgentJob(nextJob);
+        setEmbeddedSubtitles((nextJob.subtitles || []).filter((track) => track.supported));
       }
       selectionSentRef.current = `${source.id}:${file.index}`;
       await sendAction("select-media", {
@@ -638,7 +743,8 @@ export default function WatchApp() {
         session={session}
         mediaUrl={mediaUrl}
         subtitleCues={subtitleCues}
-        subtitleName={subtitleName}
+        localSubtitleName={localSubtitleName}
+        subtitleTracks={embeddedSubtitles}
         onBack={() => setView("lobby")}
         onSend={sendPlayerState}
       />
@@ -778,6 +884,33 @@ export default function WatchApp() {
             </button>
           </form>
 
+          {!agentAvailable && (
+            <div className="companion-callout">
+              <div>
+                <span className="companion-icon"><Plug /></span>
+                <span>
+                  <strong>Companion needed</strong>
+                  <small>Connect it for magnet pages, torrent downloads, and embedded MKV subtitles.</small>
+                </span>
+              </div>
+              <div className="companion-actions">
+                <button
+                  className="primary-button"
+                  type="button"
+                  onClick={connectCompanion}
+                  disabled={agentPairing}
+                >
+                  {agentPairing ? <LoaderCircle className="spin" /> : <Plug />}
+                  {agentPairing ? "Waiting for approval" : "Connect"}
+                </button>
+                <a className="secondary-button" href="/watchpair-companion.zip" download>
+                  <PackageOpen />
+                  Get companion
+                </a>
+              </div>
+            </div>
+          )}
+
           {session?.source ? (
             <>
               <div className="source-current">
@@ -789,14 +922,14 @@ export default function WatchApp() {
                       ? `Companion connected: ${agentJob?.status || "starting"}`
                       : session.source.kind === "direct"
                         ? "Downloading in this browser"
-                        : "Companion unavailable: torrent client handoff"}
+                        : "Connect the companion to start this torrent"}
                   </span>
                 </div>
                 {session.source.kind === "magnet" && !agentAvailable ? (
-                  <a className="secondary-button compact-button" href={session.source.value}>
-                    <Download />
-                    Open magnet
-                  </a>
+                  <button className="secondary-button compact-button" type="button" onClick={connectCompanion}>
+                    <Plug />
+                    Connect
+                  </button>
                 ) : agentAvailable ? (
                   <span className="agent-chip"><Radio /> Local agent</span>
                 ) : null}
@@ -923,7 +1056,7 @@ export default function WatchApp() {
               {mediaUrl && (
                 <button className="secondary-button" type="button" onClick={() => subtitleInputRef.current?.click()}>
                   <Subtitles />
-                  {subtitleName || "Add subtitles"}
+                  {localSubtitleName || "Add subtitles"}
                 </button>
               )}
               <button className="secondary-button" type="button" onClick={() => fileInputRef.current?.click()}>
@@ -982,7 +1115,8 @@ interface SyncedPlayerProps {
   session: WatchSession;
   mediaUrl: string;
   subtitleCues: SubtitleCue[];
-  subtitleName: string;
+  localSubtitleName: string;
+  subtitleTracks: AgentSubtitleTrack[];
   onBack: () => void;
   onSend: (player: PlayerState) => Promise<void>;
 }
@@ -991,7 +1125,8 @@ function SyncedPlayer({
   session,
   mediaUrl,
   subtitleCues,
-  subtitleName,
+  localSubtitleName,
+  subtitleTracks,
   onBack,
   onSend,
 }: SyncedPlayerProps) {
@@ -1069,7 +1204,7 @@ function SyncedPlayer({
       setCurrentTime(video.currentTime);
       setDuration(video.duration || 0);
 
-      if (session.player.subtitleLanguage !== "local" || !subtitleCues.length) {
+      if (session.player.subtitleLanguage === "off" || !subtitleCues.length) {
         setSubtitleText("");
         return;
       }
@@ -1282,13 +1417,18 @@ function SyncedPlayer({
                 aria-label="Subtitles"
               >
                 <option value="off">Off</option>
-                <option value="local" disabled={!subtitleCues.length}>
-                  {subtitleName || "Local subtitle"}
+                <option value="local" disabled={!localSubtitleName}>
+                  {localSubtitleName || "Local subtitle file"}
                 </option>
+                {subtitleTracks.map((track) => (
+                  <option key={track.id} value={"embedded:" + track.id}>
+                    {track.label} ({track.language.toUpperCase()})
+                  </option>
+                ))}
               </select>
             </label>
 
-            {session.player.subtitleLanguage === "local" && (
+            {session.player.subtitleLanguage !== "off" && (
               <div className="offset-control" title="Subtitle timing offset">
                 <button onClick={() => updateOffset(-100)} aria-label="Subtitles earlier"><Minus /></button>
                 <span>{session.player.subtitleOffset > 0 ? "+" : ""}{session.player.subtitleOffset}ms</span>

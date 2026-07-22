@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { access, readFile } from "node:fs/promises";
 import { after, before, test } from "node:test";
+import { strFromU8, unzipSync } from "fflate";
 
 const port = 3199;
 let server;
@@ -106,4 +107,23 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(media, /fingerprintFile/);
   assert.match(packageJson, /"agent": "node agent\/server\.mjs"/);
   await assert.rejects(access(new URL("../app/_sites-preview", import.meta.url)));
+});
+
+test("packages the pairable magnet and subtitle companion", async () => {
+  const archive = unzipSync(
+    new Uint8Array(await readFile(new URL("../public/watchpair-companion.zip", import.meta.url))),
+  );
+  const expected = [
+    "WatchPair Companion/server.mjs",
+    "WatchPair Companion/install-and-start.cmd",
+    "WatchPair Companion/install-runtime.ps1",
+    "WatchPair Companion/package-lock.json",
+  ];
+  for (const path of expected) assert.ok(archive[path], `Missing ${path}`);
+
+  const bundledAgent = strFromU8(archive["WatchPair Companion/server.mjs"]);
+  assert.match(bundledAgent, /url\.pathname === "\/pair"/);
+  assert.match(bundledAgent, /url\.pathname === "\/resolve"/);
+  assert.match(bundledAgent, /FFPROBE_PATH/);
+  assert.match(bundledAgent, /subtitleFile/);
 });

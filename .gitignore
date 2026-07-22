@@ -42,4 +42,6 @@ next-env.d.ts
 /.wrangler/
 /downloads/
 /outputs/
+/companion/runtime/
+/companion/.runtime-download/
 /work/
