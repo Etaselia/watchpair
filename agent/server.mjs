@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { createServer } from "node:http";
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { BlockList } from "node:net";
 import { homedir } from "node:os";
@@ -14,7 +14,7 @@ import ffmpegStaticPath from "ffmpeg-static";
 import ffprobeStatic from "ffprobe-static";
 import WebTorrent from "webtorrent";
 import { isSupportedMagnet } from "./torrent-input.mjs";
-import { installWebTorrentSafetyGuards, normalizedTorrentFileProgress, stabilizeTorrentPieceState } from "./webtorrent-safety.mjs";
+import { installWebTorrentSafetyGuards, monotonicTorrentFileProgress, stabilizeTorrentPieceState } from "./webtorrent-safety.mjs";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.WATCHPAIR_AGENT_PORT || 41735);
@@ -291,23 +291,31 @@ async function readJson(request) {
   return JSON.parse((await readBody(request)) || "{}");
 }
 
+function selectedFileKey(job) {
+  const media = selectedJobFile(job);
+  return String(job.selectedIndex) + ":" + media.name + ":" + media.size;
+}
+
 function selectTorrentFile(job, index) {
-  if (!job.torrent?.files[index]) throw new Error("Torrent file not found.");
-  job.torrent.files.forEach((file) => file.deselect());
-  job.torrent.files[index].select(10);
+  const file = job.torrent?.files[index];
+  if (!file) throw new Error("Torrent file not found.");
+  job.torrent.files.forEach((item) => item.deselect());
+  file.select(10);
   job.selectedIndex = index;
+  job.audioTracks = [];
   job.subtitleTracks = [];
   job.subtitleStatus = "waiting";
   job.subtitleError = null;
   job.subtitleProbeKey = null;
+  job.status = file.done ? "ready" : "downloading";
   job.updatedAt = Date.now();
-  if (Number(job.torrent.files[index].progress || 0) >= 0.999) void queueSubtitleProbe(job);
+  if (file.done) void queueSubtitleProbe(job);
 }
 
-function selectedJobFile(job) {
+function jobFile(job, index) {
   if (job.kind === "magnet") {
-    const file = job.torrent?.files[job.selectedIndex];
-    if (!file) throw new Error("Select a torrent file first.");
+    const file = job.torrent?.files[index];
+    if (!file) throw new Error("Torrent file not found.");
     const root = path.resolve(job.torrent.path || path.join(DOWNLOAD_DIR, job.id));
     const filePath = path.resolve(root, file.path);
     if (filePath !== root && !filePath.startsWith(root + path.sep)) {
@@ -315,20 +323,40 @@ function selectedJobFile(job) {
     }
     return { path: filePath, name: file.path || file.name, size: file.length };
   }
-  if (!job.file) throw new Error("Downloaded file not found.");
+  if (!job.file || index !== 0) throw new Error("Downloaded file not found.");
   return job.file;
+}
+
+function selectedJobFile(job) {
+  if (job.selectedIndex === null) throw new Error("Select a media file first.");
+  return jobFile(job, job.selectedIndex);
+}
+
+function streamTrackLabel(stream, fallback) {
+  const title = String(stream.tags?.title || "").trim();
+  const language = String(stream.tags?.language || "und").toLowerCase();
+  return title || (language === "und" ? fallback : language.toUpperCase());
 }
 
 async function probeSubtitleTracks(job) {
   const media = selectedJobFile(job);
-  const selectionKey = String(job.selectedIndex) + ":" + media.name + ":" + media.size;
+  const selectionKey = selectedFileKey(job);
   if (job.subtitleProbeKey === selectionKey && job.subtitleStatus === "ready") return;
 
   job.subtitleProbeKey = selectionKey;
   job.subtitleStatus = "probing";
   job.subtitleError = null;
+  job.audioTracks = [];
   job.subtitleTracks = [];
   job.updatedAt = Date.now();
+
+  const isStillSelected = () => {
+    try {
+      return selectedFileKey(job) === selectionKey;
+    } catch {
+      return false;
+    }
+  };
 
   try {
     const result = await runFile(
@@ -336,18 +364,30 @@ async function probeSubtitleTracks(job) {
       ["-v", "error", "-print_format", "json", "-show_streams", media.path],
       { maxBuffer: 8 * 1024 * 1024 }
     );
+    if (!isStillSelected()) return;
+
     const metadata = JSON.parse(result.stdout || "{}");
+    job.audioTracks = (metadata.streams || [])
+      .filter((stream) => stream.codec_type === "audio")
+      .map((stream) => ({
+        id: String(stream.index),
+        streamIndex: Number(stream.index),
+        language: String(stream.tags?.language || "und").toLowerCase(),
+        label: streamTrackLabel(stream, "Audio track"),
+        codec: String(stream.codec_name || "unknown"),
+        channels: Number(stream.channels || 0),
+        default: Boolean(stream.disposition?.default),
+      }));
     job.subtitleTracks = (metadata.streams || [])
       .filter((stream) => stream.codec_type === "subtitle")
       .map((stream) => {
         const codec = String(stream.codec_name || "unknown");
         const language = String(stream.tags?.language || "und").toLowerCase();
-        const title = String(stream.tags?.title || "").trim();
         return {
           id: String(stream.index),
           streamIndex: Number(stream.index),
           language,
-          label: title || (language === "und" ? "Embedded subtitles" : language.toUpperCase()),
+          label: streamTrackLabel(stream, "Embedded subtitles"),
           codec,
           supported: TEXT_SUBTITLE_CODECS.has(codec),
           default: Boolean(stream.disposition?.default),
@@ -357,19 +397,33 @@ async function probeSubtitleTracks(job) {
       });
     job.subtitleStatus = "ready";
   } catch (error) {
+    if (!isStillSelected()) return;
     job.subtitleStatus = "error";
-    job.subtitleError = error instanceof Error ? error.message : "Could not inspect embedded subtitles.";
+    job.subtitleError = error instanceof Error ? error.message : "Could not inspect embedded media tracks.";
   } finally {
-    job.updatedAt = Date.now();
+    if (isStillSelected()) job.updatedAt = Date.now();
   }
 }
 
 function queueSubtitleProbe(job) {
-  if (job.subtitleProbePromise) return job.subtitleProbePromise;
-  job.subtitleProbePromise = probeSubtitleTracks(job).finally(() => {
-    job.subtitleProbePromise = null;
+  const selectionKey = selectedFileKey(job);
+  if (job.subtitleProbeKey === selectionKey && job.subtitleStatus === "ready") {
+    return Promise.resolve();
+  }
+  if (job.subtitleProbePromise && job.subtitleProbePromiseKey === selectionKey) {
+    return job.subtitleProbePromise;
+  }
+
+  let promise;
+  promise = probeSubtitleTracks(job).finally(() => {
+    if (job.subtitleProbePromise === promise) {
+      job.subtitleProbePromise = null;
+      job.subtitleProbePromiseKey = null;
+    }
   });
-  return job.subtitleProbePromise;
+  job.subtitleProbePromise = promise;
+  job.subtitleProbePromiseKey = selectionKey;
+  return promise;
 }
 
 async function subtitleFile(job, trackId) {
@@ -399,13 +453,15 @@ async function subtitleFile(job, trackId) {
 function torrentFiles(job) {
   if (!job.torrent) return [];
   return job.torrent.files.map((file, index) => {
-    const progress = normalizedTorrentFileProgress(file);
+    const progress = monotonicTorrentFileProgress(file, job.fileProgress.get(index));
+    job.fileProgress.set(index, progress);
     return {
       index,
       name: file.path || file.name,
       size: file.length,
       downloaded: Math.round(file.length * progress),
       progress: Math.round(progress * 1000) / 10,
+      ready: Boolean(file.done),
       selected: index === job.selectedIndex,
       streamUrl: `http://${HOST}:${PORT}/stream/${encodeURIComponent(job.id)}/${index}`,
     };
@@ -423,6 +479,7 @@ function snapshot(job) {
             size: job.file.size,
             downloaded: job.downloaded,
             progress: job.file.size ? Math.round((job.downloaded / job.file.size) * 1000) / 10 : 0,
+            ready: job.status === "ready" && job.downloaded === job.file.size,
             selected: true,
             streamUrl: `http://${HOST}:${PORT}/stream/${encodeURIComponent(job.id)}/0`,
           }]
@@ -438,6 +495,7 @@ function snapshot(job) {
     error: job.error || null,
     subtitleStatus: job.subtitleStatus,
     subtitleError: job.subtitleError,
+    audioTracks: job.audioTracks || [],
     subtitles: job.subtitleTracks || [],
     files,
     updatedAt: job.updatedAt,
@@ -463,7 +521,7 @@ function startTorrent(job) {
       .map((file, index) => ({ index, size: file.length, video: VIDEO_EXTENSIONS.test(file.name) }))
       .sort((a, b) => Number(b.video) - Number(a.video) || b.size - a.size);
     if (videos[0]) selectTorrentFile(job, videos[0].index);
-    job.status = "downloading";
+    job.status = torrent.files[job.selectedIndex]?.done ? "ready" : "downloading";
     job.updatedAt = Date.now();
   });
   torrent.on("download", () => {
@@ -558,11 +616,15 @@ async function addDownload(source) {
     selectedIndex: null,
     torrent: null,
     file: null,
+    audioTracks: [],
     subtitleTracks: [],
     subtitleStatus: "waiting",
     subtitleError: null,
     subtitleProbeKey: null,
     subtitleProbePromise: null,
+    subtitleProbePromiseKey: null,
+    fileProgress: new Map(),
+    audioRenderPromises: new Map(),
     updatedAt: Date.now(),
   };
   jobs.set(id, job);
@@ -584,13 +646,78 @@ function contentType(fileName, fallback = "application/octet-stream") {
   }[extension] || fallback;
 }
 
-async function streamFile(request, response, job, fileIndex, headers) {
+async function renderAudioPlayback(job, fileIndex, track) {
+  const media = jobFile(job, fileIndex);
+  const directory = path.join(DOWNLOAD_DIR, ".watchpair-media", job.id);
+  const output = path.join(directory, String(fileIndex) + "-audio-" + track.id + ".mp4");
+  const partial = output + ".partial.mp4";
+  await mkdir(directory, { recursive: true });
+
+  try {
+    const existing = await stat(output);
+    if (existing.size > 0) return output;
+  } catch {
+    // The selected audio variant has not been prepared yet.
+  }
+
+  await rm(partial, { force: true });
+  try {
+    await runFile(
+      FFMPEG_PATH,
+      [
+        "-v", "error", "-y", "-i", media.path,
+        "-map", "0:v:0", "-map", "0:" + track.streamIndex,
+        "-sn", "-dn", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart", partial,
+      ],
+      { maxBuffer: 8 * 1024 * 1024 }
+    );
+    await rename(partial, output);
+    return output;
+  } catch (error) {
+    await rm(partial, { force: true });
+    throw error;
+  }
+}
+
+async function preparedAudioFile(job, fileIndex, trackId) {
+  if (job.selectedIndex !== fileIndex) throw new Error("That media file is no longer selected.");
+  const ready = job.kind === "magnet"
+    ? Boolean(job.torrent?.files[fileIndex]?.done)
+    : job.status === "ready";
+  if (!ready) throw new Error("The selected media file is not ready.");
+  await queueSubtitleProbe(job);
+
+  const track = job.audioTracks.find((item) => item.id === trackId);
+  if (!track) throw new Error("Embedded audio track not found.");
+  const key = String(fileIndex) + ":" + track.id;
+  let promise = job.audioRenderPromises.get(key);
+  if (!promise) {
+    promise = renderAudioPlayback(job, fileIndex, track);
+    job.audioRenderPromises.set(key, promise);
+  }
+  try {
+    return await promise;
+  } finally {
+    if (job.audioRenderPromises.get(key) === promise) job.audioRenderPromises.delete(key);
+  }
+}
+
+async function streamFile(request, response, job, fileIndex, headers, audioTrackId) {
   let fileName;
   let size;
   let createStream;
   let fallbackType;
 
-  if (job.kind === "magnet") {
+  if (audioTrackId) {
+    if (!/^\d+$/.test(audioTrackId)) throw new Error("Invalid audio track.");
+    const audioPath = await preparedAudioFile(job, fileIndex, audioTrackId);
+    const info = await stat(audioPath);
+    fileName = path.parse(jobFile(job, fileIndex).name).name + ".mp4";
+    size = info.size;
+    fallbackType = "video/mp4";
+    createStream = (options) => createReadStream(audioPath, options);
+  } else if (job.kind === "magnet") {
     const file = job.torrent?.files[fileIndex];
     if (!file) throw new Error("Torrent file not found.");
     fileName = file.name;
@@ -609,7 +736,7 @@ async function streamFile(request, response, job, fileIndex, headers) {
     ...headers,
     "accept-ranges": "bytes",
     "content-type": contentType(fileName, fallbackType),
-    "content-disposition": `inline; filename="${safeName(fileName)}"`,
+    "content-disposition": "inline; filename=\"" + safeName(fileName) + "\"",
   };
 
   if (!range) {
@@ -620,7 +747,7 @@ async function streamFile(request, response, job, fileIndex, headers) {
 
   const match = /^bytes=(\d*)-(\d*)$/.exec(range);
   if (!match) {
-    response.writeHead(416, { ...baseHeaders, "content-range": `bytes */${size}` });
+    response.writeHead(416, { ...baseHeaders, "content-range": "bytes */" + size });
     response.end();
     return;
   }
@@ -628,7 +755,7 @@ async function streamFile(request, response, job, fileIndex, headers) {
   const start = match[1] ? Number(match[1]) : 0;
   const end = match[2] ? Math.min(Number(match[2]), size - 1) : size - 1;
   if (start > end || start >= size) {
-    response.writeHead(416, { ...baseHeaders, "content-range": `bytes */${size}` });
+    response.writeHead(416, { ...baseHeaders, "content-range": "bytes */" + size });
     response.end();
     return;
   }
@@ -636,7 +763,7 @@ async function streamFile(request, response, job, fileIndex, headers) {
   response.writeHead(206, {
     ...baseHeaders,
     "content-length": end - start + 1,
-    "content-range": `bytes ${start}-${end}/${size}`,
+    "content-range": "bytes " + start + "-" + end + "/" + size,
   });
   createStream({ start, end }).pipe(response);
 }
@@ -691,7 +818,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/health") {
       sendJson(response, 200, {
         ok: true,
-        version: "0.2.4",
+        version: "0.2.5",
         downloadDirectory: DOWNLOAD_DIR,
         jobs: jobs.size,
       }, headers);
@@ -753,7 +880,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && streamMatch) {
       const job = jobs.get(streamMatch[1]);
       if (!job) throw new Error("Download not found.");
-      await streamFile(request, response, job, Number(streamMatch[2]), headers);
+      await streamFile(request, response, job, Number(streamMatch[2]), headers, url.searchParams.get("audio"));
       return;
     }
 

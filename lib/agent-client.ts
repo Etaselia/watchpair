@@ -8,8 +8,19 @@ export interface AgentFile {
   size: number;
   downloaded: number;
   progress: number;
+  ready: boolean;
   selected: boolean;
   streamUrl: string;
+}
+
+export interface AgentAudioTrack {
+  id: string;
+  streamIndex: number;
+  language: string;
+  label: string;
+  codec: string;
+  channels: number;
+  default: boolean;
 }
 
 export interface AgentSubtitleTrack {
@@ -33,6 +44,7 @@ export interface AgentJob {
   error: string | null;
   subtitleStatus: "waiting" | "probing" | "ready" | "error";
   subtitleError: string | null;
+  audioTracks: AgentAudioTrack[];
   subtitles: AgentSubtitleTrack[];
   files: AgentFile[];
   updatedAt: number;

@@ -23,7 +23,14 @@ export function stabilizeTorrentPieceState(torrent) {
 }
 
 export function normalizedTorrentFileProgress(file) {
-  return file?.done ? 1 : Number(file?.progress || 0);
+  if (file?.done) return 1;
+  const measured = Number(file?.progress || 0);
+  const progress = Number.isFinite(measured) ? Math.max(0, measured) : 0;
+  return Math.min(0.999, progress);
+}
+
+export function monotonicTorrentFileProgress(file, previous = 0) {
+  return Math.max(normalizedTorrentFileProgress(file), Math.max(0, Math.min(1, Number(previous) || 0)));
 }
 
 export function installWebTorrentSafetyGuards() {

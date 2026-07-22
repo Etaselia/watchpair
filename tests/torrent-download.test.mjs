@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import WebTorrent from "webtorrent";
 import Torrent from "webtorrent/lib/torrent.js";
-import { installWebTorrentSafetyGuards, normalizedTorrentFileProgress, stabilizeTorrentPieceState } from "../agent/webtorrent-safety.mjs";
+import { installWebTorrentSafetyGuards, monotonicTorrentFileProgress, normalizedTorrentFileProgress, stabilizeTorrentPieceState } from "../agent/webtorrent-safety.mjs";
 
 installWebTorrentSafetyGuards();
 
@@ -18,6 +18,9 @@ test("scheduler guard skips a stale completed piece instead of terminating", () 
   assert.equal(torrent._request({ requests: [] }, 0, false), false);
   assert.equal(normalizedTorrentFileProgress({ done: true, progress: 0.992 }), 1);
   assert.equal(normalizedTorrentFileProgress({ done: false, progress: 0.5 }), 0.5);
+  assert.equal(normalizedTorrentFileProgress({ done: false, progress: 1 }), 0.999);
+  assert.equal(monotonicTorrentFileProgress({ done: false, progress: 0.75 }, 0.85), 0.85);
+  assert.equal(monotonicTorrentFileProgress({ done: true, progress: 0.75 }, 0.85), 1);
 
   const staleState = { pieces: [null, { missing: 8 }], bitfield: { get: () => false } };
   stabilizeTorrentPieceState(staleState);

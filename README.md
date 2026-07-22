@@ -20,7 +20,8 @@ subtitle timing synchronized.
   state
 - Drift correction and reconnect recovery in the player
 - Local SRT and WebVTT subtitle parsing
-- Embedded MKV text-subtitle discovery and on-demand WebVTT extraction with FFmpeg
+- Per-file audio and subtitle discovery for MKV and other containers with FFprobe
+- On-demand WebVTT extraction and cached browser-compatible alternate-audio remuxes with FFmpeg
 - Byte-range streaming from the companion so the browser can seek efficiently
 
 ## Architecture
@@ -107,9 +108,8 @@ npm run lint
 ## Operational notes
 
 - Browsers may require one click before a remote play command can start media.
-- Embedded audio-track switching depends on the container and browser. The
-  synchronized language preference is retained even when a particular browser
-  cannot expose alternate tracks.
+- Alternate embedded audio tracks are remuxed to MP4 with AAC on first selection.
+  The video stream is copied, so its codec must still be supported by the browser.
 - MKV text subtitles such as SRT, ASS, and WebVTT are extracted by the companion.
   Image-based PGS/VobSub tracks cannot be rendered as browser text. Video and
   audio codec support still depends on the browser; remux or transcode releases

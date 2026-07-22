@@ -78,6 +78,43 @@ test("production session API supports join-in-progress state", async () => {
   });
   assert.equal(joinedResponse.status, 200);
 
+  const playerResponse = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      action: "player",
+      token: created.session.token,
+      deviceId: "test-host",
+      name: "Host",
+      player: {
+        paused: false,
+        position: 42,
+        playbackRate: 1,
+        audioLanguage: "embedded:3",
+        subtitleLanguage: "embedded:4",
+        subtitleOffset: 250,
+      },
+    }),
+  });
+  assert.equal(playerResponse.status, 200);
+
+  const selectedResponse = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      action: "select-media",
+      token: created.session.token,
+      deviceId: "test-host",
+      name: "Host",
+      media: { name: "episode-2.mkv", size: 2048, fingerprint: "episode-2" },
+    }),
+  });
+  assert.equal(selectedResponse.status, 200);
+  const selected = await selectedResponse.json();
+  assert.equal(selected.session.player.position, 0);
+  assert.equal(selected.session.player.audioLanguage, "original");
+  assert.equal(selected.session.player.subtitleLanguage, "off");
+
   const snapshotResponse = await fetch(
     `http://127.0.0.1:${port}/api/sessions?token=${created.session.token}`,
   );
@@ -104,6 +141,8 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(route, /action === "select-media"/);
   assert.match(agent, /new WebTorrent/);
   assert.match(agent, /content-range/);
+  assert.match(agent, /audioTracks/);
+  assert.match(agent, /renderAudioPlayback/);
   assert.match(media, /fingerprintFile/);
   assert.match(packageJson, /"agent": "node agent\/server\.mjs"/);
   await assert.rejects(access(new URL("../app/_sites-preview", import.meta.url)));
@@ -135,9 +174,11 @@ test("packages the pairable magnet and subtitle companion", async () => {
   assert.match(bundledAgent, /url\.pathname === "\/resolve"/);
   assert.match(bundledAgent, /FFPROBE_PATH/);
   assert.match(bundledAgent, /subtitleFile/);
+  assert.match(bundledAgent, /renderAudioPlayback/);
   assert.match(bundledAgent, /installWebTorrentSafetyGuards/);
   assert.match(bundledSafetyGuard, /if \(!this\.pieces\?\.\[index\]\) return false/);
   assert.match(bundledSafetyGuard, /pieces\[index\] === null/);
+  assert.match(bundledSafetyGuard, /monotonicTorrentFileProgress/);
   assert.match(companionPackage, /"webtorrent": "3\.0\.11"/);
   assert.match(installer, /\$Releases = Invoke-RestMethod/);
   assert.match(installer, /\$Release = \(\$Releases \| Where-Object/);

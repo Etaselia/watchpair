@@ -30,6 +30,7 @@ import {
   type FormEvent,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -41,6 +42,7 @@ import {
   getAgentSubtitle,
   resolveAgentSource,
   selectAgentFile,
+  type AgentAudioTrack,
   type AgentFile,
   type AgentJob,
   type AgentSubtitleTrack,
@@ -111,6 +113,7 @@ export default function WatchApp() {
   const [agentAvailable, setAgentAvailable] = useState(false);
   const [agentPairing, setAgentPairing] = useState(false);
   const [agentJob, setAgentJob] = useState<AgentJob | null>(null);
+  const [embeddedAudioTracks, setEmbeddedAudioTracks] = useState<AgentAudioTrack[]>([]);
   const [embeddedSubtitles, setEmbeddedSubtitles] = useState<AgentSubtitleTrack[]>([]);
   const [connection, setConnection] = useState<"syncing" | "online" | "offline">("syncing");
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -331,6 +334,8 @@ export default function WatchApp() {
       setBusy("file");
       setError("");
       try {
+        setEmbeddedAudioTracks([]);
+        setEmbeddedSubtitles([]);
         const playableFile =
           preferredName === file.name ? file : new File([file], preferredName, { type: file.type });
         const fingerprint = await fingerprintFile(playableFile);
@@ -429,6 +434,7 @@ export default function WatchApp() {
     handledSourceRef.current = source.id;
     selectionSentRef.current = "";
     setAgentJob(null);
+    setEmbeddedAudioTracks([]);
     setEmbeddedSubtitles([]);
     setSubtitleCues([]);
     setLocalSubtitleName("");
@@ -448,7 +454,8 @@ export default function WatchApp() {
         if (controller.signal.aborted) return;
         setAgentAvailable(true);
         setAgentJob(job);
-        setEmbeddedSubtitles((job.subtitles || []).filter((track) => track.supported));
+        setEmbeddedAudioTracks(job.audioTracks || []);
+        setEmbeddedSubtitles(job.subtitles || []);
         setBusy(null);
         return;
       } catch {
@@ -514,7 +521,8 @@ export default function WatchApp() {
         let job = await getAgentDownload(source.id);
         if (!active) return;
         setAgentJob(job);
-        setEmbeddedSubtitles((job.subtitles || []).filter((track) => track.supported));
+        setEmbeddedAudioTracks(job.audioTracks || []);
+        setEmbeddedSubtitles(job.subtitles || []);
 
         if (job.status === "error") {
           const next = {
@@ -569,11 +577,12 @@ export default function WatchApp() {
         if (job.kind === "magnet" && !target.selected) {
           job = await selectAgentFile(source.id, target.index);
           setAgentJob(job);
-          setEmbeddedSubtitles((job.subtitles || []).filter((track) => track.supported));
+          setEmbeddedAudioTracks(job.audioTracks || []);
+          setEmbeddedSubtitles(job.subtitles || []);
           target = job.files.find((file) => file.index === target?.index) || target;
         }
 
-        const isReady = target.progress >= 99.9;
+        const isReady = target.ready;
         const next: LocalReadiness = {
           ready: isReady,
           progress: target.progress,
@@ -586,6 +595,7 @@ export default function WatchApp() {
         readinessRef.current = next;
         setReadiness(next);
         if (isReady) setMediaUrl(target.streamUrl);
+        else setMediaUrl("");
         if (becameReady) await sendAction("heartbeat", { readiness: next });
       } catch {
         if (active) setAgentAvailable(false);
@@ -609,20 +619,32 @@ export default function WatchApp() {
   );
   const requestedSubtitleTrackSupported = Boolean(requestedSubtitleTrack?.supported);
 
+  const selectedMediaTrackKey =
+    session?.selectedMedia?.fingerprint ||
+    (session?.selectedMedia ? session.selectedMedia.name + ":" + session.selectedMedia.size : "");
+
   useEffect(() => {
     const selection = requestedSubtitleSelection;
     const sourceId = session?.source?.id;
-    if (!selection.startsWith("embedded:") || !sourceId) {
+    if (!selection.startsWith("embedded:")) {
       loadedSubtitleRef.current = "";
       return;
     }
+    if (!sourceId || !requestedSubtitleTrackSupported) {
+      loadedSubtitleRef.current = "";
+      const clearTimer = window.setTimeout(() => setSubtitleCues([]), 0);
+      return () => window.clearTimeout(clearTimer);
+    }
 
     const trackId = requestedSubtitleTrackId;
-    const loadKey = sourceId + ":" + trackId;
-    if (!requestedSubtitleTrackSupported || loadedSubtitleRef.current === loadKey) return;
+    const loadKey = sourceId + ":" + selectedMediaTrackKey + ":" + trackId;
+    if (loadedSubtitleRef.current === loadKey) return;
     loadedSubtitleRef.current = loadKey;
 
     let active = true;
+    const clearTimer = window.setTimeout(() => {
+      if (active) setSubtitleCues([]);
+    }, 0);
     void getAgentSubtitle(sourceId, trackId)
       .then((contents) => {
         if (!active) return;
@@ -632,16 +654,19 @@ export default function WatchApp() {
       })
       .catch((caught) => {
         if (!active) return;
+        loadedSubtitleRef.current = "";
         setError(caught instanceof Error ? caught.message : "Could not load embedded subtitles.");
       });
 
     return () => {
       active = false;
+      window.clearTimeout(clearTimer);
     };
   }, [
     requestedSubtitleSelection,
     requestedSubtitleTrackId,
     requestedSubtitleTrackSupported,
+    selectedMediaTrackKey,
     session?.source?.id,
   ]);
 
@@ -651,10 +676,13 @@ export default function WatchApp() {
     setBusy("file");
     setError("");
     try {
+      setMediaUrl("");
+      setSubtitleCues([]);
       if (agentJob.kind === "magnet") {
         const nextJob = await selectAgentFile(source.id, file.index);
         setAgentJob(nextJob);
-        setEmbeddedSubtitles((nextJob.subtitles || []).filter((track) => track.supported));
+        setEmbeddedAudioTracks(nextJob.audioTracks || []);
+        setEmbeddedSubtitles(nextJob.subtitles || []);
       }
       selectionSentRef.current = `${source.id}:${file.index}`;
       await sendAction("select-media", {
@@ -744,6 +772,7 @@ export default function WatchApp() {
         mediaUrl={mediaUrl}
         subtitleCues={subtitleCues}
         localSubtitleName={localSubtitleName}
+        audioTracks={embeddedAudioTracks}
         subtitleTracks={embeddedSubtitles}
         onBack={() => setView("lobby")}
         onSend={sendPlayerState}
@@ -1116,6 +1145,7 @@ interface SyncedPlayerProps {
   mediaUrl: string;
   subtitleCues: SubtitleCue[];
   localSubtitleName: string;
+  audioTracks: AgentAudioTrack[];
   subtitleTracks: AgentSubtitleTrack[];
   onBack: () => void;
   onSend: (player: PlayerState) => Promise<void>;
@@ -1126,6 +1156,7 @@ function SyncedPlayer({
   mediaUrl,
   subtitleCues,
   localSubtitleName,
+  audioTracks,
   subtitleTracks,
   onBack,
   onSend,
@@ -1139,6 +1170,29 @@ function SyncedPlayer({
   const [muted, setMuted] = useState(false);
   const [needsGesture, setNeedsGesture] = useState(false);
   const [subtitleText, setSubtitleText] = useState("");
+
+  const defaultAudioTrack = audioTracks.find((track) => track.default) || audioTracks[0];
+  const requestedAudioTrackId = session.player.audioLanguage.startsWith("embedded:")
+    ? session.player.audioLanguage.slice("embedded:".length)
+    : "";
+  const requestedAudioTrack = audioTracks.find((track) => track.id === requestedAudioTrackId);
+  const audioSelection = requestedAudioTrack ? session.player.audioLanguage : "original";
+  const requestedPlayerSubtitleId = session.player.subtitleLanguage.startsWith("embedded:")
+    ? session.player.subtitleLanguage.slice("embedded:".length)
+    : "";
+  const hasRequestedSubtitle = subtitleTracks.some((track) => track.id === requestedPlayerSubtitleId);
+  const subtitleSelection =
+    session.player.subtitleLanguage === "local" && localSubtitleName
+      ? "local"
+      : hasRequestedSubtitle
+        ? session.player.subtitleLanguage
+        : "off";
+  const playbackUrl = useMemo(() => {
+    if (!requestedAudioTrack) return mediaUrl;
+    const url = new URL(mediaUrl);
+    url.searchParams.set("audio", requestedAudioTrack.id);
+    return url.toString();
+  }, [mediaUrl, requestedAudioTrack]);
 
   const send = useCallback(
     (values: Partial<PlayerState>) => {
@@ -1184,17 +1238,6 @@ function SyncedPlayer({
         .catch(() => setNeedsGesture(true));
     }
 
-    const audioTracks = (video as HTMLVideoElement & {
-      audioTracks?: ArrayLike<{ enabled: boolean; language: string; label: string }>;
-    }).audioTracks;
-    if (audioTracks) {
-      Array.from(audioTracks).forEach((track, index) => {
-        track.enabled =
-          state.audioLanguage === "original"
-            ? index === 0
-            : track.language === state.audioLanguage || track.label.toLowerCase().includes(state.audioLanguage);
-      });
-    }
   }, [session.player, session.seq]);
 
   useEffect(() => {
@@ -1302,7 +1345,7 @@ function SyncedPlayer({
     <main className="player-shell" ref={playerRef}>
       <video
         ref={videoRef}
-        src={mediaUrl}
+        src={playbackUrl}
         playsInline
         onLoadedMetadata={(event) => {
           const video = event.currentTarget;
@@ -1397,22 +1440,29 @@ function SyncedPlayer({
             <label className="player-select" title="Audio language">
               <Headphones />
               <select
-                value={session.player.audioLanguage}
+                value={audioSelection}
                 onChange={(event) => updateTrack("audioLanguage", event.target.value)}
                 aria-label="Audio language"
               >
-                <option value="original">Original</option>
-                <option value="en">English</option>
-                <option value="ja">Japanese</option>
-                <option value="de">German</option>
-                <option value="fr">French</option>
+                <option value="original">
+                  {defaultAudioTrack
+                    ? defaultAudioTrack.label + (defaultAudioTrack.language === "und" ? "" : " (" + defaultAudioTrack.language.toUpperCase() + ")")
+                    : "Original audio"}
+                </option>
+                {audioTracks
+                  .filter((track) => track.id !== defaultAudioTrack?.id)
+                  .map((track) => (
+                    <option key={track.id} value={"embedded:" + track.id}>
+                      {track.label}{track.language === "und" ? "" : " (" + track.language.toUpperCase() + ")"}
+                    </option>
+                  ))}
               </select>
             </label>
 
             <label className="player-select" title="Subtitles">
               <Subtitles />
               <select
-                value={session.player.subtitleLanguage}
+                value={subtitleSelection}
                 onChange={(event) => updateTrack("subtitleLanguage", event.target.value)}
                 aria-label="Subtitles"
               >
@@ -1421,14 +1471,14 @@ function SyncedPlayer({
                   {localSubtitleName || "Local subtitle file"}
                 </option>
                 {subtitleTracks.map((track) => (
-                  <option key={track.id} value={"embedded:" + track.id}>
+                  <option key={track.id} value={"embedded:" + track.id} disabled={!track.supported}>
                     {track.label} ({track.language.toUpperCase()})
                   </option>
                 ))}
               </select>
             </label>
 
-            {session.player.subtitleLanguage !== "off" && (
+            {subtitleSelection !== "off" && (
               <div className="offset-control" title="Subtitle timing offset">
                 <button onClick={() => updateOffset(-100)} aria-label="Subtitles earlier"><Minus /></button>
                 <span>{session.player.subtitleOffset > 0 ? "+" : ""}{session.player.subtitleOffset}ms</span>

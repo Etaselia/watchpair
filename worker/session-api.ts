@@ -212,8 +212,8 @@ class D1SessionStore implements SessionStore {
 
   async setSelectedMedia(token: string, media: SelectedMedia, now: number) {
     await this.db
-      .prepare("UPDATE watch_sessions SET selected_media_json = ?, seq = seq + 1, updated_at = ? WHERE token = ?")
-      .bind(JSON.stringify(media), now, token)
+      .prepare("UPDATE watch_sessions SET selected_media_json = ?, player_json = ?, seq = seq + 1, updated_at = ? WHERE token = ?")
+      .bind(JSON.stringify(media), JSON.stringify(initialPlayerState(now)), now, token)
       .run();
   }
 
@@ -324,6 +324,7 @@ class MemorySessionStore implements SessionStore {
     const record = memorySessions.get(token);
     if (!record) return;
     record.selectedMedia = media;
+    record.player = initialPlayerState(now);
     record.seq += 1;
     record.updatedAt = now;
   }
