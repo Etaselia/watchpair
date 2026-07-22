@@ -18,6 +18,8 @@ import {
   Plug,
   Plus,
   Radio,
+  RotateCcw,
+  Settings2,
   Subtitles,
   Upload,
   Users,
@@ -26,6 +28,7 @@ import {
   X,
 } from "lucide-react";
 import {
+  type CSSProperties,
   type ChangeEvent,
   type FormEvent,
   useCallback,
@@ -94,6 +97,136 @@ function sameSelectedFile(session: WatchSession, readiness: LocalReadiness) {
   );
 }
 
+type SubtitleFont =
+  | "proportional-sans"
+  | "proportional-serif"
+  | "monospace-sans"
+  | "monospace-serif"
+  | "casual"
+  | "cursive"
+  | "small-caps";
+
+type SubtitleEdge = "none" | "raised" | "depressed" | "uniform" | "drop-shadow";
+
+interface SubtitleAppearance {
+  font: SubtitleFont;
+  fontColor: string;
+  fontOpacity: number;
+  fontSize: number;
+  backgroundColor: string;
+  backgroundOpacity: number;
+  windowColor: string;
+  windowOpacity: number;
+  edgeStyle: SubtitleEdge;
+}
+
+const subtitleColors = [
+  { value: "#ffffff", label: "White" },
+  { value: "#000000", label: "Black" },
+  { value: "#ff5252", label: "Red" },
+  { value: "#73d13d", label: "Green" },
+  { value: "#4d9fff", label: "Blue" },
+  { value: "#ffe45c", label: "Yellow" },
+  { value: "#f062d0", label: "Magenta" },
+  { value: "#58e5e5", label: "Cyan" },
+] as const;
+
+const subtitleFonts: { value: SubtitleFont; label: string; family: string }[] = [
+  { value: "proportional-sans", label: "Proportional Sans-Serif", family: "Arial, Helvetica, sans-serif" },
+  { value: "proportional-serif", label: "Proportional Serif", family: "Georgia, 'Times New Roman', serif" },
+  { value: "monospace-sans", label: "Monospace Sans-Serif", family: "Consolas, 'Liberation Mono', monospace" },
+  { value: "monospace-serif", label: "Monospace Serif", family: "'Courier New', Courier, monospace" },
+  { value: "casual", label: "Casual", family: "'Comic Sans MS', cursive" },
+  { value: "cursive", label: "Cursive", family: "'Brush Script MT', cursive" },
+  { value: "small-caps", label: "Small Capitals", family: "Arial, Helvetica, sans-serif" },
+];
+
+const subtitleEdges: { value: SubtitleEdge; label: string; shadow: string }[] = [
+  { value: "none", label: "None", shadow: "none" },
+  { value: "raised", label: "Raised", shadow: "-1px -1px 0 #000, 1px 1px 0 rgba(255,255,255,0.35)" },
+  { value: "depressed", label: "Depressed", shadow: "1px 1px 0 #000, -1px -1px 0 rgba(255,255,255,0.3)" },
+  { value: "uniform", label: "Uniform", shadow: "-1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000" },
+  { value: "drop-shadow", label: "Drop shadow", shadow: "2px 2px 2px #000" },
+];
+
+const defaultSubtitleAppearance: SubtitleAppearance = {
+  font: "proportional-sans",
+  fontColor: "#ffffff",
+  fontOpacity: 100,
+  fontSize: 100,
+  backgroundColor: "#000000",
+  backgroundOpacity: 75,
+  windowColor: "#000000",
+  windowOpacity: 0,
+  edgeStyle: "drop-shadow",
+};
+
+function rgba(hex: string, opacity: number) {
+  const value = Number.parseInt(hex.slice(1), 16);
+  return "rgba(" + (value >> 16) + ", " + ((value >> 8) & 255) + ", " + (value & 255) + ", " + (opacity / 100) + ")";
+}
+
+function readSubtitleAppearance(): SubtitleAppearance {
+  try {
+    const saved = JSON.parse(localStorage.getItem("watchpair-subtitle-appearance") || "{}") as Partial<SubtitleAppearance>;
+    const font = subtitleFonts.some((option) => option.value === saved.font)
+      ? saved.font as SubtitleFont
+      : defaultSubtitleAppearance.font;
+    const edgeStyle = subtitleEdges.some((option) => option.value === saved.edgeStyle)
+      ? saved.edgeStyle as SubtitleEdge
+      : defaultSubtitleAppearance.edgeStyle;
+    const color = (candidate: unknown, fallback: string) =>
+      subtitleColors.some((option) => option.value === candidate) ? String(candidate) : fallback;
+    const percentage = (candidate: unknown, fallback: number, min = 0, max = 100) => {
+      const number = Number(candidate);
+      return Number.isFinite(number) ? Math.max(min, Math.min(max, number)) : fallback;
+    };
+    return {
+      font,
+      edgeStyle,
+      fontColor: color(saved.fontColor, defaultSubtitleAppearance.fontColor),
+      backgroundColor: color(saved.backgroundColor, defaultSubtitleAppearance.backgroundColor),
+      windowColor: color(saved.windowColor, defaultSubtitleAppearance.windowColor),
+      fontOpacity: percentage(saved.fontOpacity, defaultSubtitleAppearance.fontOpacity),
+      fontSize: percentage(saved.fontSize, defaultSubtitleAppearance.fontSize, 50, 200),
+      backgroundOpacity: percentage(saved.backgroundOpacity, defaultSubtitleAppearance.backgroundOpacity),
+      windowOpacity: percentage(saved.windowOpacity, defaultSubtitleAppearance.windowOpacity),
+    };
+  } catch {
+    return defaultSubtitleAppearance;
+  }
+}
+
+function ColorSwatches({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div className="color-swatches" role="radiogroup" aria-label={label}>
+      {subtitleColors.map((color) => (
+        <button
+          key={color.value}
+          type="button"
+          className={value === color.value ? "selected" : ""}
+          role="radio"
+          aria-checked={value === color.value}
+          aria-label={color.label}
+          title={color.label}
+          onClick={() => onChange(color.value)}
+          style={{ "--swatch-color": color.value } as CSSProperties}
+        >
+          <span />
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export default function WatchApp() {
   const [deviceId, setDeviceId] = useState("");
   const [displayName, setDisplayName] = useState("Guest");
@@ -125,6 +258,7 @@ export default function WatchApp() {
   const selectionSentRef = useRef("");
   const loadedSubtitleRef = useRef("");
   const initializedMediaTracksRef = useRef("");
+  const autoOpenedMediaRef = useRef("");
   const pairingTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -155,10 +289,26 @@ export default function WatchApp() {
   }, [session]);
 
   useEffect(() => {
-    void detectAgent()
-      .then(setAgentAvailable)
-      .catch(() => setAgentAvailable(false));
+    let active = true;
+    let failures = 0;
+    const keepAlive = async () => {
+      try {
+        const available = await detectAgent();
+        if (!active) return;
+        failures = 0;
+        setAgentAvailable(available);
+      } catch {
+        if (!active) return;
+        failures += 1;
+        if (failures >= 3) setAgentAvailable(false);
+      }
+    };
+
+    void keepAlive();
+    const timer = window.setInterval(keepAlive, 8_000);
     return () => {
+      active = false;
+      window.clearInterval(timer);
       if (pairingTimerRef.current !== null) window.clearInterval(pairingTimerRef.current);
     };
   }, []);
@@ -441,6 +591,7 @@ export default function WatchApp() {
     setLocalSubtitleName("");
     loadedSubtitleRef.current = "";
     initializedMediaTracksRef.current = "";
+    autoOpenedMediaRef.current = "";
     const controller = new AbortController();
     const initial: LocalReadiness = {
       ...emptyReadiness(),
@@ -520,7 +671,12 @@ export default function WatchApp() {
     let active = true;
     const refresh = async () => {
       try {
-        let job = await getAgentDownload(source.id);
+        let job: AgentJob;
+        try {
+          job = await getAgentDownload(source.id);
+        } catch {
+          job = await addAgentDownload(source);
+        }
         if (!active) return;
         setAgentJob(job);
         setEmbeddedAudioTracks(job.audioTracks || []);
@@ -600,7 +756,7 @@ export default function WatchApp() {
         else setMediaUrl("");
         if (becameReady) await sendAction("heartbeat", { readiness: next });
       } catch {
-        if (active) setAgentAvailable(false);
+        // The keepalive retries transient companion failures without stopping this poller.
       }
     };
 
@@ -801,6 +957,23 @@ export default function WatchApp() {
     session!.participants.every((participant) => participant.ready) &&
     !hasMismatch;
   const invitePending = Boolean(roomToken && !joined);
+  const playerMediaKey = session?.selectedMedia
+    ? (session.source?.id || "local") + ":" +
+      (session.selectedMedia.fingerprint || session.selectedMedia.name + ":" + session.selectedMedia.size)
+    : "";
+
+  const openPlayer = useCallback(() => {
+    if (playerMediaKey) autoOpenedMediaRef.current = playerMediaKey;
+    setView("player");
+  }, [playerMediaKey]);
+
+  useEffect(() => {
+    if (!joined || view !== "lobby" || !everyoneReady || !mediaUrl || !playerMediaKey) return;
+    if (autoOpenedMediaRef.current === playerMediaKey) return;
+    autoOpenedMediaRef.current = playerMediaKey;
+    const timer = window.setTimeout(() => setView("player"), 0);
+    return () => window.clearTimeout(timer);
+  }, [everyoneReady, joined, mediaUrl, playerMediaKey, view]);
 
   if (joined && session && view === "player" && mediaUrl) {
     return (
@@ -1148,7 +1321,7 @@ export default function WatchApp() {
 
           <div className="watch-actions">
             {mediaUrl && !everyoneReady && (
-              <button className="secondary-button" onClick={() => setView("player")}>
+              <button className="secondary-button" onClick={openPlayer}>
                 <Play />
                 Preview alone
               </button>
@@ -1156,7 +1329,7 @@ export default function WatchApp() {
             <button
               className="watch-button"
               disabled={!everyoneReady || !mediaUrl}
-              onClick={() => setView("player")}
+              onClick={openPlayer}
             >
               <Play fill="currentColor" />
               Watch together
@@ -1201,12 +1374,16 @@ function SyncedPlayer({
   const videoRef = useRef<HTMLVideoElement>(null);
   const playerRef = useRef<HTMLDivElement>(null);
   const lastSeqRef = useRef(-1);
+  const controlsHideTimerRef = useRef<number | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [volume, setVolume] = useState(1);
   const [muted, setMuted] = useState(false);
   const [needsGesture, setNeedsGesture] = useState(false);
   const [subtitleText, setSubtitleText] = useState("");
+  const [controlsVisible, setControlsVisible] = useState(true);
+  const [captionSettingsOpen, setCaptionSettingsOpen] = useState(false);
+  const [subtitleAppearance, setSubtitleAppearance] = useState(defaultSubtitleAppearance);
 
   const defaultAudioTrack = audioTracks.find((track) => track.default) || audioTracks[0];
   const requestedAudioTrackId = session.player.audioLanguage.startsWith("embedded:")
@@ -1231,6 +1408,77 @@ function SyncedPlayer({
     url.searchParams.set("audio", playbackAudioTrack.id);
     return url.toString();
   }, [mediaUrl, playbackAudioTrack]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setSubtitleAppearance(readSubtitleAppearance()), 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  const clearControlsTimer = useCallback(() => {
+    if (controlsHideTimerRef.current !== null) {
+      window.clearTimeout(controlsHideTimerRef.current);
+      controlsHideTimerRef.current = null;
+    }
+  }, []);
+
+  const pinControls = useCallback(() => {
+    clearControlsTimer();
+    setControlsVisible(true);
+  }, [clearControlsTimer]);
+
+  const scheduleControlsHide = useCallback((ignoreOpenSettings = false) => {
+    clearControlsTimer();
+    const video = videoRef.current;
+    if (!video || video.paused || (!ignoreOpenSettings && captionSettingsOpen) || needsGesture) return;
+    controlsHideTimerRef.current = window.setTimeout(() => {
+      controlsHideTimerRef.current = null;
+      const focused = document.activeElement;
+      if (focused && focused !== video && playerRef.current?.contains(focused)) return;
+      setControlsVisible(false);
+    }, 2_500);
+  }, [captionSettingsOpen, clearControlsTimer, needsGesture]);
+
+  const revealControls = useCallback(() => {
+    setControlsVisible(true);
+    scheduleControlsHide();
+  }, [scheduleControlsHide]);
+
+  const hideControls = useCallback(() => {
+    const video = videoRef.current;
+    if (!video || video.paused || captionSettingsOpen || needsGesture) return;
+    clearControlsTimer();
+    setControlsVisible(false);
+  }, [captionSettingsOpen, clearControlsTimer, needsGesture]);
+
+  useEffect(() => () => clearControlsTimer(), [clearControlsTimer]);
+
+  const updateSubtitleAppearance = (values: Partial<SubtitleAppearance>) => {
+    const next = { ...subtitleAppearance, ...values };
+    setSubtitleAppearance(next);
+    localStorage.setItem("watchpair-subtitle-appearance", JSON.stringify(next));
+  };
+
+  const resetSubtitleAppearance = () => {
+    setSubtitleAppearance(defaultSubtitleAppearance);
+    localStorage.removeItem("watchpair-subtitle-appearance");
+  };
+
+  const selectedSubtitleFont =
+    subtitleFonts.find((option) => option.value === subtitleAppearance.font) || subtitleFonts[0];
+  const selectedSubtitleEdge =
+    subtitleEdges.find((option) => option.value === subtitleAppearance.edgeStyle) || subtitleEdges[0];
+  const subtitleStyle = {
+    "--subtitle-font-family": selectedSubtitleFont.family,
+    "--subtitle-font-scale": subtitleAppearance.fontSize / 100,
+    "--subtitle-font-color": rgba(subtitleAppearance.fontColor, subtitleAppearance.fontOpacity),
+    "--subtitle-background": rgba(
+      subtitleAppearance.backgroundColor,
+      subtitleAppearance.backgroundOpacity
+    ),
+    "--subtitle-window": rgba(subtitleAppearance.windowColor, subtitleAppearance.windowOpacity),
+    "--subtitle-edge": selectedSubtitleEdge.shadow,
+    fontVariant: subtitleAppearance.font === "small-caps" ? "small-caps" : "normal",
+  } as CSSProperties;
 
   const send = useCallback(
     (values: Partial<PlayerState>) => {
@@ -1273,7 +1521,10 @@ function SyncedPlayer({
       void video
         .play()
         .then(() => setNeedsGesture(false))
-        .catch(() => setNeedsGesture(true));
+        .catch(() => {
+          setNeedsGesture(true);
+          pinControls();
+        });
     }
 
   }, [session.player, session.seq]);
@@ -1299,6 +1550,12 @@ function SyncedPlayer({
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      revealControls();
+      if (event.key === "Escape" && captionSettingsOpen) {
+        setCaptionSettingsOpen(false);
+        scheduleControlsHide(true);
+        return;
+      }
       const target = event.target as HTMLElement;
       if (["INPUT", "SELECT", "TEXTAREA", "BUTTON"].includes(target.tagName)) return;
       const video = videoRef.current;
@@ -1371,6 +1628,17 @@ function SyncedPlayer({
     });
   };
 
+  const toggleCaptionSettings = () => {
+    if (captionSettingsOpen) {
+      setCaptionSettingsOpen(false);
+      setControlsVisible(true);
+      scheduleControlsHide(true);
+    } else {
+      setCaptionSettingsOpen(true);
+      pinControls();
+    }
+  };
+
   const fullscreen = () => {
     if (document.fullscreenElement) {
       void document.exitFullscreen();
@@ -1380,7 +1648,15 @@ function SyncedPlayer({
   };
 
   return (
-    <main className="player-shell" ref={playerRef}>
+    <main
+      className={"player-shell " + (controlsVisible ? "controls-visible" : "controls-hidden")}
+      ref={playerRef}
+      onPointerMove={revealControls}
+      onPointerDown={revealControls}
+      onPointerLeave={hideControls}
+      onFocusCapture={revealControls}
+      onBlurCapture={revealControls}
+    >
       <video
         ref={videoRef}
         src={playbackUrl}
@@ -1394,6 +1670,8 @@ function SyncedPlayer({
           video.currentTime = Math.max(0, expected);
         }}
         onEnded={() => void send({ paused: true, position: duration })}
+        onPlay={revealControls}
+        onPause={pinControls}
         onDoubleClick={fullscreen}
       />
 
@@ -1416,7 +1694,9 @@ function SyncedPlayer({
 
       {subtitleText && (
         <div className="subtitle-overlay">
-          {subtitleText.split("\n").map((line, index) => <span key={`${line}-${index}`}>{line}</span>)}
+          <div className="subtitle-window" style={subtitleStyle}>
+            {subtitleText.split("\n").map((line, index) => <span key={`${line}-${index}`}>{line}</span>)}
+          </div>
         </div>
       )}
 
@@ -1428,6 +1708,119 @@ function SyncedPlayer({
       )}
 
       <div className="player-controls">
+        {captionSettingsOpen && (
+          <section className="caption-settings" role="dialog" aria-label="Caption options">
+            <header className="caption-settings-header">
+              <strong>Caption options</strong>
+              <button type="button" className="caption-reset-button" onClick={resetSubtitleAppearance}>
+                <RotateCcw />
+                Reset
+              </button>
+            </header>
+
+            <div className="caption-settings-grid">
+              <label className="caption-setting caption-setting-wide">
+                <span>Font</span>
+                <select
+                  value={subtitleAppearance.font}
+                  onChange={(event) => updateSubtitleAppearance({ font: event.target.value as SubtitleFont })}
+                >
+                  {subtitleFonts.map((font) => (
+                    <option key={font.value} value={font.value}>{font.label}</option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="caption-setting">
+                <span>Font size <output>{subtitleAppearance.fontSize}%</output></span>
+                <input
+                  type="range"
+                  min={50}
+                  max={200}
+                  step={25}
+                  value={subtitleAppearance.fontSize}
+                  onChange={(event) => updateSubtitleAppearance({ fontSize: Number(event.target.value) })}
+                />
+              </label>
+
+              <label className="caption-setting">
+                <span>Font opacity <output>{subtitleAppearance.fontOpacity}%</output></span>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={25}
+                  value={subtitleAppearance.fontOpacity}
+                  onChange={(event) => updateSubtitleAppearance({ fontOpacity: Number(event.target.value) })}
+                />
+              </label>
+
+              <div className="caption-setting caption-setting-wide">
+                <span>Font color</span>
+                <ColorSwatches
+                  label="Font color"
+                  value={subtitleAppearance.fontColor}
+                  onChange={(fontColor) => updateSubtitleAppearance({ fontColor })}
+                />
+              </div>
+
+              <div className="caption-setting caption-setting-wide">
+                <span>Background color</span>
+                <ColorSwatches
+                  label="Background color"
+                  value={subtitleAppearance.backgroundColor}
+                  onChange={(backgroundColor) => updateSubtitleAppearance({ backgroundColor })}
+                />
+              </div>
+
+              <label className="caption-setting caption-setting-wide">
+                <span>Background opacity <output>{subtitleAppearance.backgroundOpacity}%</output></span>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={25}
+                  value={subtitleAppearance.backgroundOpacity}
+                  onChange={(event) => updateSubtitleAppearance({ backgroundOpacity: Number(event.target.value) })}
+                />
+              </label>
+
+              <div className="caption-setting caption-setting-wide">
+                <span>Window color</span>
+                <ColorSwatches
+                  label="Window color"
+                  value={subtitleAppearance.windowColor}
+                  onChange={(windowColor) => updateSubtitleAppearance({ windowColor })}
+                />
+              </div>
+
+              <label className="caption-setting">
+                <span>Window opacity <output>{subtitleAppearance.windowOpacity}%</output></span>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={25}
+                  value={subtitleAppearance.windowOpacity}
+                  onChange={(event) => updateSubtitleAppearance({ windowOpacity: Number(event.target.value) })}
+                />
+              </label>
+
+              <label className="caption-setting">
+                <span>Character edge</span>
+                <select
+                  value={subtitleAppearance.edgeStyle}
+                  onChange={(event) => updateSubtitleAppearance({ edgeStyle: event.target.value as SubtitleEdge })}
+                >
+                  {subtitleEdges.map((edge) => (
+                    <option key={edge.value} value={edge.value}>{edge.label}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          </section>
+        )}
+
         <input
           className="timeline"
           type="range"
@@ -1515,6 +1908,16 @@ function SyncedPlayer({
                 ))}
               </select>
             </label>
+
+            <button
+              className={"player-icon-button caption-settings-button" + (captionSettingsOpen ? " active" : "")}
+              onClick={toggleCaptionSettings}
+              title="Caption options"
+              aria-label="Caption options"
+              aria-expanded={captionSettingsOpen}
+            >
+              <Settings2 />
+            </button>
 
             {subtitleSelection !== "off" && (
               <div className="offset-control" title="Subtitle timing offset">

@@ -136,6 +136,12 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /action: "create",\s+deviceId,\s+name: displayName/);
   assert.match(app, /getAgentDownload/);
   assert.match(app, /subtitleOffset/);
+  assert.match(app, /autoOpenedMediaRef/);
+  assert.match(app, /window\.setInterval\(keepAlive, 8_000\)/);
+  assert.match(app, /scheduleControlsHide/);
+  assert.match(app, /Caption options/);
+  assert.match(app, /Background opacity/);
+  assert.match(app, /Character edge/);
   assert.match(route, /action === "heartbeat"/);
   assert.match(route, /action === "player"/);
   assert.match(route, /action === "select-media"/);
