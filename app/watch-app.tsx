@@ -175,7 +175,8 @@ export default function WatchApp() {
       localStorage.setItem("watchpair-display-name", displayName.trim() || "Guest");
       const nextSession = await sessionRequest({
         action: "create",
-              name: displayName,
+        deviceId,
+        name: displayName,
       });
       enterSession(nextSession);
     } catch (caught) {

@@ -95,6 +95,7 @@ test("ships the coordination and companion surfaces", async () => {
   ]);
 
   assert.match(app, /Watch together/);
+  assert.match(app, /action: "create",\s+deviceId,\s+name: displayName/);
   assert.match(app, /getAgentDownload/);
   assert.match(app, /subtitleOffset/);
   assert.match(route, /action === "heartbeat"/);
