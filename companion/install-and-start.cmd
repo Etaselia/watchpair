@@ -10,9 +10,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\install-runtime.ps
 if errorlevel 1 goto failed
 
 :install
+set "PATH=%CD%\runtime;%PATH%"
 if not exist "%CD%\node_modules\webtorrent" (
   echo Installing WatchPair Companion dependencies...
-  call "%CD%\runtime\npm.cmd" install --omit=dev
+  call "%CD%\runtime\corepack.cmd" pnpm install --prod --frozen-lockfile
   if errorlevel 1 goto failed
 )
 

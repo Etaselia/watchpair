@@ -10,7 +10,8 @@ const folder = "WatchPair Companion";
 const inputs = [
   ["server.mjs", resolve(root, "agent", "server.mjs")],
   ["package.json", resolve(root, "companion", "package.json")],
-  ["package-lock.json", resolve(root, "companion", "package-lock.json")],
+  ["pnpm-lock.yaml", resolve(root, "companion", "pnpm-lock.yaml")],
+  ["pnpm-workspace.yaml", resolve(root, "companion", "pnpm-workspace.yaml")],
   ["install-and-start.cmd", resolve(root, "companion", "install-and-start.cmd")],
   ["install-runtime.ps1", resolve(root, "companion", "install-runtime.ps1")],
   ["start.cmd", resolve(root, "companion", "start.cmd")],

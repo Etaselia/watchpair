@@ -13,8 +13,13 @@ if [ "$major" -lt 22 ]; then
   exit 1
 fi
 
+if ! command -v corepack >/dev/null 2>&1; then
+  echo "WatchPair Companion requires Corepack, which is included with official Node.js releases."
+  exit 1
+fi
+
 if [ ! -d node_modules/webtorrent ]; then
-  npm install --omit=dev
+  corepack pnpm install --prod --frozen-lockfile
 fi
 
 exec node server.mjs

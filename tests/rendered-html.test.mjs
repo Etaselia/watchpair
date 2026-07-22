@@ -117,13 +117,25 @@ test("packages the pairable magnet and subtitle companion", async () => {
     "WatchPair Companion/server.mjs",
     "WatchPair Companion/install-and-start.cmd",
     "WatchPair Companion/install-runtime.ps1",
-    "WatchPair Companion/package-lock.json",
+    "WatchPair Companion/pnpm-lock.yaml",
+    "WatchPair Companion/pnpm-workspace.yaml",
   ];
   for (const path of expected) assert.ok(archive[path], `Missing ${path}`);
 
   const bundledAgent = strFromU8(archive["WatchPair Companion/server.mjs"]);
+  const installer = strFromU8(archive["WatchPair Companion/install-runtime.ps1"]);
+  const windowsLauncher = strFromU8(archive["WatchPair Companion/install-and-start.cmd"]);
+  const buildPolicy = strFromU8(archive["WatchPair Companion/pnpm-workspace.yaml"]);
   assert.match(bundledAgent, /url\.pathname === "\/pair"/);
   assert.match(bundledAgent, /url\.pathname === "\/resolve"/);
   assert.match(bundledAgent, /FFPROBE_PATH/);
   assert.match(bundledAgent, /subtitleFile/);
+  assert.match(installer, /\$Releases = Invoke-RestMethod/);
+  assert.match(installer, /\$Release = \(\$Releases \| Where-Object/);
+  assert.match(installer, /\$Version = \[string\]\$Release\.version/);
+  assert.match(installer, /win-x64-zip/);
+  assert.match(installer, /SHASUMS256\.txt" -OutFile \$ChecksumFile/);
+  assert.match(windowsLauncher, /corepack\.cmd" pnpm install --prod --frozen-lockfile/);
+  assert.match(buildPolicy, /allowBuilds:/);
+  assert.match(buildPolicy, /node-datachannel: true/);
 });
