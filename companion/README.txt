@@ -37,8 +37,9 @@ override automatic selection. A failed hardware decode retries GPU encoding
 with CPU decoding; a failed GPU encode then retries full CPU encoding.
 
 Downloads are saved in the downloads folder by default. Queued downloads run
-concurrently; selected torrents are prepared for browser playback one at a time
-while they download. Playback unlocks after the initial verified HLS segments. Jobs and local seeds resume after restart. WatchPair can also
+concurrently. A torrent is fully downloaded and verified before FFprobe or FFmpeg
+starts. Playback unlocks after the initial HLS segments without waiting for the
+remaining conversion. Jobs and local seeds resume after restart. WatchPair can also
 publish a selected local file as a torrent; its bytes remain between participant
 computers, while torrent peers and trackers can see their IP addresses.
 

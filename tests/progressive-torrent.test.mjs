@@ -12,7 +12,7 @@ import WebTorrent from "webtorrent";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 
-test("unlocks torrent playback after initial HLS segments instead of the full download", { timeout: 60_000 }, async () => {
+test("waits for a verified torrent before probing and preparing initial HLS segments", { timeout: 60_000 }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "watchpair-progressive-"));
   const input = path.join(directory, "progressive.mkv");
   const seeder = new WebTorrent({
@@ -82,16 +82,31 @@ test("unlocks torrent playback after initial HLS segments instead of the full do
     });
     assert.equal(response.status, 202);
 
-    const result = await waitForJson(
+    const downloading = await waitForJson(
       base + "/downloads/progressive-torrent",
-      35_000,
-      (body) => body?.job?.preparation?.status === "ready",
+      15_000,
+      (body) => {
+        const progress = body?.job?.files?.[0]?.progress || 0;
+        return progress > 0 && progress < 100;
+      },
       () => companion.exitCode !== null
     );
-    assert.equal(result.job.files[0].ready, false);
-    assert.ok(result.job.files[0].progress > 0);
-    assert.ok(result.job.files[0].progress < 100);
-    assert.equal(result.job.preparation.status, "ready");
+    assert.equal(downloading.job.files[0].ready, false);
+    assert.equal(downloading.job.subtitleStatus, "waiting");
+    assert.equal(downloading.job.preparation.status, "waiting");
+
+    seeder.throttleUpload(-1);
+    const prepared = await waitForJson(
+      base + "/downloads/progressive-torrent",
+      35_000,
+      (body) =>
+        body?.job?.files?.[0]?.ready === true &&
+        body?.job?.preparation?.status === "ready",
+      () => companion.exitCode !== null
+    );
+    assert.equal(prepared.job.files[0].progress, 100);
+    assert.equal(prepared.job.subtitleStatus, "ready");
+    assert.equal(prepared.job.preparation.status, "ready");
   } catch (error) {
     throw new Error(`${error.message}\nCompanion output:\n${output}`);
   } finally {
@@ -141,9 +156,9 @@ async function waitForJson(url, timeout, ready, exited) {
       lastBody = body;
       if (response.ok && ready(body)) return body;
     } catch {
-      // The service, torrent metadata, or initial HLS segment is still pending.
+      // The service, torrent metadata, download, or initial HLS segment is still pending.
     }
-    if (exited()) throw new Error("Companion exited before the progressive stream became ready");
+    if (exited()) throw new Error("Companion exited before post-download preparation became ready");
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error(`Timed out waiting for ${url}: ${JSON.stringify(lastBody)}`);

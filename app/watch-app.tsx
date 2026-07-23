@@ -161,23 +161,20 @@ function queueReadinessForJob(job: AgentJob, file: AgentFile | null): QueueReadi
   }
 
   const fingerprint = job.identityFingerprint || `${job.infoHash || job.id}:${file.index}:${file.size}`;
-  const playable = file.ready || preparation === "ready" || preparation === "direct";
   const status = job.status === "error"
     ? job.error || "Download failed"
-    : preparation === "error"
-      ? job.preparation.error || "Browser preparation failed"
-      : playable && !file.ready
-        ? "Ready to watch while downloading"
+    : !file.ready
+      ? job.status === "metadata" ? "Reading torrent metadata" : "Downloading locally"
+      : preparation === "error"
+        ? job.preparation.error || "Browser preparation failed"
         : preparation === "queued"
           ? "Queued for browser preparation"
           : preparation === "preparing"
             ? "Preparing initial video buffer"
-            : !file.ready
-              ? job.status === "metadata" ? "Reading torrent metadata" : "Downloading locally"
-              : "Ready to watch";
+            : "Ready to watch";
 
   return {
-    ready: playable,
+    ready: file.ready,
     progress: file.progress,
     status,
     fileName: file.name,
@@ -1040,7 +1037,7 @@ export default function WatchApp() {
       const becameReady = next.ready && (!previous.ready || previous.fingerprint !== next.fingerprint);
       readinessRef.current = next;
       setReadiness(next);
-      if (activeFile && activeItem.ready) setMediaUrl(activeFile.hlsUrl || activeFile.streamUrl);
+      if (activeFile?.ready) setMediaUrl(activeFile.hlsUrl || activeFile.streamUrl);
       else if (mediaUrlRef.current.startsWith(AGENT_URL)) setMediaUrl("");
       if (becameReady) await sendAction("heartbeat", { readiness: next });
     };
@@ -1620,7 +1617,7 @@ export default function WatchApp() {
                   {agentPairing ? <LoaderCircle className="spin" /> : <Plug />}
                   {agentPairing ? "Waiting for approval" : "Connect"}
                 </button>
-                <a className="secondary-button" href="/watchpair-companion.zip?v=0.4.1" download>
+                <a className="secondary-button" href="/watchpair-companion.zip?v=0.4.2" download>
                   <PackageOpen />
                   Get companion
                 </a>

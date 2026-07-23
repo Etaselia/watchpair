@@ -209,9 +209,8 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /action: "create",\s+deviceId,\s+name: displayName/);
   assert.match(app, /getAgentDownloads/);
   assert.match(app, /Download queue/);
-  assert.match(app, /watchpair-companion\.zip\?v=0\.4\.1/);
+  assert.match(app, /watchpair-companion\.zip\?v=0\.4\.2/);
   assert.match(app, /queueReadinessForJob/);
-  assert.match(app, /Ready to watch while downloading/);
   assert.match(app, /GPU decode/);
   assert.match(app, /uploadAndSeedAgentFile/);
   assert.match(app, /downloadMode === "automatic"/);
@@ -294,7 +293,6 @@ test("packages the pairable magnet and subtitle companion", async () => {
   assert.match(bundledHardware, /h264_amf/);
   assert.match(bundledHardware, /testEncoder/);
   assert.match(bundledAgent, /queueBackgroundPreparation/);
-  assert.match(bundledAgent, /mediaInput/);
   assert.match(bundledAgent, /pipeResponseStream/);
   assert.match(bundledAgent, /TRANSCODER/);
   assert.match(bundledAgent, /installWebTorrentSafetyGuards/);
