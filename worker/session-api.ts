@@ -10,7 +10,7 @@ import {
 } from "../lib/session-types";
 
 const TOKEN_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const PARTICIPANT_ACTIVE_MS = 20_000;
 
 export interface SessionRuntimeEnv {
@@ -48,7 +48,8 @@ interface SessionStore {
     now: number
   ): Promise<void>;
   setSource(token: string, source: SharedSource, now: number): Promise<void>;
-  setSelectedMedia(token: string, media: SelectedMedia, now: number): Promise<void>;
+  setSources(token: string, sources: SharedSource[], now: number): Promise<void>;
+  setSelectedMedia(token: string, media: SelectedMedia | null, now: number): Promise<void>;
   setPlayer(token: string, player: PlayerState, now: number): Promise<void>;
 }
 
@@ -242,6 +243,10 @@ class D1SessionStore implements SessionStore {
           updated_at = excluded.updated_at`)
       .bind(token, deviceId, safeName(name), JSON.stringify(sanitizeReadiness(readiness)), now)
       .run();
+    await this.db
+      .prepare("UPDATE watch_sessions SET expires_at = ? WHERE token = ?")
+      .bind(now + SESSION_TTL_MS, token)
+      .run();
   }
 
   async setSource(token: string, source: SharedSource, now: number) {
@@ -260,10 +265,17 @@ class D1SessionStore implements SessionStore {
       .run();
   }
 
-  async setSelectedMedia(token: string, media: SelectedMedia, now: number) {
+  async setSources(token: string, sources: SharedSource[], now: number) {
+    await this.db
+      .prepare("UPDATE watch_sessions SET source_json = ?, seq = seq + 1, updated_at = ? WHERE token = ?")
+      .bind(JSON.stringify(sources), now, token)
+      .run();
+  }
+
+  async setSelectedMedia(token: string, media: SelectedMedia | null, now: number) {
     await this.db
       .prepare("UPDATE watch_sessions SET selected_media_json = ?, player_json = ?, seq = seq + 1, updated_at = ? WHERE token = ?")
-      .bind(JSON.stringify(media), JSON.stringify(initialPlayerState(now)), now, token)
+      .bind(media ? JSON.stringify(media) : null, JSON.stringify(initialPlayerState(now)), now, token)
       .run();
   }
 
@@ -352,6 +364,7 @@ class MemorySessionStore implements SessionStore {
       ...sanitizeReadiness(readiness),
       updatedAt: now,
     });
+    record.expiresAt = now + SESSION_TTL_MS;
   }
 
   async setSource(token: string, source: SharedSource, now: number) {
@@ -362,7 +375,15 @@ class MemorySessionStore implements SessionStore {
     record.updatedAt = now;
   }
 
-  async setSelectedMedia(token: string, media: SelectedMedia, now: number) {
+  async setSources(token: string, sources: SharedSource[], now: number) {
+    const record = memorySessions.get(token);
+    if (!record) return;
+    record.sources = sources;
+    record.seq += 1;
+    record.updatedAt = now;
+  }
+
+  async setSelectedMedia(token: string, media: SelectedMedia | null, now: number) {
     const record = memorySessions.get(token);
     if (!record) return;
     record.selectedMedia = media;
@@ -434,19 +455,65 @@ async function handlePost(request: Request, store: SessionStore) {
       return Response.json({ error: "A session can queue up to 30 downloads." }, { status: 400 });
     }
     const candidate = body.source as Partial<SharedSource> | null;
+    const sourceId = String(candidate?.id || crypto.randomUUID()).slice(0, 80);
+    if (!/^[a-zA-Z0-9-]{8,80}$/.test(sourceId)) {
+      return Response.json({ error: "A valid source id is required" }, { status: 400 });
+    }
+    if (currentSession.sources.some((source) => source.id === sourceId)) return Response.json({ session: currentSession });
     if (!candidate?.value || !["magnet", "direct"].includes(String(candidate.kind))) {
       return Response.json({ error: "A supported source is required" }, { status: 400 });
     }
     await store.setSource(
       token,
       {
-        id: crypto.randomUUID(),
+        id: sourceId,
         kind: candidate.kind as SharedSource["kind"],
         value: String(candidate.value).slice(0, 8_000),
         label: String(candidate.label ?? "Shared media").slice(0, 180),
         addedBy: deviceId,
         addedAt: now,
       },
+      now
+    );
+  } else if (action === "remove-source") {
+    const sourceId = String(body.sourceId || "");
+    if (!currentSession.sources.some((source) => source.id === sourceId)) {
+      return Response.json({ error: "That queued source was not found." }, { status: 400 });
+    }
+    await store.setSources(
+      token,
+      currentSession.sources.filter((source) => source.id !== sourceId),
+      now
+    );
+    if (currentSession.selectedMedia?.sourceId === sourceId) {
+      await store.setSelectedMedia(token, null, now);
+    }
+  } else if (action === "rename-source") {
+    const sourceId = String(body.sourceId || "");
+    const label = String(body.label || "").trim().slice(0, 180);
+    if (!label || !currentSession.sources.some((source) => source.id === sourceId)) {
+      return Response.json({ error: "A queued source and name are required." }, { status: 400 });
+    }
+    await store.setSources(
+      token,
+      currentSession.sources.map((source) => source.id === sourceId ? { ...source, label } : source),
+      now
+    );
+  } else if (action === "reorder-sources") {
+    const sourceIds = Array.isArray(body.sourceIds)
+      ? body.sourceIds.map((value) => String(value))
+      : [];
+    if (
+      sourceIds.length !== currentSession.sources.length ||
+      new Set(sourceIds).size !== sourceIds.length ||
+      sourceIds.some((id) => !currentSession.sources.some((source) => source.id === id))
+    ) {
+      return Response.json({ error: "The complete queue order is required." }, { status: 400 });
+    }
+    const byId = new Map(currentSession.sources.map((source) => [source.id, source]));
+    await store.setSources(
+      token,
+      sourceIds.map((id) => byId.get(id)!),
       now
     );
   } else if (action === "select-media") {

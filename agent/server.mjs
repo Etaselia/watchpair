@@ -1,9 +1,9 @@
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { createServer } from "node:http";
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { BlockList } from "node:net";
 import { homedir } from "node:os";
@@ -15,6 +15,7 @@ import ffprobeStatic from "ffprobe-static";
 import WebTorrent from "webtorrent";
 import { createHlsPlaybackManager, streamHlsAsset } from "./hls-playback.mjs";
 import { publicTranscoder, selectTranscodeRuntime } from "./hardware-acceleration.mjs";
+import { createJsonStore } from "./job-store.mjs";
 import { isSupportedMagnet } from "./torrent-input.mjs";
 import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, verifiedTorrentFileProgress } from "./webtorrent-safety.mjs";
 
@@ -24,6 +25,20 @@ const DOWNLOAD_DIR = path.resolve(process.env.WATCHPAIR_DOWNLOAD_DIR || "./downl
 const CONFIG_PATH = path.resolve(
   process.env.WATCHPAIR_CONFIG_PATH || path.join(homedir(), ".watchpair", "companion.json")
 );
+const JOBS_PATH = path.join(DOWNLOAD_DIR, ".watchpair-jobs.json");
+const IMPORT_DIR = path.join(DOWNLOAD_DIR, ".watchpair-imports");
+const LIBRARY_DIRS = Array.from(new Set([
+  DOWNLOAD_DIR,
+  ...(process.env.WATCHPAIR_LIBRARY_DIRS || "")
+    .split(path.delimiter)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => path.resolve(entry)),
+]));
+const TRACKERS = (process.env.WATCHPAIR_TRACKERS || "")
+  .split(",")
+  .map((entry) => entry.trim())
+  .filter(Boolean);
 const TRANSCODE_RUNTIME = await selectTranscodeRuntime({ bundledPath: ffmpegStaticPath });
 const FFMPEG_PATH = TRANSCODE_RUNTIME.ffmpegPath;
 const TRANSCODER = publicTranscoder(TRANSCODE_RUNTIME);
@@ -50,6 +65,8 @@ PRIVATE_NETWORKS.addSubnet("fc00::", 7, "ipv6");
 PRIVATE_NETWORKS.addSubnet("fe80::", 10, "ipv6");
 const pairingNonces = new Map();
 const jobs = new Map();
+const libraryEntries = new Map();
+const jobStore = createJsonStore(JOBS_PATH);
 const preparationQueue = [];
 let preparationWorker = null;
 installWebTorrentSafetyGuards();
@@ -62,6 +79,7 @@ const hlsPlayback = createHlsPlaybackManager({
 client.on("error", (error) => console.error(`WebTorrent client error: ${error.message}`));
 
 await mkdir(DOWNLOAD_DIR, { recursive: true });
+await mkdir(IMPORT_DIR, { recursive: true });
 await mkdir(path.dirname(CONFIG_PATH), { recursive: true });
 
 try {
@@ -77,7 +95,7 @@ function corsHeaders(request) {
   if (!ALLOWED_ORIGINS.has(origin)) return null;
   return {
     "access-control-allow-origin": origin,
-    "access-control-allow-methods": "GET,POST,OPTIONS",
+    "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
     "access-control-allow-headers": "content-type",
     "access-control-allow-private-network": "true",
     vary: "origin",
@@ -540,6 +558,12 @@ function snapshot(job) {
     status: job.status,
     progress: selected?.progress || 0,
     infoHash: job.torrent?.infoHash || null,
+    magnetURI: job.torrent?.magnetURI || job.value || null,
+    seed: Boolean(job.seed),
+    peers: job.torrent?.numPeers || 0,
+    uploadSpeed: job.torrent?.uploadSpeed || 0,
+    uploaded: job.torrent?.uploaded || 0,
+    identityFingerprint: job.identityFingerprint || null,
     error: job.error || null,
     subtitleStatus: job.subtitleStatus,
     subtitleError: job.subtitleError,
@@ -670,27 +694,16 @@ async function startDirect(job) {
   }
 }
 
-async function addDownload(source) {
-  const id = String(source?.id || "");
-  if (!/^[a-zA-Z0-9-]{8,80}$/.test(id)) throw new Error("Invalid source id.");
-  if (jobs.has(id)) return jobs.get(id);
-
+function createJob(source) {
   const kind = source.kind === "magnet" ? "magnet" : "direct";
-  const value = String(source.value || "").trim();
-  if (kind === "magnet") {
-    if (/^magnet:\?/i.test(value) && !isSupportedMagnet(value)) {
-      throw new Error("Magnet link needs a valid BitTorrent v1 info hash (BTIH).");
-    }
-    if (!/^magnet:\?/i.test(value) && !/^https?:\/\//i.test(value)) {
-      throw new Error("Invalid magnet or torrent source.");
-    }
-  }
-
   const job = {
-    id,
+    id: String(source.id),
     kind,
-    value,
+    value: String(source.value || "").trim(),
     label: String(source.label || "video").slice(0, 180),
+    seed: Boolean(source.seed),
+    seedPath: source.seedPath || null,
+    identityFingerprint: source.identityFingerprint || null,
     status: "queued",
     error: null,
     downloaded: 0,
@@ -712,11 +725,293 @@ async function addDownload(source) {
     preparation: { status: "waiting", error: null, encoder: null, fallback: false },
     updatedAt: Date.now(),
   };
-  jobs.set(id, job);
+  jobs.set(job.id, job);
+  return job;
+}
 
+function persistedJobs() {
+  return Array.from(jobs.values()).map((job) => ({
+    id: job.id,
+    kind: job.kind,
+    value: job.value,
+    label: job.label,
+    seed: Boolean(job.seed),
+    seedPath: job.seedPath,
+    identityFingerprint: job.identityFingerprint,
+    selectedIndex: job.selectedIndex,
+    file: job.file
+      ? { name: job.file.name, size: job.file.size, path: job.file.path, type: job.file.type }
+      : null,
+  }));
+}
+
+function persistJobs() {
+  jobStore.schedule(persistedJobs());
+}
+
+async function addDownload(source) {
+  const id = String(source?.id || "");
+  if (!/^[a-zA-Z0-9-]{8,80}$/.test(id)) throw new Error("Invalid source id.");
+  if (jobs.has(id)) return jobs.get(id);
+
+  const kind = source.kind === "magnet" ? "magnet" : "direct";
+  const value = String(source.value || "").trim();
+  if (kind === "magnet") {
+    if (/^magnet:\?/i.test(value) && !isSupportedMagnet(value)) {
+      throw new Error("Magnet link needs a valid BitTorrent v1 info hash (BTIH).");
+    }
+    if (!/^magnet:\?/i.test(value) && !/^https?:\/\//i.test(value)) {
+      throw new Error("Invalid magnet or torrent source.");
+    }
+  }
+
+  const job = createJob({ id, kind, value, label: source.label });
   if (kind === "magnet") startTorrent(job);
   else void startDirect(job);
+  persistJobs();
   return job;
+}
+
+function validJobId(value) {
+  const id = String(value || "");
+  if (!/^[a-zA-Z0-9-]{8,80}$/.test(id)) throw new Error("Invalid source id.");
+  return id;
+}
+
+function importPartPath(id) {
+  return path.join(IMPORT_DIR, validJobId(id) + ".part");
+}
+
+async function receiveImportChunk(request, id, url) {
+  const offset = Number(url.searchParams.get("offset"));
+  const total = Number(url.searchParams.get("total"));
+  if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(total) || total <= 0 || offset > total) {
+    throw new Error("Invalid import range.");
+  }
+
+  const partial = importPartPath(id);
+  if (offset === 0) await rm(partial, { force: true });
+  const existing = await stat(partial).then((info) => info.size).catch((error) => {
+    if (error?.code === "ENOENT") return 0;
+    throw error;
+  });
+  if (existing !== offset) {
+    const error = new Error(`Import offset mismatch; resume from ${existing}.`);
+    error.resumeOffset = existing;
+    throw error;
+  }
+
+  const writable = createWriteStream(partial, { flags: offset === 0 ? "w" : "a" });
+  let received = 0;
+  try {
+    for await (const chunk of request) {
+      received += chunk.length;
+      if (offset + received > total) throw new Error("Import exceeded its declared size.");
+      if (!writable.write(chunk)) await once(writable, "drain");
+    }
+    writable.end();
+    await once(writable, "finish");
+  } catch (error) {
+    writable.destroy();
+    throw error;
+  }
+  return { uploaded: offset + received, total };
+}
+
+async function seedLocalFile({ id, filePath, label }) {
+  validJobId(id);
+  if (jobs.has(id)) return jobs.get(id);
+
+  const resolvedPath = path.resolve(filePath);
+  const info = await stat(resolvedPath);
+  if (!info.isFile()) throw new Error("The selected library entry is not a file.");
+
+  const job = createJob({
+    id,
+    kind: "magnet",
+    value: "",
+    label: label || path.basename(resolvedPath),
+    seed: true,
+    seedPath: resolvedPath,
+  });
+  job.seed = true;
+  job.seedPath = resolvedPath;
+  job.status = "metadata";
+  job.selectedIndex = 0;
+  job.downloaded = info.size;
+
+  const options = { pieceLength: 1024 * 1024 };
+  if (TRACKERS.length) options.announce = TRACKERS;
+  await new Promise((resolve, reject) => {
+    const torrent = client.seed(resolvedPath, options, (readyTorrent) => {
+      job.torrent = readyTorrent;
+      job.value = readyTorrent.magnetURI;
+      job.status = "ready";
+      job.updatedAt = Date.now();
+      const torrentPath = path.join(path.dirname(resolvedPath), ".watchpair-" + id + ".torrent");
+      void writeFile(torrentPath, readyTorrent.torrentFile).catch((error) => {
+        console.warn(`Could not persist torrent metadata for ${job.label}: ${error.message}`);
+      });
+      void queueSubtitleProbe(job);
+      queueBackgroundPreparation(job);
+      persistJobs();
+      resolve();
+    });
+    job.torrent = torrent;
+    torrent.once("error", reject);
+    torrent.on("upload", () => {
+      job.updatedAt = Date.now();
+    });
+  }).catch((error) => {
+    jobs.delete(id);
+    throw error;
+  });
+
+  return job;
+}
+
+async function finalizeImport(id, body) {
+  validJobId(id);
+  const name = safeName(body?.name || "video");
+  const expectedSize = Number(body?.size);
+  const partial = importPartPath(id);
+  const info = await stat(partial);
+  if (!Number.isSafeInteger(expectedSize) || info.size !== expectedSize) {
+    throw new Error(`Import is incomplete; received ${info.size} of ${expectedSize || 0} bytes.`);
+  }
+
+  const directory = path.join(DOWNLOAD_DIR, id);
+  await mkdir(directory, { recursive: true });
+  const target = path.join(directory, name);
+  await rm(target, { force: true });
+  await rename(partial, target);
+  return seedLocalFile({ id, filePath: target, label: name });
+}
+
+async function walkLibrary(root, directory, query, results, depth = 0) {
+  if (depth > 6 || results.length >= 300) return;
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    if (results.length >= 300) return;
+    if (entry.name.startsWith(".watchpair")) continue;
+    const candidate = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      await walkLibrary(root, candidate, query, results, depth + 1);
+      continue;
+    }
+    if (!entry.isFile() || !VIDEO_EXTENSIONS.test(entry.name)) continue;
+    if (query && !entry.name.toLowerCase().includes(query)) continue;
+    const resolved = await realpath(candidate).catch(() => null);
+    if (!resolved || (resolved !== root && !resolved.startsWith(root + path.sep))) continue;
+    const info = await stat(resolved).catch(() => null);
+    if (!info?.isFile()) continue;
+    const libraryId = createHash("sha256").update(resolved).digest("hex").slice(0, 24);
+    const item = { id: libraryId, name: entry.name, size: info.size };
+    libraryEntries.set(libraryId, { ...item, path: resolved });
+    results.push(item);
+  }
+}
+
+async function scanLibrary(queryValue) {
+  const query = String(queryValue || "").trim().toLowerCase();
+  const results = [];
+  libraryEntries.clear();
+  for (const configuredRoot of LIBRARY_DIRS) {
+    const root = await realpath(configuredRoot).catch(() => null);
+    if (root) await walkLibrary(root, root, query, results);
+  }
+  return results.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+async function attachLibraryFile({ id, entry, label, identityFingerprint }) {
+  validJobId(id);
+  if (jobs.has(id)) await stopJob(id);
+  const info = await stat(entry.path);
+  const job = createJob({
+    id,
+    kind: "direct",
+    value: entry.path,
+    label: label || entry.name,
+    identityFingerprint,
+  });
+  job.identityFingerprint = String(identityFingerprint || "").slice(0, 160) || null;
+  job.file = {
+    name: entry.name,
+    size: info.size,
+    path: entry.path,
+    type: contentType(entry.name),
+  };
+  job.downloaded = info.size;
+  job.selectedIndex = 0;
+  job.status = "ready";
+  job.updatedAt = Date.now();
+  void queueSubtitleProbe(job);
+  queueBackgroundPreparation(job);
+  persistJobs();
+  return job;
+}
+
+async function stopJob(id, { deleteFiles = false } = {}) {
+  const job = jobs.get(validJobId(id));
+  if (!job) return false;
+  if (job.torrent && !job.torrent.destroyed) {
+    await new Promise((resolve) => job.torrent.destroy(resolve));
+  }
+  jobs.delete(id);
+  const queueIndex = preparationQueue.indexOf(job);
+  if (queueIndex >= 0) preparationQueue.splice(queueIndex, 1);
+  if (deleteFiles && !job.seedPath) {
+    await rm(path.join(DOWNLOAD_DIR, id), { recursive: true, force: true });
+  }
+  persistJobs();
+  return true;
+}
+
+async function retryJob(id) {
+  const job = jobs.get(validJobId(id));
+  if (!job) throw new Error("Download not found.");
+  if (job.seed) throw new Error("A local seed does not need to be retried.");
+  const source = { id: job.id, kind: job.kind, value: job.value, label: job.label };
+  await stopJob(id);
+  return addDownload(source);
+}
+
+async function restoreJobs() {
+  const records = await jobStore.load([]);
+  if (!Array.isArray(records)) return;
+  for (const record of records.slice(0, 100)) {
+    try {
+      if (record.seed && record.seedPath) {
+        await seedLocalFile({
+          id: record.id,
+          filePath: record.seedPath,
+          label: record.label,
+        });
+      } else if (record.kind === "magnet") {
+        await addDownload(record);
+      } else if (record.file?.path) {
+        const info = await stat(record.file.path);
+        const job = createJob(record);
+        job.file = { ...record.file, size: info.size };
+        job.downloaded = info.size;
+        job.selectedIndex = 0;
+        job.status = "ready";
+        void queueSubtitleProbe(job);
+        queueBackgroundPreparation(job);
+      } else {
+        await addDownload(record);
+      }
+    } catch (error) {
+      console.warn(`Could not restore companion job ${record?.id || "unknown"}: ${error.message}`);
+    }
+  }
+  persistJobs();
 }
 
 function contentType(fileName, fallback = "application/octet-stream") {
@@ -940,6 +1235,10 @@ async function streamFile(request, response, job, fileIndex, headers, audioTrack
   createStream({ start, end }).pipe(response);
 }
 
+await restoreJobs();
+const persistenceTimer = setInterval(persistJobs, 2_000);
+persistenceTimer.unref?.();
+
 const server = createServer(async (request, response) => {
   const url = new URL(request.url || "/", "http://" + HOST + ":" + PORT);
 
@@ -990,7 +1289,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/health") {
       sendJson(response, 200, {
         ok: true,
-        version: "0.3.0",
+        version: "0.4.0",
         downloadDirectory: DOWNLOAD_DIR,
         jobs: jobs.size,
         transcoder: TRANSCODER,
@@ -1002,6 +1301,72 @@ const server = createServer(async (request, response) => {
       const body = await readJson(request);
       const source = await resolveSource(body.value);
       sendJson(response, 200, { source }, headers);
+      return;
+    }
+
+    const importMatch = /^\/imports\/([a-zA-Z0-9-]{8,80})$/.exec(url.pathname);
+    if (request.method === "GET" && importMatch) {
+      const uploaded = await stat(importPartPath(importMatch[1]))
+        .then((info) => info.size)
+        .catch((error) => error?.code === "ENOENT" ? 0 : Promise.reject(error));
+      sendJson(response, 200, { uploaded }, headers);
+      return;
+    }
+    if (request.method === "PUT" && importMatch) {
+      const progress = await receiveImportChunk(request, importMatch[1], url);
+      sendJson(response, 200, progress, headers);
+      return;
+    }
+    if (request.method === "DELETE" && importMatch) {
+      await rm(importPartPath(importMatch[1]), { force: true });
+      sendJson(response, 200, { ok: true }, headers);
+      return;
+    }
+
+    const seedImportMatch = /^\/imports\/([a-zA-Z0-9-]{8,80})\/seed$/.exec(url.pathname);
+    if (request.method === "POST" && seedImportMatch) {
+      const job = await finalizeImport(seedImportMatch[1], await readJson(request));
+      sendJson(response, 201, { job: snapshot(job), magnetURI: job.value }, headers);
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/library") {
+      const files = await scanLibrary(url.searchParams.get("query"));
+      sendJson(response, 200, { files }, headers);
+      return;
+    }
+
+    const librarySeedMatch = /^\/library\/([a-f0-9]{24})\/seed$/.exec(url.pathname);
+    if (request.method === "POST" && librarySeedMatch) {
+      const entry = libraryEntries.get(librarySeedMatch[1]);
+      if (!entry) throw new Error("Scan the companion library again before selecting that file.");
+      const body = await readJson(request);
+      const job = await seedLocalFile({
+        id: validJobId(body.sourceId),
+        filePath: entry.path,
+        label: body.label || entry.name,
+      });
+      sendJson(response, 201, { job: snapshot(job), magnetURI: job.value }, headers);
+      return;
+    }
+
+    const libraryAttachMatch = /^\/library\/([a-f0-9]{24})\/attach$/.exec(url.pathname);
+    if (request.method === "POST" && libraryAttachMatch) {
+      const entry = libraryEntries.get(libraryAttachMatch[1]);
+      if (!entry) throw new Error("Scan the companion library again before selecting that file.");
+      const body = await readJson(request);
+      const job = await attachLibraryFile({
+        id: validJobId(body.sourceId),
+        entry,
+        label: body.label || entry.name,
+        identityFingerprint: body.identityFingerprint,
+      });
+      sendJson(response, 201, { job: snapshot(job) }, headers);
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/downloads") {
+      sendJson(response, 200, { jobs: Array.from(jobs.values(), snapshot) }, headers);
       return;
     }
 
@@ -1020,6 +1385,21 @@ const server = createServer(async (request, response) => {
         return;
       }
       sendJson(response, 200, { job: snapshot(job) }, headers);
+      return;
+    }
+
+    if (request.method === "DELETE" && jobMatch) {
+      const stopped = await stopJob(jobMatch[1], {
+        deleteFiles: url.searchParams.get("deleteFiles") === "1",
+      });
+      sendJson(response, stopped ? 200 : 404, stopped ? { ok: true } : { error: "Download not found." }, headers);
+      return;
+    }
+
+    const retryMatch = /^\/downloads\/([a-zA-Z0-9-]{8,80})\/retry$/.exec(url.pathname);
+    if (request.method === "POST" && retryMatch) {
+      const job = await retryJob(retryMatch[1]);
+      sendJson(response, 202, { job: snapshot(job) }, headers);
       return;
     }
 
@@ -1086,8 +1466,11 @@ let shuttingDown = false;
 const shutdown = async () => {
   if (shuttingDown) return;
   shuttingDown = true;
+  clearInterval(persistenceTimer);
   hlsPlayback.shutdown();
+  persistJobs();
   await Promise.all([
+    jobStore.flush(),
     new Promise((resolve) => server.close(resolve)),
     new Promise((resolve) => {
       if (client.destroyed) resolve();

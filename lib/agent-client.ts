@@ -71,6 +71,12 @@ export interface AgentJob {
   status: "queued" | "metadata" | "downloading" | "ready" | "error";
   progress: number;
   infoHash: string | null;
+  magnetURI: string | null;
+  seed: boolean;
+  peers: number;
+  uploadSpeed: number;
+  uploaded: number;
+  identityFingerprint: string | null;
   error: string | null;
   subtitleStatus: "waiting" | "probing" | "ready" | "error";
   subtitleError: string | null;
@@ -80,6 +86,12 @@ export interface AgentJob {
   transcoder: AgentTranscoder;
   files: AgentFile[];
   updatedAt: number;
+}
+
+export interface AgentLibraryFile {
+  id: string;
+  name: string;
+  size: number;
 }
 
 async function agentFetch<T>(path: string, init?: RequestInit) {
@@ -151,4 +163,108 @@ export async function selectAgentFile(sourceId: string, fileIndex: number) {
     }
   );
   return result.job;
+}
+
+export async function getAgentDownloads() {
+  const result = await agentFetch<{ jobs: AgentJob[] }>("/downloads", { cache: "no-store" });
+  return result.jobs;
+}
+
+export async function stopAgentDownload(sourceId: string, deleteFiles = false) {
+  await agentFetch<{ ok: boolean }>(
+    `/downloads/${encodeURIComponent(sourceId)}?deleteFiles=${deleteFiles ? "1" : "0"}`,
+    { method: "DELETE" }
+  );
+}
+
+export async function retryAgentDownload(sourceId: string) {
+  const result = await agentFetch<{ job: AgentJob }>(
+    `/downloads/${encodeURIComponent(sourceId)}/retry`,
+    { method: "POST" }
+  );
+  return result.job;
+}
+
+export async function scanAgentLibrary(query = "") {
+  const result = await agentFetch<{ files: AgentLibraryFile[] }>(
+    `/library?query=${encodeURIComponent(query)}`,
+    { cache: "no-store" }
+  );
+  return result.files;
+}
+
+export async function seedAgentLibraryFile(sourceId: string, libraryId: string, label: string) {
+  return agentFetch<{ job: AgentJob; magnetURI: string }>(
+    `/library/${encodeURIComponent(libraryId)}/seed`,
+    {
+      method: "POST",
+      body: JSON.stringify({ sourceId, label }),
+    }
+  );
+}
+
+export async function attachAgentLibraryFile(
+  sourceId: string,
+  libraryId: string,
+  label: string,
+  identityFingerprint?: string
+) {
+  const result = await agentFetch<{ job: AgentJob }>(
+    `/library/${encodeURIComponent(libraryId)}/attach`,
+    {
+      method: "POST",
+      body: JSON.stringify({ sourceId, label, identityFingerprint }),
+    }
+  );
+  return result.job;
+}
+
+export async function uploadAndSeedAgentFile(
+  sourceId: string,
+  file: File,
+  onProgress: (progress: number) => void,
+  signal?: AbortSignal
+) {
+  const chunkSize = 16 * 1024 * 1024;
+  let offset = 0;
+  try {
+    const existing = await agentFetch<{ uploaded: number }>(
+      `/imports/${encodeURIComponent(sourceId)}`,
+      { cache: "no-store", signal }
+    );
+    offset = Math.min(file.size, Math.max(0, existing.uploaded || 0));
+    onProgress(file.size ? (offset / file.size) * 100 : 100);
+    while (offset < file.size) {
+      if (signal?.aborted) throw new DOMException("Upload cancelled", "AbortError");
+      const chunk = file.slice(offset, Math.min(file.size, offset + chunkSize));
+      const progress = await agentFetch<{ uploaded: number; total: number }>(
+        `/imports/${encodeURIComponent(sourceId)}?offset=${offset}&total=${file.size}`,
+        {
+          method: "PUT",
+          body: chunk,
+          headers: { "content-type": "application/octet-stream" },
+          signal,
+        }
+      );
+      offset = progress.uploaded;
+      onProgress(file.size ? (offset / file.size) * 100 : 100);
+    }
+
+    return await agentFetch<{ job: AgentJob; magnetURI: string }>(
+      `/imports/${encodeURIComponent(sourceId)}/seed`,
+      {
+        method: "POST",
+        body: JSON.stringify({ name: file.name, size: file.size }),
+        signal,
+      }
+    );
+  } catch (error) {
+    if (signal?.aborted) {
+      void agentFetch<{ ok: boolean }>(
+        `/imports/${encodeURIComponent(sourceId)}`,
+        { method: "DELETE" }
+      ).catch(() => {});
+    }
+    throw error;
+  }
 }

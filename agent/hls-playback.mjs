@@ -60,7 +60,7 @@ function masterPlaylist(audioTracks) {
   return lines.join("\n");
 }
 
-function playlistArguments(directory, segmentSeconds) {
+function playlistArguments(segmentSeconds) {
   return [
     "-f", "hls",
     "-hls_time", String(segmentSeconds),
@@ -68,9 +68,9 @@ function playlistArguments(directory, segmentSeconds) {
     "-hls_playlist_type", "event",
     "-hls_segment_type", "fmp4",
     "-hls_fmp4_init_filename", "init.mp4",
-    "-hls_segment_filename", path.join(directory, "segment-%06d.m4s"),
+    "-hls_segment_filename", "segment-%06d.m4s",
     "-hls_flags", "independent_segments+temp_file",
-    path.join(directory, "index.m3u8"),
+    "index.m3u8",
   ];
 }
 
@@ -123,8 +123,9 @@ export function createHlsPlaybackManager({
     ).then((values) => values.every(Boolean));
   }
 
-  function launch(state, label, args) {
+  function launch(state, label, args, cwd) {
     const child = spawn(ffmpegPath, args, {
+      cwd,
       windowsHide: true,
       stdio: ["ignore", "ignore", "pipe"],
     });
@@ -194,8 +195,9 @@ export function createHlsPlaybackManager({
           "-an", "-sn", "-dn",
           ...argumentsFor(state.encoder),
           "-max_muxing_queue_size", "4096",
-          ...playlistArguments(videoDirectory, segmentSeconds),
-        ]
+          ...playlistArguments(segmentSeconds),
+        ],
+        videoDirectory
       );
 
       try {
@@ -229,8 +231,9 @@ export function createHlsPlaybackManager({
             "-c:a", "aac",
             "-b:a", "192k",
             "-af", "aresample=async=1:first_pts=0",
-            ...playlistArguments(audioDirectory, segmentSeconds),
-          ]
+            ...playlistArguments(segmentSeconds),
+          ],
+          audioDirectory
         ).catch((error) => {
           state.errors.set(`audio:${id}`, error);
           throw error;

@@ -4,6 +4,7 @@ import { promisify } from "node:util";
 
 const runFile = promisify(execFile);
 const PROBE_TIMEOUT_MS = 8_000;
+export const ENCODER_PROBE_SOURCE = "color=c=black:s=640x360:r=24:d=0.2";
 
 const ENCODERS = {
   nvenc: {
@@ -91,7 +92,7 @@ async function testEncoder(path, encoder) {
   try {
     await commandOutput(path, [
       "-hide_banner", "-loglevel", "error", "-y",
-      "-f", "lavfi", "-i", "color=c=black:s=128x72:r=24:d=0.2",
+      "-f", "lavfi", "-i", ENCODER_PROBE_SOURCE,
       "-an", ...encoder.arguments,
       "-frames:v", "2", "-f", "null", "-",
     ]);
@@ -134,13 +135,14 @@ async function inspectCandidate(candidate, platform, preference) {
 export async function selectTranscodeRuntime({
   bundledPath,
   configuredPath = process.env.WATCHPAIR_FFMPEG_PATH,
+  systemPath = "ffmpeg",
   preference = String(process.env.WATCHPAIR_TRANSCODER || "auto").toLowerCase(),
   platform = process.platform,
 } = {}) {
   const normalizedPreference = preference in ENCODERS || preference === "cpu" ? preference : "auto";
   const candidates = uniqueCandidates([
     { path: configuredPath, source: "configured" },
-    { path: "ffmpeg", source: "system" },
+    { path: systemPath, source: "system" },
     { path: bundledPath, source: "bundled" },
   ]);
 

@@ -3,12 +3,15 @@
 import type Hls from "hls.js";
 import type { ErrorData } from "hls.js";
 import {
+  ArrowDown,
   ArrowLeft,
+  ArrowUp,
   Check,
   Copy,
   Cpu,
   Download,
   Expand,
+  FileSearch,
   FileVideo2,
   Headphones,
   Link2,
@@ -17,13 +20,16 @@ import {
   MonitorUp,
   PackageOpen,
   Pause,
+  Pencil,
   Play,
   Plug,
   Plus,
   Radio,
   RotateCcw,
   Settings2,
+  Share2,
   Subtitles,
+  Trash2,
   Upload,
   Users,
   Volume2,
@@ -43,15 +49,22 @@ import {
 import {
   AGENT_URL,
   addAgentDownload,
+  attachAgentLibraryFile,
   detectAgent,
-  getAgentDownload,
+  getAgentDownloads,
   getAgentPermissionState,
   getAgentPairingUrl,
   getAgentSubtitle,
   resolveAgentSource,
+  retryAgentDownload,
+  scanAgentLibrary,
+  seedAgentLibraryFile,
   selectAgentFile,
+  stopAgentDownload,
+  uploadAndSeedAgentFile,
   type AgentAudioTrack,
   type AgentFile,
+  type AgentLibraryFile,
   type AgentPermissionState,
   type AgentJob,
   type AgentSubtitleTrack,
@@ -76,6 +89,8 @@ import {
 
 const EMPTY_AUDIO_TRACKS: AgentAudioTrack[] = [];
 const EMPTY_SUBTITLE_TRACKS: AgentSubtitleTrack[] = [];
+
+type DownloadMode = "automatic" | "manual" | "external";
 
 const emptyReadiness = (): LocalReadiness => ({
   ready: false,
@@ -145,7 +160,7 @@ function queueReadinessForJob(job: AgentJob, file: AgentFile | null): QueueReadi
     };
   }
 
-  const fingerprint = `${job.infoHash || job.id}:${file.index}:${file.size}`;
+  const fingerprint = job.identityFingerprint || `${job.infoHash || job.id}:${file.index}:${file.size}`;
   const status = job.status === "error"
     ? job.error || "Download failed"
     : !file.ready
@@ -319,6 +334,12 @@ export default function WatchApp() {
   const [agentPermission, setAgentPermission] = useState<AgentPermissionState | "checking">("checking");
   const [agentPairing, setAgentPairing] = useState(false);
   const [agentJobs, setAgentJobs] = useState<Record<string, AgentJob>>({});
+  const [downloadMode, setDownloadMode] = useState<DownloadMode>("automatic");
+  const [shareLocalFiles, setShareLocalFiles] = useState(true);
+  const [manualStartedSources, setManualStartedSources] = useState<string[]>([]);
+  const [libraryFiles, setLibraryFiles] = useState<AgentLibraryFile[]>([]);
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  const [libraryBusy, setLibraryBusy] = useState(false);
   const [connection, setConnection] = useState<"syncing" | "online" | "offline">("syncing");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const subtitleInputRef = useRef<HTMLInputElement>(null);
@@ -331,6 +352,7 @@ export default function WatchApp() {
   const initializedMediaTracksRef = useRef("");
   const autoOpenedMediaRef = useRef("");
   const pairingTimerRef = useRef<number | null>(null);
+  const roomSourcesRef = useRef<{ token: string; ids: string[] }>({ token: "", ids: [] });
   const sources = session?.sources?.length ? session.sources : session?.source ? [session.source] : [];
   const activeSource = sources.find((source) => source.id === session?.selectedMedia?.sourceId)
     || sources[0]
@@ -351,6 +373,11 @@ export default function WatchApp() {
       }
 
       const savedName = localStorage.getItem("watchpair-display-name") || "Guest";
+      const savedMode = localStorage.getItem("watchpair-download-mode");
+      if (savedMode === "automatic" || savedMode === "manual" || savedMode === "external") {
+        setDownloadMode(savedMode);
+      }
+      setShareLocalFiles(localStorage.getItem("watchpair-share-local-files") !== "0");
       const invitedToken = normalizeToken(new URLSearchParams(window.location.search).get("room") || "");
       setDeviceId(id);
       setDisplayName(savedName);
@@ -368,6 +395,24 @@ export default function WatchApp() {
   useEffect(() => {
     sessionRef.current = session;
   }, [session]);
+
+  useEffect(() => {
+    if (!joined || !roomToken) return;
+    const currentIds = sourcesKey ? sourcesKey.split(":") : [];
+    const previous = roomSourcesRef.current;
+    if (previous.token === roomToken) {
+      const current = new Set(currentIds);
+      for (const removedId of previous.ids.filter((id) => !current.has(id))) {
+        void stopAgentDownload(removedId).catch(() => {});
+        setAgentJobs((jobs) => {
+          const next = { ...jobs };
+          delete next[removedId];
+          return next;
+        });
+      }
+    }
+    roomSourcesRef.current = { token: roomToken, ids: currentIds };
+  }, [joined, roomToken, sourcesKey]);
 
   useEffect(() => {
     let active = true;
@@ -572,7 +617,16 @@ export default function WatchApp() {
     if (!joined || !roomToken) return;
 
     let active = true;
+    let timer: number | null = null;
+    let refreshing = false;
+    const interval = () => document.hidden ? 5_000 : view === "player" ? 1_000 : 2_000;
+    const schedule = () => {
+      if (!active) return;
+      timer = window.setTimeout(() => void refresh(), interval());
+    };
     const refresh = async () => {
+      if (refreshing) return;
+      refreshing = true;
       try {
         const response = await fetch(`/api/sessions?token=${encodeURIComponent(roomToken)}`, {
           cache: "no-store",
@@ -586,16 +640,26 @@ export default function WatchApp() {
         }
       } catch {
         if (active) setConnection("offline");
+      } finally {
+        refreshing = false;
+        schedule();
       }
+    };
+    const onVisibilityChange = () => {
+      if (timer !== null) window.clearTimeout(timer);
+      timer = null;
+      if (!document.hidden) void refresh();
+      else schedule();
     };
 
     void refresh();
-    const poll = window.setInterval(refresh, 700);
+    document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
       active = false;
-      window.clearInterval(poll);
+      if (timer !== null) window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [applySession, joined, roomToken]);
+  }, [applySession, joined, roomToken, view]);
 
   useEffect(() => {
     if (!joined || !roomToken || !deviceId) return;
@@ -668,10 +732,85 @@ export default function WatchApp() {
     [sendAction]
   );
 
+  const publishLocalFile = useCallback(
+    async (file: File) => {
+      const sourceId = crypto.randomUUID();
+      setBusy("file");
+      setError("");
+      try {
+        const updateProgress = (progress: number) => {
+          const next: LocalReadiness = {
+            ...readinessRef.current,
+            ready: false,
+            progress,
+            status: progress >= 100 ? "Creating torrent" : "Importing into companion",
+            fileName: file.name,
+            fileSize: file.size,
+            fingerprint: null,
+            preparation: "waiting",
+          };
+          readinessRef.current = next;
+          setReadiness(next);
+        };
+        updateProgress(0);
+        const published = await uploadAndSeedAgentFile(sourceId, file, updateProgress);
+        const job = published.job;
+        const target = preferredAgentFile(job);
+        if (!target || !job.infoHash) throw new Error("The companion did not publish the selected video.");
+
+        await sendAction("source", {
+          source: {
+            id: sourceId,
+            kind: "magnet",
+            value: published.magnetURI,
+            label: file.name,
+          },
+        });
+        setAgentJobs((current) => ({ ...current, [sourceId]: job }));
+
+        const item = queueReadinessForJob(job, target);
+        const next: LocalReadiness = {
+          ...item,
+          queue: { ...readinessRef.current.queue, [sourceId]: item },
+        };
+        readinessRef.current = next;
+        setReadiness(next);
+        setMediaUrl(target.hlsUrl || target.streamUrl);
+        await sendAction("heartbeat", { readiness: next });
+        await sendAction("select-media", {
+          media: {
+            sourceId,
+            fileIndex: target.index,
+            name: target.name,
+            size: target.size,
+            fingerprint: item.fingerprint,
+          },
+        });
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : "Could not share that local video.");
+      } finally {
+        setBusy(null);
+      }
+    },
+    [sendAction]
+  );
+
   const onChooseFile = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     event.target.value = "";
-    if (file) await attachLocalFile(file, file.name, activeSource?.id);
+    if (!file) return;
+    if (shareLocalFiles && agentAvailable) {
+      const warned = localStorage.getItem("watchpair-local-share-warning") === "1";
+      const accepted = warned || window.confirm(
+        "Share this file directly with the room using BitTorrent? Participants can see the seeder's IP address."
+      );
+      if (accepted) {
+        localStorage.setItem("watchpair-local-share-warning", "1");
+        await publishLocalFile(file);
+        return;
+      }
+    }
+    await attachLocalFile(file, file.name, activeSource?.id);
   };
 
   const onChooseSubtitle = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -714,7 +853,10 @@ export default function WatchApp() {
   };
 
   useEffect(() => {
-    if (!joined || agentAvailable || activeSourceKind !== "direct" || !activeSourceId) return;
+    const browserDownloadEnabled =
+      downloadMode === "automatic" ||
+      (downloadMode === "manual" && manualStartedSources.includes(activeSourceId));
+    if (!joined || agentAvailable || !browserDownloadEnabled || activeSourceKind !== "direct" || !activeSourceId) return;
     if (handledSourceRef.current === activeSourceId) return;
 
     const currentSession = sessionRef.current;
@@ -779,7 +921,7 @@ export default function WatchApp() {
       .finally(() => setBusy(null));
 
     return () => controller.abort();
-  }, [activeSourceId, activeSourceKind, agentAvailable, attachLocalFile, joined]);
+  }, [activeSourceId, activeSourceKind, agentAvailable, attachLocalFile, downloadMode, joined, manualStartedSources]);
 
   useEffect(() => {
     if (!joined || !agentAvailable || !sourcesKey) return;
@@ -792,25 +934,36 @@ export default function WatchApp() {
         : currentSession?.source ? [currentSession.source] : [];
       if (!queueSources.length) return;
 
-      const entries = await Promise.all(
-        queueSources.map(async (source) => {
-          try {
-            let job: AgentJob;
+      let localJobs: AgentJob[];
+      try {
+        localJobs = await getAgentDownloads();
+      } catch {
+        return;
+      }
+      const existingById = new Map(localJobs.map((job) => [job.id, job]));
+      const canStart = (sourceId: string) =>
+        downloadMode === "automatic" ||
+        (downloadMode === "manual" && manualStartedSources.includes(sourceId));
+      const started = await Promise.all(
+        queueSources
+          .filter((source) => !existingById.has(source.id) && canStart(source.id))
+          .map(async (source) => {
             try {
-              job = await getAgentDownload(source.id);
+              return await addAgentDownload(source);
             } catch {
-              job = await addAgentDownload(source);
+              return null;
             }
-            return [source.id, job] as const;
-          } catch {
-            return [source.id, null] as const;
-          }
-        })
+          })
       );
+      for (const job of started) {
+        if (job) existingById.set(job.id, job);
+      }
       if (!active) return;
 
       const jobsById = Object.fromEntries(
-        entries.filter((entry): entry is readonly [string, AgentJob] => Boolean(entry[1]))
+        queueSources
+          .map((source) => [source.id, existingById.get(source.id)] as const)
+          .filter((entry): entry is readonly [string, AgentJob] => Boolean(entry[1]))
       );
       setAgentJobs((current) => ({ ...current, ...jobsById }));
 
@@ -844,7 +997,7 @@ export default function WatchApp() {
               fileIndex: target.index,
               name: target.name,
               size: target.size,
-              fingerprint: `${job.infoHash || source.id}:${target.index}:${target.size}`,
+              fingerprint: queueReadinessForJob(job, target).fingerprint || undefined,
             },
           });
           selectedMedia = nextSession.selectedMedia;
@@ -860,7 +1013,12 @@ export default function WatchApp() {
           : {
               ready: false,
               progress: 0,
-              status: "Waiting for companion",
+              status:
+                downloadMode === "automatic"
+                  ? "Waiting for companion"
+                  : downloadMode === "manual"
+                    ? "Ready to start locally"
+                    : "Use an external client or local file",
               fileName: null,
               fileSize: null,
               fingerprint: null,
@@ -890,7 +1048,7 @@ export default function WatchApp() {
       active = false;
       window.clearInterval(timer);
     };
-  }, [agentAvailable, joined, sendAction, sourcesKey]);
+  }, [agentAvailable, downloadMode, joined, manualStartedSources, sendAction, sourcesKey]);
 
   useEffect(() => {
     if (!joined || agentAvailable || !activeSourceId || !agentJobs[activeSourceId]) return;
@@ -1029,7 +1187,7 @@ export default function WatchApp() {
           fileIndex: file.index,
           name: file.name,
           size: file.size,
-          fingerprint: `${selectedJob.infoHash || sourceId}:${file.index}:${file.size}`,
+          fingerprint: selectedJob.identityFingerprint || `${selectedJob.infoHash || sourceId}:${file.index}:${file.size}`,
         },
       });
       const item = queueReadinessForJob(
@@ -1065,6 +1223,122 @@ export default function WatchApp() {
     return () => window.clearTimeout(timer);
   }, [readiness, sendAction, session]);
 
+  const changeDownloadMode = (mode: DownloadMode) => {
+    setDownloadMode(mode);
+    localStorage.setItem("watchpair-download-mode", mode);
+  };
+
+  const startQueuedSource = (sourceId: string) => {
+    setManualStartedSources((current) => current.includes(sourceId) ? current : [...current, sourceId]);
+  };
+
+  const stopQueuedSource = async (sourceId: string) => {
+    try {
+      await stopAgentDownload(sourceId);
+      setManualStartedSources((current) => current.filter((id) => id !== sourceId));
+      setAgentJobs((current) => {
+        const next = { ...current };
+        delete next[sourceId];
+        return next;
+      });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not stop that download.");
+    }
+  };
+
+  const retryQueuedSource = async (sourceId: string) => {
+    try {
+      const job = await retryAgentDownload(sourceId);
+      setAgentJobs((current) => ({ ...current, [sourceId]: job }));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not retry that download.");
+    }
+  };
+
+  const moveQueuedSource = async (sourceId: string, direction: -1 | 1) => {
+    const index = sources.findIndex((source) => source.id === sourceId);
+    const target = index + direction;
+    if (index < 0 || target < 0 || target >= sources.length) return;
+    const ordered = sources.map((source) => source.id);
+    [ordered[index], ordered[target]] = [ordered[target], ordered[index]];
+    await sendAction("reorder-sources", { sourceIds: ordered });
+  };
+
+  const renameQueuedSource = async (sourceId: string, currentLabel: string) => {
+    const label = window.prompt("Queue item name", currentLabel)?.trim();
+    if (!label || label === currentLabel) return;
+    await sendAction("rename-source", { sourceId, label });
+  };
+
+  const removeQueuedSource = async (sourceId: string) => {
+    if (!window.confirm("Remove this item from the shared queue? Downloaded files will be kept.")) return;
+    await sendAction("remove-source", { sourceId });
+    void stopAgentDownload(sourceId).catch(() => {});
+    setAgentJobs((current) => {
+      const next = { ...current };
+      delete next[sourceId];
+      return next;
+    });
+  };
+
+  const copySource = async (value: string) => {
+    await navigator.clipboard.writeText(value);
+  };
+
+  const openLibrary = async () => {
+    setLibraryOpen(true);
+    setLibraryBusy(true);
+    try {
+      setLibraryFiles(await scanAgentLibrary());
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not scan the companion library.");
+    } finally {
+      setLibraryBusy(false);
+    }
+  };
+
+  const chooseLibraryFile = async (libraryFile: AgentLibraryFile) => {
+    setLibraryBusy(true);
+    setError("");
+    try {
+      const source = activeSource;
+      if (source) {
+        const selected = session?.selectedMedia?.sourceId === source.id ? session.selectedMedia : null;
+        const match = source.value.match(/urn:btih:([a-zA-Z0-9]+)/i);
+        const identityFingerprint = selected?.fingerprint ||
+          (match ? `${match[1].toLowerCase()}:${selected?.fileIndex || 0}:${libraryFile.size}` : undefined);
+        const job = await attachAgentLibraryFile(
+          source.id,
+          libraryFile.id,
+          libraryFile.name,
+          identityFingerprint
+        );
+        setAgentJobs((current) => ({ ...current, [source.id]: job }));
+        const target = preferredAgentFile(job);
+        if (target) await chooseAgentMedia(source.id, job, target);
+      } else {
+        const sourceId = crypto.randomUUID();
+        const published = await seedAgentLibraryFile(sourceId, libraryFile.id, libraryFile.name);
+        await sendAction("source", {
+          source: {
+            id: sourceId,
+            kind: "magnet",
+            value: published.magnetURI,
+            label: libraryFile.name,
+          },
+        });
+        setAgentJobs((current) => ({ ...current, [sourceId]: published.job }));
+        const target = preferredAgentFile(published.job);
+        if (target) await chooseAgentMedia(sourceId, published.job, target);
+      }
+      setLibraryOpen(false);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not use that library file.");
+    } finally {
+      setLibraryBusy(false);
+    }
+  };
+
   const copyInvite = async () => {
     if (!session) return;
     const invite = new URL(window.location.href);
@@ -1093,6 +1367,21 @@ export default function WatchApp() {
     },
     [sendAction]
   );
+
+  const advancePlaylist = async () => {
+    if (!session || deviceId !== session.hostId || !session.selectedMedia?.sourceId) return;
+    const currentIndex = sources.findIndex((source) => source.id === session.selectedMedia?.sourceId);
+    for (const source of sources.slice(currentIndex + 1)) {
+      const job = agentJobs[source.id];
+      const target = job ? preferredAgentFile(job) : null;
+      const readyForEveryone = session.participants.every(
+        (participant) => participant.queue?.[source.id]?.ready
+      );
+      if (!job || !target || !readyForEveryone) continue;
+      await chooseAgentMedia(source.id, job, target);
+      return;
+    }
+  };
 
   const readyParticipants = session?.participants.filter((participant) => participant.ready) ?? [];
   const fingerprints = new Set(
@@ -1134,6 +1423,7 @@ export default function WatchApp() {
         audioTracks={embeddedAudioTracks}
         subtitleTracks={embeddedSubtitles}
         onBack={() => setView("lobby")}
+        onEnded={deviceId === session.hostId ? () => void advancePlaylist() : undefined}
         onSend={sendPlayerState}
       />
     );
@@ -1272,6 +1562,42 @@ export default function WatchApp() {
             </button>
           </form>
 
+          <div className="download-controls">
+            <div className="mode-switch" role="group" aria-label="Local download behavior">
+              {(["automatic", "manual", "external"] as DownloadMode[]).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  className={downloadMode === mode ? "selected" : ""}
+                  aria-pressed={downloadMode === mode}
+                  onClick={() => changeDownloadMode(mode)}
+                >
+                  {mode === "automatic" ? "Auto" : mode === "manual" ? "Manual" : "External"}
+                </button>
+              ))}
+            </div>
+            <label className="toggle-control">
+              <input
+                type="checkbox"
+                checked={shareLocalFiles}
+                onChange={(event) => {
+                  setShareLocalFiles(event.target.checked);
+                  localStorage.setItem("watchpair-share-local-files", event.target.checked ? "1" : "0");
+                }}
+              />
+              <span>Share local files</span>
+            </label>
+            <button
+              className="secondary-button compact-button"
+              type="button"
+              onClick={() => void openLibrary()}
+              disabled={!agentAvailable || libraryBusy}
+            >
+              {libraryBusy ? <LoaderCircle className="spin" /> : <FileSearch />}
+              Library
+            </button>
+          </div>
+
           {!agentAvailable && (
             <div className="companion-callout">
               <div>
@@ -1291,7 +1617,7 @@ export default function WatchApp() {
                   {agentPairing ? <LoaderCircle className="spin" /> : <Plug />}
                   {agentPairing ? "Waiting for approval" : "Connect"}
                 </button>
-                <a className="secondary-button" href="/watchpair-companion.zip?v=0.3.0" download>
+                <a className="secondary-button" href="/watchpair-companion.zip?v=0.4.0" download>
                   <PackageOpen />
                   Get companion
                 </a>
@@ -1361,6 +1687,107 @@ export default function WatchApp() {
                         <strong>GPU</strong>}
                     </div>
 
+                    <div className="queue-actions">
+                      {!job && downloadMode === "manual" && (
+                        <button
+                          className="secondary-button compact-button"
+                          type="button"
+                          onClick={() => startQueuedSource(source.id)}
+                        >
+                          <Download />
+                          Start
+                        </button>
+                      )}
+                      {!job && downloadMode === "external" && (
+                        <>
+                          <a
+                            className="secondary-button compact-button"
+                            href={source.value}
+                            target={source.value.startsWith("magnet:") ? undefined : "_blank"}
+                            rel="noreferrer"
+                          >
+                            <Share2 />
+                            Open
+                          </a>
+                          <button
+                            className="icon-button"
+                            type="button"
+                            title="Copy source"
+                            aria-label="Copy source"
+                            onClick={() => void copySource(source.value)}
+                          >
+                            <Copy />
+                          </button>
+                        </>
+                      )}
+                      {job?.status === "error" && !job.seed && (
+                        <button
+                          className="secondary-button compact-button"
+                          type="button"
+                          onClick={() => void retryQueuedSource(source.id)}
+                        >
+                          <RotateCcw />
+                          Retry
+                        </button>
+                      )}
+                      {job && downloadMode !== "automatic" && !job.seed && (
+                        <button
+                          className="icon-button"
+                          type="button"
+                          title="Stop local download"
+                          aria-label="Stop local download"
+                          onClick={() => void stopQueuedSource(source.id)}
+                        >
+                          <X />
+                        </button>
+                      )}
+                      {job?.seed && (
+                        <span className="seed-status">
+                          <Upload />
+                          {job.peers} peers / {formatBytes(job.uploadSpeed)}/s
+                        </span>
+                      )}
+                      <span className="queue-action-spacer" />
+                      <button
+                        className="icon-button"
+                        type="button"
+                        title="Move up"
+                        aria-label="Move up"
+                        disabled={queueIndex === 0}
+                        onClick={() => void moveQueuedSource(source.id, -1)}
+                      >
+                        <ArrowUp />
+                      </button>
+                      <button
+                        className="icon-button"
+                        type="button"
+                        title="Move down"
+                        aria-label="Move down"
+                        disabled={queueIndex === sources.length - 1}
+                        onClick={() => void moveQueuedSource(source.id, 1)}
+                      >
+                        <ArrowDown />
+                      </button>
+                      <button
+                        className="icon-button"
+                        type="button"
+                        title="Rename"
+                        aria-label="Rename"
+                        onClick={() => void renameQueuedSource(source.id, source.label)}
+                      >
+                        <Pencil />
+                      </button>
+                      <button
+                        className="icon-button danger"
+                        type="button"
+                        title="Remove from queue"
+                        aria-label="Remove from queue"
+                        onClick={() => void removeQueuedSource(source.id)}
+                      >
+                        <Trash2 />
+                      </button>
+                    </div>
+
                     {job && job.files.length > 1 && (
                       <div className="agent-files" aria-label={`Files in ${source.label}`}>
                         {job.files
@@ -1399,6 +1826,41 @@ export default function WatchApp() {
               <Upload />
               <span><strong>Use a local video</strong> already on this device</span>
             </button>
+          )}
+
+          {libraryOpen && (
+            <div className="library-panel" role="dialog" aria-modal="false" aria-label="Companion library">
+              <div className="library-header">
+                <strong>Companion library</strong>
+                <button
+                  className="icon-button"
+                  type="button"
+                  title="Close library"
+                  aria-label="Close library"
+                  onClick={() => setLibraryOpen(false)}
+                >
+                  <X />
+                </button>
+              </div>
+              <div className="library-list">
+                {libraryBusy && <LoaderCircle className="spin" />}
+                {!libraryBusy && !libraryFiles.length && <span>No videos found in configured library folders.</span>}
+                {libraryFiles.map((file) => (
+                  <button
+                    type="button"
+                    key={file.id}
+                    onClick={() => void chooseLibraryFile(file)}
+                    disabled={libraryBusy}
+                  >
+                    <FileVideo2 />
+                    <span>
+                      <strong>{file.name}</strong>
+                      <small>{formatBytes(file.size)}</small>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
           )}
 
           <input
@@ -1553,6 +2015,7 @@ interface SyncedPlayerProps {
   audioTracks: AgentAudioTrack[];
   subtitleTracks: AgentSubtitleTrack[];
   onBack: () => void;
+  onEnded?: () => void;
   onSend: (player: PlayerState) => Promise<void>;
 }
 
@@ -1569,6 +2032,7 @@ function SyncedPlayer({
   audioTracks,
   subtitleTracks,
   onBack,
+  onEnded,
   onSend,
 }: SyncedPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -1576,6 +2040,8 @@ function SyncedPlayer({
   const hlsRef = useRef<Hls | null>(null);
   const hlsRecoveryRef = useRef(false);
   const lastSeqRef = useRef(-1);
+  const playerStateRef = useRef(session.player);
+  const clockOffsetRef = useRef(session.serverTime - Date.now());
   const controlsHideTimerRef = useRef<number | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -1815,17 +2281,21 @@ function SyncedPlayer({
   );
 
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video || lastSeqRef.current === session.seq) return;
-    lastSeqRef.current = session.seq;
+    playerStateRef.current = session.player;
+    const sample = session.serverTime - Date.now();
+    clockOffsetRef.current = clockOffsetRef.current * 0.8 + sample * 0.2;
+  }, [session.player, session.serverTime]);
 
-    const state = session.player;
+  const synchronizePlayback = useCallback((state: PlayerState) => {
+    const video = videoRef.current;
+    if (!video) return;
+    const serverNow = Date.now() + clockOffsetRef.current;
     const expected = state.paused
       ? state.position
-      : state.position + ((Date.now() - state.changedAt) / 1000) * state.playbackRate;
+      : state.position + ((serverNow - state.changedAt) / 1000) * state.playbackRate;
     const drift = expected - video.currentTime;
 
-    if (Math.abs(drift) > 0.85) {
+    if (Math.abs(drift) > 0.75) {
       video.currentTime = Math.max(0, expected);
     } else if (!state.paused && Math.abs(drift) > 0.2) {
       video.playbackRate = Math.max(0.5, Math.min(2, state.playbackRate + Math.sign(drift) * 0.05));
@@ -1844,8 +2314,20 @@ function SyncedPlayer({
         .then(() => setNeedsGesture(false))
         .catch(handlePlaybackFailure);
     }
+  }, [handlePlaybackFailure]);
 
-  }, [handlePlaybackFailure, session.player, session.seq]);
+  useEffect(() => {
+    if (lastSeqRef.current === session.seq) return;
+    lastSeqRef.current = session.seq;
+    synchronizePlayback(session.player);
+  }, [session.player, session.seq, synchronizePlayback]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      synchronizePlayback(playerStateRef.current);
+    }, 5_000);
+    return () => window.clearInterval(timer);
+  }, [synchronizePlayback]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -2010,7 +2492,7 @@ function SyncedPlayer({
           );
           pinControls();
         }}
-        onEnded={() => void send({ paused: true, position: duration })}
+        onEnded={() => { if (onEnded) void send({ paused: true, position: duration }).then(onEnded); }}
         onPlay={revealControls}
         onPause={pinControls}
         onDoubleClick={fullscreen}

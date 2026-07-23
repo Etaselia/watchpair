@@ -79,8 +79,8 @@ test("production session API supports join-in-progress state", async () => {
   assert.equal(joinedResponse.status, 200);
 
   const queuedSources = [
-    { kind: "magnet", value: "magnet:?xt=urn:btih:1111111111111111111111111111111111111111", label: "Episode 1" },
-    { kind: "magnet", value: "magnet:?xt=urn:btih:2222222222222222222222222222222222222222", label: "Episode 2" },
+    { id: "source-episode-one", kind: "magnet", value: "magnet:?xt=urn:btih:1111111111111111111111111111111111111111", label: "Episode 1" },
+    { id: "source-episode-two", kind: "magnet", value: "magnet:?xt=urn:btih:2222222222222222222222222222222222222222", label: "Episode 2" },
   ];
   let queueSession;
   for (const source of queuedSources) {
@@ -100,6 +100,7 @@ test("production session API supports join-in-progress state", async () => {
   }
   assert.equal(queueSession.sources.length, 2);
   assert.deepEqual(queueSession.sources.map((source) => source.label), ["Episode 1", "Episode 2"]);
+  assert.deepEqual(queueSession.sources.map((source) => source.id), ["source-episode-one", "source-episode-two"]);
 
   const playerResponse = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
     method: "POST",
@@ -157,6 +158,40 @@ test("production session API supports join-in-progress state", async () => {
     snapshot.session.participants.map((participant) => participant.deviceId),
     ["test-host", "test-guest"],
   );
+
+  const mutate = async (action, values) => {
+    const response = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        action,
+        token: created.session.token,
+        deviceId: "test-host",
+        name: "Host",
+        ...values,
+      }),
+    });
+    assert.equal(response.status, 200);
+    return (await response.json()).session;
+  };
+
+  const renamed = await mutate("rename-source", {
+    sourceId: "source-episode-one",
+    label: "Pilot",
+  });
+  assert.equal(renamed.sources[0].label, "Pilot");
+
+  const reordered = await mutate("reorder-sources", {
+    sourceIds: ["source-episode-two", "source-episode-one"],
+  });
+  assert.deepEqual(reordered.sources.map((source) => source.id), ["source-episode-two", "source-episode-one"]);
+
+  const removed = await mutate("remove-source", { sourceId: "source-episode-one" });
+  assert.deepEqual(removed.sources.map((source) => source.id), ["source-episode-two"]);
+
+  const cleared = await mutate("remove-source", { sourceId: "source-episode-two" });
+  assert.equal(cleared.selectedMedia, null);
+  assert.equal(cleared.sources.length, 0);
 });
 
 test("ships the coordination and companion surfaces", async () => {
@@ -172,10 +207,14 @@ test("ships the coordination and companion surfaces", async () => {
 
   assert.match(app, /Watch together/);
   assert.match(app, /action: "create",\s+deviceId,\s+name: displayName/);
-  assert.match(app, /getAgentDownload/);
+  assert.match(app, /getAgentDownloads/);
   assert.match(app, /Download queue/);
-  assert.match(app, /watchpair-companion\.zip\?v=0\.3\.0/);
+  assert.match(app, /watchpair-companion\.zip\?v=0\.4\.0/);
   assert.match(app, /queueReadinessForJob/);
+  assert.match(app, /uploadAndSeedAgentFile/);
+  assert.match(app, /downloadMode === "automatic"/);
+  assert.match(app, /synchronizePlayback/);
+  assert.match(app, /5_000/);
   assert.match(app, /subtitleOffset/);
   assert.match(app, /autoOpenedMediaRef/);
   assert.match(app, /window\.setInterval\(keepAlive, 8_000\)/);
@@ -190,13 +229,20 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(route, /action === "heartbeat"/);
   assert.match(route, /action === "player"/);
   assert.match(route, /action === "select-media"/);
+  assert.match(route, /action === "remove-source"/);
+  assert.match(route, /action === "reorder-sources"/);
+  assert.match(route, /action === "rename-source"/);
   assert.match(route, /normalizeSources/);
   assert.match(route, /stableParticipants/);
   assert.match(agent, /new WebTorrent/);
   assert.match(agent, /content-range/);
   assert.match(agent, /audioTracks/);
   assert.match(agent, /renderAudioPlayback/);
+  assert.match(agent, /receiveImportChunk/);
+  assert.match(agent, /seedLocalFile/);
+  assert.match(agent, /restoreJobs/);
   assert.match(agentClient, /loopback-network/);
+  assert.match(agentClient, /getAgentDownloads/);
   assert.match(agentClient, /getAgentPermissionState/);
   assert.match(media, /fingerprintFile/);
   assert.match(packageJson, /"agent": "node agent\/server\.mjs"/);
@@ -212,6 +258,7 @@ test("packages the pairable magnet and subtitle companion", async () => {
     "WatchPair Companion/server.mjs",
     "WatchPair Companion/hls-playback.mjs",
     "WatchPair Companion/hardware-acceleration.mjs",
+    "WatchPair Companion/job-store.mjs",
     "WatchPair Companion/torrent-input.mjs",
     "WatchPair Companion/webtorrent-safety.mjs",
     "WatchPair Companion/package.json",

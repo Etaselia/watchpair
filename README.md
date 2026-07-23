@@ -14,7 +14,10 @@ subtitle timing synchronized.
   fallback for CORS-enabled URLs
 - Magnet-first page resolution through the local companion, including encoded links
 - Concurrent queued magnet, `.torrent`, and direct downloads through the local companion
-- Synchronized queue and torrent file selection with background download priority
+- Synchronized queue and torrent file selection with remove, rename, reorder, retry, and auto-advance
+- Per-device automatic, manual, or external-client download policy
+- Resumable local-file imports that publish a room-only magnet and seed from the companion
+- Persistent companion jobs and configurable external download-library folders
 - Per-device progress and a both-ready gate before shared playback
 - Server-authoritative play, pause, seek, speed, language, subtitle, and offset
   state
@@ -39,7 +42,7 @@ local file + range stream                                        local file + ra
 
 The coordinator stores only session metadata and playback state. Video bytes
 stay on participant machines. A session token is a bearer secret and expires
-after 24 hours.
+seven days after its last participant heartbeat.
 
 ## Local development
 
@@ -78,6 +81,10 @@ npm run agent
 - `WATCHPAIR_ORIGINS` pre-approves a comma-separated list of coordinator origins.
   Normal users approve the current website through the local pairing page instead.
 - `WATCHPAIR_AGENT_PORT` changes the localhost port.
+- `WATCHPAIR_LIBRARY_DIRS` adds external-client download folders, separated by
+  the platform path delimiter (`;` on Windows and `:` on macOS/Linux).
+- `WATCHPAIR_TRACKERS` sets comma-separated trackers for locally published torrents.
+  With no override, WebTorrent's standard discovery settings are used.
 - `WATCHPAIR_FFMPEG_PATH` selects a specific GPU-capable FFmpeg executable.
 - `WATCHPAIR_TRANSCODER` accepts `auto`, `cpu`, `nvenc`, `qsv`, `vaapi`,
   `amf`, or `videotoolbox`. The companion validates the requested encoder with
@@ -123,7 +130,11 @@ npm run lint
   Image-based PGS/VobSub tracks cannot be rendered as browser text. Video and
   audio codec support still depends on the browser; remux or transcode releases
   that use unsupported codecs.
-- Magnet use exposes each downloader to the torrent swarm. Use content you have
+- Magnet use exposes each downloader to the torrent swarm. Locally published files
+  never pass through the coordinator, but peers and configured trackers can see IP
+  addresses and anyone holding the magnet can join the swarm. Use content you have
   the legal right to download and share.
+- Companion jobs, local seeds, and direct-download records are restored from
+  `downloads/.watchpair-jobs.json` after restart.
 - The companion blocks obvious private-network direct-download targets and
   accepts browser requests only from configured origins.

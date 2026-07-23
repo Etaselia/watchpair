@@ -123,18 +123,27 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
     assert.equal(preparation.encoder.id, "cpu");
     assert.equal(preparation.fallback, true);
 
-    const probe = JSON.parse(
+    assert.ok((await stat(masterAsset.filePath)).size > 0);
+    const probeAsset = async (filePath) => JSON.parse(
       (
         await runFile(ffprobeStatic.path, [
           "-v", "error",
           "-print_format", "json",
           "-show_streams",
-          masterAsset.filePath,
+          filePath,
         ])
       ).stdout
     );
-    assert.ok(probe.streams.some((stream) => stream.codec_name === "h264"));
-    assert.ok(probe.streams.some((stream) => stream.codec_name === "aac"));
+    const [videoInit, audioInit] = await Promise.all([
+      manager.getAsset(descriptor, "video/init.mp4"),
+      manager.getAsset(descriptor, "audio/1/init.mp4"),
+    ]);
+    const [videoProbe, audioProbe] = await Promise.all([
+      probeAsset(videoInit.filePath),
+      probeAsset(audioInit.filePath),
+    ]);
+    assert.ok(videoProbe.streams.some((stream) => stream.codec_name === "h264"));
+    assert.ok(audioProbe.streams.some((stream) => stream.codec_name === "aac"));
     manager.shutdown();
 
     const cachedManager = createHlsPlaybackManager({

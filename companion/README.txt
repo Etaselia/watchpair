@@ -36,6 +36,14 @@ override automatic selection. A failed GPU encode retries with CPU encoding.
 
 Downloads are saved in the downloads folder by default. Queued downloads run
 concurrently; completed videos are prepared for browser playback one at a time
-in the background. The companion listens only on 127.0.0.1:41735. Websites
-cannot use it until you explicitly approve their origin on the local pairing
-page. Approved origins are stored in ~/.watchpair/companion.json.
+in the background. Jobs and local seeds resume after restart. WatchPair can also
+publish a selected local file as a torrent; its bytes remain between participant
+computers, while torrent peers and trackers can see their IP addresses.
+
+Set WATCHPAIR_LIBRARY_DIRS to additional external-client download folders,
+separated by ; on Windows or : on macOS/Linux. Set WATCHPAIR_TRACKERS to a
+comma-separated tracker list for locally published torrents.
+
+The companion listens only on 127.0.0.1:41735. Websites cannot use it until you
+explicitly approve their origin on the local pairing page. Approved origins are
+stored in ~/.watchpair/companion.json.
