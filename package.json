@@ -13,7 +13,6 @@
     "start": "vinext start",
     "test": "npm run build && node --test tests/*.test.mjs",
     "lint": "eslint . --max-warnings=0 --ignore-pattern dist --ignore-pattern .next",
-    "db:generate": "drizzle-kit generate",
     "agent": "node agent/server.mjs",
     "typecheck": "tsc --noEmit",
     "build:companion": "node scripts/build-companion.mjs",
@@ -25,7 +24,6 @@
   },
   "dependencies": {
     "cheerio": "^1.2.0",
-    "drizzle-orm": "0.45.2",
     "ffmpeg-static": "^5.3.0",
     "ffprobe-static": "^3.1.0",
     "hls.js": "^1.6.16",
@@ -44,7 +42,6 @@
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.4",
     "@vitejs/plugin-rsc": "0.5.30",
-    "drizzle-kit": "0.31.10",
     "eslint": "9.39.4",
     "eslint-config-next": "16.2.11",
     "fflate": "^0.8.3",
