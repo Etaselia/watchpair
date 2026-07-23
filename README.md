@@ -54,7 +54,7 @@ seven days after its last participant heartbeat.
 
 ## Local development
 
-Requirements: Node.js 22.13 or newer. Node.js 24 LTS is recommended.
+Requirements: Node.js 24 or newer.
 
 ```bash
 npm install

@@ -3,13 +3,13 @@ set -eu
 cd "$(dirname "$0")"
 
 if ! command -v node >/dev/null 2>&1; then
-  echo "Install Node.js 22.13 or newer, then run this file again."
+  echo "Install Node.js 24 or newer, then run this file again."
   exit 1
 fi
 
 major="$(node -p 'process.versions.node.split(".")[0]')"
-if [ "$major" -lt 22 ]; then
-  echo "WatchPair Companion requires Node.js 22.13 or newer."
+if [ "$major" -lt 24 ]; then
+  echo "WatchPair Companion requires Node.js 24 or newer."
   exit 1
 fi
 

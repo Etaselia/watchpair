@@ -16,6 +16,7 @@ import WebTorrent from "webtorrent";
 import { createHlsPlaybackManager, streamHlsAsset } from "./hls-playback.mjs";
 import { publicTranscoder, selectTranscodeRuntime } from "./hardware-acceleration.mjs";
 import { createJsonStore } from "./job-store.mjs";
+import { fingerprintPath } from "./media-fingerprint.mjs";
 import { isSupportedMagnet } from "./torrent-input.mjs";
 import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, verifiedTorrentFileProgress } from "./webtorrent-safety.mjs";
 
@@ -362,6 +363,55 @@ function selectedFileKey(job) {
   return String(job.selectedIndex) + ":" + media.name + ":" + media.size;
 }
 
+async function identifySelectedFile(job, index = job.selectedIndex) {
+  if (index === null || index !== job.selectedIndex) return null;
+  const selectionKey = selectedFileKey(job);
+  if (job.identityFingerprint && job.identityFingerprintKey === selectionKey) {
+    return job.identityFingerprint;
+  }
+  if (job.identityFingerprintPromise && job.identityFingerprintPromiseKey === selectionKey) {
+    return job.identityFingerprintPromise;
+  }
+
+  let promise;
+  promise = fingerprintPath(jobFile(job, index).path)
+    .then((fingerprint) => {
+      if (job.selectedIndex === index && selectedFileKey(job) === selectionKey) {
+        job.identityFingerprint = fingerprint;
+        job.identityFingerprintKey = selectionKey;
+        job.updatedAt = Date.now();
+        persistJobs();
+      }
+      return fingerprint;
+    })
+    .finally(() => {
+      if (job.identityFingerprintPromise === promise) {
+        job.identityFingerprintPromise = null;
+        job.identityFingerprintPromiseKey = null;
+      }
+    });
+  job.identityFingerprintPromise = promise;
+  job.identityFingerprintPromiseKey = selectionKey;
+  return promise;
+}
+
+async function completeSelectedFile(job, index = job.selectedIndex) {
+  if (index === null || index !== job.selectedIndex) return;
+  try {
+    await identifySelectedFile(job, index);
+    if (index !== job.selectedIndex) return;
+    job.status = "ready";
+    job.updatedAt = Date.now();
+    void queueSubtitleProbe(job);
+    queueBackgroundPreparation(job);
+  } catch (error) {
+    if (index !== job.selectedIndex) return;
+    job.status = "error";
+    job.error = error instanceof Error ? error.message : "Could not identify the completed media file.";
+    job.updatedAt = Date.now();
+  }
+}
+
 function selectTorrentFile(job, index) {
   const file = job.torrent?.files[index];
   if (!file) throw new Error("Torrent file not found.");
@@ -371,6 +421,8 @@ function selectTorrentFile(job, index) {
     else item.deselect();
   });
   job.selectedIndex = index;
+  job.identityFingerprint = null;
+  job.identityFingerprintKey = null;
   job.audioTracks = [];
   job.subtitleTracks = [];
   job.videoCodec = null;
@@ -378,12 +430,9 @@ function selectTorrentFile(job, index) {
   job.subtitleError = null;
   job.subtitleProbeKey = null;
   job.preparation = { status: "waiting", error: null, encoder: null, fallback: false };
-  job.status = file.done ? "ready" : "downloading";
+  job.status = "downloading";
   job.updatedAt = Date.now();
-  if (file.done) {
-    void queueSubtitleProbe(job);
-    queueBackgroundPreparation(job);
-  }
+  if (file.done) void completeSelectedFile(job, index);
 }
 
 function jobFile(job, index) {
@@ -674,13 +723,11 @@ function startTorrent(job) {
     torrent.files.forEach((file, index) => {
       file.on("done", () => {
         if (job.selectedIndex !== index) return;
-        job.status = "ready";
-        job.updatedAt = Date.now();
-        void queueSubtitleProbe(job);
-        queueBackgroundPreparation(job);
+        void completeSelectedFile(job, index);
       });
     });
-    job.status = torrent.files[job.selectedIndex]?.done ? "ready" : "downloading";
+    job.status = "downloading";
+    if (torrent.files[job.selectedIndex]?.done) void completeSelectedFile(job);
     job.updatedAt = Date.now();
   });
   torrent.on("download", () => {
@@ -688,10 +735,7 @@ function startTorrent(job) {
     job.updatedAt = Date.now();
   });
   torrent.on("done", () => {
-    job.status = "ready";
-    job.updatedAt = Date.now();
-    void queueSubtitleProbe(job);
-    queueBackgroundPreparation(job);
+    void completeSelectedFile(job);
   });
   torrent.on("warning", (error) => {
     job.warning = error.message;
@@ -739,6 +783,9 @@ async function startDirect(job) {
     job.file.size = completed.size;
     job.downloaded = completed.size;
     job.selectedIndex = 0;
+    job.identityFingerprint = null;
+    job.identityFingerprintKey = null;
+    await identifySelectedFile(job);
     job.status = "ready";
     job.updatedAt = Date.now();
     await queueSubtitleProbe(job);
@@ -760,6 +807,9 @@ function createJob(source) {
     seed: Boolean(source.seed),
     seedPath: source.seedPath || null,
     identityFingerprint: source.identityFingerprint || null,
+    identityFingerprintKey: source.identityFingerprintKey || null,
+    identityFingerprintPromise: null,
+    identityFingerprintPromiseKey: null,
     status: "queued",
     error: null,
     downloaded: 0,
@@ -799,6 +849,7 @@ function persistedJobs() {
     seed: Boolean(job.seed),
     seedPath: job.seedPath,
     identityFingerprint: job.identityFingerprint,
+    identityFingerprintKey: job.identityFingerprintKey,
     selectedIndex: job.selectedIndex,
     file: job.file
       ? { name: job.file.name, size: job.file.size, path: job.file.path, type: job.file.type }
@@ -901,6 +952,8 @@ async function seedLocalFile({ id, filePath, label }) {
   job.selectedIndex = 0;
   job.downloaded = info.size;
   job.seedStartedAt = Date.now();
+  job.identityFingerprint = await fingerprintPath(resolvedPath);
+  job.identityFingerprintKey = "0:" + path.basename(resolvedPath) + ":" + info.size;
 
   const options = {
     pieceLength: 1024 * 1024,
@@ -1034,7 +1087,7 @@ async function scanLibrary(queryValue) {
   return results.sort((left, right) => left.name.localeCompare(right.name));
 }
 
-async function attachLibraryFile({ id, entry, label, identityFingerprint }) {
+async function attachLibraryFile({ id, entry, label }) {
   validJobId(id);
   if (jobs.has(id)) await stopJob(id);
   const info = await stat(entry.path);
@@ -1043,9 +1096,7 @@ async function attachLibraryFile({ id, entry, label, identityFingerprint }) {
     kind: "direct",
     value: entry.path,
     label: label || entry.name,
-    identityFingerprint,
   });
-  job.identityFingerprint = String(identityFingerprint || "").slice(0, 160) || null;
   job.file = {
     name: entry.name,
     size: info.size,
@@ -1054,6 +1105,8 @@ async function attachLibraryFile({ id, entry, label, identityFingerprint }) {
   };
   job.downloaded = info.size;
   job.selectedIndex = 0;
+  job.identityFingerprint = await fingerprintPath(entry.path);
+  job.identityFingerprintKey = selectedFileKey(job);
   job.status = "ready";
   job.updatedAt = Date.now();
   void queueSubtitleProbe(job);
@@ -1107,6 +1160,9 @@ async function restoreJobs() {
         job.file = { ...record.file, size: info.size };
         job.downloaded = info.size;
         job.selectedIndex = 0;
+        job.identityFingerprint = null;
+        job.identityFingerprintKey = null;
+        await identifySelectedFile(job);
         job.status = "ready";
         void queueSubtitleProbe(job);
         queueBackgroundPreparation(job);
@@ -1486,7 +1542,6 @@ const server = createServer(async (request, response) => {
         id: validJobId(body.sourceId),
         entry,
         label: body.label || entry.name,
-        identityFingerprint: body.identityFingerprint,
       });
       sendJson(response, 201, { job: snapshot(job) }, headers);
       return;

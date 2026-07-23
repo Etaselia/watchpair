@@ -47,6 +47,7 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
         ...process.env,
         WATCHPAIR_AGENT_PORT: String(agentPort),
         WATCHPAIR_ALLOW_PRIVATE_DOWNLOADS: "1",
+        WATCHPAIR_TORRENT_PORT: "0",
         WATCHPAIR_CONFIG_PATH: path.join(directory, "companion.json"),
         WATCHPAIR_DOWNLOAD_DIR: path.join(directory, "downloads"),
         WATCHPAIR_FFMPEG_PATH: ffmpegPath,

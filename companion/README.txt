@@ -14,7 +14,7 @@ the bundled private Node runtime through Windows Firewall when prompted; blockin
 it can prevent other participants from reaching local torrent seeds.
 
 macOS / Linux
-Install Node.js 22.13 or newer, then run:
+Install Node.js 24 or newer, then run:
   chmod +x install-and-start.sh
   ./install-and-start.sh
 

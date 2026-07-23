@@ -25,6 +25,7 @@ test("a companion-published local file is discoverable and serves every byte", {
       ...process.env,
       WATCHPAIR_AGENT_PORT: String(agentPort),
       WATCHPAIR_CONFIG_PATH: path.join(directory, "companion.json"),
+      WATCHPAIR_TORRENT_PORT: "0",
       WATCHPAIR_DOWNLOAD_DIR: path.join(directory, "downloads"),
       WATCHPAIR_TRACKERS: trackerUrl,
       WATCHPAIR_TRANSCODER: "cpu",

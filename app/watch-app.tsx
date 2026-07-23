@@ -123,12 +123,12 @@ async function sessionRequest(payload: Record<string, unknown>) {
 
 function sameSelectedFile(session: WatchSession, readiness: LocalReadiness) {
   if (!session.selectedMedia || !readiness.fileName) return true;
+  if (session.selectedMedia.fingerprint && readiness.fingerprint) {
+    return session.selectedMedia.fingerprint === readiness.fingerprint;
+  }
   return (
     session.selectedMedia.name === readiness.fileName &&
-    session.selectedMedia.size === readiness.fileSize &&
-    (!session.selectedMedia.fingerprint ||
-      !readiness.fingerprint ||
-      session.selectedMedia.fingerprint === readiness.fingerprint)
+    session.selectedMedia.size === readiness.fileSize
   );
 }
 
@@ -165,11 +165,13 @@ function queueReadinessForJob(job: AgentJob, file: AgentFile | null): QueueReadi
     };
   }
 
-  const fingerprint = job.identityFingerprint || `${job.infoHash || job.id}:${file.index}:${file.size}`;
+  const fingerprint = job.identityFingerprint;
   const status = job.status === "error"
     ? job.error || "Download failed"
     : !file.ready
       ? job.status === "metadata" ? "Reading torrent metadata" : "Downloading locally"
+      : !fingerprint
+        ? "Verifying file identity"
       : preparation === "error"
         ? job.preparation.error || "Browser preparation failed"
         : preparation === "queued"
@@ -179,7 +181,7 @@ function queueReadinessForJob(job: AgentJob, file: AgentFile | null): QueueReadi
             : "Ready to watch";
 
   return {
-    ready: file.ready && (preparation === "ready" || preparation === "direct"),
+    ready: file.ready && Boolean(fingerprint) && (preparation === "ready" || preparation === "direct"),
     progress: file.progress,
     status,
     fileName: file.name,
@@ -1110,6 +1112,17 @@ export default function WatchApp() {
       setReadiness(next);
       if (activeFile?.ready) setMediaUrl(activeFile.hlsUrl || activeFile.streamUrl);
       else if (mediaUrlRef.current.startsWith(AGENT_URL)) setMediaUrl("");
+      if (
+        next.ready &&
+        next.fingerprint &&
+        activeFile &&
+        selectedMedia?.sourceId === activeSourceId &&
+        selectedMedia.fingerprint !== next.fingerprint
+      ) {
+        await sendAction("select-media", {
+          media: { ...selectedMedia, fingerprint: next.fingerprint },
+        });
+      }
       if (becameReady) await sendAction("heartbeat", { readiness: next });
     };
 
@@ -1259,7 +1272,7 @@ export default function WatchApp() {
           fileIndex: file.index,
           name: file.name,
           size: file.size,
-          fingerprint: selectedJob.identityFingerprint || `${selectedJob.infoHash || sourceId}:${file.index}:${file.size}`,
+          fingerprint: selectedJob.identityFingerprint || undefined,
         },
       });
       const item = queueReadinessForJob(
@@ -1376,16 +1389,7 @@ export default function WatchApp() {
     try {
       const source = activeSource;
       if (source) {
-        const selected = session?.selectedMedia?.sourceId === source.id ? session.selectedMedia : null;
-        const match = source.value.match(/urn:btih:([a-zA-Z0-9]+)/i);
-        const identityFingerprint = selected?.fingerprint ||
-          (match ? `${match[1].toLowerCase()}:${selected?.fileIndex || 0}:${libraryFile.size}` : undefined);
-        const job = await attachAgentLibraryFile(
-          source.id,
-          libraryFile.id,
-          libraryFile.name,
-          identityFingerprint
-        );
+        const job = await attachAgentLibraryFile(source.id, libraryFile.id, libraryFile.name);
         setAgentJobs((current) => ({ ...current, [source.id]: job }));
         const target = preferredAgentFile(job);
         if (target) await chooseAgentMedia(source.id, job, target);

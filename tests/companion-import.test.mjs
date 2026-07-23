@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -24,6 +25,7 @@ test("imports, seeds, restores, and stops a local companion file", { timeout: 30
         ...process.env,
         WATCHPAIR_AGENT_PORT: String(agentPort),
         WATCHPAIR_CONFIG_PATH: path.join(directory, "companion.json"),
+        WATCHPAIR_TORRENT_PORT: "0",
         WATCHPAIR_DOWNLOAD_DIR: path.join(directory, "downloads"),
         WATCHPAIR_FFMPEG_PATH: ffmpegPath,
         WATCHPAIR_TRANSCODER: "cpu",
@@ -88,6 +90,13 @@ test("imports, seeds, restores, and stops a local companion file", { timeout: 30
     assert.equal(seeded.job.creationProgress, 100);
     assert.match(seeded.job.magnetURI, /^magnet:\?xt=urn:btih:/i);
     assert.equal(seeded.job.files[0].size, bytes.length);
+    const expectedFingerprint = createHash("sha256")
+      .update(bytes.subarray(0, 512 * 1024))
+      .update(bytes.subarray(bytes.length - 512 * 1024))
+      .update(String(bytes.length))
+      .digest("hex")
+      .slice(0, 32);
+    assert.equal(seeded.job.identityFingerprint, expectedFingerprint);
 
     const bulk = await (await fetch(base + "/downloads")).json();
     assert.equal(bulk.jobs.length, 1);
@@ -109,6 +118,7 @@ test("imports, seeds, restores, and stops a local companion file", { timeout: 30
     );
     assert.equal(restored.job.files[0].size, bytes.length);
 
+    assert.equal(restored.job.identityFingerprint, expectedFingerprint);
     const stopped = await fetch(base + "/downloads/" + sourceId, { method: "DELETE" });
     assert.equal(stopped.status, 200);
     const afterStop = await (await fetch(base + "/downloads")).json();

@@ -56,6 +56,7 @@ test("waits for a verified torrent before probing and preparing initial HLS segm
         ...process.env,
         WATCHPAIR_AGENT_PORT: String(agentPort),
         WATCHPAIR_CONFIG_PATH: path.join(directory, "companion.json"),
+        WATCHPAIR_TORRENT_PORT: "0",
         WATCHPAIR_DOWNLOAD_DIR: path.join(directory, "downloads"),
         WATCHPAIR_FFMPEG_PATH: ffmpegPath,
         WATCHPAIR_TRANSCODER: "cpu",

@@ -271,7 +271,7 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /const COMPANION_VERSION = "\d+\.\d+\.\d+"; \/\/ x-release-please-version/);
   assert.match(app, /watchpair-companion\.zip\?v=\$\{COMPANION_VERSION\}/);
   assert.match(app, /queueReadinessForJob/);
-  assert.match(app, /file\.ready && \(preparation === "ready" \|\| preparation === "direct"\)/);
+  assert.match(app, /file\.ready && Boolean\(fingerprint\) && \(preparation === "ready" \|\| preparation === "direct"\)/);
   assert.match(app, /GPU decode/);
   assert.match(app, /uploadAndSeedAgentFile/);
   assert.match(app, /Seeding \/ waiting for peers/);

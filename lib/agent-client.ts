@@ -238,14 +238,13 @@ export async function seedAgentLibraryFile(sourceId: string, libraryId: string, 
 export async function attachAgentLibraryFile(
   sourceId: string,
   libraryId: string,
-  label: string,
-  identityFingerprint?: string
+  label: string
 ) {
   const result = await agentFetch<{ job: AgentJob }>(
     `/library/${encodeURIComponent(libraryId)}/attach`,
     {
       method: "POST",
-      body: JSON.stringify({ sourceId, label, identityFingerprint }),
+      body: JSON.stringify({ sourceId, label }),
     }
   );
   return result.job;
