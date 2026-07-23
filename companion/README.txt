@@ -38,10 +38,12 @@ with CPU decoding; a failed GPU encode then retries full CPU encoding.
 
 Downloads are saved in the downloads folder by default. Queued downloads run
 concurrently. A torrent is fully downloaded and verified before FFprobe or FFmpeg
-starts. Playback unlocks after the initial HLS segments without waiting for the
-remaining conversion. Jobs and local seeds resume after restart. WatchPair can also
-publish a selected local file as a torrent; its bytes remain between participant
-computers, while torrent peers and trackers can see their IP addresses.
+starts. Playback unlocks after a contiguous two-minute window from the beginning
+is ready (or the whole file when shorter), without waiting for the remaining
+conversion. Jobs and local seeds resume after restart. WatchPair can also publish a
+selected local file as a torrent; hashing progress is shown and network announce
+delays do not block magnet creation. Its bytes remain between participant computers,
+while torrent peers and trackers can see their IP addresses.
 
 Set WATCHPAIR_LIBRARY_DIRS to additional external-client download folders,
 separated by ; on Windows or : on macOS/Linux. Set WATCHPAIR_TRACKERS to a

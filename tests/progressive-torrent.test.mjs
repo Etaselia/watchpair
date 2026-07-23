@@ -156,7 +156,7 @@ async function waitForJson(url, timeout, ready, exited) {
       lastBody = body;
       if (response.ok && ready(body)) return body;
     } catch {
-      // The service, torrent metadata, download, or initial HLS segment is still pending.
+      // The service, verified download, or opening HLS window is still pending.
     }
     if (exited()) throw new Error("Companion exited before post-download preparation became ready");
     await new Promise((resolve) => setTimeout(resolve, 100));

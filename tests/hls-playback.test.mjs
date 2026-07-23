@@ -83,6 +83,7 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
         arguments: ["-c:v", "watchpair_missing_encoder"],
       },
       segmentSeconds: 2,
+      playableSeconds: 4,
       playlistWaitMs: 15_000,
     });
 
@@ -112,9 +113,12 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
     ]);
     assert.match(video, /#EXT-X-PLAYLIST-TYPE:EVENT/);
     assert.match(video, /segment-000000\.m4s/);
+    assert.match(video, /segment-000001\.m4s/);
     assert.doesNotMatch(video, /#EXT-X-ENDLIST/, "playback should unlock before conversion finishes");
     assert.match(japanese, /segment-000000\.m4s/);
+    assert.match(japanese, /segment-000001\.m4s/);
     assert.match(english, /segment-000000\.m4s/);
+    assert.match(english, /segment-000001\.m4s/);
 
     for (let attempt = 0; attempt < 200; attempt += 1) {
       const playlists = await Promise.all([

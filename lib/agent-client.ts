@@ -12,8 +12,26 @@ export async function getAgentPermissionState(): Promise<AgentPermissionState> {
     } catch {
       // Try the permission name used by the previous Chrome generation.
     }
+
   }
   return "unsupported";
+}
+
+async function waitForAgentSeed(
+  sourceId: string,
+  onProgress?: (progress: number) => void,
+  signal?: AbortSignal
+) {
+  while (true) {
+    if (signal?.aborted) throw new DOMException("Torrent creation cancelled", "AbortError");
+    const job = await getAgentDownload(sourceId);
+    onProgress?.(100 + Math.min(100, Math.max(0, job.creationProgress || 0)));
+    if (job.status === "error") throw new Error(job.error || "Could not create the torrent.");
+    if (job.status === "ready" && job.magnetURI) {
+      return { job, magnetURI: job.magnetURI };
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 500));
+  }
 }
 
 export interface AgentFile {
@@ -78,6 +96,7 @@ export interface AgentJob {
   peers: number;
   uploadSpeed: number;
   uploaded: number;
+  creationProgress: number;
   identityFingerprint: string | null;
   error: string | null;
   subtitleStatus: "waiting" | "probing" | "ready" | "error";
@@ -196,13 +215,16 @@ export async function scanAgentLibrary(query = "") {
 }
 
 export async function seedAgentLibraryFile(sourceId: string, libraryId: string, label: string) {
-  return agentFetch<{ job: AgentJob; magnetURI: string }>(
+  const pending = await agentFetch<{ job: AgentJob; magnetURI: string | null }>(
     `/library/${encodeURIComponent(libraryId)}/seed`,
     {
       method: "POST",
       body: JSON.stringify({ sourceId, label }),
     }
   );
+  return pending.magnetURI
+    ? { job: pending.job, magnetURI: pending.magnetURI }
+    : waitForAgentSeed(sourceId);
 }
 
 export async function attachAgentLibraryFile(
@@ -252,7 +274,7 @@ export async function uploadAndSeedAgentFile(
       onProgress(file.size ? (offset / file.size) * 100 : 100);
     }
 
-    return await agentFetch<{ job: AgentJob; magnetURI: string }>(
+    const pending = await agentFetch<{ job: AgentJob; magnetURI: string | null }>(
       `/imports/${encodeURIComponent(sourceId)}/seed`,
       {
         method: "POST",
@@ -260,6 +282,9 @@ export async function uploadAndSeedAgentFile(
         signal,
       }
     );
+    return pending.magnetURI
+      ? { job: pending.job, magnetURI: pending.magnetURI }
+      : waitForAgentSeed(sourceId, onProgress, signal);
   } catch (error) {
     if (signal?.aborted) {
       void agentFetch<{ ok: boolean }>(

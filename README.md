@@ -121,11 +121,12 @@ npm run lint
 ## Operational notes
 
 - Browsers may require one click before a remote play command can start media.
-- Browser-incompatible files are prepared as progressive HLS. Playback starts from the first
-  four-second segments while the remaining video is encoded in the background.
+- Browser-incompatible files are prepared as progressive HLS. Playback unlocks when a contiguous
+  two-minute window from the start is ready (or the whole file for shorter videos), while the
+  remaining video continues encoding in the background.
 - Torrent files are fully downloaded and verified before FFprobe, subtitle discovery, or FFmpeg
-  preparation begins. The room then unlocks after each participant has initial HLS segments,
-  without waiting for the remaining conversion.
+  preparation begins. Local torrent creation runs in the background and reports hashing progress;
+  tracker or DHT announce delays do not block publishing the magnet.
 - Video is encoded once and embedded audio languages are exposed as separate AAC renditions.
   NVIDIA systems use CUDA decoding and NVENC encoding when both work for the selected file.
   Other supported GPU encoders accelerate encoding; the bundled FFmpeg is the universal CPU fallback.

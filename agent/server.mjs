@@ -563,6 +563,7 @@ function snapshot(job) {
     peers: job.torrent?.numPeers || 0,
     uploadSpeed: job.torrent?.uploadSpeed || 0,
     uploaded: job.torrent?.uploaded || 0,
+    creationProgress: job.torrentCreationProgress || 0,
     identityFingerprint: job.identityFingerprint || null,
     error: job.error || null,
     subtitleStatus: job.subtitleStatus,
@@ -722,6 +723,7 @@ function createJob(source) {
     peerFailures: 0,
     peersRejected: 0,
     audioRenderPromises: new Map(),
+    torrentCreationProgress: 0,
     preparation: { status: "waiting", error: null, encoder: null, fallback: false },
     updatedAt: Date.now(),
   };
@@ -840,13 +842,25 @@ async function seedLocalFile({ id, filePath, label }) {
   job.selectedIndex = 0;
   job.downloaded = info.size;
 
-  const options = { pieceLength: 1024 * 1024 };
+  const options = {
+    pieceLength: 1024 * 1024,
+    onProgress(hashed, total) {
+      job.torrentCreationProgress = total > 0
+        ? Math.min(100, Math.round((hashed / total) * 1000) / 10)
+        : 0;
+      job.updatedAt = Date.now();
+    },
+  };
   if (TRACKERS.length) options.announce = TRACKERS;
-  await new Promise((resolve, reject) => {
-    const torrent = client.seed(resolvedPath, options, (readyTorrent) => {
+  try {
+    let published = false;
+    const publish = (readyTorrent) => {
+      if (published || !readyTorrent.infoHash || !readyTorrent.torrentFile) return;
+      published = true;
       job.torrent = readyTorrent;
       job.value = readyTorrent.magnetURI;
       job.status = "ready";
+      job.torrentCreationProgress = 100;
       job.updatedAt = Date.now();
       const torrentPath = path.join(path.dirname(resolvedPath), ".watchpair-" + id + ".torrent");
       void writeFile(torrentPath, readyTorrent.torrentFile).catch((error) => {
@@ -855,17 +869,22 @@ async function seedLocalFile({ id, filePath, label }) {
       void queueSubtitleProbe(job);
       queueBackgroundPreparation(job);
       persistJobs();
-      resolve();
-    });
+    };
+    const torrent = client.seed(resolvedPath, options, publish);
     job.torrent = torrent;
-    torrent.once("error", reject);
+    torrent.once("metadata", () => publish(torrent));
+    torrent.once("error", (error) => {
+      job.status = "error";
+      job.error = error.message;
+      job.updatedAt = Date.now();
+    });
     torrent.on("upload", () => {
       job.updatedAt = Date.now();
     });
-  }).catch((error) => {
+  } catch (error) {
     jobs.delete(id);
     throw error;
-  });
+  }
 
   return job;
 }
@@ -1303,7 +1322,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/health") {
       sendJson(response, 200, {
         ok: true,
-        version: "0.4.2",
+        version: "0.4.3",
         downloadDirectory: DOWNLOAD_DIR,
         jobs: jobs.size,
         transcoder: TRANSCODER,

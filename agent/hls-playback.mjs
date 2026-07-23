@@ -9,9 +9,10 @@ import {
   videoEncoderArguments,
 } from "./hardware-acceleration.mjs";
 
-const CACHE_VERSION = "hls-v3";
+const CACHE_VERSION = "hls-v4";
 const DEFAULT_SEGMENT_SECONDS = 4;
-const PLAYLIST_WAIT_MS = 60_000;
+const DEFAULT_PLAYABLE_SECONDS = 120;
+const PLAYLIST_WAIT_MS = 15 * 60_000;
 
 function quoted(value) {
   return String(value || "")
@@ -98,6 +99,7 @@ export function createHlsPlaybackManager({
   cacheRoot,
   encoder = CPU_ENCODER,
   segmentSeconds = DEFAULT_SEGMENT_SECONDS,
+  playableSeconds = DEFAULT_PLAYABLE_SECONDS,
   playlistWaitMs = PLAYLIST_WAIT_MS,
 }) {
   const sessions = new Map();
@@ -286,19 +288,23 @@ export function createHlsPlaybackManager({
       });
     void state.done.catch(() => {});
     const playableAssets = [
-      "video/index.m3u8",
       "video/init.mp4",
-      "video/segment-000000.m4s",
-      ...descriptor.audioTracks.flatMap((track) => {
-        const id = trackDirectory(track);
-        return [
-          `audio/${id}/index.m3u8`,
-          `audio/${id}/init.mp4`,
-          `audio/${id}/segment-000000.m4s`,
-        ];
-      }),
+      ...descriptor.audioTracks.map((track) =>
+        `audio/${trackDirectory(track)}/init.mp4`
+      ),
+    ];
+    const playablePlaylists = [
+      "video/index.m3u8",
+      ...descriptor.audioTracks.map((track) =>
+        `audio/${trackDirectory(track)}/index.m3u8`
+      ),
     ];
     state.playable = Promise.all(playableAssets.map((asset) => waitForAsset(state, asset)))
+      .then(() => Promise.all(
+        playablePlaylists.map((playlist) =>
+          waitForPlaylistWindow(state, playlist, playableSeconds)
+        )
+      ))
       .then(() => {
         if (state.status === "preparing") state.status = "ready";
       });
@@ -342,6 +348,25 @@ export function createHlsPlaybackManager({
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     return target;
+  }
+
+  async function waitForPlaylistWindow(state, relativePath, requiredSeconds) {
+    const filePath = await waitForAsset(state, relativePath);
+    const started = Date.now();
+    while (true) {
+      const playlist = await readFile(filePath, "utf8").catch(() => "");
+      const duration = Array.from(playlist.matchAll(/^#EXTINF:([\d.]+)/gm))
+        .reduce((total, match) => total + Number(match[1] || 0), 0);
+      if (duration >= requiredSeconds || playlist.includes("#EXT-X-ENDLIST")) return filePath;
+
+      const errorKey = assetErrorKey(relativePath);
+      const error = errorKey ? state.errors.get(errorKey) : null;
+      if (error) throw error;
+      if (Date.now() - started >= playlistWaitMs) {
+        throw new Error(`Timed out while preparing the first ${requiredSeconds} seconds for playback.`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
   }
 
   async function getAsset(descriptor, relativePath) {

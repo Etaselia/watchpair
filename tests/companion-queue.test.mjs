@@ -63,7 +63,7 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
       (body) => Boolean(body?.ok),
       () => companion.exitCode !== null
     );
-    assert.equal(health.version, "0.4.2");
+    assert.equal(health.version, "0.4.3");
     assert.equal(health.transcoder.encoder, "cpu");
 
     const ids = ["queuejob-one", "queuejob-two"];

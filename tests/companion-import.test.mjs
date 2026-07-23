@@ -67,22 +67,33 @@ test("imports, seeds, restores, and stops a local companion file", { timeout: 30
       assert.equal(progress.uploaded, offset + chunk.length);
     }
 
+    const seedStarted = Date.now();
     const seededResponse = await fetch(`${base}/imports/${sourceId}/seed`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "shared-video.mkv", size: bytes.length }),
     });
     assert.equal(seededResponse.status, 201);
-    const seeded = await seededResponse.json();
+    assert.ok(Date.now() - seedStarted < 2_000, "seed request should return before network announce");
+    const pendingSeed = await seededResponse.json();
+    assert.ok(["metadata", "ready"].includes(pendingSeed.job.status));
+    const seeded = await waitForJson(
+      base + "/downloads/" + sourceId,
+      10_000,
+      (body) => body?.job?.status === "ready",
+      () => companion.exitCode !== null,
+    );
     assert.equal(seeded.job.seed, true);
     assert.equal(seeded.job.status, "ready");
-    assert.match(seeded.magnetURI, /^magnet:\?xt=urn:btih:/i);
+    assert.equal(seeded.job.creationProgress, 100);
+    assert.match(seeded.job.magnetURI, /^magnet:\?xt=urn:btih:/i);
     assert.equal(seeded.job.files[0].size, bytes.length);
 
     const bulk = await (await fetch(base + "/downloads")).json();
     assert.equal(bulk.jobs.length, 1);
     assert.equal(bulk.jobs[0].id, sourceId);
 
+    await new Promise((resolve) => setTimeout(resolve, 300));
     await stop(companion);
     companion = null;
     const manifest = JSON.parse(await readFile(path.join(directory, "downloads", ".watchpair-jobs.json"), "utf8"));

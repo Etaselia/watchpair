@@ -174,7 +174,7 @@ function queueReadinessForJob(job: AgentJob, file: AgentFile | null): QueueReadi
             : "Ready to watch";
 
   return {
-    ready: file.ready,
+    ready: file.ready && (preparation === "ready" || preparation === "direct"),
     progress: file.progress,
     status,
     fileName: file.name,
@@ -739,11 +739,16 @@ export default function WatchApp() {
       setError("");
       try {
         const updateProgress = (progress: number) => {
+          const importing = progress < 100;
+          const creatingProgress = progress > 100 ? progress - 100 : 0;
+          const visibleProgress = importing ? progress : creatingProgress;
           const next: LocalReadiness = {
             ...readinessRef.current,
             ready: false,
-            progress,
-            status: progress >= 100 ? "Creating torrent" : "Importing into companion",
+            progress: visibleProgress,
+            status: importing
+              ? "Importing into companion"
+              : `Creating torrent${progress > 100 ? ` ${Math.round(creatingProgress)}%` : ""}`,
             fileName: file.name,
             fileSize: file.size,
             fingerprint: null,
@@ -1617,7 +1622,7 @@ export default function WatchApp() {
                   {agentPairing ? <LoaderCircle className="spin" /> : <Plug />}
                   {agentPairing ? "Waiting for approval" : "Connect"}
                 </button>
-                <a className="secondary-button" href="/watchpair-companion.zip?v=0.4.2" download>
+                <a className="secondary-button" href="/watchpair-companion.zip?v=0.4.3" download>
                   <PackageOpen />
                   Get companion
                 </a>
