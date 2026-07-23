@@ -12,7 +12,7 @@ const ENCODERS = {
     codec: "h264_nvenc",
     label: "NVIDIA NVENC",
     platforms: new Set(["linux", "win32"]),
-    arguments: ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq", "-rc", "vbr", "-cq", "23", "-b:v", "0"],
+    arguments: ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq", "-rc", "vbr", "-cq", "23", "-b:v", "0", "-forced-idr", "1"],
   },
   qsv: {
     id: "qsv",
@@ -77,6 +77,21 @@ export function videoEncoderArguments(encoder, segmentSeconds) {
     ...(encoder.id === "cpu" ? ["-sc_threshold", "0"] : []),
     "-force_key_frames", `expr:gte(t,n_forced*${segmentSeconds})`,
   ];
+}
+
+export function videoDecoderFilterArguments(encoder) {
+  if (encoder?.hardware && encoder.id === "nvenc") {
+    return ["-vf", "scale_cuda=format=yuv420p"];
+  }
+  return [];
+}
+
+export function videoDecoderArguments(encoder) {
+  if (!encoder?.hardware) return [];
+  if (encoder.id === "nvenc") {
+    return ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"];
+  }
+  return [];
 }
 
 async function commandOutput(path, args) {
@@ -163,6 +178,7 @@ export function publicTranscoder(runtime) {
     encoder: runtime.encoder.id,
     label: runtime.encoder.label,
     hardware: runtime.encoder.hardware,
+    hardwareDecode: videoDecoderArguments(runtime.encoder).length > 0,
     ffmpegSource: runtime.ffmpegSource,
     preference: runtime.preference,
   };

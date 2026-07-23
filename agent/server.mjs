@@ -343,10 +343,8 @@ function selectTorrentFile(job, index) {
   job.preparation = { status: "waiting", error: null, encoder: null, fallback: false };
   job.status = file.done ? "ready" : "downloading";
   job.updatedAt = Date.now();
-  if (file.done) {
-    void queueSubtitleProbe(job);
-    queueBackgroundPreparation(job);
-  }
+  void queueSubtitleProbe(job);
+  queueBackgroundPreparation(job);
 }
 
 function jobFile(job, index) {
@@ -369,6 +367,14 @@ function selectedJobFile(job) {
   return jobFile(job, job.selectedIndex);
 }
 
+function mediaInput(job, fileIndex = job.selectedIndex) {
+  if (fileIndex === null) throw new Error("Select a media file first.");
+  if (job.kind === "magnet" && !job.torrent?.files[fileIndex]?.done) {
+    return `http://127.0.0.1:${PORT}/stream/${encodeURIComponent(job.id)}/${fileIndex}`;
+  }
+  return jobFile(job, fileIndex).path;
+}
+
 function streamTrackLabel(stream, fallback) {
   const title = String(stream.tags?.title || "").trim();
   const language = String(stream.tags?.language || "und").toLowerCase();
@@ -376,7 +382,6 @@ function streamTrackLabel(stream, fallback) {
 }
 
 async function probeSubtitleTracks(job) {
-  const media = selectedJobFile(job);
   const selectionKey = selectedFileKey(job);
   if (job.subtitleProbeKey === selectionKey && job.subtitleStatus === "ready") return;
 
@@ -398,7 +403,7 @@ async function probeSubtitleTracks(job) {
   try {
     const result = await runFile(
       FFPROBE_PATH,
-      ["-v", "error", "-print_format", "json", "-show_streams", media.path],
+      ["-v", "error", "-print_format", "json", "-show_streams", mediaInput(job)],
       { maxBuffer: 8 * 1024 * 1024 }
     );
     if (!isStillSelected()) return;
@@ -1088,17 +1093,13 @@ async function preparedAudioFile(job, fileIndex, trackId) {
 
 async function hlsDescriptor(job, fileIndex) {
   if (job.selectedIndex !== fileIndex) throw new Error("That media file is no longer selected.");
-  const ready = job.kind === "magnet"
-    ? Boolean(job.torrent?.files[fileIndex]?.done)
-    : job.status === "ready";
-  if (!ready) throw new Error("The selected media file is not ready.");
   await queueSubtitleProbe(job);
   const media = jobFile(job, fileIndex);
   return {
     jobId: job.id,
     fileIndex,
     fileSize: media.size,
-    inputPath: media.path,
+    inputPath: mediaInput(job, fileIndex),
     videoCodec: job.videoCodec,
     audioTracks: job.audioTracks,
   };
@@ -1170,6 +1171,20 @@ function queueBackgroundPreparation(job) {
   startPreparationWorker();
 }
 
+function pipeResponseStream(stream, response) {
+  const onResponseClose = () => {
+    if (!stream.destroyed) stream.destroy();
+  };
+  const onStreamError = (error) => {
+    if (!response.destroyed) response.destroy(error);
+  };
+
+  stream.on("error", onStreamError);
+  stream.once("close", () => response.off("close", onResponseClose));
+  response.once("close", onResponseClose);
+  stream.pipe(response);
+}
+
 async function streamFile(request, response, job, fileIndex, headers, audioTrackId) {
   let fileName;
   let size;
@@ -1208,7 +1223,7 @@ async function streamFile(request, response, job, fileIndex, headers, audioTrack
 
   if (!range) {
     response.writeHead(200, { ...baseHeaders, "content-length": size });
-    createStream({ start: 0, end: size - 1 }).pipe(response);
+    pipeResponseStream(createStream({ start: 0, end: size - 1 }), response);
     return;
   }
 
@@ -1232,7 +1247,7 @@ async function streamFile(request, response, job, fileIndex, headers, audioTrack
     "content-length": end - start + 1,
     "content-range": "bytes " + start + "-" + end + "/" + size,
   });
-  createStream({ start, end }).pipe(response);
+  pipeResponseStream(createStream({ start, end }), response);
 }
 
 await restoreJobs();
@@ -1289,7 +1304,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/health") {
       sendJson(response, 200, {
         ok: true,
-        version: "0.4.0",
+        version: "0.4.1",
         downloadDirectory: DOWNLOAD_DIR,
         jobs: jobs.size,
         transcoder: TRANSCODER,

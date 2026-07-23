@@ -35,6 +35,7 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
     fileSize: 0,
     inputPath: input,
     videoCodec: "mpeg4",
+    inputArguments: ["-readrate", "4"],
     audioTracks: [
       {
         id: "1",
@@ -98,6 +99,12 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
       manager.getAsset(descriptor, "audio/1/index.m3u8"),
       manager.getAsset(descriptor, "audio/2/index.m3u8"),
     ]);
+    const initialPreparation = await manager.prepare(descriptor);
+    assert.equal(initialPreparation.status, "ready");
+    assert.equal(initialPreparation.encoder.id, "cpu");
+    assert.equal(initialPreparation.hardwareDecode, false);
+    assert.equal(initialPreparation.fallback, true);
+
     const [video, japanese, english] = await Promise.all([
       readPlaylist(videoAsset.filePath),
       readPlaylist(japaneseAsset.filePath),
@@ -105,6 +112,7 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
     ]);
     assert.match(video, /#EXT-X-PLAYLIST-TYPE:EVENT/);
     assert.match(video, /segment-000000\.m4s/);
+    assert.doesNotMatch(video, /#EXT-X-ENDLIST/, "playback should unlock before conversion finishes");
     assert.match(japanese, /segment-000000\.m4s/);
     assert.match(english, /segment-000000\.m4s/);
 

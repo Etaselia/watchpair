@@ -54,6 +54,7 @@ export interface AgentTranscoder {
   encoder: string;
   label: string;
   hardware: boolean;
+  hardwareDecode?: boolean;
   ffmpegSource: "configured" | "system" | "bundled";
   preference?: string;
 }
@@ -62,6 +63,7 @@ export interface AgentPreparation {
   status: "waiting" | "queued" | "preparing" | "ready" | "direct" | "error";
   error: string | null;
   encoder: { id: string; label: string; hardware: boolean } | null;
+  hardwareDecode?: boolean;
   fallback: boolean;
 }
 

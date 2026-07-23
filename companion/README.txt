@@ -29,14 +29,16 @@ Supported encoders:
 - AMD on Windows: h264_amf
 - macOS: h264_videotoolbox
 
-The companion runs a tiny test encode before selecting an encoder. Its startup
-log and the WatchPair queue show the selected transcoder. Set
+The companion runs a tiny test encode before selecting an encoder. NVIDIA
+preparation also uses CUDA hardware decoding and GPU-side 10-bit conversion.
+Its startup log and the WatchPair queue show the selected transcoder. Set
 WATCHPAIR_TRANSCODER to auto, cpu, nvenc, qsv, vaapi, amf, or videotoolbox to
-override automatic selection. A failed GPU encode retries with CPU encoding.
+override automatic selection. A failed hardware decode retries GPU encoding
+with CPU decoding; a failed GPU encode then retries full CPU encoding.
 
 Downloads are saved in the downloads folder by default. Queued downloads run
-concurrently; completed videos are prepared for browser playback one at a time
-in the background. Jobs and local seeds resume after restart. WatchPair can also
+concurrently; selected torrents are prepared for browser playback one at a time
+while they download. Playback unlocks after the initial verified HLS segments. Jobs and local seeds resume after restart. WatchPair can also
 publish a selected local file as a torrent; its bytes remain between participant
 computers, while torrent peers and trackers can see their IP addresses.
 

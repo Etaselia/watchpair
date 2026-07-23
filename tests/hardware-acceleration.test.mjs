@@ -6,6 +6,8 @@ import {
   ENCODER_PROBE_SOURCE,
   encoderCandidates,
   selectTranscodeRuntime,
+  videoDecoderArguments,
+  videoDecoderFilterArguments,
   videoEncoderArguments,
 } from "../agent/hardware-acceleration.mjs";
 
@@ -24,6 +26,16 @@ test("orders platform hardware encoders and builds segment-aligned arguments", (
   );
   assert.deepEqual(encoderCandidates("linux", "cpu"), []);
   assert.match(ENCODER_PROBE_SOURCE, /s=640x360/);
+  const nvenc = encoderCandidates("win32", "nvenc")[0];
+  assert.deepEqual(
+    videoDecoderArguments({ ...nvenc, hardware: true }),
+    ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+  );
+  assert.deepEqual(
+    videoDecoderFilterArguments({ ...nvenc, hardware: true }),
+    ["-vf", "scale_cuda=format=yuv420p"]
+  );
+  assert.deepEqual(videoDecoderArguments(CPU_ENCODER), []);
 
   const argumentsList = videoEncoderArguments(CPU_ENCODER, 4);
   assert.ok(argumentsList.includes("libx264"));

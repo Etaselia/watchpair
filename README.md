@@ -24,8 +24,9 @@ subtitle timing synchronized.
 - Drift correction and reconnect recovery in the player
 - Local SRT and WebVTT subtitle parsing
 - Per-file audio and subtitle discovery for MKV and other containers with FFprobe
-- Background WebVTT discovery and cached progressive HLS preparation with FFmpeg
+- Progressive torrent-to-HLS preparation that unlocks playback before the download finishes
 - Automatic NVENC, Quick Sync, VAAPI, AMF, and VideoToolbox detection with CPU fallback
+- NVIDIA CUDA hardware decoding plus NVENC encoding, including 10-bit HEVC input
 - Byte-range streaming from the companion so the browser can seek efficiently
 
 ## Architecture
@@ -122,9 +123,11 @@ npm run lint
 - Browsers may require one click before a remote play command can start media.
 - Browser-incompatible files are prepared as progressive HLS. Playback starts from the first
   four-second segments while the remaining video is encoded in the background.
-- Completed queue items are prepared one at a time in the background while all downloads continue.
+- Selected torrent files are prepared one at a time while downloading; the room unlocks after
+  every participant has initial verified HLS segments rather than waiting for 100%.
 - Video is encoded once and embedded audio languages are exposed as separate AAC renditions.
-  A working system GPU encoder is preferred; the bundled FFmpeg provides the universal CPU fallback.
+  NVIDIA systems use CUDA decoding and NVENC encoding when both work for the selected file.
+  Other supported GPU encoders accelerate encoding; the bundled FFmpeg is the universal CPU fallback.
   Prepared segments are cached under `downloads/.watchpair-hls` for later watches.
 - MKV text subtitles such as SRT, ASS, and WebVTT are extracted by the companion.
   Image-based PGS/VobSub tracks cannot be rendered as browser text. Video and
