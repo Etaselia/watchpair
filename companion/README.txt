@@ -9,7 +9,9 @@ Windows
 
 The first launch downloads a private Node.js 24 runtime from nodejs.org when
 Node is not already installed. Its SHA-256 checksum is verified before use.
-It then installs the companion dependencies into this folder.
+It then installs the companion dependencies into this folder. On Windows, allow
+the bundled private Node runtime through Windows Firewall when prompted; blocking
+it can prevent other participants from reaching local torrent seeds.
 
 macOS / Linux
 Install Node.js 22.13 or newer, then run:
@@ -49,6 +51,8 @@ their IP addresses.
 Set WATCHPAIR_LIBRARY_DIRS to additional external-client download folders,
 separated by ; on Windows or : on macOS/Linux. Set WATCHPAIR_TRACKERS to a
 comma-separated tracker list to override the defaults for locally published torrents.
+The default torrent listener is TCP 41736 and DHT chooses an available UDP port. Override them
+with WATCHPAIR_TORRENT_PORT and WATCHPAIR_DHT_PORT when those ports are occupied.
 
 The companion listens only on 127.0.0.1:41735. Websites cannot use it until you
 explicitly approve their origin on the local pairing page. Approved origins are

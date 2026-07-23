@@ -58,7 +58,18 @@ test("a companion-published local file is discoverable and serves every byte", {
     );
 
     assert.equal(published.job.seedState, "seeding");
+    assert.ok(published.job.torrentPort > 0);
+    assert.ok(published.job.dhtPort > 0);
+    assert.equal(published.job.webRtcSupported, true);
+    assert.equal(published.job.files[0].name, "shared.bin");
     assert.match(published.job.magnetURI, new RegExp(encodeURIComponent(trackerUrl).replaceAll(".", "\\.")));
+    const announced = await waitForJson(
+      base + "/downloads/" + sourceId,
+      5_000,
+      (body) => body?.job?.trackerAnnounces > 0,
+      () => companion.exitCode !== null,
+    );
+    assert.ok(announced.job.trackerAnnounces > 0);
 
     const downloadDirectory = path.join(directory, "leecher");
     const downloaded = await new Promise((resolve, reject) => {

@@ -21,6 +21,21 @@ import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, verifiedTor
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.WATCHPAIR_AGENT_PORT || 41735);
+const REQUESTED_TORRENT_PORT = Number(process.env.WATCHPAIR_TORRENT_PORT || PORT + 1);
+const DHT_PORT = Number(process.env.WATCHPAIR_DHT_PORT || 0);
+
+async function availableTcpPort(preferredPort) {
+  if (!preferredPort) return 0;
+  const probe = createServer();
+  return new Promise((resolve) => {
+    probe.once("error", () => resolve(0));
+    probe.listen(preferredPort, "0.0.0.0", () => {
+      probe.close(() => resolve(preferredPort));
+    });
+  });
+}
+
+const TORRENT_PORT = await availableTcpPort(REQUESTED_TORRENT_PORT);
 const DOWNLOAD_DIR = path.resolve(process.env.WATCHPAIR_DOWNLOAD_DIR || "./downloads");
 const CONFIG_PATH = path.resolve(
   process.env.WATCHPAIR_CONFIG_PATH || path.join(homedir(), ".watchpair", "companion.json")
@@ -80,13 +95,21 @@ const jobStore = createJsonStore(JOBS_PATH);
 const preparationQueue = [];
 let preparationWorker = null;
 installWebTorrentSafetyGuards();
-const client = new WebTorrent({ utp: false });
+const client = new WebTorrent({
+  utp: false,
+  torrentPort: TORRENT_PORT,
+  dhtPort: DHT_PORT,
+  seedOutgoingConnections: true,
+});
 const hlsPlayback = createHlsPlaybackManager({
   ffmpegPath: FFMPEG_PATH,
   encoder: TRANSCODE_RUNTIME.encoder,
   cacheRoot: path.join(DOWNLOAD_DIR, ".watchpair-hls"),
 });
 client.on("error", (error) => console.error(`WebTorrent client error: ${error.message}`));
+client.on("listening", () => {
+  console.log(`Torrent listener ready on TCP ${client.torrentPort}; DHT uses UDP ${client.dhtPort}.`);
+});
 
 await mkdir(DOWNLOAD_DIR, { recursive: true });
 await mkdir(IMPORT_DIR, { recursive: true });
@@ -330,6 +353,10 @@ async function readJson(request) {
   return JSON.parse((await readBody(request)) || "{}");
 }
 
+function torrentFileName(file) {
+  return path.posix.basename(String(file?.path || file?.name || "video").replaceAll("\\", "/"));
+}
+
 function selectedFileKey(job) {
   const media = selectedJobFile(job);
   return String(job.selectedIndex) + ":" + media.name + ":" + media.size;
@@ -368,7 +395,7 @@ function jobFile(job, index) {
     if (filePath !== root && !filePath.startsWith(root + path.sep)) {
       throw new Error("Torrent file path escaped its download directory.");
     }
-    return { path: filePath, name: file.path || file.name, size: file.length };
+    return { path: filePath, name: torrentFileName(file), size: file.length };
   }
   if (!job.file || index !== 0) throw new Error("Downloaded file not found.");
   return job.file;
@@ -527,7 +554,7 @@ function torrentFiles(job) {
     const progress = verifiedTorrentFileProgress(file);
     return {
       index,
-      name: file.path || file.name,
+      name: torrentFileName(file),
       size: file.length,
       downloaded: Math.round(file.length * progress),
       progress: Math.round(progress * 1000) / 10,
@@ -585,6 +612,13 @@ function snapshot(job) {
     uploadSpeed: job.torrent?.uploadSpeed || 0,
     uploaded: job.torrent?.uploaded || 0,
     creationProgress: job.torrentCreationProgress || 0,
+    trackerAnnounces: job.trackerAnnounces || 0,
+    trackerWarnings: job.trackerWarnings || [],
+    seedStartedAt: job.seedStartedAt,
+    platform: process.platform,
+    torrentPort: client.torrentPort || TORRENT_PORT,
+    dhtPort: client.dhtPort || DHT_PORT,
+    webRtcSupported: WebTorrent.WEBRTC_SUPPORT,
     identityFingerprint: job.identityFingerprint || null,
     error: job.error || null,
     subtitleStatus: job.subtitleStatus,
@@ -745,6 +779,10 @@ function createJob(source) {
     peersRejected: 0,
     audioRenderPromises: new Map(),
     torrentCreationProgress: 0,
+    trackerAnnounces: 0,
+    trackerWarnings: [],
+    seedStartedAt: null,
+    seedReannounceTimer: null,
     preparation: { status: "waiting", error: null, encoder: null, fallback: false },
     updatedAt: Date.now(),
   };
@@ -862,6 +900,7 @@ async function seedLocalFile({ id, filePath, label }) {
   job.status = "metadata";
   job.selectedIndex = 0;
   job.downloaded = info.size;
+  job.seedStartedAt = Date.now();
 
   const options = {
     pieceLength: 1024 * 1024,
@@ -903,11 +942,28 @@ async function seedLocalFile({ id, filePath, label }) {
     job.torrent = torrent;
     torrent.once("metadata", () => publishMetadata(torrent));
     torrent.once("ready", () => markServing(torrent));
+    torrent.on("trackerAnnounce", () => {
+      job.trackerAnnounces += 1;
+      job.updatedAt = Date.now();
+    });
+    torrent.on("wire", () => {
+      job.updatedAt = Date.now();
+    });
+    torrent.on("warning", (error) => {
+      const message = String(error?.message || error).slice(0, 240);
+      job.trackerWarnings = [...job.trackerWarnings.filter((item) => item !== message), message].slice(-5);
+      job.updatedAt = Date.now();
+    });
     torrent.once("error", (error) => {
       job.status = "error";
       job.error = error.message;
       job.updatedAt = Date.now();
     });
+    job.seedReannounceTimer = setInterval(() => {
+      if (torrent.destroyed || torrent.numPeers > 0) return;
+      torrent.discovery?.tracker?.update({ numwant: 50 });
+    }, 25_000);
+    job.seedReannounceTimer.unref?.();
     torrent.on("upload", () => {
       job.updatedAt = Date.now();
     });
@@ -1009,6 +1065,7 @@ async function attachLibraryFile({ id, entry, label, identityFingerprint }) {
 async function stopJob(id, { deleteFiles = false } = {}) {
   const job = jobs.get(validJobId(id));
   if (!job) return false;
+  if (job.seedReannounceTimer) clearInterval(job.seedReannounceTimer);
   if (job.torrent && !job.torrent.destroyed) {
     await new Promise((resolve) => job.torrent.destroy(resolve));
   }
@@ -1352,8 +1409,15 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/health") {
       sendJson(response, 200, {
         ok: true,
-        version: "0.4.4",
+        version: "0.5.1",
         downloadDirectory: DOWNLOAD_DIR,
+        platform: process.platform,
+        torrent: {
+          port: client.torrentPort || TORRENT_PORT,
+          dhtPort: client.dhtPort || DHT_PORT,
+          webRtcSupported: WebTorrent.WEBRTC_SUPPORT,
+          trackers: TRACKERS,
+        },
         jobs: jobs.size,
         transcoder: TRANSCODER,
       }, headers);

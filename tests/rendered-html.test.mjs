@@ -262,7 +262,7 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /action: "create",\s+deviceId,\s+name: displayName/);
   assert.match(app, /getAgentDownloads/);
   assert.match(app, /Download queue/);
-  assert.match(app, /watchpair-companion\.zip\?v=0\.4\.4/);
+  assert.match(app, /watchpair-companion\.zip\?v=0\.5\.1/);
   assert.match(app, /queueReadinessForJob/);
   assert.match(app, /file\.ready && \(preparation === "ready" \|\| preparation === "direct"\)/);
   assert.match(app, /GPU decode/);
@@ -289,6 +289,13 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(voice, /voiceIsolation/);
   assert.match(voice, /setSinkId/);
   assert.match(voice, /HeadphoneOff/);
+  assert.match(voice, /Minimize2/);
+  assert.match(voice, /Maximize2/);
+  assert.match(voice, /setMasterVolume/);
+  assert.match(voice, /setParticipantVolume/);
+  assert.match(voice, /speakingUntilRef/);
+  assert.match(voice, /playVoiceCue\("connect"\)/);
+  assert.match(voice, /playVoiceCue\("disconnect"\)/);
   assert.match(route, /action === "heartbeat"/);
   assert.match(route, /action === "voice-signal"/);
   assert.match(route, /watch_voice_signals/);
@@ -306,6 +313,10 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(agent, /receiveImportChunk/);
   assert.match(agent, /seedLocalFile/);
   assert.match(agent, /DEFAULT_TRACKERS/);
+  assert.match(agent, /WATCHPAIR_TORRENT_PORT/);
+  assert.match(agent, /seedOutgoingConnections: true/);
+  assert.match(agent, /tracker\?\.update\(\{ numwant: 50 \}\)/);
+  assert.match(agent, /torrentFileName/);
   assert.match(agent, /torrent\.once\("ready", \(\) => markServing\(torrent\)\)/);
   assert.match(agent, /restoreJobs/);
   assert.match(agentClient, /loopback-network/);
@@ -367,6 +378,7 @@ test("packages the pairable magnet and subtitle companion", async () => {
   assert.match(bundledSafetyGuard, /stabilizeWireBitfieldWrites/);
   assert.match(bundledSafetyGuard, /new Uint8Array\(bytes\)/);
   assert.match(bundledSafetyGuard, /verifiedTorrentFileProgress/);
+  assert.match(companionPackage, /"version": "0\.5\.1"/);
   assert.match(companionPackage, /"webtorrent": "3\.0\.11"/);
   assert.match(installer, /\$Releases = Invoke-RestMethod/);
   assert.match(installer, /\$Release = \(\$Releases \| Where-Object/);

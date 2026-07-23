@@ -352,6 +352,7 @@ export default function WatchApp() {
   const mediaUrlRef = useRef("");
   const sessionRef = useRef<WatchSession | null>(null);
   const selectionSentRef = useRef("");
+  const filenameSyncedRef = useRef(new Set<string>());
   const loadedSubtitleRef = useRef("");
   const initializedMediaTracksRef = useRef("");
   const autoOpenedMediaRef = useRef("");
@@ -1017,6 +1018,21 @@ export default function WatchApp() {
       );
       setAgentJobs((current) => ({ ...current, ...jobsById }));
 
+      for (const source of queueSources) {
+        const job = jobsById[source.id];
+        const target = job ? preferredAgentFile(job) : null;
+        const renameKey = target ? `${source.id}:${target.name}` : "";
+        if (!target?.name || source.label === target.name || filenameSyncedRef.current.has(renameKey)) {
+          continue;
+        }
+        filenameSyncedRef.current.add(renameKey);
+        try {
+          await sendAction("rename-source", { sourceId: source.id, label: target.name });
+        } catch {
+          filenameSyncedRef.current.delete(renameKey);
+        }
+      }
+
       let selectedMedia = currentSession?.selectedMedia || null;
       if (selectedMedia?.sourceId) {
         const selectedJob = jobsById[selectedMedia.sourceId];
@@ -1678,7 +1694,7 @@ export default function WatchApp() {
                   {agentPairing ? <LoaderCircle className="spin" /> : <Plug />}
                   {agentPairing ? "Waiting for approval" : "Connect"}
                 </button>
-                <a className="secondary-button" href="/watchpair-companion.zip?v=0.4.4" download>
+                <a className="secondary-button" href="/watchpair-companion.zip?v=0.5.1" download>
                   <PackageOpen />
                   Get companion
                 </a>
@@ -1805,7 +1821,10 @@ export default function WatchApp() {
                         </button>
                       )}
                       {job?.seed && (
-                        <span className="seed-status">
+                        <span
+                          className="seed-status"
+                          title={job.trackerWarnings?.at(-1) || `Torrent TCP ${job.torrentPort || "dynamic"}, DHT UDP ${job.dhtPort || "dynamic"}`}
+                        >
                           <Upload />
                           {job.seedState === "creating"
                             ? `Creating torrent ${Math.round(job.creationProgress)}%`
@@ -1815,7 +1834,11 @@ export default function WatchApp() {
                                 ? `Uploading to ${job.peers} peer${job.peers === 1 ? "" : "s"} / ${formatBytes(job.uploadSpeed)}/s`
                                 : job.seedState === "error"
                                   ? "Seed failed"
-                                  : "Seeding / waiting for peers"}
+                                  : job.webRtcSupported === false
+                                    ? "Seeding / WebRTC unavailable"
+                                    : job.trackerAnnounces === 0
+                                      ? "Seeding / contacting trackers"
+                                      : "Seeding / waiting for peers"}
                         </span>
                       )}
                       <span className="queue-action-spacer" />

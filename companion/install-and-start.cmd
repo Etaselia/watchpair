@@ -17,6 +17,8 @@ if not exist "%CD%\node_modules\webtorrent" (
   if errorlevel 1 goto failed
 )
 
+echo If Windows Firewall asks about this private Node runtime, allow network access
+echo so other WatchPair participants can reach local torrent seeds.
 echo Starting WatchPair Companion...
 "%NODE_EXE%" server.mjs
 if errorlevel 1 goto failed

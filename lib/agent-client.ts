@@ -98,6 +98,13 @@ export interface AgentJob {
   uploadSpeed: number;
   uploaded: number;
   creationProgress: number;
+  trackerAnnounces: number;
+  trackerWarnings: string[];
+  seedStartedAt: number | null;
+  platform: string;
+  torrentPort: number;
+  dhtPort: number;
+  webRtcSupported: boolean;
   identityFingerprint: string | null;
   error: string | null;
   subtitleStatus: "waiting" | "probing" | "ready" | "error";

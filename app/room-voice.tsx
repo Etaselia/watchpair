@@ -4,8 +4,10 @@ import {
   HeadphoneOff,
   Headphones,
   LoaderCircle,
+  Maximize2,
   Mic,
   MicOff,
+  Minimize2,
   PhoneOff,
   Settings2,
   ShieldCheck,
@@ -41,6 +43,9 @@ export interface RoomVoiceController {
   settingsOpen: boolean;
   noiseSuppression: boolean;
   inputGain: number;
+  masterVolume: number;
+  participantVolumes: Record<string, number>;
+  selfId: string;
   inputDeviceId: string;
   outputDeviceId: string;
   inputs: AudioDevice[];
@@ -60,6 +65,8 @@ export interface RoomVoiceController {
   setOutputDevice: (id: string) => Promise<void>;
   setNoiseSuppression: (enabled: boolean) => Promise<void>;
   setInputGain: (gain: number) => void;
+  setMasterVolume: (volume: number) => void;
+  setParticipantVolume: (deviceId: string, volume: number) => void;
 }
 
 interface RoomVoiceOptions {
@@ -96,6 +103,10 @@ function voiceConstraints(
   return constraints;
 }
 
+function setAudioVolume(audio: HTMLAudioElement, volume: number) {
+  audio.volume = Math.max(0, Math.min(1, volume));
+}
+
 function level(analyser: AnalyserNode, data: Uint8Array<ArrayBuffer>) {
   analyser.getByteTimeDomainData(data);
   let energy = 0;
@@ -104,6 +115,27 @@ function level(analyser: AnalyserNode, data: Uint8Array<ArrayBuffer>) {
     energy += centered * centered;
   }
   return Math.sqrt(energy / data.length);
+}
+
+function playVoiceCue(kind: "connect" | "disconnect") {
+  const context = new AudioContext({ latencyHint: "interactive" });
+  const frequencies = kind === "connect" ? [440, 660] : [660, 390];
+  const startedAt = context.currentTime + 0.01;
+  frequencies.forEach((frequency, index) => {
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    const start = startedAt + index * 0.085;
+    oscillator.type = "sine";
+    oscillator.frequency.value = frequency;
+    gain.gain.setValueAtTime(0.0001, start);
+    gain.gain.exponentialRampToValueAtTime(0.09, start + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.075);
+    oscillator.connect(gain);
+    gain.connect(context.destination);
+    oscillator.start(start);
+    oscillator.stop(start + 0.08);
+  });
+  window.setTimeout(() => void context.close().catch(() => {}), 300);
 }
 
 function sameIds(left: Set<string>, right: Set<string>) {
@@ -125,6 +157,8 @@ export function useRoomVoice({
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [noiseSuppression, setNoiseSuppressionState] = useState(true);
   const [inputGain, setInputGainState] = useState(1);
+  const [masterVolume, setMasterVolumeState] = useState(1);
+  const [participantVolumes, setParticipantVolumes] = useState<Record<string, number>>({});
   const [inputDeviceId, setInputDeviceIdState] = useState("");
   const [outputDeviceId, setOutputDeviceIdState] = useState("");
   const [inputs, setInputs] = useState<AudioDevice[]>([]);
@@ -142,6 +176,9 @@ export function useRoomVoice({
   const localAnalyserRef = useRef<AnalyserNode | null>(null);
   const localLevelDataRef = useRef<Uint8Array<ArrayBuffer> | null>(null);
   const monitorFrameRef = useRef(0);
+  const speakingUntilRef = useRef(new Map<string, number>());
+  const masterVolumeRef = useRef(1);
+  const participantVolumesRef = useRef<Record<string, number>>({});
   const enabledRef = useRef(false);
   const mutedRef = useRef(false);
   const deafenedRef = useRef(false);
@@ -188,6 +225,7 @@ export function useRoomVoice({
     const peer = peersRef.current.get(remoteId);
     if (!peer) return;
     peersRef.current.delete(remoteId);
+    speakingUntilRef.current.delete(remoteId);
     peer.audio?.pause();
     peer.audio?.remove();
     peer.pc.close();
@@ -244,6 +282,10 @@ export function useRoomVoice({
         audio.className = "room-voice-audio";
         audio.srcObject = stream;
         audio.muted = deafenedRef.current;
+        audio.volume = Math.min(
+          1,
+          masterVolumeRef.current * (participantVolumesRef.current[remoteId] ?? 1)
+        );
         peer.audio = audio;
         void applyOutputDevice(audio, outputDeviceRef.current).catch(() => {});
         void audio.play().catch(() => setError("Click the voice controls to allow room audio."));
@@ -252,7 +294,7 @@ export function useRoomVoice({
       if (context && !peer.analyser) {
         const analyser = context.createAnalyser();
         analyser.fftSize = 256;
-        analyser.smoothingTimeConstant = 0.72;
+        analyser.smoothingTimeConstant = 0.85;
         context.createMediaStreamSource(stream).connect(analyser);
         peer.analyser = analyser;
         peer.levelData = new Uint8Array(analyser.fftSize);
@@ -319,7 +361,7 @@ export function useRoomVoice({
     gain.gain.value = inputGain;
     const analyser = context.createAnalyser();
     analyser.fftSize = 256;
-    analyser.smoothingTimeConstant = 0.72;
+    analyser.smoothingTimeConstant = 0.85;
     const destination = context.createMediaStreamDestination();
     source.connect(gain);
     gain.connect(analyser);
@@ -351,7 +393,7 @@ export function useRoomVoice({
       if (!(remoteStream instanceof MediaStream)) continue;
       const remoteAnalyser = context.createAnalyser();
       remoteAnalyser.fftSize = 256;
-      remoteAnalyser.smoothingTimeConstant = 0.72;
+      remoteAnalyser.smoothingTimeConstant = 0.85;
       context.createMediaStreamSource(remoteStream).connect(remoteAnalyser);
       peer.analyser = remoteAnalyser;
       peer.levelData = new Uint8Array(remoteAnalyser.fftSize);
@@ -359,7 +401,9 @@ export function useRoomVoice({
   }, [inputGain]);
 
   const stop = useCallback(() => {
+    const wasEnabled = enabledRef.current;
     enabledRef.current = false;
+    if (wasEnabled) playVoiceCue("disconnect");
     for (const remoteId of Array.from(peersRef.current.keys())) closePeer(remoteId);
     rawStreamRef.current?.getTracks().forEach((track) => track.stop());
     outboundTrackRef.current?.stop();
@@ -394,6 +438,7 @@ export function useRoomVoice({
       enabledRef.current = true;
       setEnabled(true);
       setBusy(false);
+      playVoiceCue("connect");
       presenceRef.current({ enabled: true, muted: false, deafened: false });
       await refreshDevices();
       reconcilePeers();
@@ -486,15 +531,64 @@ export function useRoomVoice({
     localStorage.setItem("watchpair-voice-gain", String(gain));
   }, []);
 
+  const applyVolumes = useCallback(() => {
+    for (const [remoteId, peer] of peersRef.current) {
+      if (!peer.audio) continue;
+      setAudioVolume(
+        peer.audio,
+        masterVolumeRef.current * (participantVolumesRef.current[remoteId] ?? 1)
+      );
+    }
+  }, []);
+
+  const setMasterVolume = useCallback((next: number) => {
+    const volume = Math.max(0, Math.min(1, next));
+    masterVolumeRef.current = volume;
+    setMasterVolumeState(volume);
+    localStorage.setItem("watchpair-voice-master-volume", String(volume));
+    applyVolumes();
+  }, [applyVolumes]);
+
+  const setParticipantVolume = useCallback((remoteId: string, next: number) => {
+    const volume = Math.max(0, Math.min(1, next));
+    const values = { ...participantVolumesRef.current, [remoteId]: volume };
+    participantVolumesRef.current = values;
+    setParticipantVolumes(values);
+    localStorage.setItem("watchpair-voice-participant-volumes", JSON.stringify(values));
+    applyVolumes();
+  }, [applyVolumes]);
+
   useEffect(() => {
     const timer = window.setTimeout(() => {
       const savedInput = localStorage.getItem("watchpair-voice-input") || "";
       const savedOutput = localStorage.getItem("watchpair-voice-output") || "";
-      const savedGain = Number(localStorage.getItem("watchpair-voice-gain"));
+      const savedGainValue = localStorage.getItem("watchpair-voice-gain");
+      const savedMasterVolumeValue = localStorage.getItem("watchpair-voice-master-volume");
+      const savedGain = savedGainValue === null ? Number.NaN : Number(savedGainValue);
+      const savedMasterVolume =
+        savedMasterVolumeValue === null ? Number.NaN : Number(savedMasterVolumeValue);
+      let savedParticipantVolumes: Record<string, number> = {};
+      try {
+        savedParticipantVolumes = JSON.parse(
+          localStorage.getItem("watchpair-voice-participant-volumes") || "{}"
+        ) as Record<string, number>;
+      } catch {
+        savedParticipantVolumes = {};
+      }
       const savedSuppression = localStorage.getItem("watchpair-voice-noise-suppression");
       setInputDeviceIdState(savedInput);
       setOutputDeviceIdState(savedOutput);
       outputDeviceRef.current = savedOutput;
+      if (Number.isFinite(savedMasterVolume) && savedMasterVolume >= 0 && savedMasterVolume <= 1) {
+        masterVolumeRef.current = savedMasterVolume;
+        setMasterVolumeState(savedMasterVolume);
+      }
+      participantVolumesRef.current = Object.fromEntries(
+        Object.entries(savedParticipantVolumes)
+          .filter(([, volume]) => Number.isFinite(volume))
+          .map(([id, volume]) => [id, Math.max(0, Math.min(1, volume))])
+      );
+      setParticipantVolumes(participantVolumesRef.current);
       if (Number.isFinite(savedGain) && savedGain >= 0 && savedGain <= 2) setInputGainState(savedGain);
       if (savedSuppression === "0") setNoiseSuppressionState(false);
       void refreshDevices();
@@ -547,19 +641,23 @@ export function useRoomVoice({
   useEffect(() => {
     if (!enabled) return;
     const monitor = () => {
+      const now = performance.now();
       const next = new Set<string>();
-      if (
-        !mutedRef.current &&
-        localAnalyserRef.current &&
-        localLevelDataRef.current &&
-        level(localAnalyserRef.current, localLevelDataRef.current) > 0.035
-      ) {
-        next.add(deviceId);
-      }
+      const keepSpeaking = (id: string, currentLevel: number) => {
+        if (currentLevel > 0.035) speakingUntilRef.current.set(id, now + 360);
+        if ((speakingUntilRef.current.get(id) || 0) > now) next.add(id);
+      };
+      keepSpeaking(
+        deviceId,
+        !mutedRef.current && localAnalyserRef.current && localLevelDataRef.current
+          ? level(localAnalyserRef.current, localLevelDataRef.current)
+          : 0
+      );
       for (const [remoteId, peer] of peersRef.current) {
-        if (peer.analyser && peer.levelData && level(peer.analyser, peer.levelData) > 0.035) {
-          next.add(remoteId);
-        }
+        keepSpeaking(
+          remoteId,
+          peer.analyser && peer.levelData ? level(peer.analyser, peer.levelData) : 0
+        );
       }
       setSpeakingIds((current) => sameIds(current, next) ? current : next);
       monitorFrameRef.current = requestAnimationFrame(monitor);
@@ -598,6 +696,9 @@ export function useRoomVoice({
     settingsOpen,
     noiseSuppression,
     inputGain,
+    masterVolume,
+    participantVolumes,
+    selfId: deviceId,
     inputDeviceId,
     outputDeviceId,
     inputs,
@@ -617,11 +718,15 @@ export function useRoomVoice({
     setOutputDevice,
     setNoiseSuppression,
     setInputGain,
+    setMasterVolume,
+    setParticipantVolume,
   };
 }
 
 export function VoiceDock({ voice }: { voice: RoomVoiceController }) {
+  const [minimized, setMinimized] = useState(false);
   const voiceParticipants = voice.participants.filter((participant) => participant.voice.enabled);
+  const remoteParticipants = voiceParticipants.filter((participant) => participant.deviceId !== voice.selfId);
 
   if (!voice.enabled) {
     return (
@@ -631,6 +736,35 @@ export function VoiceDock({ voice }: { voice: RoomVoiceController }) {
           {voice.busy ? "Opening microphone" : "Join voice"}
         </button>
         {voice.error && <span className="voice-error" role="alert">{voice.error}</span>}
+      </aside>
+    );
+  }
+
+  if (minimized) {
+    return (
+      <aside className="voice-dock voice-minimized" aria-label="Room voice minimized">
+        <div className={"voice-self-avatar" + (voice.selfSpeaking ? " speaking" : "")}>
+          {voice.muted ? <MicOff /> : <Volume2 />}
+        </div>
+        <span className="voice-minimized-count">{voice.connectedPeers}</span>
+        <button
+          className={"icon-button" + (voice.muted ? " active danger" : "")}
+          type="button"
+          onClick={voice.toggleMute}
+          aria-label={voice.muted ? "Unmute microphone" : "Mute microphone"}
+          title={voice.muted ? "Unmute microphone" : "Mute microphone"}
+        >
+          {voice.muted ? <MicOff /> : <Mic />}
+        </button>
+        <button
+          className="icon-button"
+          type="button"
+          onClick={() => setMinimized(false)}
+          aria-label="Expand room voice"
+          title="Expand room voice"
+        >
+          <Maximize2 />
+        </button>
       </aside>
     );
   }
@@ -691,6 +825,18 @@ export function VoiceDock({ voice }: { voice: RoomVoiceController }) {
           <Settings2 />
         </button>
         <button
+          className="icon-button"
+          type="button"
+          onClick={() => {
+            voice.closeSettings();
+            setMinimized(true);
+          }}
+          title="Minimize room voice"
+          aria-label="Minimize room voice"
+        >
+          <Minimize2 />
+        </button>
+        <button
           className="icon-button danger"
           type="button"
           onClick={voice.stop}
@@ -724,7 +870,41 @@ export function VoiceDock({ voice }: { voice: RoomVoiceController }) {
             </select>
           </label>
           <label>
-            <span>Input gain</span>
+            <span>Room volume <output>{Math.round(voice.masterVolume * 100)}%</output></span>
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              value={voice.masterVolume}
+              onChange={(event) => voice.setMasterVolume(Number(event.target.value))}
+            />
+          </label>
+          {remoteParticipants.length > 0 && (
+            <div className="voice-volume-list">
+              <strong>People</strong>
+              {remoteParticipants.map((participant) => (
+                <label key={participant.deviceId}>
+                  <span>
+                    {participant.name}
+                    <output>{Math.round((voice.participantVolumes[participant.deviceId] ?? 1) * 100)}%</output>
+                  </span>
+                  <input
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.05"
+                    value={voice.participantVolumes[participant.deviceId] ?? 1}
+                    onChange={(event) =>
+                      voice.setParticipantVolume(participant.deviceId, Number(event.target.value))
+                    }
+                  />
+                </label>
+              ))}
+            </div>
+          )}
+          <label>
+            <span>Input gain <output>{Math.round(voice.inputGain * 100)}%</output></span>
             <input
               type="range"
               min="0"

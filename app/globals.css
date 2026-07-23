@@ -1245,6 +1245,20 @@ svg {
   padding: 4px;
 }
 
+.voice-dock.voice-minimized {
+  min-height: 48px;
+  gap: 4px;
+  padding: 5px;
+}
+
+.voice-minimized-count {
+  min-width: 20px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 750;
+  text-align: center;
+}
+
 .voice-join-button {
   display: inline-flex;
   min-height: 36px;
@@ -1293,6 +1307,11 @@ svg {
   border-radius: 50%;
   background: #e9ebe4;
   color: #4d5148;
+  transition:
+    border-color 240ms ease,
+    background-color 240ms ease,
+    color 240ms ease,
+    box-shadow 320ms ease;
 }
 
 .voice-self-avatar.speaking {
@@ -1318,6 +1337,10 @@ svg {
   color: #0d365f;
   font-size: 10px;
   font-weight: 760;
+  transition:
+    border-color 240ms ease,
+    box-shadow 320ms ease,
+    transform 180ms ease;
 }
 
 .voice-participants > span:first-child {
@@ -1326,7 +1349,8 @@ svg {
 
 .voice-participants > span.speaking {
   border-color: #43b976;
-  box-shadow: 0 0 0 2px rgba(67, 185, 118, 0.2);
+  box-shadow: 0 0 0 3px rgba(67, 185, 118, 0.22);
+  transform: scale(1.04);
 }
 
 .voice-participants svg {
@@ -1360,8 +1384,10 @@ svg {
   top: calc(100% + 8px);
   right: 0;
   display: grid;
-  width: min(330px, calc(100vw - 24px));
+  width: min(340px, calc(100vw - 24px));
+  max-height: calc(100vh - 154px);
   gap: 14px;
+  overflow-y: auto;
   border: 1px solid #bfc2b8;
   border-radius: 6px;
   background: var(--white);
@@ -1387,6 +1413,18 @@ svg {
   font-weight: 680;
 }
 
+.voice-settings label > span {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.voice-settings output {
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
 .voice-settings select {
   width: 100%;
   min-height: 38px;
@@ -1401,6 +1439,22 @@ svg {
 .voice-settings input[type="range"] {
   width: 100%;
   accent-color: var(--success);
+}
+
+.voice-volume-list {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.voice-volume-list > strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.voice-volume-list label {
+  gap: 4px;
 }
 
 .voice-settings .voice-toggle {

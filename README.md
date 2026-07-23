@@ -86,6 +86,9 @@ npm run agent
 - `WATCHPAIR_ORIGINS` pre-approves a comma-separated list of coordinator origins.
   Normal users approve the current website through the local pairing page instead.
 - `WATCHPAIR_AGENT_PORT` changes the localhost port.
+- `WATCHPAIR_TORRENT_PORT` and `WATCHPAIR_DHT_PORT` change the peer listener ports
+  (TCP 41736 when available; DHT chooses an available UDP port). On Windows, allow the bundled private Node
+  runtime through Windows Firewall so participant-shared seeds are reachable.
 - `WATCHPAIR_LIBRARY_DIRS` adds external-client download folders, separated by
   the platform path delimiter (`;` on Windows and `:` on macOS/Linux).
 - `WATCHPAIR_TRACKERS` overrides the built-in UDP and WebRTC tracker list for locally published torrents.
