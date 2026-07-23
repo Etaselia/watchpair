@@ -18,8 +18,8 @@ importers:
         specifier: 3.1.0
         version: 3.1.0
       webtorrent:
-        specifier: 3.0.11
-        version: 3.0.11(bare-url@2.4.5)
+        specifier: 3.0.16
+        version: 3.0.16(bare-url@2.4.5)
 
 packages:
 
@@ -782,8 +782,8 @@ packages:
     resolution: {integrity: sha512-t/H2OySa7lZSq2f5j4whmr+IWCl5TqF4daGotE8VhPP7U+E4x5x8MK1wqOkqlb4xxRlag4kBB9enU4oxNk//+g==}
     engines: {node: '>=16.0.0'}
 
-  webtorrent@3.0.11:
-    resolution: {integrity: sha512-6GGDQdYmlyn2xn6CPrrjtyIV0FPg9Qcc+76y1725TeorbyA3CbH5s7N83t5aFo9DBaBkg2qMvE3aqwxhFJj0rQ==}
+  webtorrent@3.0.16:
+    resolution: {integrity: sha512-oryVor+AGWiNbI4zBT58CKw5MrUYz2GxP5fleHyIhucqwTYAl6pjGkDTjCPGiY5VZCPnVhhhlt+eFov85ZgZKg==}
     engines: {node: '>=22'}
 
   whatwg-encoding@3.1.1:
@@ -1749,7 +1749,7 @@ snapshots:
     dependencies:
       node-datachannel: 0.32.3
 
-  webtorrent@3.0.11(bare-url@2.4.5):
+  webtorrent@3.0.16(bare-url@2.4.5):
     dependencies:
       '@silentbot1/nat-api': 0.4.9
       '@thaunknown/simple-peer': 10.1.1

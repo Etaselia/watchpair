@@ -9,7 +9,6 @@ dist
 downloads
 .env*
 npm-debug.log*
-tests
 *.md
 LICENSE
 SECURITY.md

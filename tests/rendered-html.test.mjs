@@ -387,7 +387,7 @@ test("packages the pairable magnet and subtitle companion", async () => {
   assert.match(bundledSafetyGuard, /verifiedTorrentFileProgress/);
   const rootPackage = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   assert.equal(JSON.parse(companionPackage).version, rootPackage.version);
-  assert.match(companionPackage, /"webtorrent": "3\.0\.11"/);
+  assert.equal(JSON.parse(companionPackage).dependencies.webtorrent, rootPackage.dependencies.webtorrent);
   assert.match(installer, /\$Releases = Invoke-RestMethod/);
   assert.match(installer, /\$Release = \(\$Releases \| Where-Object/);
   assert.match(installer, /\$Version = \[string\]\$Release\.version/);
