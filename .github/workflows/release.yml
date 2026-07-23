@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      version:
+        description: Existing semantic version to republish, without the v prefix
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -33,23 +38,24 @@ jobs:
 
   publish:
     name: Publish release artifacts
-    if: needs.release.outputs.release_created == 'true'
+    if: needs.release.outputs.release_created == 'true' || inputs.version != ''
     needs: release
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
       contents: write
       packages: write
-      attestations: write
-      id-token: write
     env:
       IMAGE: ghcr.io/etaselia/watchpair
-      TAG: ${{ needs.release.outputs.tag_name }}
-      VERSION: ${{ needs.release.outputs.version }}
+      TAG: ${{ needs.release.outputs.tag_name || format('v{0}', inputs.version) }}
+      VERSION: ${{ needs.release.outputs.version || inputs.version }}
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.release.outputs.sha }}
+          ref: ${{ needs.release.outputs.sha || format('v{0}', inputs.version) }}
+      - id: source
+        name: Resolve source revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -71,7 +77,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build and publish multi-platform image
-        id: image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -79,14 +84,8 @@ jobs:
           push: true
           provenance: true
           sbom: true
-          build-args: VCS_REF=${{ needs.release.outputs.sha }}
+          build-args: VCS_REF=${{ steps.source.outputs.sha }}
           tags: |
             ${{ env.IMAGE }}:${{ env.VERSION }}
-            ${{ env.IMAGE }}:${{ needs.release.outputs.tag_name }}
+            ${{ env.IMAGE }}:${{ env.TAG }}
             ${{ env.IMAGE }}:latest
-      - name: Attest image provenance
-        uses: actions/attest@v4
-        with:
-          subject-name: ${{ env.IMAGE }}
-          subject-digest: ${{ steps.image.outputs.digest }}
-          push-to-registry: true
