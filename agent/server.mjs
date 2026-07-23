@@ -1409,7 +1409,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/health") {
       sendJson(response, 200, {
         ok: true,
-        version: "0.5.1", // x-release-please-version
+        version: "0.5.2", // x-release-please-version
         downloadDirectory: DOWNLOAD_DIR,
         platform: process.platform,
         torrent: {
