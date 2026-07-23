@@ -165,7 +165,9 @@ function queueReadinessForJob(job: AgentJob, file: AgentFile | null): QueueReadi
     };
   }
 
-  const fingerprint = job.identityFingerprint;
+  const fingerprint = file.fingerprint === undefined
+    ? (file.selected ? job.identityFingerprint : null)
+    : file.fingerprint;
   const status = job.status === "error"
     ? job.error || "Download failed"
     : !file.ready
@@ -1117,7 +1119,7 @@ export default function WatchApp() {
         next.fingerprint &&
         activeFile &&
         selectedMedia?.sourceId === activeSourceId &&
-        selectedMedia.fingerprint !== next.fingerprint
+        !selectedMedia.fingerprint
       ) {
         await sendAction("select-media", {
           media: { ...selectedMedia, fingerprint: next.fingerprint },
@@ -1265,6 +1267,9 @@ export default function WatchApp() {
         selectedJob = await selectAgentFile(sourceId, file.index);
         setAgentJobs((current) => ({ ...current, [sourceId]: selectedJob }));
       }
+      const selectedFile =
+        selectedJob.files.find((candidate) => candidate.index === file.index) || file;
+      const item = queueReadinessForJob(selectedJob, selectedFile);
       selectionSentRef.current = `${sourceId}:${file.index}`;
       await sendAction("select-media", {
         media: {
@@ -1272,13 +1277,9 @@ export default function WatchApp() {
           fileIndex: file.index,
           name: file.name,
           size: file.size,
-          fingerprint: selectedJob.identityFingerprint || undefined,
+          fingerprint: item.fingerprint || undefined,
         },
       });
-      const item = queueReadinessForJob(
-        selectedJob,
-        selectedJob.files.find((candidate) => candidate.index === file.index) || file
-      );
       const next: LocalReadiness = {
         ...item,
         voice: readinessRef.current.voice,

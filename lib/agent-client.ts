@@ -42,6 +42,7 @@ export interface AgentFile {
   progress: number;
   ready: boolean;
   selected: boolean;
+  fingerprint?: string | null;
   streamUrl: string;
   hlsUrl?: string | null;
 }

@@ -358,9 +358,19 @@ function torrentFileName(file) {
   return path.posix.basename(String(file?.path || file?.name || "video").replaceAll("\\", "/"));
 }
 
+function fileIdentityKey(index, file) {
+  return String(index) + ":" + file.name + ":" + file.size;
+}
+
 function selectedFileKey(job) {
   const media = selectedJobFile(job);
-  return String(job.selectedIndex) + ":" + media.name + ":" + media.size;
+  return fileIdentityKey(job.selectedIndex, media);
+}
+
+function fileIdentityFingerprint(job, index, file) {
+  return job.identityFingerprintKey === fileIdentityKey(index, file)
+    ? job.identityFingerprint
+    : null;
 }
 
 async function identifySelectedFile(job, index = job.selectedIndex) {
@@ -609,6 +619,7 @@ function torrentFiles(job) {
       progress: Math.round(progress * 1000) / 10,
       ready: Boolean(file.done),
       selected: index === job.selectedIndex,
+      fingerprint: fileIdentityFingerprint(job, index, { name: torrentFileName(file), size: file.length }),
       streamUrl: `http://${HOST}:${PORT}/stream/${encodeURIComponent(job.id)}/${index}`,
       hlsUrl: needsHlsPlayback(job, file.path || file.name)
         ? `http://${HOST}:${PORT}/hls/${encodeURIComponent(job.id)}/${index}/master.m3u8`
@@ -630,6 +641,7 @@ function snapshot(job) {
             progress: job.file.size ? Math.round((job.downloaded / job.file.size) * 1000) / 10 : 0,
             ready: job.status === "ready" && job.downloaded === job.file.size,
             selected: true,
+            fingerprint: fileIdentityFingerprint(job, 0, job.file),
             streamUrl: `http://${HOST}:${PORT}/stream/${encodeURIComponent(job.id)}/0`,
             hlsUrl: needsHlsPlayback(job, job.file.name)
               ? `http://${HOST}:${PORT}/hls/${encodeURIComponent(job.id)}/0/master.m3u8`
