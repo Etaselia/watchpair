@@ -1622,7 +1622,7 @@ export default function WatchApp() {
                   {agentPairing ? <LoaderCircle className="spin" /> : <Plug />}
                   {agentPairing ? "Waiting for approval" : "Connect"}
                 </button>
-                <a className="secondary-button" href="/watchpair-companion.zip?v=0.4.3" download>
+                <a className="secondary-button" href="/watchpair-companion.zip?v=0.4.4" download>
                   <PackageOpen />
                   Get companion
                 </a>
@@ -1751,7 +1751,15 @@ export default function WatchApp() {
                       {job?.seed && (
                         <span className="seed-status">
                           <Upload />
-                          {job.peers} peers / {formatBytes(job.uploadSpeed)}/s
+                          {job.seedState === "creating"
+                            ? `Creating torrent ${Math.round(job.creationProgress)}%`
+                            : job.seedState === "starting"
+                              ? "Starting seed"
+                              : job.seedState === "uploading"
+                                ? `Uploading to ${job.peers} peer${job.peers === 1 ? "" : "s"} / ${formatBytes(job.uploadSpeed)}/s`
+                                : job.seedState === "error"
+                                  ? "Seed failed"
+                                  : "Seeding / waiting for peers"}
                         </span>
                       )}
                       <span className="queue-action-spacer" />

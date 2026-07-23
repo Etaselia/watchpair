@@ -84,7 +84,7 @@ npm run agent
 - `WATCHPAIR_AGENT_PORT` changes the localhost port.
 - `WATCHPAIR_LIBRARY_DIRS` adds external-client download folders, separated by
   the platform path delimiter (`;` on Windows and `:` on macOS/Linux).
-- `WATCHPAIR_TRACKERS` sets comma-separated trackers for locally published torrents.
+- `WATCHPAIR_TRACKERS` overrides the built-in UDP and WebRTC tracker list for locally published torrents.
   With no override, WebTorrent's standard discovery settings are used.
 - `WATCHPAIR_FFMPEG_PATH` selects a specific GPU-capable FFmpeg executable.
 - `WATCHPAIR_TRANSCODER` accepts `auto`, `cpu`, `nvenc`, `qsv`, `vaapi`,
@@ -125,8 +125,9 @@ npm run lint
   two-minute window from the start is ready (or the whole file for shorter videos), while the
   remaining video continues encoding in the background.
 - Torrent files are fully downloaded and verified before FFprobe, subtitle discovery, or FFmpeg
-  preparation begins. Local torrent creation runs in the background and reports hashing progress;
-  tracker or DHT announce delays do not block publishing the magnet.
+  preparation begins. Local torrent creation runs in the background and reports hashing progress.
+  A seed is marked ready only after WebTorrent's file store is serving; UDP, DHT, and WebRTC trackers
+  provide peer discovery, with WebRTC available for peers behind restrictive NAT.
 - Video is encoded once and embedded audio languages are exposed as separate AAC renditions.
   NVIDIA systems use CUDA decoding and NVENC encoding when both work for the selected file.
   Other supported GPU encoders accelerate encoding; the bundled FFmpeg is the universal CPU fallback.

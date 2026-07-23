@@ -41,13 +41,14 @@ concurrently. A torrent is fully downloaded and verified before FFprobe or FFmpe
 starts. Playback unlocks after a contiguous two-minute window from the beginning
 is ready (or the whole file when shorter), without waiting for the remaining
 conversion. Jobs and local seeds resume after restart. WatchPair can also publish a
-selected local file as a torrent; hashing progress is shown and network announce
-delays do not block magnet creation. Its bytes remain between participant computers,
-while torrent peers and trackers can see their IP addresses.
+selected local file as a torrent; hashing progress and actual seed state are shown.
+The built-in tracker list includes UDP and WebRTC discovery for restrictive NAT. Its
+bytes remain between participant computers, while torrent peers and trackers can see
+their IP addresses.
 
 Set WATCHPAIR_LIBRARY_DIRS to additional external-client download folders,
 separated by ; on Windows or : on macOS/Linux. Set WATCHPAIR_TRACKERS to a
-comma-separated tracker list for locally published torrents.
+comma-separated tracker list to override the defaults for locally published torrents.
 
 The companion listens only on 127.0.0.1:41735. Websites cannot use it until you
 explicitly approve their origin on the local pairing page. Approved origins are

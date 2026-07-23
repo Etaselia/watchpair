@@ -93,6 +93,7 @@ export interface AgentJob {
   infoHash: string | null;
   magnetURI: string | null;
   seed: boolean;
+  seedState: "creating" | "starting" | "seeding" | "uploading" | "error" | null;
   peers: number;
   uploadSpeed: number;
   uploaded: number;

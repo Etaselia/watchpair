@@ -35,10 +35,20 @@ const LIBRARY_DIRS = Array.from(new Set([
     .filter(Boolean)
     .map((entry) => path.resolve(entry)),
 ]));
-const TRACKERS = (process.env.WATCHPAIR_TRACKERS || "")
+const DEFAULT_TRACKERS = [
+  "udp://open.stealth.si:80/announce",
+  "udp://tracker.opentrackr.org:1337/announce",
+  "udp://exodus.desync.com:6969/announce",
+  "udp://tracker.torrent.eu.org:451/announce",
+  "wss://tracker.openwebtorrent.com",
+  "wss://tracker.btorrent.xyz",
+  "wss://tracker.webtorrent.dev",
+];
+const configuredTrackers = (process.env.WATCHPAIR_TRACKERS || "")
   .split(",")
   .map((entry) => entry.trim())
   .filter(Boolean);
+const TRACKERS = configuredTrackers.length ? configuredTrackers : DEFAULT_TRACKERS;
 const TRANSCODE_RUNTIME = await selectTranscodeRuntime({ bundledPath: ffmpegStaticPath });
 const FFMPEG_PATH = TRANSCODE_RUNTIME.ffmpegPath;
 const TRANSCODER = publicTranscoder(TRANSCODE_RUNTIME);
@@ -560,6 +570,17 @@ function snapshot(job) {
     infoHash: job.torrent?.infoHash || null,
     magnetURI: job.torrent?.magnetURI || job.value || null,
     seed: Boolean(job.seed),
+    seedState: job.seed
+      ? job.status === "error"
+        ? "error"
+        : !job.value
+          ? "creating"
+          : !job.torrent?.ready
+            ? "starting"
+            : job.torrent.numPeers > 0
+              ? "uploading"
+              : "seeding"
+      : null,
     peers: job.torrent?.numPeers || 0,
     uploadSpeed: job.torrent?.uploadSpeed || 0,
     uploaded: job.torrent?.uploaded || 0,
@@ -853,26 +874,35 @@ async function seedLocalFile({ id, filePath, label }) {
   };
   if (TRACKERS.length) options.announce = TRACKERS;
   try {
-    let published = false;
-    const publish = (readyTorrent) => {
-      if (published || !readyTorrent.infoHash || !readyTorrent.torrentFile) return;
-      published = true;
+    let metadataPublished = false;
+    let serving = false;
+    const publishMetadata = (readyTorrent) => {
+      if (metadataPublished || !readyTorrent.infoHash || !readyTorrent.torrentFile) return;
+      metadataPublished = true;
       job.torrent = readyTorrent;
       job.value = readyTorrent.magnetURI;
-      job.status = "ready";
       job.torrentCreationProgress = 100;
       job.updatedAt = Date.now();
       const torrentPath = path.join(path.dirname(resolvedPath), ".watchpair-" + id + ".torrent");
       void writeFile(torrentPath, readyTorrent.torrentFile).catch((error) => {
         console.warn(`Could not persist torrent metadata for ${job.label}: ${error.message}`);
       });
+      persistJobs();
+    };
+    const markServing = (readyTorrent) => {
+      if (serving) return;
+      publishMetadata(readyTorrent);
+      serving = true;
+      job.status = "ready";
+      job.updatedAt = Date.now();
       void queueSubtitleProbe(job);
       queueBackgroundPreparation(job);
       persistJobs();
     };
-    const torrent = client.seed(resolvedPath, options, publish);
+    const torrent = client.seed(resolvedPath, options, markServing);
     job.torrent = torrent;
-    torrent.once("metadata", () => publish(torrent));
+    torrent.once("metadata", () => publishMetadata(torrent));
+    torrent.once("ready", () => markServing(torrent));
     torrent.once("error", (error) => {
       job.status = "error";
       job.error = error.message;
@@ -1322,7 +1352,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/health") {
       sendJson(response, 200, {
         ok: true,
-        version: "0.4.3",
+        version: "0.4.4",
         downloadDirectory: DOWNLOAD_DIR,
         jobs: jobs.size,
         transcoder: TRANSCODER,

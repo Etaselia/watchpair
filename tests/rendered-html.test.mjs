@@ -209,11 +209,12 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /action: "create",\s+deviceId,\s+name: displayName/);
   assert.match(app, /getAgentDownloads/);
   assert.match(app, /Download queue/);
-  assert.match(app, /watchpair-companion\.zip\?v=0\.4\.3/);
+  assert.match(app, /watchpair-companion\.zip\?v=0\.4\.4/);
   assert.match(app, /queueReadinessForJob/);
   assert.match(app, /file\.ready && \(preparation === "ready" \|\| preparation === "direct"\)/);
   assert.match(app, /GPU decode/);
   assert.match(app, /uploadAndSeedAgentFile/);
+  assert.match(app, /Seeding \/ waiting for peers/);
   assert.match(app, /downloadMode === "automatic"/);
   assert.match(app, /synchronizePlayback/);
   assert.match(app, /5_000/);
@@ -242,6 +243,8 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(agent, /renderAudioPlayback/);
   assert.match(agent, /receiveImportChunk/);
   assert.match(agent, /seedLocalFile/);
+  assert.match(agent, /DEFAULT_TRACKERS/);
+  assert.match(agent, /torrent\.once\("ready", \(\) => markServing\(torrent\)\)/);
   assert.match(agent, /restoreJobs/);
   assert.match(agentClient, /loopback-network/);
   assert.match(agentClient, /getAgentDownloads/);
