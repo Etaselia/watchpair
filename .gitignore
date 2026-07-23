@@ -40,6 +40,7 @@ next-env.d.ts
 *.tsbuildinfo
 /dist/
 /.wrangler/
+/wrangler.jsonc
 /downloads/
 /outputs/
 /companion/runtime/

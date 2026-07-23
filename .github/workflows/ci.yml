@@ -53,3 +53,83 @@ jobs:
           build-args: VCS_REF=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy site
+    if: github.event_name == 'push' && vars.CLOUDFLARE_DEPLOY_ENABLED == 'true'
+    needs: [verify, docker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: production
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Resolve production database
+        id: database
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        shell: bash
+        run: |
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          test -n "$CLOUDFLARE_API_TOKEN"
+
+          database_id="$(
+            npx wrangler d1 list --json |
+              node --input-type=module -e '
+                let input = "";
+                for await (const chunk of process.stdin) input += chunk;
+                const database = JSON.parse(input).find(
+                  (item) => item.name === "watchpair"
+                );
+                if (database) process.stdout.write(database.uuid);
+              '
+          )"
+
+          if [ -z "$database_id" ]; then
+            npx wrangler d1 create watchpair --location weur
+            for attempt in 1 2 3 4 5; do
+              database_id="$(
+                npx wrangler d1 list --json |
+                  node --input-type=module -e '
+                    let input = "";
+                    for await (const chunk of process.stdin) input += chunk;
+                    const database = JSON.parse(input).find(
+                      (item) => item.name === "watchpair"
+                    );
+                    if (database) process.stdout.write(database.uuid);
+                  '
+              )"
+              [ -n "$database_id" ] && break
+              sleep "$((attempt * 2))"
+            done
+          fi
+
+          test -n "$database_id"
+          echo "id=$database_id" >> "$GITHUB_OUTPUT"
+      - name: Configure production Worker
+        env:
+          WATCHPAIR_D1_DATABASE_ID: ${{ steps.database.outputs.id }}
+          WATCHPAIR_WORKER_NAME: ${{ vars.WATCHPAIR_WORKER_NAME }}
+        run: node scripts/write-wrangler-config.mjs
+      - name: Configure voice relay
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          WATCHPAIR_ICE_SERVERS: ${{ secrets.WATCHPAIR_ICE_SERVERS }}
+        run: |
+          if [ -n "$WATCHPAIR_ICE_SERVERS" ]; then
+            printf '%s' "$WATCHPAIR_ICE_SERVERS" |
+              npx wrangler secret put WATCHPAIR_ICE_SERVERS
+          fi
+      - name: Publish tested commit
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npm run deploy
