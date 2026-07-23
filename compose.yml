@@ -1,6 +1,14 @@
 services:
   coordinator:
+    image: ${WATCHPAIR_IMAGE:-watchpair:local}
     build: .
+    init: true
     restart: unless-stopped
+    environment:
+      PORT: 3000
+      WATCHPAIR_ICE_SERVERS: ${WATCHPAIR_ICE_SERVERS:-}
     ports:
       - "3000:3000"
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s

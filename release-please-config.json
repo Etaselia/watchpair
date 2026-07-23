@@ -1,0 +1,25 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "release-type": "node",
+  "include-component-in-tag": false,
+  "packages": {
+    ".": {
+      "package-name": "watchpair",
+      "extra-files": [
+        {
+          "type": "json",
+          "path": "companion/package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "generic",
+          "path": "agent/server.mjs"
+        },
+        {
+          "type": "generic",
+          "path": "app/watch-app.tsx"
+        }
+      ]
+    }
+  }
+}

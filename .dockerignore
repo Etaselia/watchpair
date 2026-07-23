@@ -1,9 +1,15 @@
+.git
+.github
+.githooks
 node_modules
 dist
 .next
 .vinext
 .wrangler
 downloads
-.git
 .env*
 npm-debug.log*
+tests
+*.md
+LICENSE
+SECURITY.md

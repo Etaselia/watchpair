@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+set -eu
+
+echo "Running WatchPair pre-commit checks..."
+npm run check

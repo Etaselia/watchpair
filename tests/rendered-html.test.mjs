@@ -56,6 +56,12 @@ test("production-renders the WatchPair application", async () => {
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|react-loading-skeleton/i);
 });
 
+test("production health endpoint reports readiness", async () => {
+  const response = await fetch(`http://127.0.0.1:${port}/api/health`);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true, service: "watchpair" });
+});
+
 test("production session API supports join-in-progress state", async () => {
   const createdResponse = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
     method: "POST",
@@ -262,7 +268,8 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /action: "create",\s+deviceId,\s+name: displayName/);
   assert.match(app, /getAgentDownloads/);
   assert.match(app, /Download queue/);
-  assert.match(app, /watchpair-companion\.zip\?v=0\.5\.1/);
+  assert.match(app, /const COMPANION_VERSION = "\d+\.\d+\.\d+"; \/\/ x-release-please-version/);
+  assert.match(app, /watchpair-companion\.zip\?v=\$\{COMPANION_VERSION\}/);
   assert.match(app, /queueReadinessForJob/);
   assert.match(app, /file\.ready && \(preparation === "ready" \|\| preparation === "direct"\)/);
   assert.match(app, /GPU decode/);
@@ -378,7 +385,8 @@ test("packages the pairable magnet and subtitle companion", async () => {
   assert.match(bundledSafetyGuard, /stabilizeWireBitfieldWrites/);
   assert.match(bundledSafetyGuard, /new Uint8Array\(bytes\)/);
   assert.match(bundledSafetyGuard, /verifiedTorrentFileProgress/);
-  assert.match(companionPackage, /"version": "0\.5\.1"/);
+  const rootPackage = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(JSON.parse(companionPackage).version, rootPackage.version);
   assert.match(companionPackage, /"webtorrent": "3\.0\.11"/);
   assert.match(installer, /\$Releases = Invoke-RestMethod/);
   assert.match(installer, /\$Release = \(\$Releases \| Where-Object/);

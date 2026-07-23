@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import ffmpegPath from "ffmpeg-static";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
+const packageVersion = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).version;
 
 test("keeps multiple downloads active and prepares completed jobs in the background", { timeout: 30_000 }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "watchpair-companion-queue-"));
@@ -63,7 +64,7 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
       (body) => Boolean(body?.ok),
       () => companion.exitCode !== null
     );
-    assert.equal(health.version, "0.5.1");
+    assert.equal(health.version, packageVersion);
     assert.equal(health.transcoder.encoder, "cpu");
 
     const ids = ["queuejob-one", "queuejob-two"];

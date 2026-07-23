@@ -1,5 +1,8 @@
 # WatchPair
 
+[![CI](https://github.com/Etaselia/watchpair/actions/workflows/ci.yml/badge.svg)](https://github.com/Etaselia/watchpair/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 WatchPair is a private two-person watch room for videos that remain on each
 participant's own computer. A session keeps an ordered download queue, active
 file selection, per-item readiness, play/pause, seeks, playback speed, audio language, subtitles, and
@@ -112,19 +115,42 @@ uses the website **Connect** action to approve that public HTTPS origin. Current
 Chromium browsers are the primary target because localhost private-network
 permissions and media codec support vary between browsers.
 
-## VPS / Docker
+## Docker and external hosting
+
+The image runs the coordinator website. Participants still run the companion locally so torrent
+traffic, media files, FFmpeg, and GPU access remain on their own machines.
+
+Build and run locally:
 
 ```bash
 docker compose up --build
 ```
 
-The coordinator is then available on port 3000. Put it behind Caddy, Traefik, or
-Nginx with HTTPS before exposing it publicly. Standalone sessions are kept in memory, so restarting the coordinator invalidates active tokens.
-Hosted Sites deployments use D1 for durable session state.
+Or deploy a released image from the private GitHub Container Registry package:
+
+```bash
+docker login ghcr.io
+WATCHPAIR_IMAGE=ghcr.io/etaselia/watchpair:latest docker compose pull
+WATCHPAIR_IMAGE=ghcr.io/etaselia/watchpair:latest docker compose up -d --no-build
+```
+
+The coordinator listens on port 3000 and exposes `GET /api/health`. Set
+`WATCHPAIR_ICE_SERVERS` to the JSON configuration shown above. Put the service behind HTTPS using
+Caddy, Traefik, Nginx, or the hosting provider's managed proxy.
+
+Docker sessions are held in memory. Run exactly one coordinator replica; restarts invalidate active
+room tokens. Hosted Sites deployments use D1 for durable session state and can scale independently.
 
 A hosted Sites deployment uses the `DB` D1 binding declared in
 `.openai/hosting.json`. The Docker path uses the same Worker-compatible build
-and its local persistent runtime state.
+with its in-memory fallback store.
+
+## Development and releases
+
+`npm install` configures tracked pre-commit and pre-push hooks. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for checks and Conventional Commit guidance. Pull requests must pass lint, type checking, all tests,
+and a production Docker build. Release Please prepares semantic-version release pull requests;
+merging one publishes the companion ZIP, checksum, and multi-platform GHCR image.
 
 ## Verification
 
@@ -160,3 +186,7 @@ npm run lint
   `downloads/.watchpair-jobs.json` after restart.
 - The companion blocks obvious private-network direct-download targets and
   accepts browser requests only from configured origins.
+
+## License
+
+WatchPair is licensed under the [MIT License](LICENSE).

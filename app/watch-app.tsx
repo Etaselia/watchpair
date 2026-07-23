@@ -90,6 +90,7 @@ import {
   type WatchSession,
 } from "../lib/session-types";
 
+const COMPANION_VERSION = "0.5.1"; // x-release-please-version
 const EMPTY_AUDIO_TRACKS: AgentAudioTrack[] = [];
 const EMPTY_SUBTITLE_TRACKS: AgentSubtitleTrack[] = [];
 
@@ -1694,7 +1695,7 @@ export default function WatchApp() {
                   {agentPairing ? <LoaderCircle className="spin" /> : <Plug />}
                   {agentPairing ? "Waiting for approval" : "Connect"}
                 </button>
-                <a className="secondary-button" href="/watchpair-companion.zip?v=0.5.1" download>
+                <a className="secondary-button" href={`/watchpair-companion.zip?v=${COMPANION_VERSION}`} download>
                   <PackageOpen />
                   Get companion
                 </a>

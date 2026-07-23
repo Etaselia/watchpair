@@ -10,12 +10,16 @@
     "build": "vinext build",
     "start": "vinext start",
     "test": "npm run build && node --test tests/*.test.mjs",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
+    "lint": "eslint . --max-warnings=0 --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate",
     "agent": "node agent/server.mjs",
     "typecheck": "tsc --noEmit",
     "build:companion": "node scripts/build-companion.mjs",
-    "prebuild": "npm run build:companion"
+    "prebuild": "npm run build:companion",
+    "test:unit": "node --test tests/hardware-acceleration.test.mjs tests/torrent-download.test.mjs tests/torrent-runtime.test.mjs",
+    "check": "npm run lint && npm run typecheck && npm run test:unit",
+    "hooks:install": "node scripts/install-hooks.mjs",
+    "prepare": "node scripts/install-hooks.mjs"
   },
   "dependencies": {
     "cheerio": "^1.2.0",
