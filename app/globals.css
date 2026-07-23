@@ -1221,6 +1221,227 @@ svg {
   line-height: 1.4;
 }
 
+/* Room voice */
+
+.voice-dock {
+  position: fixed;
+  z-index: 140;
+  top: 80px;
+  right: 18px;
+  display: flex;
+  min-height: 52px;
+  max-width: min(520px, calc(100vw - 36px));
+  align-items: center;
+  gap: 12px;
+  border: 1px solid #bfc2b8;
+  border-radius: 6px;
+  background: var(--white);
+  padding: 7px 8px 7px 10px;
+  box-shadow: 0 12px 30px rgba(17, 19, 15, 0.16);
+}
+
+.voice-dock.voice-off {
+  min-height: 44px;
+  padding: 4px;
+}
+
+.voice-join-button {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  border-radius: 4px;
+  background: var(--ink);
+  color: var(--white);
+  padding: 0 13px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.voice-join-button:disabled {
+  opacity: 0.65;
+}
+
+.voice-summary {
+  display: flex;
+  min-width: 142px;
+  align-items: center;
+  gap: 9px;
+}
+
+.voice-summary > span {
+  display: grid;
+  gap: 2px;
+}
+
+.voice-summary strong {
+  font-size: 13px;
+}
+
+.voice-summary small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.voice-self-avatar {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border: 2px solid transparent;
+  border-radius: 50%;
+  background: #e9ebe4;
+  color: #4d5148;
+}
+
+.voice-self-avatar.speaking {
+  border-color: #43b976;
+  background: #e8f7ee;
+  color: #17683c;
+}
+
+.voice-participants {
+  display: flex;
+  align-items: center;
+}
+
+.voice-participants > span {
+  display: grid;
+  width: 29px;
+  height: 29px;
+  place-items: center;
+  margin-left: -5px;
+  border: 2px solid var(--white);
+  border-radius: 50%;
+  background: var(--blue);
+  color: #0d365f;
+  font-size: 10px;
+  font-weight: 760;
+}
+
+.voice-participants > span:first-child {
+  margin-left: 0;
+}
+
+.voice-participants > span.speaking {
+  border-color: #43b976;
+  box-shadow: 0 0 0 2px rgba(67, 185, 118, 0.2);
+}
+
+.voice-participants svg {
+  width: 12px;
+  height: 12px;
+}
+
+.voice-actions {
+  display: flex;
+  gap: 2px;
+  padding-left: 3px;
+  border-left: 1px solid var(--line);
+}
+
+.voice-actions .icon-button.active {
+  background: #dcecff;
+  color: #155998;
+}
+
+.voice-actions .icon-button.danger,
+.voice-actions .icon-button.active.danger {
+  color: var(--danger);
+}
+
+.voice-actions .icon-button.active.danger {
+  background: #ffe8e5;
+}
+
+.voice-settings {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  display: grid;
+  width: min(330px, calc(100vw - 24px));
+  gap: 14px;
+  border: 1px solid #bfc2b8;
+  border-radius: 6px;
+  background: var(--white);
+  padding: 14px;
+  box-shadow: 0 18px 45px rgba(17, 19, 15, 0.2);
+}
+
+.voice-settings-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.voice-settings-heading strong {
+  font-size: 14px;
+}
+
+.voice-settings label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 680;
+}
+
+.voice-settings select {
+  width: 100%;
+  min-height: 38px;
+  border: 1px solid #c7cac0;
+  border-radius: 4px;
+  background: #f8f9f4;
+  padding: 0 9px;
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.voice-settings input[type="range"] {
+  width: 100%;
+  accent-color: var(--success);
+}
+
+.voice-settings .voice-toggle {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid var(--line);
+  color: var(--ink);
+  padding-top: 12px;
+}
+
+.voice-toggle span,
+.voice-processing {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.voice-toggle input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--success);
+}
+
+.voice-processing,
+.voice-error {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.voice-error {
+  max-width: 250px;
+  color: var(--danger);
+  line-height: 1.35;
+}
+
+.room-voice-audio {
+  display: none;
+}
+
 /* Player */
 
 .player-shell {
@@ -1800,6 +2021,29 @@ svg {
 }
 
 @media (max-width: 560px) {
+  .voice-dock {
+    top: 70px;
+    right: 10px;
+    max-width: calc(100vw - 20px);
+  }
+
+  .voice-summary {
+    min-width: 0;
+  }
+
+  .voice-summary > span {
+    display: none;
+  }
+
+  .voice-participants {
+    max-width: 86px;
+    overflow: hidden;
+  }
+
+  .voice-settings {
+    right: -1px;
+  }
+
   .entry-shell {
     min-height: 100svh;
     padding: 22px 18px;

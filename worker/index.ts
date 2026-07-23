@@ -6,6 +6,7 @@ import { handleSessionApi } from "./session-api";
 interface Env {
   ASSETS: Fetcher;
   DB?: D1Database;
+  WATCHPAIR_ICE_SERVERS?: string;
   IMAGES: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {

@@ -78,6 +78,58 @@ test("production session API supports join-in-progress state", async () => {
   });
   assert.equal(joinedResponse.status, 200);
 
+  const voicePresenceResponse = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      action: "heartbeat",
+      token: created.session.token,
+      deviceId: "test-guest",
+      name: "Guest",
+      readiness: {
+        status: "idle",
+        progress: 0,
+        queue: {},
+        voice: { enabled: true, muted: false, deafened: false },
+      },
+    }),
+  });
+  assert.equal(voicePresenceResponse.status, 200);
+
+  const voiceSignalResponse = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      action: "voice-signal",
+      token: created.session.token,
+      deviceId: "test-host",
+      name: "Host",
+      signal: {
+        toId: "test-guest",
+        type: "offer",
+        data: JSON.stringify({ type: "offer", sdp: "test-room-voice-sdp" }),
+      },
+    }),
+  });
+  assert.equal(voiceSignalResponse.status, 200);
+
+  const hostVoiceSnapshot = await fetch(
+    `http://127.0.0.1:${port}/api/sessions?token=${created.session.token}&deviceId=test-host`,
+  ).then((response) => response.json());
+  assert.equal(hostVoiceSnapshot.session.voiceSignals.length, 0);
+
+  const guestVoiceSnapshot = await fetch(
+    `http://127.0.0.1:${port}/api/sessions?token=${created.session.token}&deviceId=test-guest`,
+  ).then((response) => response.json());
+  assert.equal(guestVoiceSnapshot.session.voiceSignals.length, 1);
+  assert.equal(guestVoiceSnapshot.session.voiceSignals[0].fromId, "test-host");
+  assert.equal(guestVoiceSnapshot.session.voiceSignals[0].type, "offer");
+  assert.equal(
+    guestVoiceSnapshot.session.participants.find((participant) => participant.deviceId === "test-guest").voice.enabled,
+    true,
+  );
+  assert.match(guestVoiceSnapshot.session.voice.iceServers[0].urls[0], /^stun:/);
+
   const queuedSources = [
     { id: "source-episode-one", kind: "magnet", value: "magnet:?xt=urn:btih:1111111111111111111111111111111111111111", label: "Episode 1" },
     { id: "source-episode-two", kind: "magnet", value: "magnet:?xt=urn:btih:2222222222222222222222222222222222222222", label: "Episode 2" },
@@ -195,8 +247,9 @@ test("production session API supports join-in-progress state", async () => {
 });
 
 test("ships the coordination and companion surfaces", async () => {
-  const [app, route, agent, agentClient, media, packageJson, layout] = await Promise.all([
+  const [app, voice, route, agent, agentClient, media, packageJson, layout] = await Promise.all([
     readFile(new URL("../app/watch-app.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/room-voice.tsx", import.meta.url), "utf8"),
     readFile(new URL("../worker/session-api.ts", import.meta.url), "utf8"),
     readFile(new URL("../agent/server.mjs", import.meta.url), "utf8"),
     readFile(new URL("../lib/agent-client.ts", import.meta.url), "utf8"),
@@ -229,7 +282,16 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /Preparing video for this browser/);
   assert.match(app, /HlsRuntime\.isSupported/);
   assert.match(app, /AUDIO_TRACKS_UPDATED/);
+  assert.match(voice, /new RTCPeerConnection/);
+  assert.match(voice, /echoCancellation: true/);
+  assert.match(voice, /noiseSuppression/);
+  assert.match(voice, /autoGainControl: true/);
+  assert.match(voice, /voiceIsolation/);
+  assert.match(voice, /setSinkId/);
+  assert.match(voice, /HeadphoneOff/);
   assert.match(route, /action === "heartbeat"/);
+  assert.match(route, /action === "voice-signal"/);
+  assert.match(route, /watch_voice_signals/);
   assert.match(route, /action === "player"/);
   assert.match(route, /action === "select-media"/);
   assert.match(route, /action === "remove-source"/);

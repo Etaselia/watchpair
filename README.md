@@ -8,6 +8,8 @@ subtitle timing synchronized.
 ## What works
 
 - Short session tokens and shareable invite links
+- Peer-to-peer room voice with mute, deafen, device selection, input gain, speaking indicators,
+  echo cancellation, automatic gain control, and browser noise suppression
 - Join-in-progress snapshots after refresh, reconnect, or late arrival
 - Local video selection with sampled SHA-256 file matching
 - Automatic direct downloads through the local companion, with an OPFS browser
@@ -32,17 +34,19 @@ subtitle timing synchronized.
 ## Architecture
 
 ```text
-Browser A ---- polling/JIP ---- Coordinator + D1 / memory ---- polling/JIP ---- Browser B
+Browser A ---- polling/JIP + WebRTC signaling ---- Coordinator + D1 / memory ---- Browser B
    |                                                                  |
 localhost companion                                              localhost companion
    |                                                                  |
 HTTP / magnet download                                           HTTP / magnet download
    |                                                                  |
 local file + range stream                                        local file + range stream
+   \---------------- peer-to-peer WebRTC room audio ----------------/
 ```
 
-The coordinator stores only session metadata and playback state. Video bytes
-stay on participant machines. A session token is a bearer secret and expires
+The coordinator stores session metadata, playback state, and short-lived recipient-only WebRTC
+signaling messages. Video bytes and room audio stay between participant machines, except when a
+configured TURN server must relay encrypted WebRTC audio. A session token is a bearer secret and expires
 seven days after its last participant heartbeat.
 
 ## Local development
@@ -90,6 +94,15 @@ npm run agent
 - `WATCHPAIR_TRANSCODER` accepts `auto`, `cpu`, `nvenc`, `qsv`, `vaapi`,
   `amf`, or `videotoolbox`. The companion validates the requested encoder with
   a tiny real encode and falls back to CPU when it is unavailable.
+
+Room voice works without the companion. The browser requests a microphone only after **Join voice**
+is pressed and enables echo cancellation, automatic gain control, noise suppression, and voice
+isolation where the browser and operating system expose it. For reliable voice on restrictive or
+symmetric-NAT networks, configure STUN/TURN servers on the coordinator:
+
+```bash
+WATCHPAIR_ICE_SERVERS='{"iceServers":[{"urls":["stun:stun.example.com:3478"]},{"urls":["turns:turn.example.com:5349"],"username":"watchpair","credential":"secret"}]}'
+```
 
 For a VPS-hosted coordinator, every participant runs the companion locally and
 uses the website **Connect** action to approve that public HTTPS origin. Current

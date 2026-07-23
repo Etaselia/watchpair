@@ -1,4 +1,4 @@
-import { integer, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 export const watchSessions = sqliteTable("watch_sessions", {
   token: text("token").primaryKey(),
@@ -22,4 +22,26 @@ export const watchParticipants = sqliteTable(
     updatedAt: integer("updated_at").notNull(),
   },
   (table) => [primaryKey({ columns: [table.sessionToken, table.deviceId] })]
+);
+
+
+export const watchVoiceSignals = sqliteTable(
+  "watch_voice_signals",
+  {
+    sessionToken: text("session_token").notNull(),
+    id: text("id").notNull(),
+    fromId: text("from_id").notNull(),
+    toId: text("to_id").notNull(),
+    signalType: text("signal_type").notNull(),
+    data: text("data").notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.sessionToken, table.id] }),
+    index("watch_voice_signals_recipient_idx").on(
+      table.sessionToken,
+      table.toId,
+      table.createdAt
+    ),
+  ]
 );

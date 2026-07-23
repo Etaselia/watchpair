@@ -38,7 +38,35 @@ export interface QueueReadiness {
   preparation: "waiting" | "queued" | "preparing" | "ready" | "direct" | "error";
 }
 
+export interface VoicePresence {
+  enabled: boolean;
+  muted: boolean;
+  deafened: boolean;
+}
+
+export type VoiceSignalType = "offer" | "answer" | "candidate";
+
+export interface VoiceSignal {
+  id: string;
+  fromId: string;
+  toId: string;
+  type: VoiceSignalType;
+  data: string;
+  createdAt: number;
+}
+
+export interface VoiceIceServer {
+  urls: string | string[];
+  username?: string;
+  credential?: string;
+}
+
+export interface VoiceConfig {
+  iceServers: VoiceIceServer[];
+}
+
 export interface ParticipantState extends QueueReadiness {
+  voice: VoicePresence;
   deviceId: string;
   name: string;
   queue: Record<string, QueueReadiness>;
@@ -58,10 +86,13 @@ export interface WatchSession {
   updatedAt: number;
   serverTime: number;
   participants: ParticipantState[];
+  voiceSignals: VoiceSignal[];
+  voice: VoiceConfig;
 }
 
 export interface LocalReadiness extends QueueReadiness {
   queue: Record<string, QueueReadiness>;
+  voice: VoicePresence;
 }
 
 export const initialPlayerState = (now = Date.now()): PlayerState => ({

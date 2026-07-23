@@ -69,6 +69,7 @@ import {
   type AgentJob,
   type AgentSubtitleTrack,
 } from "../lib/agent-client";
+import { VoiceDock, useRoomVoice } from "./room-voice";
 import {
   downloadDirectFile,
   fingerprintFile,
@@ -84,6 +85,8 @@ import {
   type LocalReadiness,
   type QueueReadiness,
   type PlayerState,
+  type VoicePresence,
+  type VoiceSignalType,
   type WatchSession,
 } from "../lib/session-types";
 
@@ -101,6 +104,7 @@ const emptyReadiness = (): LocalReadiness => ({
   fingerprint: null,
   preparation: "waiting",
   queue: {},
+  voice: { enabled: false, muted: true, deafened: false },
 });
 
 async function sessionRequest(payload: Record<string, unknown>) {
@@ -619,7 +623,7 @@ export default function WatchApp() {
     let active = true;
     let timer: number | null = null;
     let refreshing = false;
-    const interval = () => document.hidden ? 5_000 : view === "player" ? 1_000 : 2_000;
+    const interval = () => document.hidden ? 5_000 : 1_000;
     const schedule = () => {
       if (!active) return;
       timer = window.setTimeout(() => void refresh(), interval());
@@ -628,9 +632,12 @@ export default function WatchApp() {
       if (refreshing) return;
       refreshing = true;
       try {
-        const response = await fetch(`/api/sessions?token=${encodeURIComponent(roomToken)}`, {
-          cache: "no-store",
-        });
+        const response = await fetch(
+          `/api/sessions?token=${encodeURIComponent(roomToken)}&deviceId=${encodeURIComponent(deviceId)}`,
+          {
+            cache: "no-store",
+          }
+        );
         const data = (await response.json()) as { session?: WatchSession };
         if (active && response.ok && data.session) {
           applySession(data.session);
@@ -659,7 +666,7 @@ export default function WatchApp() {
       if (timer !== null) window.clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [applySession, joined, roomToken, view]);
+  }, [applySession, deviceId, joined, roomToken]);
 
   useEffect(() => {
     if (!joined || !roomToken || !deviceId) return;
@@ -684,6 +691,41 @@ export default function WatchApp() {
     return () => window.clearInterval(timer);
   }, [applySession, deviceId, displayName, joined, roomToken]);
 
+  const publishVoicePresence = useCallback((voicePresence: VoicePresence) => {
+    const next = { ...readinessRef.current, voice: voicePresence };
+    readinessRef.current = next;
+    setReadiness(next);
+    if (!joined || !roomToken || !deviceId) return;
+    void sessionRequest({
+      action: "heartbeat",
+      token: roomToken,
+      deviceId,
+      name: displayName,
+      readiness: next,
+    })
+      .then((nextSession) => {
+        applySession(nextSession);
+        setConnection("online");
+      })
+      .catch(() => setConnection("offline"));
+  }, [applySession, deviceId, displayName, joined, roomToken]);
+
+  const sendVoiceSignal = useCallback(
+    async (toId: string, type: VoiceSignalType, data: string) => {
+      await sendAction("voice-signal", {
+        signal: { toId, type, data },
+      });
+    },
+    [sendAction]
+  );
+
+  const voice = useRoomVoice({
+    session,
+    deviceId,
+    onSignal: sendVoiceSignal,
+    onPresence: publishVoicePresence,
+  });
+
   const attachLocalFile = useCallback(
     async (file: File, preferredName = file.name, sourceId?: string) => {
       setBusy("file");
@@ -707,6 +749,7 @@ export default function WatchApp() {
         };
         const nextReadiness: LocalReadiness = {
           ...itemReadiness,
+          voice: readinessRef.current.voice,
           queue: sourceId
             ? { ...readinessRef.current.queue, [sourceId]: itemReadiness }
             : readinessRef.current.queue,
@@ -776,6 +819,7 @@ export default function WatchApp() {
         const item = queueReadinessForJob(job, target);
         const next: LocalReadiness = {
           ...item,
+          voice: readinessRef.current.voice,
           queue: { ...readinessRef.current.queue, [sourceId]: item },
         };
         readinessRef.current = next;
@@ -873,6 +917,7 @@ export default function WatchApp() {
     const updateItem = (item: QueueReadiness) => {
       const next: LocalReadiness = {
         ...item,
+        voice: readinessRef.current.voice,
         queue: { ...readinessRef.current.queue, [source.id]: item },
       };
       readinessRef.current = next;
@@ -1037,7 +1082,11 @@ export default function WatchApp() {
       const activeItem = activeSourceId ? queue[activeSourceId] : null;
       if (!activeItem) return;
 
-      const next: LocalReadiness = { ...activeItem, queue };
+      const next: LocalReadiness = {
+        ...activeItem,
+        queue,
+        voice: readinessRef.current.voice,
+      };
       const previous = readinessRef.current;
       const becameReady = next.ready && (!previous.ready || previous.fingerprint !== next.fingerprint);
       readinessRef.current = next;
@@ -1069,6 +1118,7 @@ export default function WatchApp() {
       };
       const next: LocalReadiness = {
         ...item,
+        voice: readinessRef.current.voice,
         queue: { ...readinessRef.current.queue, [activeSourceId]: item },
       };
       readinessRef.current = next;
@@ -1201,6 +1251,7 @@ export default function WatchApp() {
       );
       const next: LocalReadiness = {
         ...item,
+        voice: readinessRef.current.voice,
         queue: { ...readinessRef.current.queue, [sourceId]: item },
       };
       readinessRef.current = next;
@@ -1354,6 +1405,7 @@ export default function WatchApp() {
   };
 
   const leaveSession = () => {
+    voice.stop();
     setJoined(false);
     sessionRef.current = null;
     setSession(null);
@@ -1420,6 +1472,7 @@ export default function WatchApp() {
 
   if (joined && session && view === "player" && mediaUrl) {
     return (
+      <>
       <SyncedPlayer
         session={session}
         mediaUrl={mediaUrl}
@@ -1431,6 +1484,8 @@ export default function WatchApp() {
         onEnded={deviceId === session.hostId ? () => void advancePlaylist() : undefined}
         onSend={sendPlayerState}
       />
+      <VoiceDock voice={voice} />
+      </>
     );
   }
 
@@ -1517,6 +1572,7 @@ export default function WatchApp() {
   }
 
   return (
+    <>
     <main className="app-shell">
       <header className="app-header">
         <button className="brand-lockup compact" onClick={leaveSession} aria-label="Leave session">
@@ -2019,6 +2075,8 @@ export default function WatchApp() {
         )}
       </div>
     </main>
+    <VoiceDock voice={voice} />
+    </>
   );
 }
 

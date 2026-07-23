@@ -6,15 +6,26 @@ import {
   type QueueReadiness,
   type SelectedMedia,
   type SharedSource,
+  type VoiceConfig,
+  type VoicePresence,
+  type VoiceSignal,
+  type VoiceSignalType,
   type WatchSession,
 } from "../lib/session-types";
 
 const TOKEN_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const PARTICIPANT_ACTIVE_MS = 20_000;
+const VOICE_SIGNAL_TTL_MS = 90_000;
+const DEFAULT_VOICE_CONFIG: VoiceConfig = {
+  iceServers: [
+    { urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"] },
+  ],
+};
 
 export interface SessionRuntimeEnv {
   DB?: D1Database;
+  WATCHPAIR_ICE_SERVERS?: string;
 }
 
 interface SessionRow {
@@ -36,9 +47,18 @@ interface ParticipantRow {
   updated_at: number;
 }
 
+interface VoiceSignalRow {
+  id: string;
+  from_id: string;
+  to_id: string;
+  signal_type: string;
+  data: string;
+  created_at: number;
+}
+
 interface SessionStore {
   initialize(): Promise<void>;
-  get(token: string): Promise<WatchSession | null>;
+  get(token: string, recipientId?: string): Promise<WatchSession | null>;
   create(token: string, hostId: string, now: number): Promise<void>;
   touch(
     token: string,
@@ -51,6 +71,7 @@ interface SessionStore {
   setSources(token: string, sources: SharedSource[], now: number): Promise<void>;
   setSelectedMedia(token: string, media: SelectedMedia | null, now: number): Promise<void>;
   setPlayer(token: string, player: PlayerState, now: number): Promise<void>;
+  addVoiceSignal(token: string, signal: VoiceSignal): Promise<void>;
 }
 
 function json<T>(value: string | null, fallback: T): T {
@@ -94,8 +115,12 @@ function defaultQueueReadiness(): QueueReadiness {
   };
 }
 
+function defaultVoicePresence(): VoicePresence {
+  return { enabled: false, muted: true, deafened: false };
+}
+
 function defaultReadiness(): LocalReadiness {
-  return { ...defaultQueueReadiness(), queue: {} };
+  return { ...defaultQueueReadiness(), queue: {}, voice: defaultVoicePresence() };
 }
 
 function sanitizeQueueReadiness(value: Partial<QueueReadiness> | undefined): QueueReadiness {
@@ -115,6 +140,14 @@ function sanitizeQueueReadiness(value: Partial<QueueReadiness> | undefined): Que
   };
 }
 
+function sanitizeVoicePresence(value: Partial<VoicePresence> | undefined): VoicePresence {
+  return {
+    enabled: Boolean(value?.enabled),
+    muted: Boolean(value?.muted),
+    deafened: Boolean(value?.deafened),
+  };
+}
+
 function sanitizeReadiness(value: Partial<LocalReadiness> | undefined): LocalReadiness {
   const queue = Object.fromEntries(
     Object.entries(value?.queue || {})
@@ -122,7 +155,11 @@ function sanitizeReadiness(value: Partial<LocalReadiness> | undefined): LocalRea
       .slice(0, 30)
       .map(([id, state]) => [id, sanitizeQueueReadiness(state)])
   );
-  return { ...sanitizeQueueReadiness(value), queue };
+  return {
+    ...sanitizeQueueReadiness(value),
+    queue,
+    voice: sanitizeVoicePresence(value?.voice),
+  };
 }
 
 function normalizeSources(value: string | null): SharedSource[] {
@@ -131,6 +168,27 @@ function normalizeSources(value: string | null): SharedSource[] {
   return (Array.isArray(stored) ? stored : [stored]).filter(
     (item) => item && typeof item.id === "string" && typeof item.value === "string"
   );
+}
+
+function voiceConfig(value: string | undefined): VoiceConfig {
+  if (!value) return DEFAULT_VOICE_CONFIG;
+  try {
+    const parsed = JSON.parse(value) as { iceServers?: VoiceConfig["iceServers"] };
+    const iceServers = (parsed.iceServers || [])
+      .slice(0, 8)
+      .map((server) => ({
+        urls: (Array.isArray(server.urls) ? server.urls : [server.urls])
+          .map((url) => String(url))
+          .filter((url) => /^(stun|turn|turns):/i.test(url))
+          .slice(0, 8),
+        username: server.username ? String(server.username).slice(0, 256) : undefined,
+        credential: server.credential ? String(server.credential).slice(0, 512) : undefined,
+      }))
+      .filter((server) => server.urls.length > 0);
+    return iceServers.length ? { iceServers } : DEFAULT_VOICE_CONFIG;
+  } catch {
+    return DEFAULT_VOICE_CONFIG;
+  }
 }
 
 function activeSource(sources: SharedSource[], selectedMedia: SelectedMedia | null) {
@@ -147,7 +205,10 @@ function stableParticipants(participants: ParticipantState[], hostId: string) {
 }
 
 class D1SessionStore implements SessionStore {
-  constructor(private readonly db: D1Database) {}
+  constructor(
+    private readonly db: D1Database,
+    private readonly voice: VoiceConfig
+  ) {}
 
   async initialize() {
     await this.db.batch([
@@ -173,10 +234,23 @@ class D1SessionStore implements SessionStore {
       this.db.prepare(
         "CREATE INDEX IF NOT EXISTS watch_participants_session_idx ON watch_participants (session_token, updated_at)"
       ),
+      this.db.prepare(`CREATE TABLE IF NOT EXISTS watch_voice_signals (
+        session_token TEXT NOT NULL,
+        id TEXT NOT NULL,
+        from_id TEXT NOT NULL,
+        to_id TEXT NOT NULL,
+        signal_type TEXT NOT NULL,
+        data TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (session_token, id)
+      )`),
+      this.db.prepare(
+        "CREATE INDEX IF NOT EXISTS watch_voice_signals_recipient_idx ON watch_voice_signals (session_token, to_id, created_at)"
+      ),
     ]);
   }
 
-  async get(token: string): Promise<WatchSession | null> {
+  async get(token: string, recipientId?: string): Promise<WatchSession | null> {
     const now = Date.now();
     const row = await this.db
       .prepare("SELECT * FROM watch_sessions WHERE token = ? AND expires_at > ?")
@@ -200,6 +274,24 @@ class D1SessionStore implements SessionStore {
       row.host_id
     );
 
+    const signalRows = recipientId
+      ? await this.db
+          .prepare(`SELECT id, from_id, to_id, signal_type, data, created_at
+            FROM watch_voice_signals
+            WHERE session_token = ? AND to_id = ? AND created_at >= ?
+            ORDER BY created_at ASC LIMIT 200`)
+          .bind(token, recipientId, now - VOICE_SIGNAL_TTL_MS)
+          .all<VoiceSignalRow>()
+      : { results: [] as VoiceSignalRow[] };
+    const voiceSignals = signalRows.results.map((signal) => ({
+      id: signal.id,
+      fromId: signal.from_id,
+      toId: signal.to_id,
+      type: signal.signal_type as VoiceSignalType,
+      data: signal.data,
+      createdAt: signal.created_at,
+    }));
+
     const sources = normalizeSources(row.source_json);
     const selectedMedia = json<SelectedMedia | null>(row.selected_media_json, null);
     return {
@@ -215,6 +307,8 @@ class D1SessionStore implements SessionStore {
       updatedAt: row.updated_at,
       serverTime: now,
       participants,
+      voiceSignals,
+      voice: this.voice,
     };
   }
 
@@ -285,6 +379,19 @@ class D1SessionStore implements SessionStore {
       .bind(JSON.stringify(player), now, token)
       .run();
   }
+
+  async addVoiceSignal(token: string, signal: VoiceSignal) {
+    await this.db.batch([
+      this.db
+        .prepare(`INSERT INTO watch_voice_signals
+          (session_token, id, from_id, to_id, signal_type, data, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .bind(token, signal.id, signal.fromId, signal.toId, signal.type, signal.data, signal.createdAt),
+      this.db
+        .prepare("DELETE FROM watch_voice_signals WHERE session_token = ? AND created_at < ?")
+        .bind(token, signal.createdAt - VOICE_SIGNAL_TTL_MS),
+    ]);
+  }
 }
 
 interface MemorySession {
@@ -298,14 +405,17 @@ interface MemorySession {
   expiresAt: number;
   updatedAt: number;
   participants: Map<string, ParticipantState>;
+  voiceSignals: VoiceSignal[];
 }
 
 const memorySessions = new Map<string, MemorySession>();
 
 class MemorySessionStore implements SessionStore {
+  constructor(private readonly voice: VoiceConfig) {}
+
   async initialize() {}
 
-  async get(token: string): Promise<WatchSession | null> {
+  async get(token: string, recipientId?: string): Promise<WatchSession | null> {
     const record = memorySessions.get(token);
     const now = Date.now();
     if (!record || record.expiresAt <= now) {
@@ -331,6 +441,12 @@ class MemorySessionStore implements SessionStore {
         ),
         record.hostId
       ),
+      voiceSignals: recipientId
+        ? record.voiceSignals.filter(
+            (signal) => signal.toId === recipientId && signal.createdAt >= now - VOICE_SIGNAL_TTL_MS
+          )
+        : [],
+      voice: this.voice,
     };
   }
 
@@ -346,6 +462,7 @@ class MemorySessionStore implements SessionStore {
       expiresAt: now + SESSION_TTL_MS,
       updatedAt: now,
       participants: new Map(),
+      voiceSignals: [],
     });
   }
 
@@ -399,6 +516,15 @@ class MemorySessionStore implements SessionStore {
     record.seq += 1;
     record.updatedAt = now;
   }
+
+  async addVoiceSignal(token: string, signal: VoiceSignal) {
+    const record = memorySessions.get(token);
+    if (!record) return;
+    record.voiceSignals = record.voiceSignals
+      .filter((item) => item.createdAt >= signal.createdAt - VOICE_SIGNAL_TTL_MS)
+      .concat(signal)
+      .slice(-400);
+  }
 }
 
 function errorResponse(error: unknown) {
@@ -407,10 +533,12 @@ function errorResponse(error: unknown) {
 }
 
 async function handleGet(request: Request, store: SessionStore) {
-  const token = normalizeToken(new URL(request.url).searchParams.get("token"));
+  const url = new URL(request.url);
+  const token = normalizeToken(url.searchParams.get("token"));
+  const deviceId = String(url.searchParams.get("deviceId") || "").slice(0, 80);
   if (!token) return Response.json({ error: "Session token is required" }, { status: 400 });
 
-  const session = await store.get(token);
+  const session = await store.get(token, deviceId || undefined);
   if (!session) return Response.json({ error: "Session not found or expired" }, { status: 404 });
   return Response.json({ session });
 }
@@ -539,6 +667,29 @@ async function handlePost(request: Request, store: SessionStore) {
       },
       now
     );
+  } else if (action === "voice-signal") {
+    const candidate = body.signal as Partial<VoiceSignal> | null;
+    const toId = String(candidate?.toId || "").slice(0, 80);
+    const type = String(candidate?.type || "") as VoiceSignalType;
+    const data = String(candidate?.data || "");
+    if (
+      !toId ||
+      toId === deviceId ||
+      !currentSession.participants.some((participant) => participant.deviceId === toId) ||
+      !["offer", "answer", "candidate"].includes(type) ||
+      !data ||
+      data.length > 32_000
+    ) {
+      return Response.json({ error: "A valid voice signal and recipient are required." }, { status: 400 });
+    }
+    await store.addVoiceSignal(token, {
+      id: crypto.randomUUID(),
+      fromId: deviceId,
+      toId,
+      type,
+      data,
+      createdAt: now,
+    });
   } else if (action === "player") {
     const candidate = body.player as Partial<PlayerState>;
     await store.setPlayer(
@@ -559,14 +710,15 @@ async function handlePost(request: Request, store: SessionStore) {
     return Response.json({ error: "Unsupported session action" }, { status: 400 });
   }
 
-  return Response.json({ session: await store.get(token) });
+  return Response.json({ session: await store.get(token, deviceId) });
 }
 
 export async function handleSessionApi(request: Request, runtimeEnv: SessionRuntimeEnv = {}) {
   try {
+    const configuredVoice = voiceConfig(runtimeEnv.WATCHPAIR_ICE_SERVERS);
     const store: SessionStore = runtimeEnv?.DB
-      ? new D1SessionStore(runtimeEnv.DB)
-      : new MemorySessionStore();
+      ? new D1SessionStore(runtimeEnv.DB, configuredVoice)
+      : new MemorySessionStore(configuredVoice);
     await store.initialize();
 
     if (request.method === "GET") return handleGet(request, store);
