@@ -106,6 +106,8 @@ test("waits for a verified torrent before probing and preparing initial HLS segm
       () => companion.exitCode !== null
     );
     assert.equal(prepared.job.files[0].progress, 100);
+    assert.ok(prepared.job.files[0].fingerprint);
+    assert.equal(prepared.job.files[0].fingerprint, prepared.job.identityFingerprint);
     assert.equal(prepared.job.subtitleStatus, "ready");
     assert.equal(prepared.job.preparation.status, "ready");
   } catch (error) {

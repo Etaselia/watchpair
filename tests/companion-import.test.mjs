@@ -97,6 +97,7 @@ test("imports, seeds, restores, and stops a local companion file", { timeout: 30
       .digest("hex")
       .slice(0, 32);
     assert.equal(seeded.job.identityFingerprint, expectedFingerprint);
+    assert.equal(seeded.job.files[0].fingerprint, expectedFingerprint);
 
     const bulk = await (await fetch(base + "/downloads")).json();
     assert.equal(bulk.jobs.length, 1);
@@ -119,6 +120,7 @@ test("imports, seeds, restores, and stops a local companion file", { timeout: 30
     assert.equal(restored.job.files[0].size, bytes.length);
 
     assert.equal(restored.job.identityFingerprint, expectedFingerprint);
+    assert.equal(restored.job.files[0].fingerprint, expectedFingerprint);
     const stopped = await fetch(base + "/downloads/" + sourceId, { method: "DELETE" });
     assert.equal(stopped.status, 200);
     const afterStop = await (await fetch(base + "/downloads")).json();

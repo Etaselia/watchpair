@@ -324,11 +324,15 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(agent, /seedOutgoingConnections: true/);
   assert.match(agent, /tracker\?\.update\(\{ numwant: 50 \}\)/);
   assert.match(agent, /torrentFileName/);
+  assert.match(agent, /fileIdentityFingerprint/);
   assert.match(agent, /torrent\.once\("ready", \(\) => markServing\(torrent\)\)/);
   assert.match(agent, /restoreJobs/);
   assert.match(agentClient, /loopback-network/);
   assert.match(agentClient, /getAgentDownloads/);
   assert.match(agentClient, /getAgentPermissionState/);
+  assert.match(app, /file\.fingerprint === undefined/);
+  assert.match(app, /!selectedMedia\.fingerprint/);
+  assert.doesNotMatch(app, /selectedMedia\.fingerprint !== next\.fingerprint/);
   assert.match(media, /fingerprintFile/);
   assert.match(packageJson, /"agent": "node agent\/server\.mjs"/);
   assert.doesNotMatch(layout, /next\/font/);
