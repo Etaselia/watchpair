@@ -6,6 +6,7 @@ import { zipSync } from "fflate";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const output = resolve(root, "public", "watchpair-companion.zip");
 const folder = "WatchPair Companion";
+const archiveModifiedAt = new Date("2000-01-01T12:00:00Z");
 
 const inputs = [
   ["server.mjs", resolve(root, "agent", "server.mjs")],
@@ -27,7 +28,10 @@ const inputs = [
 const files = {};
 for (const [name, source] of inputs) {
   const contents = await readFile(source);
-  files[folder + "/" + name] = new Uint8Array(contents);
+  files[folder + "/" + name] = [
+    new Uint8Array(contents),
+    { mtime: archiveModifiedAt },
+  ];
 }
 
 await mkdir(dirname(output), { recursive: true });
