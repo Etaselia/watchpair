@@ -82,6 +82,11 @@ import {
   type SubtitleCue,
 } from "../lib/media";
 import {
+  agentFileFingerprint,
+  findLocalAgentMedia,
+  type LocalAgentBinding,
+} from "../lib/media-binding.mjs";
+import {
   type LocalReadiness,
   type QueueReadiness,
   type PlayerState,
@@ -133,6 +138,9 @@ function sameSelectedFile(session: WatchSession, readiness: LocalReadiness) {
 }
 
 function preferredAgentFile(job: AgentJob, selectedMedia?: WatchSession["selectedMedia"]) {
+  const matchingFingerprint = selectedMedia?.fingerprint
+    ? job.files.find((file) => agentFileFingerprint(job, file) === selectedMedia.fingerprint)
+    : null;
   const selected = selectedMedia?.sourceId === job.id
     ? job.files.find((file) =>
         (selectedMedia.fileIndex === undefined || file.index === selectedMedia.fileIndex) &&
@@ -140,7 +148,8 @@ function preferredAgentFile(job: AgentJob, selectedMedia?: WatchSession["selecte
         file.size === selectedMedia.size
       )
     : null;
-  return selected
+  return matchingFingerprint
+    || selected
     || job.files.find((file) => file.selected)
     || [...job.files].sort(
       (left, right) =>
@@ -343,6 +352,7 @@ export default function WatchApp() {
   const [agentPermission, setAgentPermission] = useState<AgentPermissionState | "checking">("checking");
   const [agentPairing, setAgentPairing] = useState(false);
   const [agentJobs, setAgentJobs] = useState<Record<string, AgentJob>>({});
+  const [localAgentBinding, setLocalAgentBinding] = useState<LocalAgentBinding | null>(null);
   const [downloadMode, setDownloadMode] = useState<DownloadMode>("automatic");
   const [shareLocalFiles, setShareLocalFiles] = useState(true);
   const [manualStartedSources, setManualStartedSources] = useState<string[]>([]);
@@ -363,13 +373,20 @@ export default function WatchApp() {
   const autoOpenedMediaRef = useRef("");
   const pairingTimerRef = useRef<number | null>(null);
   const roomSourcesRef = useRef<{ token: string; ids: string[] }>({ token: "", ids: [] });
+  const localFileBindingRef = useRef<{
+    fingerprint: string;
+    url: string;
+    readiness: QueueReadiness;
+  } | null>(null);
   const sources = session?.sources?.length ? session.sources : session?.source ? [session.source] : [];
   const activeSource = sources.find((source) => source.id === session?.selectedMedia?.sourceId)
     || sources[0]
     || null;
   const activeSourceId = activeSource?.id || "";
   const activeSourceKind = activeSource?.kind || "";
-  const agentJob = activeSource ? agentJobs[activeSource.id] || null : null;
+  const localAgentMedia = findLocalAgentMedia(agentJobs, session?.selectedMedia, localAgentBinding);
+  const playbackSourceId = localAgentMedia?.sourceId || activeSourceId;
+  const agentJob = localAgentMedia?.job || (activeSource ? agentJobs[activeSource.id] || null : null);
   const embeddedAudioTracks = agentJob?.audioTracks || EMPTY_AUDIO_TRACKS;
   const embeddedSubtitles = agentJob?.subtitles || EMPTY_SUBTITLE_TRACKS;
   const sourcesKey = sources.map((source) => source.id).join(":");
@@ -753,25 +770,32 @@ export default function WatchApp() {
           fingerprint,
           preparation: "direct",
         };
+        const currentMedia = sessionRef.current?.selectedMedia;
+        const matchesCurrent = currentMedia?.fingerprint === fingerprint;
+        const logicalSourceId = matchesCurrent ? currentMedia.sourceId : sourceId;
         const nextReadiness: LocalReadiness = {
           ...itemReadiness,
           voice: readinessRef.current.voice,
-          queue: sourceId
-            ? { ...readinessRef.current.queue, [sourceId]: itemReadiness }
+          queue: logicalSourceId
+            ? { ...readinessRef.current.queue, [logicalSourceId]: itemReadiness }
             : readinessRef.current.queue,
         };
+        localFileBindingRef.current = { fingerprint, url, readiness: itemReadiness };
+        setLocalAgentBinding(null);
         setReadiness(nextReadiness);
         readinessRef.current = nextReadiness;
+        if (!matchesCurrent) {
+          await sendAction("select-media", {
+            media: {
+              sourceId,
+              fileIndex: 0,
+              name: preferredName,
+              size: playableFile.size,
+              fingerprint,
+            },
+          });
+        }
         await sendAction("heartbeat", { readiness: nextReadiness });
-        await sendAction("select-media", {
-          media: {
-            sourceId,
-            fileIndex: 0,
-            name: preferredName,
-            size: playableFile.size,
-            fingerprint,
-          },
-        });
       } catch (caught) {
         setError(caught instanceof Error ? caught.message : "Could not prepare that file.");
       } finally {
@@ -823,24 +847,39 @@ export default function WatchApp() {
         setAgentJobs((current) => ({ ...current, [sourceId]: job }));
 
         const item = queueReadinessForJob(job, target);
+        const currentMedia = sessionRef.current?.selectedMedia;
+        const matchesCurrent = Boolean(
+          item.fingerprint && currentMedia?.fingerprint === item.fingerprint
+        );
+        const logicalSourceId = matchesCurrent ? currentMedia?.sourceId : sourceId;
+        const nextQueue = { ...readinessRef.current.queue, [sourceId]: item };
+        if (logicalSourceId) nextQueue[logicalSourceId] = item;
         const next: LocalReadiness = {
           ...item,
           voice: readinessRef.current.voice,
-          queue: { ...readinessRef.current.queue, [sourceId]: item },
+          queue: nextQueue,
         };
+        setLocalAgentBinding(item.fingerprint ? {
+          sourceId,
+          fileIndex: target.index,
+          fingerprint: item.fingerprint,
+        } : null);
+        localFileBindingRef.current = null;
         readinessRef.current = next;
         setReadiness(next);
         setMediaUrl(target.hlsUrl || target.streamUrl);
+        if (!matchesCurrent) {
+          await sendAction("select-media", {
+            media: {
+              sourceId,
+              fileIndex: target.index,
+              name: target.name,
+              size: target.size,
+              fingerprint: item.fingerprint,
+            },
+          });
+        }
         await sendAction("heartbeat", { readiness: next });
-        await sendAction("select-media", {
-          media: {
-            sourceId,
-            fileIndex: target.index,
-            name: target.name,
-            size: target.size,
-            fingerprint: item.fingerprint,
-          },
-        });
       } catch (caught) {
         setError(caught instanceof Error ? caught.message : "Could not share that local video.");
       } finally {
@@ -1097,11 +1136,36 @@ export default function WatchApp() {
             };
       }
 
-      const activeSourceId = selectedMedia?.sourceId || queueSources[0]?.id;
-      const activeJob = activeSourceId ? jobsById[activeSourceId] : null;
-      const activeFile = activeJob ? preferredAgentFile(activeJob, selectedMedia) : null;
-      const activeItem = activeSourceId ? queue[activeSourceId] : null;
+      const logicalSourceId = selectedMedia?.sourceId || queueSources[0]?.id;
+      const localFileBinding = localFileBindingRef.current;
+      let localMatch = findLocalAgentMedia(jobsById, selectedMedia, localAgentBinding);
+      if (localMatch?.job.kind === "magnet" && !localMatch.file.selected) {
+        try {
+          const updated = await selectAgentFile(localMatch.sourceId, localMatch.file.index);
+          jobsById[localMatch.sourceId] = updated;
+          localMatch = findLocalAgentMedia(jobsById, selectedMedia, localAgentBinding);
+          if (active) setAgentJobs((current) => ({ ...current, [updated.id]: updated }));
+        } catch {
+          // The next poll retries a transient participant-specific selection failure.
+        }
+      }
+
+      const usesLocalFile = Boolean(
+        localFileBinding &&
+        selectedMedia?.fingerprint &&
+        localFileBinding.fingerprint === selectedMedia.fingerprint
+      );
+      let activeItem = usesLocalFile ? localFileBinding?.readiness || null : null;
+      let activeFile: AgentFile | null = null;
+      if (!activeItem && localMatch) {
+        activeFile = localMatch.file;
+        activeItem = queueReadinessForJob(localMatch.job, localMatch.file);
+        queue[localMatch.sourceId] = activeItem;
+      }
+      if (!activeItem && logicalSourceId) activeItem = queue[logicalSourceId] || null;
       if (!activeItem) return;
+      // Readiness belongs to the logical movie, even when this participant uses another source.
+      if (logicalSourceId) queue[logicalSourceId] = activeItem;
 
       const next: LocalReadiness = {
         ...activeItem,
@@ -1112,13 +1176,17 @@ export default function WatchApp() {
       const becameReady = next.ready && (!previous.ready || previous.fingerprint !== next.fingerprint);
       readinessRef.current = next;
       setReadiness(next);
-      if (activeFile?.ready) setMediaUrl(activeFile.hlsUrl || activeFile.streamUrl);
-      else if (mediaUrlRef.current.startsWith(AGENT_URL)) setMediaUrl("");
+      if (usesLocalFile && localFileBinding) {
+        if (mediaUrlRef.current !== localFileBinding.url) setMediaUrl(localFileBinding.url);
+      } else if (activeFile?.ready) {
+        setMediaUrl(activeFile.hlsUrl || activeFile.streamUrl);
+      } else if (mediaUrlRef.current.startsWith(AGENT_URL)) {
+        setMediaUrl("");
+      }
       if (
         next.ready &&
         next.fingerprint &&
-        activeFile &&
-        selectedMedia?.sourceId === activeSourceId &&
+        selectedMedia &&
         !selectedMedia.fingerprint
       ) {
         await sendAction("select-media", {
@@ -1134,7 +1202,7 @@ export default function WatchApp() {
       active = false;
       window.clearInterval(timer);
     };
-  }, [agentAvailable, downloadMode, joined, manualStartedSources, sendAction, sourcesKey]);
+  }, [agentAvailable, downloadMode, joined, localAgentBinding, manualStartedSources, sendAction, sourcesKey]);
 
   useEffect(() => {
     if (!joined || agentAvailable || !activeSourceId || !agentJobs[activeSourceId]) return;
@@ -1174,7 +1242,7 @@ export default function WatchApp() {
     (session?.selectedMedia ? session.selectedMedia.name + ":" + session.selectedMedia.size : "");
 
   useEffect(() => {
-    const sourceId = activeSourceId;
+    const sourceId = playbackSourceId;
     const player = sessionRef.current?.player;
     if (!player || !sourceId || !selectedMediaTrackKey || agentJob?.subtitleStatus !== "ready") return;
     const initializationKey = sourceId + ":" + selectedMediaTrackKey;
@@ -1206,12 +1274,12 @@ export default function WatchApp() {
     selectedMediaTrackKey,
     sendAction,
     requestedSubtitleSelection,
-    activeSourceId,
+    playbackSourceId,
   ]);
 
   useEffect(() => {
     const selection = requestedSubtitleSelection;
-    const sourceId = activeSourceId;
+    const sourceId = playbackSourceId;
     if (!selection.startsWith("embedded:")) {
       loadedSubtitleRef.current = "";
       return;
@@ -1253,7 +1321,7 @@ export default function WatchApp() {
     requestedSubtitleTrackId,
     requestedSubtitleTrackSupported,
     selectedMediaTrackKey,
-    activeSourceId,
+    playbackSourceId,
   ]);
 
   const chooseAgentMedia = async (sourceId: string, job: AgentJob, file: AgentFile) => {
@@ -1270,23 +1338,40 @@ export default function WatchApp() {
       const selectedFile =
         selectedJob.files.find((candidate) => candidate.index === file.index) || file;
       const item = queueReadinessForJob(selectedJob, selectedFile);
-      selectionSentRef.current = `${sourceId}:${file.index}`;
-      await sendAction("select-media", {
-        media: {
-          sourceId,
-          fileIndex: file.index,
-          name: file.name,
-          size: file.size,
-          fingerprint: item.fingerprint || undefined,
-        },
-      });
+      const currentMedia = sessionRef.current?.selectedMedia;
+      const matchesCurrent = Boolean(
+        item.fingerprint && currentMedia?.fingerprint === item.fingerprint
+      );
+      const logicalSourceId = matchesCurrent ? currentMedia?.sourceId : sourceId;
+      const nextQueue = { ...readinessRef.current.queue, [sourceId]: item };
+      if (logicalSourceId) nextQueue[logicalSourceId] = item;
       const next: LocalReadiness = {
         ...item,
         voice: readinessRef.current.voice,
-        queue: { ...readinessRef.current.queue, [sourceId]: item },
+        queue: nextQueue,
       };
+      selectionSentRef.current = `${sourceId}:${file.index}`;
+      setLocalAgentBinding(item.fingerprint ? {
+        sourceId,
+        fileIndex: selectedFile.index,
+        fingerprint: item.fingerprint,
+      } : null);
+      localFileBindingRef.current = null;
+      setMediaUrl(selectedFile.hlsUrl || selectedFile.streamUrl);
       readinessRef.current = next;
       setReadiness(next);
+      if (!matchesCurrent) {
+        await sendAction("select-media", {
+          media: {
+            sourceId,
+            fileIndex: file.index,
+            name: file.name,
+            size: file.size,
+            fingerprint: item.fingerprint || undefined,
+          },
+        });
+      }
+      await sendAction("heartbeat", { readiness: next });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not select that file.");
     } finally {
@@ -1466,6 +1551,7 @@ export default function WatchApp() {
   const fingerprints = new Set(
     readyParticipants.map((participant) => participant.fingerprint).filter(Boolean)
   );
+  if (session?.selectedMedia?.fingerprint) fingerprints.add(session.selectedMedia.fingerprint);
   const hasMismatch = fingerprints.size > 1;
   const everyoneReady =
     Boolean(session) &&
@@ -1714,7 +1800,9 @@ export default function WatchApp() {
                 const job = agentJobs[source.id];
                 const target = job ? preferredAgentFile(job, session?.selectedMedia) : null;
                 const localState = readiness.queue[source.id];
-                const selected = activeSource?.id === source.id;
+                const selected = localAgentMedia
+                  ? localAgentMedia.sourceId === source.id
+                  : activeSource?.id === source.id;
                 const readyCount = session?.participants.filter(
                   (participant) => participant.queue?.[source.id]?.ready
                 ).length || 0;
@@ -1894,9 +1982,9 @@ export default function WatchApp() {
                           .filter((file) => /\.(mp4|m4v|webm|ogv|mov|mkv|avi|ts)$/i.test(file.name))
                           .slice(0, 12)
                           .map((file) => {
-                            const fileSelected =
-                              selected &&
-                              (session?.selectedMedia?.fileIndex === file.index ||
+                            const fileSelected = selected && (localAgentMedia?.sourceId === source.id
+                              ? localAgentMedia.file.index === file.index
+                              : session?.selectedMedia?.fileIndex === file.index ||
                                 (session?.selectedMedia?.name === file.name &&
                                   session.selectedMedia.size === file.size));
                             return (
