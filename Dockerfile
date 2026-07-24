@@ -19,6 +19,10 @@ LABEL org.opencontainers.image.title="WatchPair" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.revision="${VCS_REF}"
 COPY --from=build --chown=node:node /app/node_modules/vinext ./node_modules/vinext
+COPY --from=build --chown=node:node /app/node_modules/react ./node_modules/react
+COPY --from=build --chown=node:node /app/node_modules/react-dom ./node_modules/react-dom
+COPY --from=build --chown=node:node /app/node_modules/react-server-dom-webpack ./node_modules/react-server-dom-webpack
+COPY --from=build --chown=node:node /app/node_modules/scheduler ./node_modules/scheduler
 COPY --from=build --chown=node:node /app/dist ./dist
 COPY --chown=node:node scripts/start-container.mjs ./scripts/start-container.mjs
 USER node
