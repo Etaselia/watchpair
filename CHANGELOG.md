@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.6.0](https://github.com/Etaselia/watchpair/compare/v0.5.4...v0.6.0) (2026-07-24)
+
+
+### Features
+
+* render styled MKV subtitles ([fc689b7](https://github.com/Etaselia/watchpair/commit/fc689b713b9ba448e3fa01bdc1f25c49bc1b7e61))
+
+
+### Bug Fixes
+
+* ship production server runtime dependencies ([#21](https://github.com/Etaselia/watchpair/issues/21)) ([881e29d](https://github.com/Etaselia/watchpair/commit/881e29d8217c69ef8a1e41e1bbd07a8f0cdde5d8))
+* verify media and support Linux VP9 playback ([bf44023](https://github.com/Etaselia/watchpair/commit/bf44023b20b08496dd87e9124f83ddb7b2368469))
+
 ## [0.5.4](https://github.com/Etaselia/watchpair/compare/v0.5.3...v0.5.4) (2026-07-24)
 
 
