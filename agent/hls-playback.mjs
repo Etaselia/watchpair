@@ -4,12 +4,13 @@ import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   CPU_ENCODER,
+  VP9_ENCODER,
   videoDecoderArguments,
   videoDecoderFilterArguments,
   videoEncoderArguments,
 } from "./hardware-acceleration.mjs";
 
-const CACHE_VERSION = "hls-v4";
+const CACHE_VERSION = "hls-v5";
 const DEFAULT_SEGMENT_SECONDS = 4;
 const DEFAULT_PLAYABLE_SECONDS = 120;
 const PLAYLIST_WAIT_MS = 15 * 60_000;
@@ -94,6 +95,21 @@ function pipelineError(label, code, stderr) {
   );
 }
 
+const COPYABLE_H264_PROFILES = new Set([
+  "baseline",
+  "constrained baseline",
+  "main",
+  "high",
+]);
+
+export function canCopyH264Video(descriptor) {
+  return (
+    descriptor.videoCodec === "h264" &&
+    ["yuv420p", "yuvj420p"].includes(descriptor.videoPixelFormat) &&
+    COPYABLE_H264_PROFILES.has(String(descriptor.videoProfile || "").toLowerCase())
+  );
+}
+
 export function createHlsPlaybackManager({
   ffmpegPath,
   cacheRoot,
@@ -109,6 +125,7 @@ export function createHlsPlaybackManager({
       descriptor.jobId,
       descriptor.fileIndex,
       descriptor.fileSize,
+      descriptor.rendition || "h264",
       CACHE_VERSION,
     ].join(":");
   }
@@ -117,7 +134,7 @@ export function createHlsPlaybackManager({
     return path.join(
       cacheRoot,
       descriptor.jobId,
-      `${descriptor.fileIndex}-${descriptor.fileSize}-${CACHE_VERSION}`
+      `${descriptor.fileIndex}-${descriptor.fileSize}-${descriptor.rendition || "h264"}-${CACHE_VERSION}`
     );
   }
 
@@ -165,11 +182,15 @@ export function createHlsPlaybackManager({
       done: null,
       playable: null,
       status: "preparing",
-      encoder: descriptor.videoCodec === "h264"
-        ? { id: "copy", label: "Direct stream copy", hardware: false }
-        : encoder,
+      encoder: descriptor.rendition === "vp9"
+        ? VP9_ENCODER
+        : canCopyH264Video(descriptor)
+          ? { id: "copy", label: "Direct stream copy", hardware: false }
+          : encoder,
       hardwareDecode:
-        descriptor.videoCodec !== "h264" && videoDecoderArguments(encoder).length > 0,
+        descriptor.rendition !== "vp9" &&
+        !canCopyH264Video(descriptor) &&
+        videoDecoderArguments(encoder).length > 0,
       fallback: false,
       stopping: false,
     };
@@ -194,7 +215,7 @@ export function createHlsPlaybackManager({
     ];
 
     const launchVideo = async () => {
-      const argumentsFor = (selectedEncoder) => descriptor.videoCodec === "h264"
+      const argumentsFor = (selectedEncoder) => selectedEncoder.id === "copy"
         ? ["-c:v", "copy"]
         : videoEncoderArguments(selectedEncoder, segmentSeconds);
       const run = () => launch(
@@ -222,7 +243,7 @@ export function createHlsPlaybackManager({
       try {
         await run();
       } catch (error) {
-        if (state.stopping || descriptor.videoCodec === "h264" || !state.encoder.hardware) throw error;
+        if (state.stopping || state.encoder.id === "copy" || !state.encoder.hardware) throw error;
         if (state.hardwareDecode) {
           console.warn(`WatchPair ${state.encoder.label} hardware decoding failed for this file; retrying GPU encoding with CPU decoding.`);
           state.hardwareDecode = false;

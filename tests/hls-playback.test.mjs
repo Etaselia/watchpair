@@ -8,6 +8,7 @@ import test from "node:test";
 import ffmpegPath from "ffmpeg-static";
 import ffprobeStatic from "ffprobe-static";
 import {
+  canCopyH264Video,
   createHlsPlaybackManager,
 } from "../agent/hls-playback.mjs";
 
@@ -24,6 +25,19 @@ async function readPlaylist(filePath) {
   }
   throw new Error("Playlist could not be read.");
 }
+
+test("copies only browser-compatible eight-bit H.264 video", () => {
+  assert.equal(canCopyH264Video({
+    videoCodec: "h264",
+    videoPixelFormat: "yuv420p",
+    videoProfile: "High",
+  }), true);
+  assert.equal(canCopyH264Video({
+    videoCodec: "h264",
+    videoPixelFormat: "yuv420p10le",
+    videoProfile: "High 10",
+  }), false);
+});
 
 test("progressively prepares one HLS video rendition with separate audio tracks", { timeout: 30_000 }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "watchpair-hls-"));
@@ -156,6 +170,13 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
     ]);
     assert.ok(videoProbe.streams.some((stream) => stream.codec_name === "h264"));
     assert.ok(audioProbe.streams.some((stream) => stream.codec_name === "aac"));
+    const vp9Descriptor = { ...descriptor, rendition: "vp9" };
+    const vp9Preparation = await manager.prepare(vp9Descriptor);
+    assert.equal(vp9Preparation.encoder.id, "vp9");
+    const vp9Init = await manager.getAsset(vp9Descriptor, "video/init.mp4");
+    const vp9Probe = await probeAsset(vp9Init.filePath);
+    assert.ok(vp9Probe.streams.some((stream) => stream.codec_name === "vp9"));
+
     manager.shutdown();
 
     const cachedManager = createHlsPlaybackManager({

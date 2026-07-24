@@ -70,3 +70,18 @@ test("does not alias different content merely because its size matches", () => {
 
   assert.equal(findLocalAgentMedia(jobs, selectedMedia), null);
 });
+
+test("does not bind a fingerprint to a differently sized local file", () => {
+  const selectedMedia = {
+    sourceId: "room-torrent",
+    fileIndex: 0,
+    name: "episode.mkv",
+    size: 8192,
+    fingerprint: "same-sampled-content",
+  };
+  const jobs = {
+    "partial-local-copy": job("partial-local-copy", "same-sampled-content"),
+  };
+
+  assert.equal(findLocalAgentMedia(jobs, selectedMedia), null);
+});

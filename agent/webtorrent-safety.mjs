@@ -15,8 +15,7 @@ export function verifiedTorrentFileProgress(file) {
   const fileEnd = fileStart + file.length;
   let verified = 0;
   for (let index = file._startPiece; index <= file._endPiece; index += 1) {
-    const mask = 0x80 >> (index % 8);
-    if (!(torrent.bitfield.buffer[index >> 3] & mask)) continue;
+    if (!torrent.bitfield.get(index)) continue;
     const pieceStart = index * torrent.pieceLength;
     const pieceLength = index === torrent.pieces.length - 1
       ? torrent.lastPieceLength
@@ -25,6 +24,30 @@ export function verifiedTorrentFileProgress(file) {
     verified += Math.max(0, Math.min(fileEnd, pieceEnd) - Math.max(fileStart, pieceStart));
   }
   return Math.min(1, verified / file.length);
+}
+
+export function verifyTorrentFilePieces(file) {
+  const torrent = file?._torrent;
+  if (!torrent?._verifyPiecesUsingHash || !torrent?.bitfield) {
+    return Promise.reject(new Error("Torrent file verification is unavailable."));
+  }
+
+  const pieces = [];
+  for (let index = file._startPiece; index <= file._endPiece; index += 1) {
+    pieces.push(index);
+  }
+
+  return new Promise((resolve, reject) => {
+    torrent._verifyPiecesUsingHash(pieces, (error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      torrent._checkDone?.();
+      const invalidPieces = pieces.filter((index) => !torrent.bitfield.get(index));
+      resolve({ verified: invalidPieces.length === 0, invalidPieces });
+    });
+  });
 }
 
 function rewindSelectedFile(getSelectedFile) {

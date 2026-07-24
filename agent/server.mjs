@@ -13,12 +13,12 @@ import { load } from "cheerio";
 import ffmpegStaticPath from "ffmpeg-static";
 import ffprobeStatic from "ffprobe-static";
 import WebTorrent from "webtorrent";
-import { createHlsPlaybackManager, streamHlsAsset } from "./hls-playback.mjs";
+import { canCopyH264Video, createHlsPlaybackManager, streamHlsAsset } from "./hls-playback.mjs";
 import { publicTranscoder, selectTranscodeRuntime } from "./hardware-acceleration.mjs";
 import { createJsonStore } from "./job-store.mjs";
 import { fingerprintPath } from "./media-fingerprint.mjs";
 import { isSupportedMagnet } from "./torrent-input.mjs";
-import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, verifiedTorrentFileProgress } from "./webtorrent-safety.mjs";
+import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, verifiedTorrentFileProgress, verifyTorrentFilePieces } from "./webtorrent-safety.mjs";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.WATCHPAIR_AGENT_PORT || 41735);
@@ -405,9 +405,59 @@ async function identifySelectedFile(job, index = job.selectedIndex) {
   return promise;
 }
 
+async function verifySelectedTorrentFile(job, index) {
+  if (job.kind !== "magnet") return true;
+  if (index === null || index !== job.selectedIndex) return false;
+
+  const file = job.torrent?.files[index];
+  if (!file) throw new Error("Torrent file not found.");
+  const verificationKey = selectedFileKey(job);
+  if (job.torrentVerifiedKey === verificationKey) return true;
+  if (
+    job.torrentVerificationPromise &&
+    job.torrentVerificationPromiseKey === verificationKey
+  ) {
+    return job.torrentVerificationPromise;
+  }
+
+  job.status = "downloading";
+  job.warning = "Verifying every torrent piece before playback.";
+  job.updatedAt = Date.now();
+
+  let promise;
+  promise = verifyTorrentFilePieces(file)
+    .then(({ verified, invalidPieces }) => {
+      if (index !== job.selectedIndex || selectedFileKey(job) !== verificationKey) return false;
+      if (!verified) {
+        file.deselect();
+        file.select(10);
+        job.torrentVerifiedKey = null;
+        job.warning =
+          `Found ${invalidPieces.length} incomplete or corrupt torrent piece${invalidPieces.length === 1 ? "" : "s"}; downloading them again.`;
+        job.status = "downloading";
+        job.updatedAt = Date.now();
+        return false;
+      }
+      job.torrentVerifiedKey = verificationKey;
+      job.warning = null;
+      job.updatedAt = Date.now();
+      return true;
+    })
+    .finally(() => {
+      if (job.torrentVerificationPromise === promise) {
+        job.torrentVerificationPromise = null;
+        job.torrentVerificationPromiseKey = null;
+      }
+    });
+  job.torrentVerificationPromise = promise;
+  job.torrentVerificationPromiseKey = verificationKey;
+  return promise;
+}
+
 async function completeSelectedFile(job, index = job.selectedIndex) {
   if (index === null || index !== job.selectedIndex) return;
   try {
+    if (!(await verifySelectedTorrentFile(job, index))) return;
     await identifySelectedFile(job, index);
     if (index !== job.selectedIndex) return;
     job.status = "ready";
@@ -433,9 +483,14 @@ function selectTorrentFile(job, index) {
   job.selectedIndex = index;
   job.identityFingerprint = null;
   job.identityFingerprintKey = null;
+  job.torrentVerifiedKey = null;
+  job.torrentVerificationPromise = null;
+  job.torrentVerificationPromiseKey = null;
   job.audioTracks = [];
   job.subtitleTracks = [];
   job.videoCodec = null;
+  job.videoPixelFormat = null;
+  job.videoProfile = null;
   job.subtitleStatus = "waiting";
   job.subtitleError = null;
   job.subtitleProbeKey = null;
@@ -502,6 +557,8 @@ async function probeSubtitleTracks(job) {
     const metadata = JSON.parse(result.stdout || "{}");
     const videoStream = (metadata.streams || []).find((stream) => stream.codec_type === "video");
     job.videoCodec = String(videoStream?.codec_name || "unknown");
+    job.videoPixelFormat = String(videoStream?.pix_fmt || "unknown");
+    job.videoProfile = String(videoStream?.profile || "unknown");
     job.audioTracks = (metadata.streams || [])
       .filter((stream) => stream.codec_type === "audio")
       .map((stream) => ({
@@ -590,7 +647,7 @@ function needsHlsPlayback(job, fileName) {
   const audioTracks = job.audioTracks || [];
   if (
     [".mp4", ".m4v", ".mov"].includes(extension) &&
-    job.videoCodec === "h264" &&
+    canCopyH264Video(job) &&
     audioTracks.length <= 1 &&
     (!audioTracks[0] || ["aac", "mp3", "opus"].includes(audioTracks[0].codec))
   ) {
@@ -622,7 +679,7 @@ function torrentFiles(job) {
       fingerprint: fileIdentityFingerprint(job, index, { name: torrentFileName(file), size: file.length }),
       streamUrl: `http://${HOST}:${PORT}/stream/${encodeURIComponent(job.id)}/${index}`,
       hlsUrl: needsHlsPlayback(job, file.path || file.name)
-        ? `http://${HOST}:${PORT}/hls/${encodeURIComponent(job.id)}/${index}/master.m3u8`
+        ? `http://${HOST}:${PORT}/hls/${encodeURIComponent(job.id)}/${index}/h264/master.m3u8`
         : null,
     };
   });
@@ -644,7 +701,7 @@ function snapshot(job) {
             fingerprint: fileIdentityFingerprint(job, 0, job.file),
             streamUrl: `http://${HOST}:${PORT}/stream/${encodeURIComponent(job.id)}/0`,
             hlsUrl: needsHlsPlayback(job, job.file.name)
-              ? `http://${HOST}:${PORT}/hls/${encodeURIComponent(job.id)}/0/master.m3u8`
+              ? `http://${HOST}:${PORT}/hls/${encodeURIComponent(job.id)}/0/h264/master.m3u8`
               : null,
           }]
         : [];
@@ -822,6 +879,9 @@ function createJob(source) {
     identityFingerprintKey: source.identityFingerprintKey || null,
     identityFingerprintPromise: null,
     identityFingerprintPromiseKey: null,
+    torrentVerifiedKey: null,
+    torrentVerificationPromise: null,
+    torrentVerificationPromiseKey: null,
     status: "queued",
     error: null,
     downloaded: 0,
@@ -831,6 +891,8 @@ function createJob(source) {
     audioTracks: [],
     subtitleTracks: [],
     videoCodec: null,
+    videoPixelFormat: null,
+    videoProfile: null,
     subtitleStatus: "waiting",
     subtitleError: null,
     subtitleProbeKey: null,
@@ -1216,7 +1278,7 @@ async function renderAudioPlayback(job, fileIndex, track) {
 
   await rm(partial, { force: true });
   try {
-    const videoArgs = job.videoCodec === "h264"
+    const videoArgs = canCopyH264Video(job)
       ? ["-c:v", "copy"]
       : ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"];
     await runFile(
@@ -1237,12 +1299,18 @@ async function renderAudioPlayback(job, fileIndex, track) {
   }
 }
 
+function torrentFileIsFullyVerified(job, fileIndex) {
+  if (job.kind !== "magnet") return job.status === "ready";
+  if (job.seed) return Boolean(job.torrent?.files[fileIndex]?.done);
+  if (!job.torrent?.files[fileIndex]?.done || job.selectedIndex !== fileIndex) return false;
+  return job.torrentVerifiedKey === selectedFileKey(job);
+}
+
 async function preparedAudioFile(job, fileIndex, trackId) {
   if (job.selectedIndex !== fileIndex) throw new Error("That media file is no longer selected.");
-  const ready = job.kind === "magnet"
-    ? Boolean(job.torrent?.files[fileIndex]?.done)
-    : job.status === "ready";
-  if (!ready) throw new Error("The selected media file is not ready.");
+  if (!torrentFileIsFullyVerified(job, fileIndex)) {
+    throw new Error("The selected media file has not passed full verification.");
+  }
   await queueSubtitleProbe(job);
 
   const track = job.audioTracks.find((item) => item.id === trackId);
@@ -1260,12 +1328,12 @@ async function preparedAudioFile(job, fileIndex, trackId) {
   }
 }
 
-async function hlsDescriptor(job, fileIndex) {
+async function hlsDescriptor(job, fileIndex, rendition = "h264") {
   if (job.selectedIndex !== fileIndex) throw new Error("That media file is no longer selected.");
-  const ready = job.kind === "magnet"
-    ? Boolean(job.torrent?.files[fileIndex]?.done)
-    : job.status === "ready";
-  if (!ready) throw new Error("The selected media file is not ready.");
+  if (!["h264", "vp9"].includes(rendition)) throw new Error("Unsupported video rendition.");
+  if (!torrentFileIsFullyVerified(job, fileIndex)) {
+    throw new Error("The selected media file has not passed full verification.");
+  }
   await queueSubtitleProbe(job);
   const media = jobFile(job, fileIndex);
   return {
@@ -1274,6 +1342,9 @@ async function hlsDescriptor(job, fileIndex) {
     fileSize: media.size,
     inputPath: media.path,
     videoCodec: job.videoCodec,
+    videoPixelFormat: job.videoPixelFormat,
+    videoProfile: job.videoProfile,
+    rendition,
     audioTracks: job.audioTracks,
   };
 }
@@ -1623,12 +1694,12 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    const hlsMatch = /^\/hls\/([a-zA-Z0-9-]{8,80})\/(\d+)\/(.+)$/.exec(url.pathname);
+    const hlsMatch = /^\/hls\/([a-zA-Z0-9-]{8,80})\/(\d+)\/(?:(h264|vp9)\/)?(.+)$/.exec(url.pathname);
     if (request.method === "GET" && hlsMatch) {
       const job = jobs.get(hlsMatch[1]);
       if (!job) throw new Error("Download not found.");
-      const descriptor = await hlsDescriptor(job, Number(hlsMatch[2]));
-      const asset = await hlsPlayback.getAsset(descriptor, hlsMatch[3]);
+      const descriptor = await hlsDescriptor(job, Number(hlsMatch[2]), hlsMatch[3] || "h264");
+      const asset = await hlsPlayback.getAsset(descriptor, hlsMatch[4]);
       await streamHlsAsset(response, asset, headers);
       return;
     }
