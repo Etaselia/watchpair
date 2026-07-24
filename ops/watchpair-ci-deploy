@@ -1,8 +1,9 @@
 #!/bin/bash
 set -Eeuo pipefail
 
-version=${1:-}
-revision=${2:-}
+operation=${1:-}
+version=${2:-}
+revision=${3:-}
 image="watchpair:${version}"
 public_url="https://38-180-216-137.sslip.io:8443"
 app_container="watchpair-coordinator"
@@ -10,10 +11,21 @@ candidate_container="watchpair-candidate"
 proxy_container="watchpair-proxy"
 rollback_image="watchpair:rollback"
 
-if [[ ! "$version" =~ ^[1-9][0-9]*\.0\.0$ ]] ||
+if [[ ! "$operation" =~ ^(deploy|status)$ ]] ||
+  [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
   [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
-  echo "Invalid major release version or revision." >&2
+  echo "Invalid deployment operation, version, or revision." >&2
   exit 64
+fi
+
+if [[ "$operation" == "status" ]]; then
+  if [[ -f /opt/watchpair/DEPLOYMENT ]] &&
+    grep -Fxq "revision=${revision}" /opt/watchpair/DEPLOYMENT; then
+    echo "WatchPair ${version} (${revision}) is already deployed."
+    exit 0
+  fi
+  echo "WatchPair ${version} (${revision}) is pending deployment."
+  exit 3
 fi
 
 run_app() {

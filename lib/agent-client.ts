@@ -64,8 +64,19 @@ export interface AgentSubtitleTrack {
   label: string;
   codec: string;
   supported: boolean;
+  styled: boolean;
   default: boolean;
   forced: boolean;
+  url: string;
+  assUrl: string | null;
+  fonts: AgentSubtitleFont[];
+}
+
+export interface AgentSubtitleFont {
+  id: string;
+  streamIndex: number;
+  name: string;
+  mimeType: string;
   url: string;
 }
 
@@ -156,11 +167,11 @@ export async function resolveAgentSource(value: string) {
   return result.source;
 }
 
-export async function getAgentSubtitle(sourceId: string, trackId: string) {
-  const response = await fetch(
-    AGENT_URL + "/downloads/" + encodeURIComponent(sourceId) + "/subtitles/" + encodeURIComponent(trackId) + ".vtt",
-    { cache: "force-cache" }
-  );
+export async function getAgentSubtitle(url: string) {
+  if (!url.startsWith(AGENT_URL + "/downloads/")) {
+    throw new Error("The companion returned an invalid subtitle URL.");
+  }
+  const response = await fetch(url, { cache: "force-cache" });
   if (!response.ok) {
     const data = (await response.json().catch(() => null)) as { error?: string } | null;
     throw new Error(data?.error || "Could not extract embedded subtitles.");

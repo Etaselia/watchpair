@@ -17,6 +17,14 @@ import { canCopyH264Video, createHlsPlaybackManager, streamHlsAsset } from "./hl
 import { publicTranscoder, selectTranscodeRuntime } from "./hardware-acceleration.mjs";
 import { createJsonStore } from "./job-store.mjs";
 import { fingerprintPath } from "./media-fingerprint.mjs";
+import {
+  STYLED_SUBTITLE_CODECS,
+  TEXT_SUBTITLE_CODECS,
+  fontAttachmentMetadata,
+  fontExtractionArgs,
+  safeFontExtension,
+  subtitleExtractionArgs,
+} from "./subtitle-assets.mjs";
 import { isSupportedMagnet } from "./torrent-input.mjs";
 import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, verifiedTorrentFileProgress, verifyTorrentFilePieces } from "./webtorrent-safety.mjs";
 
@@ -79,7 +87,6 @@ const ALLOWED_ORIGINS = new Set(
 );
 const VIDEO_EXTENSIONS = /\.(mp4|m4v|webm|ogv|mov|mkv|avi|ts)$/i;
 const DIRECT_MEDIA_EXTENSIONS = /\.(mp4|m4v|webm|ogv|mov|mkv|avi|ts)(?:$|[?#])/i;
-const TEXT_SUBTITLE_CODECS = new Set(["ass", "mov_text", "ssa", "subrip", "text", "webvtt"]);
 const PRIVATE_NETWORKS = new BlockList();
 PRIVATE_NETWORKS.addSubnet("10.0.0.0", 8, "ipv4");
 PRIVATE_NETWORKS.addSubnet("127.0.0.0", 8, "ipv4");
@@ -570,11 +577,26 @@ async function probeSubtitleTracks(job) {
         channels: Number(stream.channels || 0),
         default: Boolean(stream.disposition?.default),
       }));
-    job.subtitleTracks = (metadata.streams || [])
+    const streams = metadata.streams || [];
+    const selectionVersion = encodeURIComponent(selectionKey);
+    const subtitleFonts = fontAttachmentMetadata(
+      streams,
+      (stream) =>
+        "http://" + HOST + ":" + PORT +
+        "/downloads/" + encodeURIComponent(job.id) +
+        "/subtitle-fonts/" + stream.index +
+        "?v=" + selectionVersion
+    );
+    job.subtitleTracks = streams
       .filter((stream) => stream.codec_type === "subtitle")
       .map((stream) => {
         const codec = String(stream.codec_name || "unknown");
         const language = String(stream.tags?.language || "und").toLowerCase();
+        const styled = STYLED_SUBTITLE_CODECS.has(codec);
+        const subtitleBase =
+          "http://" + HOST + ":" + PORT +
+          "/downloads/" + encodeURIComponent(job.id) +
+          "/subtitles/" + stream.index;
         return {
           id: String(stream.index),
           streamIndex: Number(stream.index),
@@ -582,9 +604,12 @@ async function probeSubtitleTracks(job) {
           label: streamTrackLabel(stream, "Embedded subtitles"),
           codec,
           supported: TEXT_SUBTITLE_CODECS.has(codec),
+          styled,
           default: Boolean(stream.disposition?.default),
           forced: Boolean(stream.disposition?.forced),
-          url: "http://" + HOST + ":" + PORT + "/downloads/" + encodeURIComponent(job.id) + "/subtitles/" + stream.index + ".vtt",
+          url: subtitleBase + ".vtt?v=" + selectionVersion,
+          assUrl: styled ? subtitleBase + ".ass?v=" + selectionVersion : null,
+          fonts: styled ? subtitleFonts : [],
         };
       });
     job.subtitleStatus = "ready";
@@ -618,28 +643,64 @@ function queueSubtitleProbe(job) {
   return promise;
 }
 
-async function subtitleFile(job, trackId) {
+async function subtitleFile(job, trackId, format = "vtt") {
   await queueSubtitleProbe(job);
   const track = job.subtitleTracks.find((item) => item.id === trackId);
   if (!track) throw new Error("Embedded subtitle track not found.");
   if (!track.supported) {
     throw new Error("This image-based subtitle track cannot be converted to browser text.");
   }
+  if (format === "ass" && !track.styled) {
+    throw new Error("This subtitle track does not contain ASS/SSA styling.");
+  }
 
   const media = selectedJobFile(job);
   const directory = path.join(DOWNLOAD_DIR, ".watchpair-subtitles", job.id);
-  const output = path.join(directory, String(job.selectedIndex) + "-" + track.id + ".vtt");
+  const extension = format === "ass" ? ".ass" : ".vtt";
+  const output = path.join(directory, String(job.selectedIndex) + "-" + track.id + extension);
   await mkdir(directory, { recursive: true });
   try {
     await stat(output);
   } catch {
     await runFile(
       FFMPEG_PATH,
-      ["-v", "error", "-y", "-i", media.path, "-map", "0:" + track.streamIndex, "-f", "webvtt", output],
+      subtitleExtractionArgs(media.path, track.streamIndex, format, output),
       { maxBuffer: 8 * 1024 * 1024 }
     );
   }
   return output;
+}
+
+async function subtitleFontFile(job, fontId) {
+  await queueSubtitleProbe(job);
+  const font = job.subtitleTracks
+    .flatMap((track) => track.fonts || [])
+    .find((item) => item.id === fontId);
+  if (!font) throw new Error("Embedded subtitle font not found.");
+
+  const media = selectedJobFile(job);
+  const directory = path.join(DOWNLOAD_DIR, ".watchpair-subtitles", job.id);
+  const output = path.join(
+    directory,
+    String(job.selectedIndex) + "-font-" + font.id + safeFontExtension(font.name)
+  );
+  await mkdir(directory, { recursive: true });
+  try {
+    const info = await stat(output);
+    if (!info.size) throw new Error("Empty cached font");
+  } catch {
+    await runFile(
+      FFMPEG_PATH,
+      fontExtractionArgs(
+        media.path,
+        font.streamIndex,
+        output,
+        process.platform === "win32" ? "NUL" : "/dev/null"
+      ),
+      { maxBuffer: 8 * 1024 * 1024 }
+    );
+  }
+  return { path: output, mimeType: font.mimeType };
 }
 
 function needsHlsPlayback(job, fileName) {
@@ -1678,19 +1739,37 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    const subtitleMatch = /^\/downloads\/([a-zA-Z0-9-]{8,80})\/subtitles\/(\d+)\.vtt$/.exec(url.pathname);
+    const subtitleMatch = /^\/downloads\/([a-zA-Z0-9-]{8,80})\/subtitles\/(\d+)\.(vtt|ass)$/.exec(url.pathname);
     if (request.method === "GET" && subtitleMatch) {
       const job = jobs.get(subtitleMatch[1]);
       if (!job || job.status !== "ready") throw new Error("Download is not ready for subtitle extraction.");
-      const filePath = await subtitleFile(job, subtitleMatch[2]);
+      const format = subtitleMatch[3];
+      const filePath = await subtitleFile(job, subtitleMatch[2], format);
       const info = await stat(filePath);
       response.writeHead(200, {
         ...headers,
-        "content-type": "text/vtt; charset=utf-8",
+        "content-type": format === "ass" ? "text/x-ssa; charset=utf-8" : "text/vtt; charset=utf-8",
         "content-length": info.size,
         "cache-control": "private, max-age=3600",
       });
       createReadStream(filePath).pipe(response);
+      return;
+    }
+
+    const subtitleFontMatch =
+      /^\/downloads\/([a-zA-Z0-9-]{8,80})\/subtitle-fonts\/(\d+)$/.exec(url.pathname);
+    if (request.method === "GET" && subtitleFontMatch) {
+      const job = jobs.get(subtitleFontMatch[1]);
+      if (!job || job.status !== "ready") throw new Error("Download is not ready for font extraction.");
+      const font = await subtitleFontFile(job, subtitleFontMatch[2]);
+      const info = await stat(font.path);
+      response.writeHead(200, {
+        ...headers,
+        "content-type": font.mimeType,
+        "content-length": info.size,
+        "cache-control": "private, max-age=3600",
+      });
+      createReadStream(font.path).pipe(response);
       return;
     }
 

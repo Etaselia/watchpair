@@ -1,0 +1,151 @@
+name: Deploy VPS
+
+on:
+  schedule:
+    - cron: '7 4 * * *'
+      timezone: Europe/Vienna
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Released semantic version to deploy; blank selects the latest release
+        required: false
+        type: string
+      approve:
+        description: Approve deployment outside the maintenance window
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: watchpair-production-vps
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy released image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: ${{ github.event_name == 'workflow_dispatch' && 'production-vps' || 'production-vps-scheduled' }}
+      url: https://38-180-216-137.sslip.io:8443
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - id: release
+        name: Resolve eligible release
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            tag=$(
+              gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+                --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' |
+                grep -E '^v?[0-9]+\.[0-9]+\.0$' |
+                head -n 1 || true
+            )
+          elif [[ "${{ inputs.approve }}" != "true" ]]; then
+            echo "Manual deployment was not approved." >&2
+            exit 64
+          elif [[ -n "$REQUESTED_VERSION" ]]; then
+            tag="v${REQUESTED_VERSION#v}"
+          else
+            tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')
+          fi
+
+          version=${tag#v}
+          if [[ -z "$tag" ]] || [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "No eligible semantic release was found." >&2
+            exit 64
+          fi
+
+          echo "eligible=true" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Selected WatchPair $version."
+
+      - if: steps.release.outputs.eligible == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+
+      - if: steps.release.outputs.eligible == 'true'
+        id: source
+        name: Resolve released revision
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - if: steps.release.outputs.eligible == 'true'
+        name: Configure deployment key
+        env:
+          DEPLOY_KEY: ${{ secrets.WATCHPAIR_DEPLOY_SSH_KEY }}
+        shell: bash
+        run: |
+          test -n "$DEPLOY_KEY"
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/watchpair-deploy"
+          chmod 600 "$HOME/.ssh/watchpair-deploy"
+          cp ops/watchpair-known-hosts "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - if: steps.release.outputs.eligible == 'true'
+        id: status
+        name: Check deployed revision
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          REVISION: ${{ steps.source.outputs.sha }}
+        run: |
+          set +e
+          ssh -i "$HOME/.ssh/watchpair-deploy" -p 32913 \
+            -o BatchMode=yes -o IdentitiesOnly=yes \
+            watchpair-ci@38.180.216.137 \
+            "status $VERSION $REVISION"
+          result=$?
+          set -e
+
+          case "$result" in
+            0) echo "deploy=false" >> "$GITHUB_OUTPUT" ;;
+            3) echo "deploy=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "Could not query the current deployment." >&2; exit "$result" ;;
+          esac
+
+      - if: steps.status.outputs.deploy == 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - if: steps.status.outputs.deploy == 'true'
+        name: Build AMD64 deployment image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          outputs: type=docker,dest=${{ runner.temp }}/watchpair-image.tar
+          tags: watchpair:${{ steps.release.outputs.version }}
+          build-args: VCS_REF=${{ steps.source.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - if: steps.status.outputs.deploy == 'true'
+        name: Deploy and verify release
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          REVISION: ${{ steps.source.outputs.sha }}
+        run: |
+          gzip -9 --stdout "${{ runner.temp }}/watchpair-image.tar" |
+            ssh -i "$HOME/.ssh/watchpair-deploy" -p 32913 \
+              -o BatchMode=yes -o IdentitiesOnly=yes \
+              watchpair-ci@38.180.216.137 \
+              "deploy $VERSION $REVISION"
+
+          curl --fail --silent --show-error --max-time 15 \
+            https://38-180-216-137.sslip.io:8443/api/health
+
+      - if: steps.status.outputs.deploy == 'false'
+        name: Report current deployment
+        run: echo "The selected release is already deployed."
