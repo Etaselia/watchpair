@@ -1,0 +1,1 @@
+watchpair-ci ALL=(root) NOPASSWD: /usr/local/sbin/watchpair-ci-deploy *

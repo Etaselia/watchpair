@@ -1,0 +1,137 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+version=${1:-}
+revision=${2:-}
+image="watchpair:${version}"
+public_url="https://38-180-216-137.sslip.io:8443"
+app_container="watchpair-coordinator"
+candidate_container="watchpair-candidate"
+proxy_container="watchpair-proxy"
+rollback_image="watchpair:rollback"
+
+if [[ ! "$version" =~ ^[1-9][0-9]*\.0\.0$ ]] ||
+  [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "Invalid major release version or revision." >&2
+  exit 64
+fi
+
+run_app() {
+  local name=$1
+  local source_image=$2
+
+  docker run --detach \
+    --name "$name" \
+    --network watchpair-net \
+    --restart no \
+    --memory 192m \
+    --memory-swap 192m \
+    --cpus 1 \
+    --pids-limit 128 \
+    --read-only \
+    --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+    --security-opt no-new-privileges:true \
+    --cap-drop ALL \
+    --log-opt max-size=10m \
+    --log-opt max-file=3 \
+    --env NODE_OPTIONS=--max-old-space-size=128 \
+    "$source_image" >/dev/null
+}
+
+wait_for_container() {
+  local name=$1
+
+  for _ in {1..45}; do
+    if docker exec "$name" node -e \
+      'fetch("http://127.0.0.1:3000/api/health").then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))'
+    then
+      return 0
+    fi
+    sleep 1
+  done
+
+  return 1
+}
+
+cutover_started=false
+
+rollback() {
+  trap - ERR
+  echo "Public health check failed; restoring the previous image." >&2
+  docker rm --force "$app_container" >/dev/null 2>&1 || true
+  run_app "$app_container" "$rollback_image"
+  docker update --restart unless-stopped "$app_container" >/dev/null
+  docker restart "$proxy_container" >/dev/null
+  exit 1
+}
+
+trap 'if [[ "$cutover_started" == true ]]; then rollback; fi' ERR
+
+docker network inspect watchpair-net >/dev/null
+docker inspect "$proxy_container" >/dev/null
+
+previous_image=$(docker inspect --format '{{.Image}}' "$app_container")
+previous_source=$(docker inspect --format '{{.Config.Image}}' "$app_container")
+previous_rollback=$(
+  docker image inspect --format '{{.Id}}' "$rollback_image" 2>/dev/null || true
+)
+
+docker rm --force "$candidate_container" >/dev/null 2>&1 || true
+gzip --decompress --stdout | docker load
+
+loaded_revision=$(
+  docker image inspect \
+    --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+    "$image"
+)
+if [[ "$loaded_revision" != "$revision" ]]; then
+  echo "Loaded image revision does not match the released commit." >&2
+  exit 65
+fi
+
+run_app "$candidate_container" "$image"
+if ! wait_for_container "$candidate_container"; then
+  docker logs "$candidate_container" >&2 || true
+  docker rm --force "$candidate_container" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+docker image tag "$previous_image" "$rollback_image"
+cutover_started=true
+docker rm --force "$app_container" >/dev/null
+docker rename "$candidate_container" "$app_container"
+docker update --restart unless-stopped "$app_container" >/dev/null
+docker restart "$proxy_container" >/dev/null
+
+for _ in {1..30}; do
+  if curl --fail --silent --show-error --max-time 5 \
+    "${public_url}/api/health" >/dev/null; then
+    printf '%s\n' \
+      "url=${public_url}" \
+      "image=${image}" \
+      "revision=${revision}" \
+      "app_container=${app_container}" \
+      "proxy_container=${proxy_container}" \
+      "host_ports=80/tcp,8443/tcp" \
+      "deployed_at=$(date --iso-8601=seconds)" \
+      > /opt/watchpair/DEPLOYMENT
+    chown root:watchpair /opt/watchpair/DEPLOYMENT
+    chmod 640 /opt/watchpair/DEPLOYMENT
+
+    if [[ "$previous_source" != "$image" ]]; then
+      docker image rm "$previous_source" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$previous_rollback" ]] &&
+      [[ "$previous_rollback" != "$previous_image" ]]; then
+      docker image rm "$previous_rollback" >/dev/null 2>&1 || true
+    fi
+
+    cutover_started=false
+    trap - ERR
+    echo "WatchPair ${version} deployed successfully."
+    exit 0
+  fi
+  sleep 2
+done
+
+rollback

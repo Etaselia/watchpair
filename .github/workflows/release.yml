@@ -89,3 +89,73 @@ jobs:
             ${{ env.IMAGE }}:${{ env.VERSION }}
             ${{ env.IMAGE }}:${{ env.TAG }}
             ${{ env.IMAGE }}:latest
+
+  deploy-major:
+    name: Deploy major release to VPS
+    if: needs.release.outputs.release_created == 'true'
+    needs: [release, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production-vps
+      url: https://38-180-216-137.sslip.io:8443
+    concurrency:
+      group: watchpair-production-vps
+      cancel-in-progress: false
+    env:
+      VERSION: ${{ needs.release.outputs.version }}
+      REVISION: ${{ needs.release.outputs.sha }}
+    steps:
+      - id: release
+        name: Classify release
+        shell: bash
+        run: |
+          if [[ "$VERSION" =~ ^[1-9][0-9]*\.0\.0$ ]]; then
+            echo "major=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "major=false" >> "$GITHUB_OUTPUT"
+            echo "Version $VERSION is not a major release; skipping VPS deployment."
+          fi
+      - if: steps.release.outputs.major == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.REVISION }}
+      - if: steps.release.outputs.major == 'true'
+        uses: docker/setup-buildx-action@v4
+      - if: steps.release.outputs.major == 'true'
+        name: Build AMD64 deployment image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          outputs: type=docker,dest=${{ runner.temp }}/watchpair-image.tar
+          tags: watchpair:${{ env.VERSION }}
+          build-args: VCS_REF=${{ env.REVISION }}
+          cache-from: type=gha
+      - if: steps.release.outputs.major == 'true'
+        name: Configure deployment key
+        env:
+          DEPLOY_KEY: ${{ secrets.WATCHPAIR_DEPLOY_SSH_KEY }}
+        shell: bash
+        run: |
+          test -n "$DEPLOY_KEY"
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/watchpair-deploy"
+          chmod 600 "$HOME/.ssh/watchpair-deploy"
+          cp ops/watchpair-known-hosts "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+      - if: steps.release.outputs.major == 'true'
+        name: Deploy and verify major release
+        shell: bash
+        run: |
+          gzip -9 --stdout "${{ runner.temp }}/watchpair-image.tar" |
+            ssh \
+              -i "$HOME/.ssh/watchpair-deploy" \
+              -p 32913 \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              watchpair-ci@38.180.216.137 \
+              "deploy $VERSION $REVISION"
+
+          curl --fail --silent --show-error --max-time 15 \
+            https://38-180-216-137.sslip.io:8443/api/health
