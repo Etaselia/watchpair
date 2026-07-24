@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { access, readFile } from "node:fs/promises";
+import { access, readFile, readdir } from "node:fs/promises";
 import { after, before, test } from "node:test";
 import { strFromU8, unzipSync } from "fflate";
 
@@ -11,7 +11,7 @@ let serverOutput = "";
 before(async () => {
   server = spawn(
     process.execPath,
-    ["node_modules/vinext/dist/cli.js", "start", "--hostname", "127.0.0.1", "--port", String(port)],
+    ["scripts/start-container.mjs"],
     {
       cwd: new URL("../", import.meta.url),
       env: { ...process.env, PORT: String(port) },
@@ -60,6 +60,15 @@ test("production health endpoint reports readiness", async () => {
   const response = await fetch(`http://127.0.0.1:${port}/api/health`);
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { ok: true, service: "watchpair" });
+});
+
+test("production serves libass WebAssembly with the streaming MIME type", async () => {
+  const files = await readdir(new URL("../dist/client/_next/static/", import.meta.url));
+  const wasm = files.find((file) => file.startsWith("jassub-worker-") && file.endsWith(".wasm"));
+  assert.ok(wasm, "JASSUB worker WASM should be emitted");
+  const response = await fetch(`http://127.0.0.1:${port}/_next/static/${wasm}`, { method: "HEAD" });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "application/wasm");
 });
 
 test("production session API supports join-in-progress state", async () => {

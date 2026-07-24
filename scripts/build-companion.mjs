@@ -14,6 +14,7 @@ const inputs = [
   ["hardware-acceleration.mjs", resolve(root, "agent", "hardware-acceleration.mjs")],
   ["job-store.mjs", resolve(root, "agent", "job-store.mjs")],
   ["media-fingerprint.mjs", resolve(root, "agent", "media-fingerprint.mjs")],
+  ["subtitle-assets.mjs", resolve(root, "agent", "subtitle-assets.mjs")],
   ["torrent-input.mjs", resolve(root, "agent", "torrent-input.mjs")],
   ["webtorrent-safety.mjs", resolve(root, "agent", "webtorrent-safety.mjs")],
   ["package.json", resolve(root, "companion", "package.json")],

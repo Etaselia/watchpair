@@ -39,6 +39,18 @@ const worker = {
       return handleSessionApi(request, env);
     }
 
+    if (url.pathname.startsWith("/_next/static/") && url.pathname.endsWith(".wasm")) {
+      const asset = await env.ASSETS.fetch(request);
+      if (!asset.ok) return asset;
+      const headers = new Headers(asset.headers);
+      headers.set("content-type", "application/wasm");
+      return new Response(asset.body, {
+        status: asset.status,
+        statusText: asset.statusText,
+        headers,
+      });
+    }
+
     if (url.pathname === "/_vinext/image") {
       const allowedWidths = [...DEFAULT_DEVICE_SIZES, ...DEFAULT_IMAGE_SIZES];
       return handleImageOptimization(request, {

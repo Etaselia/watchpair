@@ -1515,6 +1515,12 @@ svg {
   background: #050505;
 }
 
+.player-shell canvas.JASSUB {
+  z-index: 2;
+  max-width: 100%;
+  max-height: 100%;
+}
+
 .player-topbar {
   position: absolute;
   z-index: 3;
@@ -1722,6 +1728,23 @@ svg {
 
 .controls-hidden .subtitle-overlay {
   bottom: 6%;
+}
+
+.caption-ass-mode {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.caption-ass-mode input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--acid);
 }
 
 .caption-settings {

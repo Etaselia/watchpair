@@ -28,6 +28,7 @@ subtitle timing synchronized.
   state
 - Drift correction and reconnect recovery in the player
 - Local SRT and WebVTT subtitle parsing
+- Faithful ASS/SSA rendering with libass, overlapping cues, authored placement, and embedded MKV fonts
 - Per-file audio and subtitle discovery for MKV and other containers with FFprobe
 - Post-download HLS preparation that unlocks playback before conversion finishes
 - Automatic NVENC, Quick Sync, VAAPI, AMF, and VideoToolbox detection with CPU fallback
@@ -168,7 +169,10 @@ The Docker path uses the same Worker-compatible build with its in-memory fallbac
 `npm install` configures tracked pre-commit and pre-push hooks. See [CONTRIBUTING.md](CONTRIBUTING.md)
 for checks and Conventional Commit guidance. Pull requests must pass lint, type checking, all tests,
 and a production Docker build. Release Please prepares semantic-version release pull requests;
-merging one publishes the companion ZIP, checksum, and multi-platform GHCR image.
+merging one publishes the companion ZIP, checksum, and multi-platform GHCR image. Published major
+and minor releases deploy to the VPS at 04:07 Europe/Vienna if they are not already live. The
+`Deploy VPS` workflow can deploy any published semantic version earlier when its manual approval
+checkbox is selected.
 
 ## Verification
 
@@ -193,7 +197,10 @@ npm run lint
   Other supported GPU encoders accelerate encoding; the bundled FFmpeg is the universal CPU fallback.
   Prepared segments are cached under `downloads/.watchpair-hls` for later watches.
 - MKV text subtitles such as SRT, ASS, and WebVTT are extracted by the companion.
-  Image-based PGS/VobSub tracks cannot be rendered as browser text. Video and
+  ASS/SSA tracks use browser-side libass rendering to preserve simultaneous cues, layers,
+  coordinates, styles, karaoke effects, and attached fonts. Viewers can disable original ASS
+  styling to use WatchPair's accessible caption appearance controls instead. Image-based
+  PGS/VobSub tracks still require a separate bitmap renderer and are not supported. Video and
   audio codec support still depends on the browser; remux or transcode releases
   that use unsupported codecs.
 - Magnet use exposes each downloader to the torrent swarm. Locally published files

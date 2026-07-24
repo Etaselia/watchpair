@@ -230,6 +230,7 @@ interface SubtitleAppearance {
   windowColor: string;
   windowOpacity: number;
   edgeStyle: SubtitleEdge;
+  originalAssStyling: boolean;
 }
 
 const subtitleColors = [
@@ -271,6 +272,7 @@ const defaultSubtitleAppearance: SubtitleAppearance = {
   windowColor: "#000000",
   windowOpacity: 0,
   edgeStyle: "drop-shadow",
+  originalAssStyling: true,
 };
 
 function rgba(hex: string, opacity: number) {
@@ -303,6 +305,7 @@ function readSubtitleAppearance(): SubtitleAppearance {
       fontSize: percentage(saved.fontSize, defaultSubtitleAppearance.fontSize, 50, 200),
       backgroundOpacity: percentage(saved.backgroundOpacity, defaultSubtitleAppearance.backgroundOpacity),
       windowOpacity: percentage(saved.windowOpacity, defaultSubtitleAppearance.windowOpacity),
+      originalAssStyling: saved.originalAssStyling !== false,
     };
   } catch {
     return defaultSubtitleAppearance;
@@ -1243,6 +1246,7 @@ export default function WatchApp() {
     (track) => track.id === requestedSubtitleTrackId
   );
   const requestedSubtitleTrackSupported = Boolean(requestedSubtitleTrack?.supported);
+  const requestedSubtitleTrackUrl = requestedSubtitleTrack?.url || "";
 
   const selectedMediaTrackKey =
     session?.selectedMedia?.fingerprint ||
@@ -1291,7 +1295,7 @@ export default function WatchApp() {
       loadedSubtitleRef.current = "";
       return;
     }
-    if (!sourceId || !requestedSubtitleTrackSupported) {
+    if (!sourceId || !requestedSubtitleTrackSupported || !requestedSubtitleTrackUrl) {
       loadedSubtitleRef.current = "";
       const clearTimer = window.setTimeout(() => setSubtitleCues([]), 0);
       return () => window.clearTimeout(clearTimer);
@@ -1306,7 +1310,7 @@ export default function WatchApp() {
     const clearTimer = window.setTimeout(() => {
       if (active) setSubtitleCues([]);
     }, 0);
-    void getAgentSubtitle(sourceId, trackId)
+    void getAgentSubtitle(requestedSubtitleTrackUrl)
       .then((contents) => {
         if (!active) return;
         const cues = parseSubtitles(contents);
@@ -1327,6 +1331,7 @@ export default function WatchApp() {
     requestedSubtitleSelection,
     requestedSubtitleTrackId,
     requestedSubtitleTrackSupported,
+    requestedSubtitleTrackUrl,
     selectedMediaTrackKey,
     playbackSourceId,
   ]);
@@ -2244,6 +2249,8 @@ function SyncedPlayer({
   const videoRef = useRef<HTMLVideoElement>(null);
   const playerRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<Hls | null>(null);
+  const assRendererRef = useRef<import("jassub").default | null>(null);
+  const subtitleOffsetRef = useRef(session.player.subtitleOffset);
   const hlsRecoveryRef = useRef(false);
   const lastSeqRef = useRef(-1);
   const playerStateRef = useRef(session.player);
@@ -2259,6 +2266,7 @@ function SyncedPlayer({
   const [hlsAudioRevision, setHlsAudioRevision] = useState(0);
   const [hlsVideoRendition] = useState<HlsVideoRendition>(preferredHlsVideoRendition);
   const [subtitleText, setSubtitleText] = useState("");
+  const [failedAssTrack, setFailedAssTrack] = useState("");
   const [controlsVisible, setControlsVisible] = useState(true);
   const [captionSettingsOpen, setCaptionSettingsOpen] = useState(false);
   const [subtitleAppearance, setSubtitleAppearance] = useState(defaultSubtitleAppearance);
@@ -2272,7 +2280,8 @@ function SyncedPlayer({
   const requestedPlayerSubtitleId = session.player.subtitleLanguage.startsWith("embedded:")
     ? session.player.subtitleLanguage.slice("embedded:".length)
     : "";
-  const hasRequestedSubtitle = subtitleTracks.some((track) => track.id === requestedPlayerSubtitleId);
+  const requestedSubtitleTrack = subtitleTracks.find((track) => track.id === requestedPlayerSubtitleId);
+  const hasRequestedSubtitle = Boolean(requestedSubtitleTrack);
   const subtitleSelection =
     session.player.subtitleLanguage === "local" && localSubtitleName
       ? "local"
@@ -2305,11 +2314,66 @@ function SyncedPlayer({
     return url.toString();
   }, [hlsVideoRendition, mediaUrl, playbackAudioTrack]);
   const isHlsPlayback = playbackUrl.includes("/hls/") && playbackUrl.includes(".m3u8");
+  const assTrackKey = requestedSubtitleTrack?.assUrl || "";
+  const assFontKey = (requestedSubtitleTrack?.fonts || []).map((font) => font.url).join("|");
+  const assFontUrls = useMemo(() => assFontKey ? assFontKey.split("|") : [], [assFontKey]);
+  subtitleOffsetRef.current = session.player.subtitleOffset;
+  const useOriginalAss = Boolean(
+    subtitleSelection !== "off" &&
+    requestedSubtitleTrack?.styled &&
+    assTrackKey &&
+    subtitleAppearance.originalAssStyling &&
+    failedAssTrack !== assTrackKey
+  );
 
   useEffect(() => {
     const timer = window.setTimeout(() => setSubtitleAppearance(readSubtitleAppearance()), 0);
     return () => window.clearTimeout(timer);
   }, []);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !useOriginalAss || !assTrackKey) return;
+
+    let active = true;
+    let renderer: import("jassub").default | null = null;
+    void import("jassub")
+      .then(({ default: JASSUB }) => {
+        if (!active) return null;
+        renderer = new JASSUB({
+          video,
+          subUrl: assTrackKey,
+          fonts: assFontUrls,
+          queryFonts: false,
+          timeOffset: -subtitleOffsetRef.current / 1000,
+          libassMemoryLimit: 96,
+          libassGlyphLimit: 48,
+        });
+        assRendererRef.current = renderer;
+        return renderer.ready;
+      })
+      .then(() => {
+        if (active && renderer) void renderer.resize(true);
+      })
+      .catch((caught) => {
+        if (!active) return;
+        console.error("Could not render ASS subtitles", caught);
+        setFailedAssTrack(assTrackKey);
+      });
+
+    return () => {
+      active = false;
+      if (assRendererRef.current === renderer) assRendererRef.current = null;
+      if (renderer) void renderer.destroy();
+    };
+  }, [assFontUrls, assTrackKey, useOriginalAss]);
+
+  useEffect(() => {
+    const renderer = assRendererRef.current;
+    if (!renderer) return;
+    renderer.timeOffset = -session.player.subtitleOffset / 1000;
+    void renderer.resize(true);
+  }, [session.player.subtitleOffset]);
 
   const clearControlsTimer = useCallback(() => {
     if (controlsHideTimerRef.current !== null) {
@@ -2563,8 +2627,8 @@ function SyncedPlayer({
         return;
       }
       const subtitleTime = video.currentTime - session.player.subtitleOffset / 1000;
-      const cue = subtitleCues.find((item) => subtitleTime >= item.start && subtitleTime <= item.end);
-      setSubtitleText(cue?.text || "");
+      const cues = subtitleCues.filter((item) => subtitleTime >= item.start && subtitleTime <= item.end);
+      setSubtitleText(cues.map((cue) => cue.text).join("\n"));
     }, 120);
 
     return () => window.clearInterval(timer);
@@ -2737,7 +2801,7 @@ function SyncedPlayer({
         </div>
       </div>
 
-      {subtitleText && (
+      {subtitleText && !useOriginalAss && (
         <div className="subtitle-overlay">
           <div className="subtitle-window" style={subtitleStyle}>
             {subtitleText.split("\n").map((line, index) => <span key={`${line}-${index}`}>{line}</span>)}
@@ -2776,6 +2840,21 @@ function SyncedPlayer({
               </button>
             </header>
 
+            {requestedSubtitleTrack?.styled && (
+              <label className="caption-ass-mode">
+                <input
+                  type="checkbox"
+                  checked={subtitleAppearance.originalAssStyling}
+                  onChange={(event) => {
+                    if (event.target.checked) setFailedAssTrack("");
+                    updateSubtitleAppearance({ originalAssStyling: event.target.checked });
+                  }}
+                />
+                <span>Original ASS styling</span>
+              </label>
+            )}
+
+            {(!requestedSubtitleTrack?.styled || !subtitleAppearance.originalAssStyling) && (
             <div className="caption-settings-grid">
               <label className="caption-setting caption-setting-wide">
                 <span>Font</span>
@@ -2876,6 +2955,7 @@ function SyncedPlayer({
                 </select>
               </label>
             </div>
+            )}
           </section>
         )}
 
