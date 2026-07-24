@@ -1,0 +1,41 @@
+name: Build deployment image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build AMD64 archive
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build image archive
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          outputs: type=docker,dest=${{ runner.temp }}/watchpair-image.tar
+          tags: watchpair:0.5.4
+          build-args: VCS_REF=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Compress and checksum archive
+        working-directory: ${{ runner.temp }}
+        run: |
+          gzip -9 watchpair-image.tar
+          sha256sum watchpair-image.tar.gz > watchpair-image.tar.gz.sha256
+      - name: Upload deployment archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: watchpair-amd64-image
+          path: |
+            ${{ runner.temp }}/watchpair-image.tar.gz
+            ${{ runner.temp }}/watchpair-image.tar.gz.sha256
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
