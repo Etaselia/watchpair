@@ -44,6 +44,22 @@ const ENCODERS = {
   },
 };
 
+const VP9_ENCODER = {
+  id: "vp9",
+  codec: "libvpx-vp9",
+  label: "VP9 compatibility (CPU)",
+  hardware: false,
+  arguments: [
+    "-c:v", "libvpx-vp9",
+    "-deadline", "realtime",
+    "-cpu-used", "6",
+    "-crf", "32",
+    "-b:v", "0",
+    "-pix_fmt", "yuv420p",
+    "-row-mt", "1",
+  ],
+};
+
 const CPU_ENCODER = {
   id: "cpu",
   codec: "libx264",
@@ -184,4 +200,4 @@ export function publicTranscoder(runtime) {
   };
 }
 
-export { CPU_ENCODER };
+export { CPU_ENCODER, VP9_ENCODER };

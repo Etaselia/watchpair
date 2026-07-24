@@ -129,7 +129,10 @@ async function sessionRequest(payload: Record<string, unknown>) {
 function sameSelectedFile(session: WatchSession, readiness: LocalReadiness) {
   if (!session.selectedMedia || !readiness.fileName) return true;
   if (session.selectedMedia.fingerprint && readiness.fingerprint) {
-    return session.selectedMedia.fingerprint === readiness.fingerprint;
+    return (
+      session.selectedMedia.fingerprint === readiness.fingerprint &&
+      session.selectedMedia.size === readiness.fileSize
+    );
   }
   return (
     session.selectedMedia.name === readiness.fileName &&
@@ -139,7 +142,11 @@ function sameSelectedFile(session: WatchSession, readiness: LocalReadiness) {
 
 function preferredAgentFile(job: AgentJob, selectedMedia?: WatchSession["selectedMedia"]) {
   const matchingFingerprint = selectedMedia?.fingerprint
-    ? job.files.find((file) => agentFileFingerprint(job, file) === selectedMedia.fingerprint)
+    ? job.files.find(
+      (file) =>
+        agentFileFingerprint(job, file) === selectedMedia.fingerprint &&
+        file.size === selectedMedia.size
+    )
     : null;
   const selected = selectedMedia?.sourceId === job.id
     ? job.files.find((file) =>
@@ -2209,6 +2216,15 @@ interface SyncedPlayerProps {
   onSend: (player: PlayerState) => Promise<void>;
 }
 
+type HlsVideoRendition = "h264" | "vp9";
+
+function preferredHlsVideoRendition(): HlsVideoRendition {
+  if (typeof window === "undefined" || !window.MediaSource?.isTypeSupported) return "h264";
+  if (window.MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"')) return "h264";
+  if (window.MediaSource.isTypeSupported('video/mp4; codecs="vp09.00.10.08"')) return "vp9";
+  return "h264";
+}
+
 function mediaDuration(video: HTMLVideoElement) {
   if (Number.isFinite(video.duration)) return video.duration;
   return video.seekable.length ? video.seekable.end(video.seekable.length - 1) : 0;
@@ -2241,6 +2257,7 @@ function SyncedPlayer({
   const [mediaLoading, setMediaLoading] = useState(true);
   const [mediaError, setMediaError] = useState("");
   const [hlsAudioRevision, setHlsAudioRevision] = useState(0);
+  const [hlsVideoRendition] = useState<HlsVideoRendition>(preferredHlsVideoRendition);
   const [subtitleText, setSubtitleText] = useState("");
   const [controlsVisible, setControlsVisible] = useState(true);
   const [captionSettingsOpen, setCaptionSettingsOpen] = useState(false);
@@ -2266,13 +2283,28 @@ function SyncedPlayer({
   const desiredAudioTrackIndex = playbackAudioTrack
     ? audioTracks.findIndex((track) => track.id === playbackAudioTrack.id)
     : -1;
-  const isHlsPlayback = mediaUrl.includes("/hls/") && mediaUrl.includes(".m3u8");
   const playbackUrl = useMemo(() => {
-    if (isHlsPlayback || !playbackAudioTrack) return mediaUrl;
+    if (mediaUrl.includes("/hls/") && mediaUrl.includes(".m3u8")) {
+      return mediaUrl.replace(
+        /\/(?:h264|vp9)\/master\.m3u8$/,
+        `/${hlsVideoRendition}/master.m3u8`
+      );
+    }
+    if (hlsVideoRendition === "vp9" && mediaUrl.startsWith(AGENT_URL)) {
+      const url = new URL(mediaUrl);
+      const stream = /^\/stream\/([a-zA-Z0-9-]{8,80})\/(\d+)$/.exec(url.pathname);
+      if (stream) {
+        url.pathname = `/hls/${stream[1]}/${stream[2]}/vp9/master.m3u8`;
+        url.search = "";
+        return url.toString();
+      }
+    }
+    if (!playbackAudioTrack) return mediaUrl;
     const url = new URL(mediaUrl);
     url.searchParams.set("audio", playbackAudioTrack.id);
     return url.toString();
-  }, [isHlsPlayback, mediaUrl, playbackAudioTrack]);
+  }, [hlsVideoRendition, mediaUrl, playbackAudioTrack]);
+  const isHlsPlayback = playbackUrl.includes("/hls/") && playbackUrl.includes(".m3u8");
 
   useEffect(() => {
     const timer = window.setTimeout(() => setSubtitleAppearance(readSubtitleAppearance()), 0);
@@ -2390,7 +2422,7 @@ function SyncedPlayer({
             fail(
               data.type === ErrorTypes.NETWORK_ERROR
                 ? "The companion could not create browser-ready video segments." + detail
-                : "Chromium could not decode the prepared video segments." + detail
+                : "This browser could not decode the prepared video segments." + detail
             );
           });
           hls.loadSource(playbackUrl);

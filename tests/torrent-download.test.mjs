@@ -7,7 +7,7 @@ import path from "node:path";
 import test from "node:test";
 import WebTorrent from "webtorrent";
 import Torrent from "webtorrent/lib/torrent.js";
-import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, stabilizeWireBitfieldWrites, verifiedTorrentFileProgress } from "../agent/webtorrent-safety.mjs";
+import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, stabilizeWireBitfieldWrites, verifiedTorrentFileProgress, verifyTorrentFilePieces } from "../agent/webtorrent-safety.mjs";
 
 installWebTorrentSafetyGuards();
 
@@ -27,7 +27,10 @@ test("torrent guards preserve verified state and skip stale requests", () => {
 
   const verifiedFile = {
     _torrent: {
-      bitfield: { buffer: new Uint8Array([0xa0]) },
+      bitfield: {
+        buffer: new Uint8Array([0xa0]),
+        get: (index) => [true, false, true][index],
+      },
       pieceLength: 10,
       lastPieceLength: 5,
       pieces: [null, {}, null],
@@ -39,6 +42,30 @@ test("torrent guards preserve verified state and skip stale requests", () => {
     done: false,
   };
   assert.equal(verifiedTorrentFileProgress(verifiedFile), 0.6);
+});
+
+test("full file verification reports stale or missing torrent pieces", async () => {
+  const states = [true, true, true];
+  let checked = [];
+  let doneChecks = 0;
+  const torrent = {
+    bitfield: { get: (index) => states[index] },
+    _verifyPiecesUsingHash(pieces, callback) {
+      checked = pieces;
+      states[1] = false;
+      callback(null);
+    },
+    _checkDone() {
+      doneChecks += 1;
+    },
+  };
+  const file = { _torrent: torrent, _startPiece: 0, _endPiece: 2 };
+
+  const result = await verifyTorrentFilePieces(file);
+
+  assert.deepEqual(checked, [0, 1, 2]);
+  assert.deepEqual(result, { verified: false, invalidPieces: [1] });
+  assert.equal(doneChecks, 1);
 });
 
 test("piece recovery rewinds the selected file", () => {
