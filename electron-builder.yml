@@ -72,6 +72,6 @@ linux:
   executableName: watchpair-companion
   maintainer: Etaselia
 appImage:
-  artifactName: WatchPair-Companion-Linux-${arch}.AppImage
+  artifactName: WatchPair-Companion-Linux-x64.AppImage
 deb:
-  artifactName: WatchPair-Companion-Linux-${arch}.deb
+  artifactName: WatchPair-Companion-Linux-x64.deb
