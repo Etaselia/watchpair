@@ -56,9 +56,12 @@ await Promise.all([
 ]);
 const output = [];
 const executable = process.env.WATCHPAIR_DESKTOP_EXECUTABLE || electronPath;
+const runtimeArguments = process.platform === "linux" && process.env.CI
+  ? ["--no-sandbox"]
+  : [];
 const applicationArguments = process.env.WATCHPAIR_DESKTOP_EXECUTABLE
-  ? []
-  : [root];
+  ? runtimeArguments
+  : [root, ...runtimeArguments];
 const child = spawn(executable, applicationArguments, {
   cwd: root,
   env: {
