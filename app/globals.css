@@ -1893,12 +1893,66 @@ svg {
   color: var(--ink);
 }
 
+.timeline-wrap {
+  position: relative;
+  width: 100%;
+  height: 18px;
+}
+
 .timeline {
   width: 100%;
   height: 18px;
   margin: 0;
   cursor: pointer;
   accent-color: var(--acid);
+}
+
+.chapter-marker {
+  position: absolute;
+  z-index: 2;
+  top: 4px;
+  width: 4px;
+  height: 10px;
+  margin-left: -2px;
+  border: 0;
+  border-radius: 1px;
+  background: rgba(255, 255, 255, 0.82);
+  padding: 0;
+  cursor: pointer;
+}
+
+.chapter-marker:hover,
+.chapter-marker:focus-visible {
+  top: 2px;
+  height: 14px;
+  background: var(--acid);
+}
+
+.chapter-controls {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+
+.chapter-select {
+  display: block;
+  width: min(190px, 20vw);
+  min-width: 92px;
+}
+
+.chapter-select select {
+  width: 100%;
+  height: 32px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--white);
+  font-size: 11px;
+  text-overflow: ellipsis;
+}
+
+.chapter-select option {
+  background: #141512;
 }
 
 .control-row {

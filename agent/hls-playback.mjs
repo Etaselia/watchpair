@@ -430,6 +430,17 @@ export function createHlsPlaybackManager({
     };
   }
 
+  async function removeJob(jobId) {
+    const matching = Array.from(sessions.entries()).filter(([key]) => key.startsWith(`${jobId}:`));
+    for (const [key] of matching) sessions.delete(key);
+    await Promise.allSettled(matching.map(([, pending]) => pending.then(async (state) => {
+      state.stopping = true;
+      for (const child of state.children) child.kill("SIGTERM");
+      await state.done?.catch(() => {});
+    })));
+    await rm(path.join(cacheRoot, jobId), { recursive: true, force: true });
+  }
+
   function shutdown() {
     for (const pending of sessions.values()) {
       void pending.then((state) => {
@@ -439,7 +450,7 @@ export function createHlsPlaybackManager({
     }
   }
 
-  return { getAsset, getPreparation, prepare, shutdown };
+  return { getAsset, getPreparation, prepare, removeJob, shutdown };
 }
 
 async function readStableAsset(filePath) {

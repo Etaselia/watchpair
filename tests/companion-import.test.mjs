@@ -98,6 +98,18 @@ test("imports, seeds, restores, and stops a local companion file", { timeout: 30
       .slice(0, 32);
     assert.equal(seeded.job.identityFingerprint, expectedFingerprint);
     assert.equal(seeded.job.files[0].fingerprint, expectedFingerprint);
+    assert.equal(seeded.job.managed, true);
+    assert.equal(seeded.job.pinned, false);
+    const storage = await (await fetch(base + "/storage")).json();
+    assert.equal(storage.usage.managedJobs, 1);
+    assert.equal(storage.cleanup.downloadRetentionDays, 30);
+    const pinnedResponse = await fetch(base + "/downloads/" + sourceId + "/pin", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ pinned: true }),
+    });
+    assert.equal(pinnedResponse.status, 200);
+    assert.equal((await pinnedResponse.json()).job.pinned, true);
 
     const bulk = await (await fetch(base + "/downloads")).json();
     assert.equal(bulk.jobs.length, 1);
@@ -109,6 +121,8 @@ test("imports, seeds, restores, and stops a local companion file", { timeout: 30
     const manifest = JSON.parse(await readFile(path.join(directory, "downloads", ".watchpair-jobs.json"), "utf8"));
     assert.equal(manifest[0].seed, true);
     assert.equal(manifest[0].id, sourceId);
+    assert.equal(manifest[0].managed, true);
+    assert.equal(manifest[0].pinned, true);
 
     companion = await start();
     const restored = await waitForJson(
@@ -121,6 +135,7 @@ test("imports, seeds, restores, and stops a local companion file", { timeout: 30
 
     assert.equal(restored.job.identityFingerprint, expectedFingerprint);
     assert.equal(restored.job.files[0].fingerprint, expectedFingerprint);
+    assert.equal(restored.job.pinned, true);
     const stopped = await fetch(base + "/downloads/" + sourceId, { method: "DELETE" });
     assert.equal(stopped.status, 200);
     const afterStop = await (await fetch(base + "/downloads")).json();

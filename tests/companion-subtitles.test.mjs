@@ -18,6 +18,7 @@ test("companion serves original ASS, WebVTT fallback, and attached MKV fonts", {
   const agentPort = await freePort();
   const assPath = path.join(directory, "input.ass");
   const mkvPath = path.join(directory, "fixture.mkv");
+  const chaptersPath = path.join(directory, "chapters.txt");
   const fontPath = path.join(root, "node_modules", "jassub", "dist", "default.woff2");
   let companion;
   let output = "";
@@ -38,11 +39,26 @@ test("companion serves original ASS, WebVTT fallback, and attached MKV fonts", {
       "Dialogue: 0,0:00:00.00,0:00:01.50,Default,,0,0,0,,{\\pos(120,80)}First",
       "Dialogue: 1,0:00:00.50,0:00:02.00,Default,,0,0,0,,Second",
     ].join("\n"));
+    await writeFile(chaptersPath, [
+      ";FFMETADATA1",
+      "[CHAPTER]",
+      "TIMEBASE=1/1000",
+      "START=0",
+      "END=1000",
+      "title=Opening",
+      "[CHAPTER]",
+      "TIMEBASE=1/1000",
+      "START=1000",
+      "END=2000",
+      "title=Second half",
+    ].join("\n"));
     await runFile(ffmpegPath, [
       "-v", "error",
       "-f", "lavfi", "-i", "color=c=black:s=640x360:d=2",
       "-i", assPath,
+      "-i", chaptersPath,
       "-map", "0:v", "-map", "1:s",
+      "-map_chapters", "2",
       "-c:v", "mpeg4", "-t", "2", "-c:s", "ass",
       "-attach", fontPath,
       "-metadata:s:t", "mimetype=font/woff2",
@@ -92,6 +108,10 @@ test("companion serves original ASS, WebVTT fallback, and attached MKV fonts", {
     assert.equal(track.styled, true);
     assert.match(track.assUrl, /\.ass\?v=/);
     assert.equal(track.fonts.length, 1);
+    assert.deepEqual(snapshot.job.chapters.map(({ title, start, end }) => ({ title, start, end })), [
+      { title: "Opening", start: 0, end: 1 },
+      { title: "Second half", start: 1, end: 2 },
+    ]);
 
     const assResponse = await fetch(track.assUrl);
     assert.equal(assResponse.status, 200);

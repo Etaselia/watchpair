@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:">
+  <title>WatchPair Companion</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand-mark" aria-hidden="true"><span></span><span></span></div>
+    <div>
+      <h1>WatchPair Companion</h1>
+      <p id="version">Version</p>
+    </div>
+    <span id="agent-status" class="status-pill">Starting</span>
+  </header>
+
+  <main>
+    <section aria-labelledby="storage-title">
+      <div class="section-heading">
+        <div>
+          <h2 id="storage-title">Storage</h2>
+          <p id="storage-summary">Reading storage usage</p>
+        </div>
+        <button id="open-downloads" class="secondary" type="button">Open folder</button>
+      </div>
+
+      <label class="field wide">
+        <span>Download folder</span>
+        <span class="path-control">
+          <input id="download-directory" type="text" readonly>
+          <button id="choose-directory" class="secondary" type="button">Choose</button>
+        </span>
+      </label>
+
+      <div class="setting-row">
+        <label class="toggle-label" for="cleanup-enabled">
+          <input id="cleanup-enabled" type="checkbox">
+          <span>Automatic cleanup</span>
+        </label>
+        <button id="cleanup-now" class="secondary" type="button">Clean now</button>
+      </div>
+
+      <div class="field-grid cleanup-fields">
+        <label class="field">
+          <span>Downloads kept for</span>
+          <span class="number-control"><input id="download-days" type="number" min="1" max="3650"><span>days</span></span>
+        </label>
+        <label class="field">
+          <span>Prepared video kept for</span>
+          <span class="number-control"><input id="cache-days" type="number" min="1" max="365"><span>days</span></span>
+        </label>
+        <label class="field">
+          <span>Incomplete imports kept for</span>
+          <span class="number-control"><input id="partial-hours" type="number" min="1" max="720"><span>hours</span></span>
+        </label>
+        <label class="field">
+          <span>Storage limit</span>
+          <span class="number-control"><input id="max-storage" type="number" min="0" max="100000"><span>GB</span></span>
+        </label>
+        <label class="field">
+          <span>Free-space reserve</span>
+          <span class="number-control"><input id="min-free-space" type="number" min="0" max="100000"><span>GB</span></span>
+        </label>
+      </div>
+    </section>
+
+    <section aria-labelledby="performance-title">
+      <h2 id="performance-title">Performance</h2>
+      <div class="field-grid">
+        <label class="field">
+          <span>Video transcoder</span>
+          <select id="transcoder">
+            <option value="auto">Automatic</option>
+            <option value="nvenc">NVIDIA NVENC</option>
+            <option value="qsv">Intel Quick Sync</option>
+            <option value="amf">AMD AMF</option>
+            <option value="vaapi">Linux VAAPI</option>
+            <option value="videotoolbox">Apple VideoToolbox</option>
+            <option value="cpu">CPU only</option>
+          </select>
+        </label>
+        <div class="field">
+          <span>Active transcoder</span>
+          <output id="active-transcoder">Starting</output>
+        </div>
+      </div>
+      <label class="toggle-label" for="start-login">
+        <input id="start-login" type="checkbox">
+        <span>Start at login</span>
+      </label>
+    </section>
+
+    <section aria-labelledby="updates-title">
+      <div class="section-heading">
+        <div>
+          <h2 id="updates-title">Updates</h2>
+          <p id="update-status">Not checked yet</p>
+        </div>
+        <div class="button-row">
+          <button id="check-update" class="secondary" type="button">Check</button>
+          <button id="download-update" class="secondary hidden" type="button">Download</button>
+          <button id="install-update" class="primary hidden" type="button">Restart and update</button>
+        </div>
+      </div>
+      <div class="setting-row start">
+        <label class="toggle-label" for="automatic-checks">
+          <input id="automatic-checks" type="checkbox">
+          <span>Check automatically</span>
+        </label>
+        <label class="toggle-label" for="automatic-downloads">
+          <input id="automatic-downloads" type="checkbox">
+          <span>Download automatically</span>
+        </label>
+      </div>
+      <div id="update-progress" class="progress hidden"><span></span></div>
+    </section>
+  </main>
+
+  <footer>
+    <span id="message" role="status"></span>
+    <button id="save-settings" class="primary" type="button">Save settings</button>
+  </footer>
+  <script src="./renderer.js"></script>
+</body>
+</html>

@@ -3,7 +3,7 @@
 [![CI](https://github.com/Etaselia/watchpair/actions/workflows/ci.yml/badge.svg)](https://github.com/Etaselia/watchpair/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-WatchPair is a private two-person watch room for videos that remain on each
+WatchPair is a self-hosted watch room for videos that remain on each
 participant's own computer. A session keeps an ordered download queue, active
 file selection, per-item readiness, play/pause, seeks, playback speed, audio language, subtitles, and
 subtitle timing synchronized.
@@ -29,11 +29,13 @@ subtitle timing synchronized.
 - Drift correction and reconnect recovery in the player
 - Local SRT and WebVTT subtitle parsing
 - Faithful ASS/SSA rendering with libass, overlapping cues, authored placement, and embedded MKV fonts
-- Per-file audio and subtitle discovery for MKV and other containers with FFprobe
+- Per-file audio, subtitle, and chapter discovery for MKV and other containers with FFprobe
+- Chapter markers plus synchronized previous, next, and chapter selection controls
 - Post-download HLS preparation that unlocks playback before conversion finishes
 - Automatic NVENC, Quick Sync, VAAPI, AMF, and VideoToolbox detection with CPU fallback
 - NVIDIA CUDA hardware decoding plus NVENC encoding, including 10-bit HEVC input
 - Byte-range streaming from the companion so the browser can seek efficiently
+- Automatic age, cache, storage-limit, and free-space cleanup with per-download pins
 
 ## Architecture
 
@@ -64,19 +66,22 @@ npm run dev
 
 The coordinator opens at [http://localhost:3000](http://localhost:3000).
 
-For magnet pages, torrent downloads, and embedded MKV subtitles, each watcher
-also runs the companion. During development it can be started in a second terminal:
+For magnet pages, torrent downloads, embedded MKV subtitles, chapters, and browser-ready
+video preparation, each watcher installs **WatchPair Companion** from the latest GitHub release:
 
-```bash
-npm run agent
-```
+- Windows: `WatchPair-Companion-Windows-x64-Setup.exe`
+- Linux portable: `WatchPair-Companion-Linux-x64.AppImage`
+- Debian/Ubuntu: `WatchPair-Companion-Linux-x64.deb`
 
-The companion listens only on `127.0.0.1:41735` and downloads into
-`./downloads`. The website offers `watchpair-companion.zip`; on Windows, extract
-it and double-click `install-and-start.cmd`, then press **Connect** in WatchPair
-and approve the displayed website. No port forwarding is needed. Without the
-companion, users can still choose matching local videos and CORS-enabled direct
-links can use the browser download fallback.
+The app bundles Electron, Node.js, FFmpeg, and FFprobe, manages its own updates, and needs no
+separate runtime dependencies. Press **Connect** on the website; the native app opens, asks for
+approval, and leaves the room page in place. The companion listens only on `127.0.0.1:41735`; no
+port forwarding is needed. Its settings window controls the download folder, retention, storage
+limits, startup behavior, hardware transcoder, cleanup, and automatic or manual updates.
+
+During development, start the desktop app with `npm run desktop:dev`, or run only the agent in a
+second terminal with `npm run agent`. Without the companion, users can still choose matching local
+videos and CORS-enabled direct links can use the browser download fallback.
 
 ## Companion settings
 
@@ -127,7 +132,7 @@ Build and run locally:
 docker compose up --build
 ```
 
-Or deploy a released image from the private GitHub Container Registry package:
+Or deploy a released image from GitHub Container Registry:
 
 ```bash
 docker login ghcr.io
@@ -169,7 +174,7 @@ The Docker path uses the same Worker-compatible build with its in-memory fallbac
 `npm install` configures tracked pre-commit and pre-push hooks. See [CONTRIBUTING.md](CONTRIBUTING.md)
 for checks and Conventional Commit guidance. Pull requests must pass lint, type checking, all tests,
 and a production Docker build. Release Please prepares semantic-version release pull requests;
-merging one publishes the companion ZIP, checksum, and multi-platform GHCR image. Published major
+merging one publishes tested Windows and Linux desktop installers, updater metadata, the transitional companion ZIP, checksum, and multi-platform GHCR image. Published major
 and minor releases deploy to the VPS at 04:07 Europe/Vienna if they are not already live. The
 `Deploy VPS` workflow can deploy any published semantic version earlier when its manual approval
 checkbox is selected.

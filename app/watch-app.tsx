@@ -21,6 +21,7 @@ import {
   PackageOpen,
   Pause,
   Pencil,
+  Pin,
   Play,
   Plug,
   Plus,
@@ -28,6 +29,8 @@ import {
   RotateCcw,
   Settings2,
   Share2,
+  SkipBack,
+  SkipForward,
   Subtitles,
   Trash2,
   Upload,
@@ -53,16 +56,18 @@ import {
   detectAgent,
   getAgentDownloads,
   getAgentPermissionState,
-  getAgentPairingUrl,
+  getAgentConnectUrl,
   getAgentSubtitle,
   resolveAgentSource,
   retryAgentDownload,
   scanAgentLibrary,
   seedAgentLibraryFile,
   selectAgentFile,
+  setAgentDownloadPinned,
   stopAgentDownload,
   uploadAndSeedAgentFile,
   type AgentAudioTrack,
+  type AgentChapter,
   type AgentFile,
   type AgentLibraryFile,
   type AgentPermissionState,
@@ -97,6 +102,7 @@ import {
 
 const COMPANION_VERSION = "0.6.0"; // x-release-please-version
 const EMPTY_AUDIO_TRACKS: AgentAudioTrack[] = [];
+const EMPTY_CHAPTERS: AgentChapter[] = [];
 const EMPTY_SUBTITLE_TRACKS: AgentSubtitleTrack[] = [];
 
 type DownloadMode = "automatic" | "manual" | "external";
@@ -398,6 +404,7 @@ export default function WatchApp() {
   const playbackSourceId = localAgentMedia?.sourceId || activeSourceId;
   const agentJob = localAgentMedia?.job || (activeSource ? agentJobs[activeSource.id] || null : null);
   const embeddedAudioTracks = agentJob?.audioTracks || EMPTY_AUDIO_TRACKS;
+  const embeddedChapters = agentJob?.chapters || EMPTY_CHAPTERS;
   const embeddedSubtitles = agentJob?.subtitles || EMPTY_SUBTITLE_TRACKS;
   const sourcesKey = sources.map((source) => source.id).join(":");
 
@@ -489,46 +496,27 @@ export default function WatchApp() {
 
   const connectCompanion = async () => {
     if (agentPairing) return;
-    const pairingWindow = window.open("about:blank", "watchpair-companion");
-    if (!pairingWindow) {
-      setError("Allow the pairing window, then try connecting the companion again.");
-      return;
-    }
-
-    const stopPairing = (message?: string) => {
-      pairingWindow.close();
-      setAgentPairing(false);
-      if (message) setError(message);
-    };
-
     setAgentPairing(true);
     setError("");
-    let permission = await getAgentPermissionState();
-    setAgentPermission(permission);
-    if (permission === "denied") {
-      stopPairing("Local network access is blocked. Allow it for this site in the browser's site settings, then connect again.");
-      return;
-    }
 
     try {
-      const available = await detectAgent();
-      permission = await getAgentPermissionState();
-      setAgentPermission(permission);
-      if (available) {
+      if (await detectAgent()) {
         setAgentAvailable(true);
-        stopPairing();
+        setAgentPermission("granted");
+        setAgentPairing(false);
         return;
       }
     } catch {
-      permission = await getAgentPermissionState();
-      setAgentPermission(permission);
-      if (permission === "denied") {
-        stopPairing("Local network access was declined. Allow it for this site in the browser's site settings, then connect again.");
-        return;
-      }
+      // Launching the native app below also starts its local agent.
     }
 
-    pairingWindow.location.replace(getAgentPairingUrl());
+    const launcher = document.createElement("a");
+    launcher.href = getAgentConnectUrl();
+    launcher.style.display = "none";
+    document.body.appendChild(launcher);
+    launcher.click();
+    launcher.remove();
+
     let attempts = 0;
     if (pairingTimerRef.current !== null) window.clearInterval(pairingTimerRef.current);
     pairingTimerRef.current = window.setInterval(() => {
@@ -539,18 +527,17 @@ export default function WatchApp() {
           setAgentAvailable(true);
           setAgentPermission("granted");
           setAgentPairing(false);
-          pairingWindow.close();
           if (pairingTimerRef.current !== null) window.clearInterval(pairingTimerRef.current);
           pairingTimerRef.current = null;
         })
         .catch(() => {
           if (attempts < 120) return;
           setAgentPairing(false);
-          setError("The companion did not answer. Make sure it is running, then connect again.");
+          setError("The companion did not answer. Install or open the WatchPair Companion app, then connect again.");
           if (pairingTimerRef.current !== null) window.clearInterval(pairingTimerRef.current);
           pairingTimerRef.current = null;
         });
-    }, 1_000);
+    }, 500);
   };
 
   useEffect(() => {
@@ -1439,6 +1426,15 @@ export default function WatchApp() {
     }
   };
 
+  const toggleQueuedSourcePin = async (sourceId: string, pinned: boolean) => {
+    try {
+      const job = await setAgentDownloadPinned(sourceId, pinned);
+      setAgentJobs((current) => ({ ...current, [sourceId]: job }));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not update download retention.");
+    }
+  };
+
   const moveQueuedSource = async (sourceId: string, direction: -1 | 1) => {
     const index = sources.findIndex((source) => source.id === sourceId);
     const target = index + direction;
@@ -1599,6 +1595,7 @@ export default function WatchApp() {
         subtitleCues={subtitleCues}
         localSubtitleName={localSubtitleName}
         audioTracks={embeddedAudioTracks}
+        chapters={embeddedChapters}
         subtitleTracks={embeddedSubtitles}
         onBack={() => setView("lobby")}
         onEnded={deviceId === session.hostId ? () => void advancePlaylist() : undefined}
@@ -1798,9 +1795,9 @@ export default function WatchApp() {
                   {agentPairing ? <LoaderCircle className="spin" /> : <Plug />}
                   {agentPairing ? "Waiting for approval" : "Connect"}
                 </button>
-                <a className="secondary-button" href={`/watchpair-companion.zip?v=${COMPANION_VERSION}`} download>
+                <a className="secondary-button" href={`https://github.com/Etaselia/WatchPair/releases/tag/v${COMPANION_VERSION}`} target="_blank" rel="noreferrer">
                   <PackageOpen />
-                  Get companion
+                  Get app
                 </a>
               </div>
             </div>
@@ -1924,6 +1921,18 @@ export default function WatchApp() {
                           onClick={() => void stopQueuedSource(source.id)}
                         >
                           <X />
+                        </button>
+                      )}
+                      {job?.managed && (
+                        <button
+                          className={job.pinned ? "icon-button selected" : "icon-button"}
+                          type="button"
+                          title={job.pinned ? "Allow automatic cleanup" : "Keep this download"}
+                          aria-label={job.pinned ? "Allow automatic cleanup" : "Keep this download"}
+                          aria-pressed={job.pinned}
+                          onClick={() => void toggleQueuedSourcePin(source.id, !job.pinned)}
+                        >
+                          <Pin />
                         </button>
                       )}
                       {job?.seed && (
@@ -2215,6 +2224,7 @@ interface SyncedPlayerProps {
   subtitleCues: SubtitleCue[];
   localSubtitleName: string;
   audioTracks: AgentAudioTrack[];
+  chapters: AgentChapter[];
   subtitleTracks: AgentSubtitleTrack[];
   onBack: () => void;
   onEnded?: () => void;
@@ -2241,6 +2251,7 @@ function SyncedPlayer({
   subtitleCues,
   localSubtitleName,
   audioTracks,
+  chapters,
   subtitleTracks,
   onBack,
   onEnded,
@@ -2270,6 +2281,10 @@ function SyncedPlayer({
   const [controlsVisible, setControlsVisible] = useState(true);
   const [captionSettingsOpen, setCaptionSettingsOpen] = useState(false);
   const [subtitleAppearance, setSubtitleAppearance] = useState(defaultSubtitleAppearance);
+  const currentChapterIndex = chapters.findIndex(
+    (chapter) => currentTime >= chapter.start && currentTime < chapter.end
+  );
+  const currentChapter = currentChapterIndex >= 0 ? chapters[currentChapterIndex] : null;
 
   const defaultAudioTrack = audioTracks.find((track) => track.default) || audioTracks[0];
   const requestedAudioTrackId = session.player.audioLanguage.startsWith("embedded:")
@@ -2693,6 +2708,28 @@ function SyncedPlayer({
     if (video) void send({ position: video.currentTime, paused: video.paused });
   };
 
+  const seekToChapter = (index: number) => {
+    const chapter = chapters[index];
+    const video = videoRef.current;
+    if (!chapter || !video) return;
+    video.currentTime = chapter.start;
+    setCurrentTime(chapter.start);
+    void send({ position: chapter.start, paused: video.paused });
+  };
+
+  const previousChapter = () => {
+    if (!chapters.length) return;
+    const current = currentChapterIndex >= 0 ? currentChapterIndex : 0;
+    const restartCurrent = currentChapter && currentTime > currentChapter.start + 3;
+    seekToChapter(restartCurrent ? current : Math.max(0, current - 1));
+  };
+
+  const nextChapter = () => {
+    if (!chapters.length) return;
+    const current = currentChapterIndex >= 0 ? currentChapterIndex : -1;
+    seekToChapter(Math.min(chapters.length - 1, current + 1));
+  };
+
   const changeVolume = (value: number) => {
     const video = videoRef.current;
     if (!video) return;
@@ -2959,25 +2996,61 @@ function SyncedPlayer({
           </section>
         )}
 
-        <input
-          className="timeline"
-          type="range"
-          min={0}
-          max={duration || 0}
-          step={0.05}
-          value={Math.min(currentTime, duration || 0)}
-          onChange={(event) => seekTo(Number(event.target.value))}
-          onPointerUp={commitSeek}
-          onKeyUp={commitSeek}
-          aria-label="Seek"
-          style={{ "--progress": `${duration ? (currentTime / duration) * 100 : 0}%` } as React.CSSProperties}
-        />
+        <div className="timeline-wrap">
+          <input
+            className="timeline"
+            type="range"
+            min={0}
+            max={duration || 0}
+            step={0.05}
+            value={Math.min(currentTime, duration || 0)}
+            onChange={(event) => seekTo(Number(event.target.value))}
+            onPointerUp={commitSeek}
+            onKeyUp={commitSeek}
+            aria-label="Seek"
+            style={{ "--progress": `${duration ? (currentTime / duration) * 100 : 0}%` } as React.CSSProperties}
+          />
+          {duration > 0 && chapters.slice(1).map((chapter) => (
+            <button
+              key={chapter.id}
+              type="button"
+              className="chapter-marker"
+              style={{ left: `${Math.min(100, (chapter.start / duration) * 100)}%` }}
+              onClick={() => seekToChapter(chapter.index)}
+              title={`${chapter.title} · ${formatTime(chapter.start)}`}
+              aria-label={`Go to ${chapter.title} at ${formatTime(chapter.start)}`}
+            />
+          ))}
+        </div>
 
         <div className="control-row">
           <div className="control-cluster">
             <button className="player-icon-button main-play" onClick={togglePlayback} title={session.player.paused ? "Play" : "Pause"} aria-label={session.player.paused ? "Play" : "Pause"}>
               {session.player.paused ? <Play fill="currentColor" /> : <Pause fill="currentColor" />}
             </button>
+            {chapters.length > 0 && (
+              <div className="chapter-controls">
+                <button className="player-icon-button" onClick={previousChapter} title="Previous chapter" aria-label="Previous chapter">
+                  <SkipBack />
+                </button>
+                <label className="chapter-select" title="Video chapters">
+                  <select
+                    value={currentChapterIndex >= 0 ? currentChapterIndex : 0}
+                    onChange={(event) => seekToChapter(Number(event.target.value))}
+                    aria-label="Video chapter"
+                  >
+                    {chapters.map((chapter) => (
+                      <option key={chapter.id} value={chapter.index}>
+                        {chapter.title} · {formatTime(chapter.start)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button className="player-icon-button" onClick={nextChapter} title="Next chapter" aria-label="Next chapter">
+                  <SkipForward />
+                </button>
+              </div>
+            )}
             <button className="player-icon-button" onClick={toggleMute} title={muted ? "Unmute" : "Mute"} aria-label={muted ? "Unmute" : "Mute"}>
               {muted || volume === 0 ? <VolumeX /> : <Volume2 />}
             </button>

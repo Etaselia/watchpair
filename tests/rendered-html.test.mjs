@@ -278,7 +278,10 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /getAgentDownloads/);
   assert.match(app, /Download queue/);
   assert.match(app, /const COMPANION_VERSION = "\d+\.\d+\.\d+"; \/\/ x-release-please-version/);
-  assert.match(app, /watchpair-companion\.zip\?v=\$\{COMPANION_VERSION\}/);
+  assert.match(app, /github.com\/Etaselia\/WatchPair\/releases\/tag\/v\$\{COMPANION_VERSION\}/);
+  assert.match(app, /getAgentConnectUrl/);
+  assert.match(app, /toggleQueuedSourcePin/);
+  assert.match(app, /embeddedChapters/);
   assert.match(app, /queueReadinessForJob/);
   assert.match(app, /file\.ready && Boolean\(fingerprint\) && \(preparation === "ready" \|\| preparation === "direct"\)/);
   assert.match(app, /GPU decode/);

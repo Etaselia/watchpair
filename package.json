@@ -2,6 +2,14 @@
   "name": "watchpair",
   "version": "0.6.0",
   "private": true,
+  "description": "Self-hosted synchronized video playback with local torrent and media support.",
+  "license": "MIT",
+  "author": "Etaselia",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Etaselia/WatchPair.git"
+  },
+  "main": "desktop/main.mjs",
   "engines": {
     "node": ">=24.0.0"
   },
@@ -16,14 +24,23 @@
     "agent": "node agent/server.mjs",
     "typecheck": "tsc --noEmit",
     "build:companion": "node scripts/build-companion.mjs",
+    "desktop:dev": "electron .",
+    "desktop:pack": "npm run desktop:icon && electron-builder --dir",
+    "desktop:dist": "npm run desktop:icon && electron-builder",
+    "desktop:dist:win": "npm run desktop:icon && electron-builder --win nsis --x64",
+    "desktop:dist:linux": "npm run desktop:icon && electron-builder --linux AppImage deb --x64",
+    "desktop:icon": "node scripts/generate-desktop-icon.mjs",
+    "test:desktop:e2e": "node tests/desktop-e2e.mjs",
     "prebuild": "npm run build:companion",
-    "test:unit": "node --test tests/deployment-policy.test.mjs tests/hardware-acceleration.test.mjs tests/media-binding.test.mjs tests/media-fingerprint.test.mjs tests/subtitle-assets.test.mjs tests/torrent-download.test.mjs tests/torrent-runtime.test.mjs tests/wrangler-config.test.mjs",
+    "test:unit": "node --test tests/desktop-settings.test.mjs tests/deployment-policy.test.mjs tests/hardware-acceleration.test.mjs tests/media-binding.test.mjs tests/media-chapters.test.mjs tests/cleanup-policy.test.mjs tests/storage-cleanup.test.mjs tests/media-fingerprint.test.mjs tests/subtitle-assets.test.mjs tests/torrent-download.test.mjs tests/torrent-runtime.test.mjs tests/wrangler-config.test.mjs",
     "check": "npm run lint && npm run typecheck && npm run test:unit",
     "hooks:install": "node scripts/install-hooks.mjs",
     "prepare": "node scripts/install-hooks.mjs"
   },
   "dependencies": {
     "cheerio": "^1.2.0",
+    "electron-log": "^5.4.4",
+    "electron-updater": "^6.8.9",
     "ffmpeg-static": "^5.3.0",
     "ffprobe-static": "^3.1.0",
     "hls.js": "^1.6.16",
@@ -43,6 +60,8 @@
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.4",
     "@vitejs/plugin-rsc": "0.5.30",
+    "electron": "^43.2.0",
+    "electron-builder": "^26.15.3",
     "eslint": "9.39.4",
     "eslint-config-next": "16.2.11",
     "fflate": "^0.8.3",

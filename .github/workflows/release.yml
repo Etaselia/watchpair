@@ -89,3 +89,77 @@ jobs:
             ${{ env.IMAGE }}:${{ env.VERSION }}
             ${{ env.IMAGE }}:${{ env.TAG }}
             ${{ env.IMAGE }}:latest
+
+  desktop-windows:
+    name: Publish Windows companion
+    if: needs.release.outputs.release_created == 'true' || inputs.version != ''
+    needs: release
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.release.outputs.tag_name || format('v{0}', inputs.version) }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release.outputs.sha || format('v{0}', inputs.version) }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - name: Build Windows installer
+        run: |
+          npm ci --no-audit --no-fund
+          npm run test:desktop:e2e
+          npm run desktop:dist:win
+      - name: Test packaged Windows client
+        shell: pwsh
+        run: |
+          $env:WATCHPAIR_DESKTOP_EXECUTABLE = "dist/desktop/win-unpacked/WatchPair Companion.exe"
+          node tests/desktop-e2e.mjs
+      - name: Attach Windows installer and update metadata
+        shell: pwsh
+        run: |
+          gh release upload "$env:TAG" `
+            "dist/desktop/WatchPair-Companion-Windows-x64-Setup.exe" `
+            "dist/desktop/WatchPair-Companion-Windows-x64-Setup.exe.blockmap" `
+            "dist/desktop/latest.yml" `
+            --clobber
+
+  desktop-linux:
+    name: Publish Linux companion
+    if: needs.release.outputs.release_created == 'true' || inputs.version != ''
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.release.outputs.tag_name || format('v{0}', inputs.version) }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release.outputs.sha || format('v{0}', inputs.version) }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - name: Build Linux installers
+        run: |
+          npm ci --no-audit --no-fund
+          xvfb-run --auto-servernum npm run test:desktop:e2e
+          npm run desktop:dist:linux
+      - name: Test packaged Linux client
+        env:
+          WATCHPAIR_DESKTOP_EXECUTABLE: dist/desktop/linux-unpacked/watchpair-companion
+        run: xvfb-run --auto-servernum node tests/desktop-e2e.mjs
+      - name: Attach Linux installers and update metadata
+        run: |
+          gh release upload "$TAG" \
+            dist/desktop/WatchPair-Companion-Linux-x64.AppImage \
+            dist/desktop/WatchPair-Companion-Linux-x64.deb \
+            dist/desktop/latest-linux.yml \
+            --clobber
