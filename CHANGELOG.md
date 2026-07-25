@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/Etaselia/watchpair/compare/v0.7.2...v0.8.0) (2026-07-25)
+
+
+### Features
+
+* prioritize queued video rendering ([#33](https://github.com/Etaselia/watchpair/issues/33)) ([3e982b8](https://github.com/Etaselia/watchpair/commit/3e982b82bedab45b8fcd8487dc0de3f16e6bcfeb))
+
 ## [0.7.2](https://github.com/Etaselia/watchpair/compare/v0.7.1...v0.7.2) (2026-07-25)
 
 
