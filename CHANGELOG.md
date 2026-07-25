@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.2](https://github.com/Etaselia/watchpair/compare/v0.7.1...v0.7.2) (2026-07-25)
+
+
+### Bug Fixes
+
+* stabilize Windows ASS subtitles ([#31](https://github.com/Etaselia/watchpair/issues/31)) ([be2c77a](https://github.com/Etaselia/watchpair/commit/be2c77a5a4e79471028f0fd7007cb7539a990684))
+
 ## [0.7.1](https://github.com/Etaselia/watchpair/compare/v0.7.0...v0.7.1) (2026-07-25)
 
 
