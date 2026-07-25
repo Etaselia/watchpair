@@ -40,6 +40,34 @@ test("all GitHub workflow files contain valid YAML", async () => {
   }
 });
 
+test("desktop release artifacts use stable names and publish only after packaged tests", async () => {
+  const builder = parse(await readFile("electron-builder.yml", "utf8"));
+  const packageJson = JSON.parse(await readFile("package.json", "utf8"));
+  const workflow = await readFile(".github/workflows/release.yml", "utf8");
+
+  assert.equal(builder.appImage.artifactName, "WatchPair-Companion-Linux-x64.AppImage");
+  assert.equal(builder.deb.artifactName, "WatchPair-Companion-Linux-x64.deb");
+  for (const script of ["desktop:dist", "desktop:dist:win", "desktop:dist:linux"]) {
+    assert.match(packageJson.scripts[script], /--publish never$/, script);
+  }
+
+  for (const artifact of [
+    "WatchPair-Companion-Windows-x64-Setup.exe",
+    "WatchPair-Companion-Linux-x64.AppImage",
+    "WatchPair-Companion-Linux-x64.deb",
+  ]) {
+    assert.ok(workflow.includes(artifact), artifact);
+  }
+  assert.ok(
+    workflow.indexOf("Test packaged Windows client") <
+      workflow.indexOf("Attach Windows installer and update metadata"),
+  );
+  assert.ok(
+    workflow.indexOf("Test packaged Linux client") <
+      workflow.indexOf("Attach Linux installers and update metadata"),
+  );
+});
+
 test("deployment shell scripts pass syntax validation", () => {
   for (const script of ["ops/watchpair-ci-gate", "ops/watchpair-ci-deploy"]) {
     const result = spawnSync("bash", ["-n", script], { encoding: "utf8" });
