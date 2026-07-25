@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import ffmpegPath from "ffmpeg-static";
 import TrackerServer from "bittorrent-tracker/server";
 import WebTorrent from "webtorrent";
+import { terminateChildProcess } from "./process-helpers.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 
@@ -113,13 +114,7 @@ test("waits for a verified torrent before probing and preparing initial HLS segm
   } catch (error) {
     throw new Error(`${error.message}\nCompanion output:\n${output}`);
   } finally {
-    if (companion && companion.exitCode === null) {
-      companion.kill("SIGTERM");
-      await Promise.race([
-        new Promise((resolve) => companion.once("close", resolve)),
-        new Promise((resolve) => setTimeout(resolve, 3_000)),
-      ]);
-    }
+    await terminateChildProcess(companion);
     if (!seeder.destroyed) {
       await new Promise((resolve) => seeder.destroy(resolve));
     }

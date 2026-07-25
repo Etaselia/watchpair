@@ -8,6 +8,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import TrackerServer from "bittorrent-tracker/server";
 import WebTorrent from "webtorrent";
+import { terminateChildProcess } from "./process-helpers.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 
@@ -94,13 +95,7 @@ test("a companion-published local file is discoverable and serves every byte", {
   } catch (error) {
     throw new Error(`${error.message}\n${output}`);
   } finally {
-    if (companion.exitCode === null) {
-      companion.kill("SIGTERM");
-      await Promise.race([
-        new Promise((resolve) => companion.once("close", resolve)),
-        new Promise((resolve) => setTimeout(resolve, 4_000)),
-      ]);
-    }
+    await terminateChildProcess(companion, { graceMs: 4_000 });
     if (!leecher.destroyed) await new Promise((resolve) => leecher.destroy(resolve));
     await new Promise((resolve) => tracker.close(resolve));
     await rm(directory, { recursive: true, force: true });

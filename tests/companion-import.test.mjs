@@ -8,6 +8,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import ffmpegPath from "ffmpeg-static";
+import { terminateChildProcess } from "./process-helpers.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 
@@ -47,12 +48,7 @@ test("imports, seeds, restores, and stops a local companion file", { timeout: 30
   };
 
   const stop = async (child) => {
-    if (!child || child.exitCode !== null) return;
-    child.kill("SIGTERM");
-    await Promise.race([
-      new Promise((resolve) => child.once("close", resolve)),
-      new Promise((resolve) => setTimeout(resolve, 4_000)),
-    ]);
+    await terminateChildProcess(child, { graceMs: 4_000 });
   };
 
   try {
