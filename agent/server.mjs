@@ -2011,6 +2011,15 @@ const server = createServer(async (request, response) => {
   }
 });
 
+server.once("error", (error) => {
+  const message = error?.code === "EADDRINUSE"
+    ? `Another WatchPair companion is already using http://${HOST}:${PORT}.`
+    : `WatchPair agent could not listen on http://${HOST}:${PORT}: ${error.message}`;
+  console.error(message);
+  process.exitCode = error?.code === "EADDRINUSE" ? 72 : 1;
+  void shutdown().finally(() => process.exit(process.exitCode || 1));
+});
+
 server.listen(PORT, HOST, () => {
   console.log(`WatchPair agent listening on http://${HOST}:${PORT}`);
   console.log(`Downloads: ${DOWNLOAD_DIR}`);

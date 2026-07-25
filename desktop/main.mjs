@@ -15,6 +15,7 @@ import {
 } from "electron";
 import electronLog from "electron-log";
 import electronUpdater from "electron-updater";
+import { createSerialTaskQueue, ownsAgentProcess } from "./agent-lifecycle.mjs";
 import { deepLinkOrigin, normalizeDesktopSettings, settingsEnvironment } from "./settings.mjs";
 
 const { autoUpdater } = electronUpdater;
@@ -37,6 +38,7 @@ let agentProcess = null;
 let agentRestartTimer = null;
 let updateTimer = null;
 let updateCheckTimer = null;
+const runAgentTransition = createSerialTaskQueue();
 let rendererReady = Promise.resolve();
 let quitting = false;
 let restartingAgent = false;
@@ -131,7 +133,7 @@ async function waitForAgent(timeoutMs = 30_000) {
   throw new Error("The companion service did not start in time.");
 }
 
-async function stopAgent() {
+async function stopAgentNow() {
   if (agentRestartTimer) clearTimeout(agentRestartTimer);
   agentRestartTimer = null;
   const processToStop = agentProcess;
@@ -153,12 +155,12 @@ async function stopAgent() {
   });
 }
 
-async function startAgent() {
-  await stopAgent();
+async function startAgentNow() {
+  await stopAgentNow();
   agentState = { status: "starting", error: null, health: null, storage: null };
   sendState();
   const serverPath = path.join(applicationRoot, "agent", "server.mjs");
-  agentProcess = utilityProcess.fork(serverPath, [], {
+  const spawnedAgent = utilityProcess.fork(serverPath, [], {
     cwd: app.getPath("userData"),
     env: {
       ...process.env,
@@ -171,9 +173,11 @@ async function startAgent() {
     stdio: "pipe",
     serviceName: "WatchPair Companion Agent",
   });
-  agentProcess.stdout?.on("data", (chunk) => electronLog.info(String(chunk).trimEnd()));
-  agentProcess.stderr?.on("data", (chunk) => electronLog.error(String(chunk).trimEnd()));
-  agentProcess.once("exit", (code) => {
+  agentProcess = spawnedAgent;
+  spawnedAgent.stdout?.on("data", (chunk) => electronLog.info(String(chunk).trimEnd()));
+  spawnedAgent.stderr?.on("data", (chunk) => electronLog.error(String(chunk).trimEnd()));
+  spawnedAgent.once("exit", (code) => {
+    if (!ownsAgentProcess(agentProcess, spawnedAgent)) return;
     agentProcess = null;
     agentState = { ...agentState, status: "stopped", error: `Companion service exited (${code}).` };
     sendState();
@@ -189,14 +193,24 @@ async function startAgent() {
   }
 }
 
+function startAgent() {
+  return runAgentTransition(startAgentNow);
+}
+
+function stopAgent() {
+  return runAgentTransition(stopAgentNow);
+}
+
 async function restartAgent() {
-  restartingAgent = true;
-  try {
-    await stopAgent();
-  } finally {
-    restartingAgent = false;
-  }
-  await startAgent();
+  await runAgentTransition(async () => {
+    restartingAgent = true;
+    try {
+      await stopAgentNow();
+    } finally {
+      restartingAgent = false;
+    }
+    await startAgentNow();
+  });
   if (TEST_MODE) console.error("WatchPair self-test: agent startup finished", agentState.status);
 }
 

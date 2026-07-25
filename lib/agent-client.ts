@@ -214,7 +214,7 @@ export async function resolveAgentSource(value: string) {
   return result.source;
 }
 
-export async function getAgentSubtitle(url: string) {
+async function getAgentSubtitleResponse(url: string) {
   if (!url.startsWith(AGENT_URL + "/downloads/")) {
     throw new Error("The companion returned an invalid subtitle URL.");
   }
@@ -223,7 +223,15 @@ export async function getAgentSubtitle(url: string) {
     const data = (await response.json().catch(() => null)) as { error?: string } | null;
     throw new Error(data?.error || "Could not extract embedded subtitles.");
   }
-  return response.text();
+  return response;
+}
+
+export async function getAgentSubtitle(url: string) {
+  return (await getAgentSubtitleResponse(url)).text();
+}
+
+export async function getAgentSubtitleBytes(url: string) {
+  return new Uint8Array(await (await getAgentSubtitleResponse(url)).arrayBuffer());
 }
 
 export async function addAgentDownload(source: SharedSource) {

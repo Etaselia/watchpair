@@ -58,6 +58,7 @@ import {
   getAgentPermissionState,
   getAgentConnectUrl,
   getAgentSubtitle,
+  getAgentSubtitleBytes,
   resolveAgentSource,
   retryAgentDownload,
   scanAgentLibrary,
@@ -2278,6 +2279,7 @@ function SyncedPlayer({
   const [hlsVideoRendition] = useState<HlsVideoRendition>(preferredHlsVideoRendition);
   const [subtitleText, setSubtitleText] = useState("");
   const [failedAssTrack, setFailedAssTrack] = useState("");
+  const [readyAssTrack, setReadyAssTrack] = useState("");
   const [controlsVisible, setControlsVisible] = useState(true);
   const [captionSettingsOpen, setCaptionSettingsOpen] = useState(false);
   const [subtitleAppearance, setSubtitleAppearance] = useState(defaultSubtitleAppearance);
@@ -2333,13 +2335,14 @@ function SyncedPlayer({
   const assFontKey = (requestedSubtitleTrack?.fonts || []).map((font) => font.url).join("|");
   const assFontUrls = useMemo(() => assFontKey ? assFontKey.split("|") : [], [assFontKey]);
   subtitleOffsetRef.current = session.player.subtitleOffset;
-  const useOriginalAss = Boolean(
+  const wantsOriginalAss = Boolean(
     subtitleSelection !== "off" &&
     requestedSubtitleTrack?.styled &&
     assTrackKey &&
     subtitleAppearance.originalAssStyling &&
     failedAssTrack !== assTrackKey
   );
+  const useOriginalAss = wantsOriginalAss && readyAssTrack === assTrackKey;
 
   useEffect(() => {
     const timer = window.setTimeout(() => setSubtitleAppearance(readSubtitleAppearance()), 0);
@@ -2348,40 +2351,62 @@ function SyncedPlayer({
 
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !useOriginalAss || !assTrackKey) return;
+    if (!video || !wantsOriginalAss || !assTrackKey) return;
 
     let active = true;
     let renderer: import("jassub").default | null = null;
-    void import("jassub")
-      .then(({ default: JASSUB }) => {
+    let workerFailed: (() => void) | null = null;
+    setReadyAssTrack("");
+    void Promise.all([
+      import("jassub"),
+      getAgentSubtitle(assTrackKey),
+      Promise.all(assFontUrls.map((url) => getAgentSubtitleBytes(url))),
+    ])
+      .then(([{ default: JASSUB }, subContent, fonts]) => {
         if (!active) return null;
         renderer = new JASSUB({
           video,
-          subUrl: assTrackKey,
-          fonts: assFontUrls,
+          subContent,
+          fonts,
           queryFonts: false,
           timeOffset: -subtitleOffsetRef.current / 1000,
+          maxRenderHeight: 1080,
           libassMemoryLimit: 96,
           libassGlyphLimit: 48,
         });
+        workerFailed = () => {
+          if (!active) return;
+          setReadyAssTrack("");
+          setFailedAssTrack(assTrackKey);
+        };
+        renderer._worker.addEventListener("error", workerFailed, { once: true });
+        renderer._worker.addEventListener("messageerror", workerFailed, { once: true });
         assRendererRef.current = renderer;
         return renderer.ready;
       })
       .then(() => {
-        if (active && renderer) void renderer.resize(true);
+        if (!active || !renderer) return;
+        setReadyAssTrack(assTrackKey);
+        return renderer.resize(true);
       })
       .catch((caught) => {
         if (!active) return;
         console.error("Could not render ASS subtitles", caught);
+        setReadyAssTrack("");
         setFailedAssTrack(assTrackKey);
       });
 
     return () => {
       active = false;
+      setReadyAssTrack((current) => current === assTrackKey ? "" : current);
       if (assRendererRef.current === renderer) assRendererRef.current = null;
-      if (renderer) void renderer.destroy();
+      if (renderer && workerFailed) {
+        renderer._worker.removeEventListener("error", workerFailed);
+        renderer._worker.removeEventListener("messageerror", workerFailed);
+      }
+      if (renderer) void renderer.destroy().catch(() => {});
     };
-  }, [assFontUrls, assTrackKey, useOriginalAss]);
+  }, [assFontUrls, assTrackKey, wantsOriginalAss]);
 
   useEffect(() => {
     const renderer = assRendererRef.current;
