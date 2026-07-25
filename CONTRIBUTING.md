@@ -11,10 +11,11 @@ Run:
 ```bash
 npm run check
 npm test
+npm run test:desktop:e2e
 docker build -t watchpair:test .
 ```
 
-The pre-commit hook runs lint, type checking, and the fast unit suite. The pre-push hook runs the production build and all integration tests. CI repeats both and verifies the production Docker image.
+The pre-commit hook runs lint, type checking, and the fast unit suite. The pre-push hook runs the production build and all integration tests. CI repeats both, exercises development and packaged Electron clients on Windows and Linux, and verifies the production Docker image.
 
 ## Commits and releases
 
@@ -25,4 +26,4 @@ Use Conventional Commit subjects so release notes and semantic versions remain u
 - `feat!:` or a `BREAKING CHANGE:` footer for breaking changes
 - `docs:`, `test:`, `build:`, and `chore:` for non-release maintenance
 
-Changes enter `main` through squash-merged pull requests after the required checks pass. Release Please maintains a release pull request. Merging that pull request creates the GitHub release, publishes the companion ZIP and checksum, and pushes multi-platform images to GHCR. Major and minor releases are deployed during the 04:07 Europe/Vienna maintenance window; an explicitly approved `Deploy VPS` workflow dispatch can deploy a released version earlier.
+Changes enter `main` through squash-merged pull requests after the required checks pass. Release Please maintains a release pull request. Merging that pull request creates the GitHub release, publishes Windows and Linux companion installers plus updater metadata, retains the transitional ZIP, and pushes multi-platform images to GHCR. Major and minor releases are deployed during the 04:07 Europe/Vienna maintenance window; an explicitly approved `Deploy VPS` workflow dispatch can deploy a released version earlier.

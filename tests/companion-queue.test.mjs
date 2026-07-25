@@ -52,6 +52,7 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
         WATCHPAIR_DOWNLOAD_DIR: path.join(directory, "downloads"),
         WATCHPAIR_FFMPEG_PATH: ffmpegPath,
         WATCHPAIR_TRANSCODER: "cpu",
+        WATCHPAIR_CONTROL_TOKEN: "test-control-token",
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -67,6 +68,21 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
     );
     assert.equal(health.version, packageVersion);
     assert.equal(health.transcoder.encoder, "cpu");
+    assert.equal(health.protocolVersion, 1);
+    const rejectedPair = await fetch(base + "/control/pair", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-watchpair-control": "wrong" },
+      body: JSON.stringify({ origin: "https://watch.example" }),
+    });
+    assert.equal(rejectedPair.status, 403);
+    const acceptedPair = await fetch(base + "/control/pair", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-watchpair-control": "test-control-token" },
+      body: JSON.stringify({ origin: "https://watch.example" }),
+    });
+    assert.equal(acceptedPair.status, 200);
+    const pairedHealth = await fetch(base + "/health", { headers: { origin: "https://watch.example" } });
+    assert.equal(pairedHealth.headers.get("access-control-allow-origin"), "https://watch.example");
 
     const ids = ["queuejob-one", "queuejob-two"];
     for (let index = 0; index < ids.length; index += 1) {

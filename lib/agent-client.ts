@@ -1,6 +1,7 @@
 import type { SharedSource } from "./session-types";
 
 export const AGENT_URL = "http://127.0.0.1:41735";
+export const AGENT_PROTOCOL_VERSION = 1;
 
 export type AgentPermissionState = PermissionState | "unsupported";
 
@@ -55,6 +56,15 @@ export interface AgentAudioTrack {
   codec: string;
   channels: number;
   default: boolean;
+}
+
+export interface AgentChapter {
+  id: string;
+  index: number;
+  title: string;
+  start: number;
+  end: number;
+  language: string;
 }
 
 export interface AgentSubtitleTrack {
@@ -122,7 +132,13 @@ export interface AgentJob {
   subtitleStatus: "waiting" | "probing" | "ready" | "error";
   subtitleError: string | null;
   audioTracks: AgentAudioTrack[];
+  chapters: AgentChapter[];
   subtitles: AgentSubtitleTrack[];
+  managed: boolean;
+  pinned: boolean;
+  createdAt: number;
+  completedAt: number | null;
+  lastAccessedAt: number;
   preparation: AgentPreparation;
   transcoder: AgentTranscoder;
   files: AgentFile[];
@@ -133,6 +149,33 @@ export interface AgentLibraryFile {
   id: string;
   name: string;
   size: number;
+}
+
+export interface AgentCleanupSettings {
+  enabled: boolean;
+  downloadRetentionDays: number;
+  cacheRetentionDays: number;
+  partialRetentionHours: number;
+  maxStorageGb: number;
+  minFreeSpaceGb: number;
+}
+
+export interface AgentStorageStatus {
+  directory: string;
+  cleanup: AgentCleanupSettings;
+  usage: {
+    bytes: number;
+    availableBytes: number | null;
+    totalBytes: number | null;
+    managedJobs: number;
+    pinnedJobs: number;
+  };
+}
+
+export interface AgentCleanupResult {
+  removedJobs: string[];
+  removedEntries: string[];
+  bytes: number;
 }
 
 async function agentFetch<T>(path: string, init?: RequestInit) {
@@ -153,6 +196,10 @@ export async function detectAgent() {
   } finally {
     window.clearTimeout(timeout);
   }
+}
+
+export function getAgentConnectUrl() {
+  return "watchpair://connect?origin=" + encodeURIComponent(window.location.origin);
 }
 
 export function getAgentPairingUrl() {
@@ -216,6 +263,22 @@ export async function stopAgentDownload(sourceId: string, deleteFiles = false) {
     `/downloads/${encodeURIComponent(sourceId)}?deleteFiles=${deleteFiles ? "1" : "0"}`,
     { method: "DELETE" }
   );
+}
+
+export async function setAgentDownloadPinned(sourceId: string, pinned: boolean) {
+  const result = await agentFetch<{ job: AgentJob }>(
+    "/downloads/" + encodeURIComponent(sourceId) + "/pin",
+    { method: "POST", body: JSON.stringify({ pinned }) }
+  );
+  return result.job;
+}
+
+export async function getAgentStorage() {
+  return agentFetch<AgentStorageStatus>("/storage", { cache: "no-store" });
+}
+
+export async function runAgentCleanup() {
+  return agentFetch<AgentCleanupResult>("/cleanup", { method: "POST" });
 }
 
 export async function retryAgentDownload(sourceId: string) {

@@ -1,0 +1,61 @@
+name: Bug report
+description: Report a reproducible WatchPair problem
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not post room tokens, private tracker URLs, TURN credentials, or media links.
+        Report security issues privately as described in SECURITY.md.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Website
+        - Desktop companion
+        - Torrent download or sharing
+        - Video playback or subtitles
+        - Voice chat
+        - Deployment
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: v0.7.0
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and browser
+      placeholder: Windows 11 and Chrome 140
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Create a room
+        2. Add a file
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and logs
+      description: Remove private URLs and tokens before attaching logs.
+    validations:
+      required: true

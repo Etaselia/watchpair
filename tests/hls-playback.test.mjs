@@ -186,6 +186,8 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
     });
     const cachedVideo = await cachedManager.getAsset(descriptor, "video/index.m3u8");
     assert.match(await readPlaylist(cachedVideo.filePath), /#EXT-X-ENDLIST/);
+    await cachedManager.removeJob(descriptor.jobId);
+    await assert.rejects(stat(path.join(cacheRoot, descriptor.jobId)), { code: "ENOENT" });
     cachedManager.shutdown();
   } finally {
     await rm(directory, { recursive: true, force: true });

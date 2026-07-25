@@ -1,0 +1,77 @@
+appId: chatgpt.etaselia.watchpair.companion
+productName: WatchPair Companion
+copyright: Copyright © Etaselia
+asar: true
+npmRebuild: false
+buildDependenciesFromSource: false
+directories:
+  buildResources: build
+  output: dist/desktop
+files:
+  - desktop/**/*
+  - agent/**/*
+  - build/icon.png
+  - package.json
+  - '!**/*.test.*'
+  - '!node_modules/next/**/*'
+  - '!node_modules/@next/**/*'
+  - '!node_modules/react/**/*'
+  - '!node_modules/react-dom/**/*'
+  - '!node_modules/styled-jsx/**/*'
+  - '!node_modules/hls.js/**/*'
+  - '!node_modules/jassub/**/*'
+  - '!node_modules/lucide-react/**/*'
+  - '!node_modules/@img/**/*'
+  - '!node_modules/@swc/**/*'
+  - '!node_modules/sharp/**/*'
+  - '!node_modules/caniuse-lite/**/*'
+  - '!node_modules/baseline-browser-mapping/**/*'
+  - '!node_modules/ffprobe-static/bin/**/*'
+asarUnpack:
+  - node_modules/ffmpeg-static/**/*
+protocols:
+  - name: WatchPair connection
+    schemes:
+      - watchpair
+publish:
+  provider: github
+  owner: Etaselia
+  repo: WatchPair
+  releaseType: release
+artifactName: WatchPair-Companion-${version}-${arch}.${ext}
+win:
+  extraResources:
+    - from: node_modules/ffprobe-static/bin/win32/x64/ffprobe.exe
+      to: ffprobe/ffprobe.exe
+  artifactName: WatchPair-Companion-Windows-${arch}-Setup.${ext}
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: build/icon.png
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: WatchPair Companion
+linux:
+  extraResources:
+    - from: node_modules/ffprobe-static/bin/linux/x64/ffprobe
+      to: ffprobe/ffprobe
+  target:
+    - target: AppImage
+      arch:
+        - x64
+    - target: deb
+      arch:
+        - x64
+  icon: build/icon.png
+  category: Network
+  executableName: watchpair-companion
+  maintainer: Etaselia
+appImage:
+  artifactName: WatchPair-Companion-Linux-${arch}.AppImage
+deb:
+  artifactName: WatchPair-Companion-Linux-${arch}.deb

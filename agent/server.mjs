@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { createServer } from "node:http";
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, rename, rm, stat, statfs, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { BlockList } from "node:net";
 import { homedir } from "node:os";
@@ -13,10 +13,23 @@ import { load } from "cheerio";
 import ffmpegStaticPath from "ffmpeg-static";
 import ffprobeStatic from "ffprobe-static";
 import WebTorrent from "webtorrent";
+
+function unpackedExecutablePath(value) {
+  return process.versions.electron && String(value).includes("app.asar")
+    ? String(value).replace("app.asar", "app.asar.unpacked")
+    : value;
+}
 import { canCopyH264Video, createHlsPlaybackManager, streamHlsAsset } from "./hls-playback.mjs";
 import { publicTranscoder, selectTranscodeRuntime } from "./hardware-acceleration.mjs";
 import { createJsonStore } from "./job-store.mjs";
+import { cacheExpired, cleanupSettingsFromEnvironment, jobCanBeCleaned, jobCleanupReason } from "./cleanup-policy.mjs";
+import { chapterProbeArguments, normalizeMediaChapters } from "./media-chapters.mjs";
 import { fingerprintPath } from "./media-fingerprint.mjs";
+import {
+  MANAGED_JOB_DIRECTORY,
+  pathSize,
+  pruneExpiredChildren,
+} from "./storage-cleanup.mjs";
 import {
   STYLED_SUBTITLE_CODECS,
   TEXT_SUBTITLE_CODECS,
@@ -29,6 +42,9 @@ import { isSupportedMagnet } from "./torrent-input.mjs";
 import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, verifiedTorrentFileProgress, verifyTorrentFilePieces } from "./webtorrent-safety.mjs";
 
 const HOST = "127.0.0.1";
+const APP_VERSION = process.env.WATCHPAIR_APP_VERSION || "0.6.0"; // x-release-please-version
+const PROTOCOL_VERSION = 1;
+const CONTROL_TOKEN = String(process.env.WATCHPAIR_CONTROL_TOKEN || "");
 const PORT = Number(process.env.WATCHPAIR_AGENT_PORT || 41735);
 const REQUESTED_TORRENT_PORT = Number(process.env.WATCHPAIR_TORRENT_PORT || PORT + 1);
 const DHT_PORT = Number(process.env.WATCHPAIR_DHT_PORT || 0);
@@ -51,6 +67,9 @@ const CONFIG_PATH = path.resolve(
 );
 const JOBS_PATH = path.join(DOWNLOAD_DIR, ".watchpair-jobs.json");
 const IMPORT_DIR = path.join(DOWNLOAD_DIR, ".watchpair-imports");
+const HLS_DIR = path.join(DOWNLOAD_DIR, ".watchpair-hls");
+const SUBTITLE_DIR = path.join(DOWNLOAD_DIR, ".watchpair-subtitles");
+const MEDIA_DIR = path.join(DOWNLOAD_DIR, ".watchpair-media");
 const LIBRARY_DIRS = Array.from(new Set([
   DOWNLOAD_DIR,
   ...(process.env.WATCHPAIR_LIBRARY_DIRS || "")
@@ -73,11 +92,13 @@ const configuredTrackers = (process.env.WATCHPAIR_TRACKERS || "")
   .map((entry) => entry.trim())
   .filter(Boolean);
 const TRACKERS = configuredTrackers.length ? configuredTrackers : DEFAULT_TRACKERS;
-const TRANSCODE_RUNTIME = await selectTranscodeRuntime({ bundledPath: ffmpegStaticPath });
+const TRANSCODE_RUNTIME = await selectTranscodeRuntime({ bundledPath: unpackedExecutablePath(ffmpegStaticPath) });
 const FFMPEG_PATH = TRANSCODE_RUNTIME.ffmpegPath;
 const TRANSCODER = publicTranscoder(TRANSCODE_RUNTIME);
 const ALLOW_PRIVATE_DOWNLOADS = process.env.WATCHPAIR_ALLOW_PRIVATE_DOWNLOADS === "1";
-const FFPROBE_PATH = process.env.WATCHPAIR_FFPROBE_PATH || ffprobeStatic.path;
+const CLEANUP_SETTINGS = cleanupSettingsFromEnvironment();
+const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const FFPROBE_PATH = process.env.WATCHPAIR_FFPROBE_PATH || unpackedExecutablePath(ffprobeStatic.path);
 const runFile = promisify(execFile);
 const ALLOWED_ORIGINS = new Set(
   (process.env.WATCHPAIR_ORIGINS || "http://localhost:3000,http://127.0.0.1:3000")
@@ -112,7 +133,7 @@ const client = new WebTorrent({
 const hlsPlayback = createHlsPlaybackManager({
   ffmpegPath: FFMPEG_PATH,
   encoder: TRANSCODE_RUNTIME.encoder,
-  cacheRoot: path.join(DOWNLOAD_DIR, ".watchpair-hls"),
+  cacheRoot: HLS_DIR,
 });
 client.on("error", (error) => console.error(`WebTorrent client error: ${error.message}`));
 client.on("listening", () => {
@@ -468,7 +489,7 @@ async function completeSelectedFile(job, index = job.selectedIndex) {
     await identifySelectedFile(job, index);
     if (index !== job.selectedIndex) return;
     job.status = "ready";
-    job.updatedAt = Date.now();
+    markJobCompleted(job);
     void queueSubtitleProbe(job);
     queueBackgroundPreparation(job);
   } catch (error) {
@@ -495,6 +516,7 @@ function selectTorrentFile(job, index) {
   job.torrentVerificationPromiseKey = null;
   job.audioTracks = [];
   job.subtitleTracks = [];
+  job.chapters = [];
   job.videoCodec = null;
   job.videoPixelFormat = null;
   job.videoProfile = null;
@@ -503,7 +525,7 @@ function selectTorrentFile(job, index) {
   job.subtitleProbeKey = null;
   job.preparation = { status: "waiting", error: null, encoder: null, fallback: false };
   job.status = "downloading";
-  job.updatedAt = Date.now();
+  touchJob(job);
   if (file.done) void completeSelectedFile(job, index);
 }
 
@@ -543,6 +565,7 @@ async function probeSubtitleTracks(job) {
   job.subtitleError = null;
   job.audioTracks = [];
   job.subtitleTracks = [];
+  job.chapters = [];
   job.updatedAt = Date.now();
 
   const isStillSelected = () => {
@@ -556,7 +579,7 @@ async function probeSubtitleTracks(job) {
   try {
     const result = await runFile(
       FFPROBE_PATH,
-      ["-v", "error", "-print_format", "json", "-show_streams", media.path],
+      chapterProbeArguments(media.path),
       { maxBuffer: 8 * 1024 * 1024 }
     );
     if (!isStillSelected()) return;
@@ -566,6 +589,7 @@ async function probeSubtitleTracks(job) {
     job.videoCodec = String(videoStream?.codec_name || "unknown");
     job.videoPixelFormat = String(videoStream?.pix_fmt || "unknown");
     job.videoProfile = String(videoStream?.profile || "unknown");
+    job.chapters = normalizeMediaChapters(metadata.chapters);
     job.audioTracks = (metadata.streams || [])
       .filter((stream) => stream.codec_type === "audio")
       .map((stream) => ({
@@ -803,8 +827,14 @@ function snapshot(job) {
     subtitleStatus: job.subtitleStatus,
     subtitleError: job.subtitleError,
     audioTracks: job.audioTracks || [],
+    chapters: job.chapters || [],
     subtitles: job.subtitleTracks || [],
     preparation: job.preparation,
+    managed: Boolean(job.managed),
+    pinned: Boolean(job.pinned),
+    createdAt: job.createdAt,
+    completedAt: job.completedAt,
+    lastAccessedAt: job.lastAccessedAt,
     transcoder: TRANSCODER,
     verification: {
       diskInvalidations: job.diskInvalidations,
@@ -917,7 +947,7 @@ async function startDirect(job) {
     job.identityFingerprintKey = null;
     await identifySelectedFile(job);
     job.status = "ready";
-    job.updatedAt = Date.now();
+    markJobCompleted(job);
     await queueSubtitleProbe(job);
     queueBackgroundPreparation(job);
   } catch (error) {
@@ -929,11 +959,17 @@ async function startDirect(job) {
 
 function createJob(source) {
   const kind = source.kind === "magnet" ? "magnet" : "direct";
+  const now = Date.now();
   const job = {
     id: String(source.id),
     kind,
     value: String(source.value || "").trim(),
     label: String(source.label || "video").slice(0, 180),
+    managed: source.managed === undefined ? !source.seed : Boolean(source.managed),
+    pinned: Boolean(source.pinned),
+    createdAt: Number(source.createdAt) || now,
+    completedAt: Number(source.completedAt) || null,
+    lastAccessedAt: Number(source.lastAccessedAt) || now,
     seed: Boolean(source.seed),
     seedPath: source.seedPath || null,
     identityFingerprint: source.identityFingerprint || null,
@@ -950,6 +986,7 @@ function createJob(source) {
     torrent: null,
     file: null,
     audioTracks: [],
+    chapters: [],
     subtitleTracks: [],
     videoCodec: null,
     videoPixelFormat: null,
@@ -969,7 +1006,7 @@ function createJob(source) {
     seedStartedAt: null,
     seedReannounceTimer: null,
     preparation: { status: "waiting", error: null, encoder: null, fallback: false },
-    updatedAt: Date.now(),
+    updatedAt: Number(source.updatedAt) || now,
   };
   jobs.set(job.id, job);
   return job;
@@ -981,6 +1018,12 @@ function persistedJobs() {
     kind: job.kind,
     value: job.value,
     label: job.label,
+    managed: Boolean(job.managed),
+    pinned: Boolean(job.pinned),
+    createdAt: job.createdAt,
+    completedAt: job.completedAt,
+    lastAccessedAt: job.lastAccessedAt,
+    updatedAt: job.updatedAt,
     seed: Boolean(job.seed),
     seedPath: job.seedPath,
     identityFingerprint: job.identityFingerprint,
@@ -994,6 +1037,19 @@ function persistedJobs() {
 
 function persistJobs() {
   jobStore.schedule(persistedJobs());
+}
+
+function touchJob(job) {
+  const now = Date.now();
+  job.lastAccessedAt = now;
+  job.updatedAt = now;
+}
+
+function markJobCompleted(job) {
+  const now = Date.now();
+  job.completedAt ||= now;
+  job.lastAccessedAt ||= now;
+  job.updatedAt = now;
 }
 
 async function addDownload(source) {
@@ -1065,7 +1121,7 @@ async function receiveImportChunk(request, id, url) {
   return { uploaded: offset + received, total };
 }
 
-async function seedLocalFile({ id, filePath, label }) {
+async function seedLocalFile({ id, filePath, label, managed = false, ...metadata }) {
   validJobId(id);
   if (jobs.has(id)) return jobs.get(id);
 
@@ -1078,6 +1134,8 @@ async function seedLocalFile({ id, filePath, label }) {
     kind: "magnet",
     value: "",
     label: label || path.basename(resolvedPath),
+    managed,
+    ...metadata,
     seed: true,
     seedPath: resolvedPath,
   });
@@ -1121,7 +1179,7 @@ async function seedLocalFile({ id, filePath, label }) {
       publishMetadata(readyTorrent);
       serving = true;
       job.status = "ready";
-      job.updatedAt = Date.now();
+      markJobCompleted(job);
       void queueSubtitleProbe(job);
       queueBackgroundPreparation(job);
       persistJobs();
@@ -1178,7 +1236,7 @@ async function finalizeImport(id, body) {
   const target = path.join(directory, name);
   await rm(target, { force: true });
   await rename(partial, target);
-  return seedLocalFile({ id, filePath: target, label: name });
+  return seedLocalFile({ id, filePath: target, label: name, managed: true });
 }
 
 async function walkLibrary(root, directory, query, results, depth = 0) {
@@ -1231,6 +1289,7 @@ async function attachLibraryFile({ id, entry, label }) {
     kind: "direct",
     value: entry.path,
     label: label || entry.name,
+    managed: false,
   });
   job.file = {
     name: entry.name,
@@ -1243,11 +1302,20 @@ async function attachLibraryFile({ id, entry, label }) {
   job.identityFingerprint = await fingerprintPath(entry.path);
   job.identityFingerprintKey = selectedFileKey(job);
   job.status = "ready";
-  job.updatedAt = Date.now();
+  markJobCompleted(job);
   void queueSubtitleProbe(job);
   queueBackgroundPreparation(job);
   persistJobs();
   return job;
+}
+
+async function removeGeneratedArtifacts(jobId) {
+  await hlsPlayback.removeJob(jobId);
+  await Promise.all([
+    rm(path.join(SUBTITLE_DIR, jobId), { recursive: true, force: true }),
+    rm(path.join(MEDIA_DIR, jobId), { recursive: true, force: true }),
+    rm(importPartPath(jobId), { force: true }),
+  ]);
 }
 
 async function stopJob(id, { deleteFiles = false } = {}) {
@@ -1260,7 +1328,8 @@ async function stopJob(id, { deleteFiles = false } = {}) {
   jobs.delete(id);
   const queueIndex = preparationQueue.indexOf(job);
   if (queueIndex >= 0) preparationQueue.splice(queueIndex, 1);
-  if (deleteFiles && !job.seedPath) {
+  await removeGeneratedArtifacts(id);
+  if (deleteFiles && job.managed) {
     await rm(path.join(DOWNLOAD_DIR, id), { recursive: true, force: true });
   }
   persistJobs();
@@ -1286,6 +1355,12 @@ async function restoreJobs() {
           id: record.id,
           filePath: record.seedPath,
           label: record.label,
+          managed: Boolean(record.managed),
+          pinned: Boolean(record.pinned),
+          createdAt: record.createdAt,
+          completedAt: record.completedAt,
+          lastAccessedAt: record.lastAccessedAt,
+          updatedAt: record.updatedAt,
         });
       } else if (record.kind === "magnet") {
         await addDownload(record);
@@ -1299,6 +1374,7 @@ async function restoreJobs() {
         job.identityFingerprintKey = null;
         await identifySelectedFile(job);
         job.status = "ready";
+        markJobCompleted(job);
         void queueSubtitleProbe(job);
         queueBackgroundPreparation(job);
       } else {
@@ -1491,6 +1567,7 @@ function pipeResponseStream(stream, response) {
 }
 
 async function streamFile(request, response, job, fileIndex, headers, audioTrackId) {
+  touchJob(job);
   let fileName;
   let size;
   let createStream;
@@ -1555,9 +1632,95 @@ async function streamFile(request, response, job, fileIndex, headers, audioTrack
   pipeResponseStream(createStream({ start, end }), response);
 }
 
+
+async function storageUsage() {
+  const filesystem = await statfs(DOWNLOAD_DIR).catch(() => null);
+  return {
+    bytes: await pathSize(DOWNLOAD_DIR),
+    availableBytes: filesystem ? filesystem.bavail * filesystem.bsize : null,
+    totalBytes: filesystem ? filesystem.blocks * filesystem.bsize : null,
+    managedJobs: Array.from(jobs.values()).filter((job) => job.managed).length,
+    pinnedJobs: Array.from(jobs.values()).filter((job) => job.pinned).length,
+  };
+}
+
+let cleanupPromise = null;
+async function runStorageCleanup({ force = false } = {}) {
+  if (cleanupPromise) return cleanupPromise;
+  cleanupPromise = (async () => {
+    const settings = force ? { ...CLEANUP_SETTINGS, enabled: true } : CLEANUP_SETTINGS;
+    if (!settings.enabled) return { removedJobs: [], removedEntries: [], bytes: 0 };
+
+    const now = Date.now();
+    const result = { removedJobs: [], removedEntries: [], bytes: 0 };
+    for (const job of Array.from(jobs.values())) {
+      if (!jobCleanupReason(job, settings, now)) continue;
+      if (job.managed) result.bytes += await pathSize(path.join(DOWNLOAD_DIR, job.id));
+      await stopJob(job.id, { deleteFiles: true });
+      result.removedJobs.push(job.id);
+    }
+
+    for (const job of jobs.values()) {
+      if (!cacheExpired(job.lastAccessedAt, settings, now) || job.preparation.status === "preparing") continue;
+      await removeGeneratedArtifacts(job.id);
+      job.preparation = { status: "waiting", error: null, encoder: null, fallback: false };
+      result.removedEntries.push(`cache:${job.id}`);
+    }
+
+    const gibibyte = 1024 ** 3;
+    const overLimit = async () => {
+      const usage = await storageUsage();
+      return (settings.maxStorageGb > 0 && usage.bytes > settings.maxStorageGb * gibibyte) ||
+        (settings.minFreeSpaceGb > 0 && usage.availableBytes !== null &&
+          usage.availableBytes < settings.minFreeSpaceGb * gibibyte);
+    };
+    const cleanupCandidates = Array.from(jobs.values())
+      .filter((job) => jobCanBeCleaned(job, settings))
+      .sort((left, right) =>
+        Number(left.lastAccessedAt || left.completedAt || left.updatedAt || 0) -
+        Number(right.lastAccessedAt || right.completedAt || right.updatedAt || 0)
+      );
+    for (const job of cleanupCandidates) {
+      if (!(await overLimit())) break;
+      result.bytes += await pathSize(path.join(DOWNLOAD_DIR, job.id));
+      await stopJob(job.id, { deleteFiles: true });
+      result.removedJobs.push(job.id);
+    }
+
+    const protectedNames = new Set(jobs.keys());
+    const expiredOwned = await pruneExpiredChildren(DOWNLOAD_DIR, {
+      now,
+      maxAgeMs: settings.downloadRetentionDays * 24 * 60 * 60 * 1000,
+      include: (entry) => entry.isDirectory() && MANAGED_JOB_DIRECTORY.test(entry.name),
+      protectedNames,
+    });
+    const expiredPartials = await pruneExpiredChildren(IMPORT_DIR, {
+      now,
+      maxAgeMs: settings.partialRetentionHours * 60 * 60 * 1000,
+      include: (entry) => entry.isFile() && /^[a-zA-Z0-9-]{8,80}\.part$/.test(entry.name),
+    });
+    for (const entry of [...expiredOwned, ...expiredPartials]) {
+      result.removedEntries.push(entry.name);
+      result.bytes += entry.bytes;
+    }
+    persistJobs();
+    return result;
+  })().finally(() => {
+    cleanupPromise = null;
+  });
+  return cleanupPromise;
+}
+
 await restoreJobs();
 const persistenceTimer = setInterval(persistJobs, 2_000);
 persistenceTimer.unref?.();
+const cleanupTimer = setInterval(() => void runStorageCleanup().catch((error) => {
+  console.warn(`Automatic cleanup failed: ${error.message}`);
+}), CLEANUP_INTERVAL_MS);
+cleanupTimer.unref?.();
+setTimeout(() => void runStorageCleanup().catch((error) => {
+  console.warn(`Startup cleanup failed: ${error.message}`);
+}), 10_000).unref?.();
 
 const server = createServer(async (request, response) => {
   const url = new URL(request.url || "/", "http://" + HOST + ":" + PORT);
@@ -1593,6 +1756,23 @@ const server = createServer(async (request, response) => {
     return;
   }
 
+  if (request.method === "POST" && url.pathname === "/control/pair") {
+    try {
+      if (!CONTROL_TOKEN || request.headers["x-watchpair-control"] !== CONTROL_TOKEN) {
+        sendJson(response, 403, { error: "Invalid companion control token." });
+        return;
+      }
+      const body = await readJson(request);
+      const origin = normalizePairOrigin(body.origin);
+      ALLOWED_ORIGINS.add(origin);
+      await persistOrigins();
+      sendJson(response, 200, { ok: true, origin });
+    } catch (error) {
+      sendJson(response, 400, { error: error.message });
+    }
+    return;
+  }
+
   const headers = corsHeaders(request);
   if (!headers) {
     sendJson(response, 403, { error: "Origin is not allowed. Pair this website with the companion first." });
@@ -1609,7 +1789,8 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/health") {
       sendJson(response, 200, {
         ok: true,
-        version: "0.6.0", // x-release-please-version
+        version: APP_VERSION,
+        protocolVersion: PROTOCOL_VERSION,
         downloadDirectory: DOWNLOAD_DIR,
         platform: process.platform,
         torrent: {
@@ -1619,8 +1800,23 @@ const server = createServer(async (request, response) => {
           trackers: TRACKERS,
         },
         jobs: jobs.size,
+        cleanup: CLEANUP_SETTINGS,
         transcoder: TRANSCODER,
       }, headers);
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/storage") {
+      sendJson(response, 200, {
+        directory: DOWNLOAD_DIR,
+        cleanup: CLEANUP_SETTINGS,
+        usage: await storageUsage(),
+      }, headers);
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/cleanup") {
+      sendJson(response, 200, await runStorageCleanup({ force: true }), headers);
       return;
     }
 
@@ -1722,6 +1918,18 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    const pinMatch = /^\/downloads\/([a-zA-Z0-9-]{8,80})\/pin$/.exec(url.pathname);
+    if (request.method === "POST" && pinMatch) {
+      const job = jobs.get(pinMatch[1]);
+      if (!job) throw new Error("Download not found.");
+      const body = await readJson(request);
+      job.pinned = Boolean(body.pinned);
+      job.updatedAt = Date.now();
+      persistJobs();
+      sendJson(response, 200, { job: snapshot(job) }, headers);
+      return;
+    }
+
     const retryMatch = /^\/downloads\/([a-zA-Z0-9-]{8,80})\/retry$/.exec(url.pathname);
     if (request.method === "POST" && retryMatch) {
       const job = await retryJob(retryMatch[1]);
@@ -1743,6 +1951,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && subtitleMatch) {
       const job = jobs.get(subtitleMatch[1]);
       if (!job || job.status !== "ready") throw new Error("Download is not ready for subtitle extraction.");
+      touchJob(job);
       const format = subtitleMatch[3];
       const filePath = await subtitleFile(job, subtitleMatch[2], format);
       const info = await stat(filePath);
@@ -1761,6 +1970,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && subtitleFontMatch) {
       const job = jobs.get(subtitleFontMatch[1]);
       if (!job || job.status !== "ready") throw new Error("Download is not ready for font extraction.");
+      touchJob(job);
       const font = await subtitleFontFile(job, subtitleFontMatch[2]);
       const info = await stat(font.path);
       response.writeHead(200, {
@@ -1777,6 +1987,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && hlsMatch) {
       const job = jobs.get(hlsMatch[1]);
       if (!job) throw new Error("Download not found.");
+      touchJob(job);
       const descriptor = await hlsDescriptor(job, Number(hlsMatch[2]), hlsMatch[3] || "h264");
       const asset = await hlsPlayback.getAsset(descriptor, hlsMatch[4]);
       await streamHlsAsset(response, asset, headers);
@@ -1787,6 +1998,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && streamMatch) {
       const job = jobs.get(streamMatch[1]);
       if (!job) throw new Error("Download not found.");
+      touchJob(job);
       await streamFile(request, response, job, Number(streamMatch[2]), headers, url.searchParams.get("audio"));
       return;
     }
@@ -1811,6 +2023,7 @@ const shutdown = async () => {
   if (shuttingDown) return;
   shuttingDown = true;
   clearInterval(persistenceTimer);
+  clearInterval(cleanupTimer);
   hlsPlayback.shutdown();
   persistJobs();
   await Promise.all([
@@ -1824,3 +2037,6 @@ const shutdown = async () => {
 };
 process.on("SIGINT", () => void shutdown());
 process.on("SIGTERM", () => void shutdown());
+process.parentPort?.on("message", (event) => {
+  if (event.data === "shutdown") void shutdown().then(() => process.exit(0));
+});

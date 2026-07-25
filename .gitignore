@@ -47,3 +47,5 @@ next-env.d.ts
 /companion/.runtime-download/
 /work/
 /public/watchpair-companion.zip
+
+/test-results/
