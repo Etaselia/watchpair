@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/Etaselia/watchpair/compare/v0.7.0...v0.7.1) (2026-07-25)
+
+
+### Bug Fixes
+
+* enforce release-compatible pull request titles ([#29](https://github.com/Etaselia/watchpair/issues/29)) ([3eb3b6c](https://github.com/Etaselia/watchpair/commit/3eb3b6c576cd6a800f7b041cb1300e61d8791dde))
+
 ## [0.7.0](https://github.com/Etaselia/watchpair/compare/v0.6.0...v0.7.0) (2026-07-25)
 
 
