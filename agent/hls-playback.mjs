@@ -9,6 +9,13 @@ import {
   videoDecoderFilterArguments,
   videoEncoderArguments,
 } from "./hardware-acceleration.mjs";
+import {
+  applyRenderProcessPriority,
+  createSerialRenderQueue,
+  renderEncoderArguments,
+  renderInputArguments,
+  renderResourceProfile,
+} from "./render-queue.mjs";
 
 const CACHE_VERSION = "hls-v5";
 const DEFAULT_SEGMENT_SECONDS = 4;
@@ -88,6 +95,12 @@ function contentType(filePath) {
   return "application/octet-stream";
 }
 
+function renderPreemptedError() {
+  const error = new Error("Background render was preempted by the selected video.");
+  error.code = "WATCHPAIR_RENDER_PREEMPTED";
+  return error;
+}
+
 function pipelineError(label, code, stderr) {
   const detail = stderr.trim().split("\n").slice(-4).join(" ").slice(0, 700);
   return new Error(
@@ -119,6 +132,7 @@ export function createHlsPlaybackManager({
   playlistWaitMs = PLAYLIST_WAIT_MS,
 }) {
   const sessions = new Map();
+  const renderQueue = createSerialRenderQueue();
 
   function cacheKey(descriptor) {
     return [
@@ -154,6 +168,7 @@ export function createHlsPlaybackManager({
       stdio: ["ignore", "ignore", "pipe"],
     });
     state.children.add(child);
+    applyRenderProcessPriority(child, state.resourceProfile);
     let stderr = "";
 
     child.stderr.on("data", (chunk) => {
@@ -193,6 +208,9 @@ export function createHlsPlaybackManager({
         videoDecoderArguments(encoder).length > 0,
       fallback: false,
       stopping: false,
+      preempted: false,
+      cancelled: false,
+      resourceProfile: descriptor.resourceProfile || renderResourceProfile("background"),
     };
 
     if (await cacheIsComplete(directory, descriptor.audioTracks)) {
@@ -212,6 +230,7 @@ export function createHlsPlaybackManager({
 
     const baseArguments = [
       "-hide_banner", "-loglevel", "error", "-y",
+      "-filter_threads", String(state.resourceProfile.filterThreads),
     ];
 
     const launchVideo = async () => {
@@ -224,6 +243,7 @@ export function createHlsPlaybackManager({
         [
           ...baseArguments,
           ...(state.hardwareDecode ? videoDecoderArguments(state.encoder) : []),
+          ...renderInputArguments(state.resourceProfile),
           ...(descriptor.inputArguments || []),
           "-i", descriptor.inputPath,
           "-map", "0:v:0",
@@ -234,6 +254,7 @@ export function createHlsPlaybackManager({
               ? ["-vf", "format=yuv420p"]
               : []),
           ...argumentsFor(state.encoder),
+          ...renderEncoderArguments(state.encoder, state.resourceProfile),
           "-max_muxing_queue_size", "4096",
           ...playlistArguments(segmentSeconds),
         ],
@@ -280,11 +301,13 @@ export function createHlsPlaybackManager({
           `audio track ${track.label}`,
           [
             ...baseArguments,
+            ...renderInputArguments(state.resourceProfile),
             ...(descriptor.inputArguments || []),
             "-i", descriptor.inputPath,
             "-map", `0:${track.streamIndex}`,
             "-vn", "-sn", "-dn",
             "-c:a", "aac",
+            "-threads", "1",
             "-b:a", "192k",
             "-af", "aresample=async=1:first_pts=0",
             ...playlistArguments(segmentSeconds),
@@ -337,13 +360,41 @@ export function createHlsPlaybackManager({
     const key = cacheKey(descriptor);
     let pending = sessions.get(key);
     if (!pending) {
-      pending = initialize(descriptor).catch((error) => {
+      pending = renderQueue.enqueue(descriptor.jobId, async (priority) => {
+        const state = await initialize({
+          ...descriptor,
+          resourceProfile: renderResourceProfile(priority),
+        });
+        return {
+          value: state,
+          completion: state.done,
+          interrupt: () => {
+            if (state.stopping) return;
+            state.preempted = true;
+            state.stopping = true;
+            for (const child of state.children) child.kill("SIGTERM");
+            void state.done.finally(async () => {
+              if (await invalidatePreempted(descriptor, state)) await ensure(descriptor);
+            }).catch(() => {});
+          },
+        };
+      }).catch((error) => {
         sessions.delete(key);
         throw error;
       });
       sessions.set(key, pending);
     }
     return pending;
+  }
+
+  async function invalidatePreempted(descriptor, state) {
+    const key = cacheKey(descriptor);
+    const pending = sessions.get(key);
+    if (pending && await pending.catch(() => null) === state) {
+      sessions.delete(key);
+      return true;
+    }
+    return false;
   }
 
   function assetErrorKey(relativePath) {
@@ -360,6 +411,8 @@ export function createHlsPlaybackManager({
 
     const started = Date.now();
     while (!(await exists(target))) {
+      if (state.cancelled) throw new Error("Render was cancelled.");
+      if (state.preempted) throw renderPreemptedError();
       const errorKey = assetErrorKey(relativePath);
       const error = errorKey ? state.errors.get(errorKey) : null;
       if (error) throw error;
@@ -375,6 +428,8 @@ export function createHlsPlaybackManager({
     const filePath = await waitForAsset(state, relativePath);
     const started = Date.now();
     while (true) {
+      if (state.cancelled) throw new Error("Render was cancelled.");
+      if (state.preempted) throw renderPreemptedError();
       const playlist = await readFile(filePath, "utf8").catch(() => "");
       const duration = Array.from(playlist.matchAll(/^#EXTINF:([\d.]+)/gm))
         .reduce((total, match) => total + Number(match[1] || 0), 0);
@@ -394,21 +449,35 @@ export function createHlsPlaybackManager({
     if (!/^(master\.m3u8|video\/(?:index\.m3u8|init\.mp4|segment-\d{6}\.m4s)|audio\/\d+\/(?:index\.m3u8|init\.mp4|segment-\d{6}\.m4s))$/.test(relativePath)) {
       throw new Error("Invalid HLS asset.");
     }
-    const state = await ensure(descriptor);
-    const filePath = await waitForAsset(state, relativePath);
-    return {
-      filePath,
-      type: contentType(filePath),
-      cacheControl: relativePath.endsWith(".m3u8")
-        ? "no-store"
-        : "private, max-age=31536000, immutable",
-    };
+    while (true) {
+      const state = await ensure(descriptor);
+      try {
+        const filePath = await waitForAsset(state, relativePath);
+        return {
+          filePath,
+          type: contentType(filePath),
+          cacheControl: relativePath.endsWith(".m3u8")
+            ? "no-store"
+            : "private, max-age=31536000, immutable",
+        };
+      } catch (error) {
+        if (error?.code !== "WATCHPAIR_RENDER_PREEMPTED") throw error;
+        await invalidatePreempted(descriptor, state);
+      }
+    }
   }
 
   async function prepare(descriptor) {
-    const state = await ensure(descriptor);
-    await state.playable;
-    return preparationState(state);
+    while (true) {
+      const state = await ensure(descriptor);
+      try {
+        await state.playable;
+        return preparationState(state);
+      } catch (error) {
+        if (error?.code !== "WATCHPAIR_RENDER_PREEMPTED") throw error;
+        await invalidatePreempted(descriptor, state);
+      }
+    }
   }
 
   async function getPreparation(descriptor) {
@@ -427,13 +496,16 @@ export function createHlsPlaybackManager({
       },
       hardwareDecode: Boolean(state.hardwareDecode),
       fallback: state.fallback,
+      resourceProfile: state.resourceProfile.kind,
     };
   }
 
   async function removeJob(jobId) {
+    renderQueue.cancel(jobId);
     const matching = Array.from(sessions.entries()).filter(([key]) => key.startsWith(`${jobId}:`));
     for (const [key] of matching) sessions.delete(key);
     await Promise.allSettled(matching.map(([, pending]) => pending.then(async (state) => {
+      state.cancelled = true;
       state.stopping = true;
       for (const child of state.children) child.kill("SIGTERM");
       await state.done?.catch(() => {});
@@ -441,16 +513,22 @@ export function createHlsPlaybackManager({
     await rm(path.join(cacheRoot, jobId), { recursive: true, force: true });
   }
 
+  function setPriorityJob(jobId) {
+    renderQueue.prioritize(jobId);
+  }
+
   function shutdown() {
+    for (const jobId of new Set(renderQueue.status().queuedJobIds)) renderQueue.cancel(jobId);
     for (const pending of sessions.values()) {
       void pending.then((state) => {
+        state.cancelled = true;
         state.stopping = true;
         for (const child of state.children) child.kill("SIGTERM");
       });
     }
   }
 
-  return { getAsset, getPreparation, prepare, removeJob, shutdown };
+  return { getAsset, getPreparation, prepare, removeJob, setPriorityJob, shutdown };
 }
 
 async function readStableAsset(filePath) {

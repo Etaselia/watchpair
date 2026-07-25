@@ -14,6 +14,7 @@ import {
 } from "../lib/session-types";
 
 const TOKEN_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const COMPLETE_TOKEN = /^[A-Z2-9]{4}-[A-Z2-9]{4}$/;
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const PARTICIPANT_ACTIVE_MS = 20_000;
 const VOICE_SIGNAL_TTL_MS = 90_000;
@@ -314,7 +315,7 @@ class D1SessionStore implements SessionStore {
 
   async create(token: string, hostId: string, now: number) {
     await this.db
-      .prepare(`INSERT INTO watch_sessions
+      .prepare(`INSERT OR IGNORE INTO watch_sessions
         (token, host_id, source_json, selected_media_json, player_json, seq, created_at, expires_at, updated_at)
         VALUES (?, ?, NULL, NULL, ?, 0, ?, ?, ?)`)
       .bind(token, hostId, JSON.stringify(initialPlayerState(now)), now, now + SESSION_TTL_MS, now)
@@ -451,6 +452,7 @@ class MemorySessionStore implements SessionStore {
   }
 
   async create(token: string, hostId: string, now: number) {
+    if (memorySessions.has(token)) return;
     memorySessions.set(token, {
       token,
       hostId,
@@ -555,18 +557,28 @@ async function handlePost(request: Request, store: SessionStore) {
   }
 
   if (action === "create") {
-    let token = makeToken();
-    for (let attempt = 0; attempt < 4 && (await store.get(token)); attempt += 1) {
+    const requestedToken = normalizeToken(body.token);
+    let token = COMPLETE_TOKEN.test(requestedToken) ? requestedToken : makeToken();
+    let currentSession = await store.get(token);
+    for (let attempt = 0; !COMPLETE_TOKEN.test(requestedToken) && attempt < 4 && currentSession; attempt += 1) {
       token = makeToken();
+      currentSession = await store.get(token);
     }
-    await store.create(token, deviceId, now);
+    if (!currentSession) await store.create(token, deviceId, now);
     await store.touch(token, deviceId, name, defaultReadiness(), now);
-    return Response.json({ session: await store.get(token) }, { status: 201 });
+    return Response.json({ session: await store.get(token) }, { status: currentSession ? 200 : 201 });
   }
 
   const token = normalizeToken(body.token);
-  const currentSession = token ? await store.get(token) : null;
-  if (!token || !currentSession) {
+  if (!COMPLETE_TOKEN.test(token)) {
+    return Response.json({ error: "A complete session token is required" }, { status: 400 });
+  }
+  let currentSession = await store.get(token);
+  if (!currentSession && action === "join") {
+    await store.create(token, deviceId, now);
+    currentSession = await store.get(token);
+  }
+  if (!currentSession) {
     return Response.json({ error: "Session not found or expired" }, { status: 404 });
   }
 

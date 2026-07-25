@@ -102,6 +102,7 @@ export interface AgentTranscoder {
 export interface AgentPreparation {
   status: "waiting" | "queued" | "preparing" | "ready" | "direct" | "error";
   error: string | null;
+  resourceProfile?: "foreground" | "background";
   encoder: { id: string; label: string; hardware: boolean } | null;
   hardwareDecode?: boolean;
   fallback: boolean;
@@ -264,6 +265,18 @@ export async function selectAgentFile(sourceId: string, fileIndex: number) {
 export async function getAgentDownloads() {
   const result = await agentFetch<{ jobs: AgentJob[] }>("/downloads", { cache: "no-store" });
   return result.jobs;
+}
+
+export async function setAgentPlaybackPriority(sourceId: string | null) {
+  return agentFetch<{
+    ok: boolean;
+    sourceId: string | null;
+    foregroundLoad: number;
+    backgroundLoad: number;
+  }>("/preparation-priority", {
+    method: "POST",
+    body: JSON.stringify({ sourceId }),
+  });
 }
 
 export async function stopAgentDownload(sourceId: string, deleteFiles = false) {

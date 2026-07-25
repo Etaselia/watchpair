@@ -47,6 +47,8 @@ test("desktop release artifacts use stable names and publish only after packaged
 
   assert.equal(builder.appImage.artifactName, "WatchPair-Companion-Linux-x64.AppImage");
   assert.equal(builder.deb.artifactName, "WatchPair-Companion-Linux-x64.deb");
+  assert.ok(builder.deb.depends.includes("libgtk-3-0 | libgtk-3-0t64"));
+  assert.ok(builder.deb.recommends.includes("libappindicator3-1 | libayatana-appindicator3-1"));
   for (const script of ["desktop:dist", "desktop:dist:win", "desktop:dist:linux"]) {
     assert.match(packageJson.scripts[script], /--publish never$/, script);
   }

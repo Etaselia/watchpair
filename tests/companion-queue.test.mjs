@@ -86,6 +86,19 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
     assert.equal(pairedHealth.headers.get("access-control-allow-origin"), "https://watch.example");
 
     const ids = ["queuejob-one", "queuejob-two"];
+    const priorityResponse = await fetch(base + "/preparation-priority", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sourceId: ids[1] }),
+    });
+    assert.equal(priorityResponse.status, 200);
+    assert.deepEqual(await priorityResponse.json(), {
+      ok: true,
+      sourceId: ids[1],
+      foregroundLoad: 0.85,
+      backgroundLoad: 0.25,
+    });
+
     for (let index = 0; index < ids.length; index += 1) {
       const response = await fetch(base + "/downloads", {
         method: "POST",
@@ -113,6 +126,8 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
       assert.equal(result.job.preparation.status, "ready");
       assert.equal(result.job.preparation.encoder.id, "cpu");
     }
+    assert.equal(completed[0].job.preparation.resourceProfile, "background");
+    assert.equal(completed[1].job.preparation.resourceProfile, "foreground");
     assert.equal((await (await fetch(base + "/health")).json()).jobs, 2);
     assert.match(output, /Transcoder: CPU \(libx264\)/);
   } finally {

@@ -65,6 +65,7 @@ import {
   seedAgentLibraryFile,
   selectAgentFile,
   setAgentDownloadPinned,
+  setAgentPlaybackPriority,
   stopAgentDownload,
   uploadAndSeedAgentFile,
   type AgentAudioTrack,
@@ -404,10 +405,16 @@ export default function WatchApp() {
   const localAgentMedia = findLocalAgentMedia(agentJobs, session?.selectedMedia, localAgentBinding);
   const playbackSourceId = localAgentMedia?.sourceId || activeSourceId;
   const agentJob = localAgentMedia?.job || (activeSource ? agentJobs[activeSource.id] || null : null);
+  const prioritySourceId = localAgentMedia?.job.id || session?.selectedMedia?.sourceId || null;
   const embeddedAudioTracks = agentJob?.audioTracks || EMPTY_AUDIO_TRACKS;
   const embeddedChapters = agentJob?.chapters || EMPTY_CHAPTERS;
   const embeddedSubtitles = agentJob?.subtitles || EMPTY_SUBTITLE_TRACKS;
   const sourcesKey = sources.map((source) => source.id).join(":");
+
+  useEffect(() => {
+    if (!agentAvailable) return;
+    void setAgentPlaybackPriority(prioritySourceId).catch(() => {});
+  }, [agentAvailable, prioritySourceId]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -576,12 +583,14 @@ export default function WatchApp() {
 
   const createSession = async () => {
     if (!deviceId) return;
+    const requestedToken = normalizeToken(tokenInput || roomToken);
     setBusy("create");
     setError("");
     try {
       localStorage.setItem("watchpair-display-name", displayName.trim() || "Guest");
       const nextSession = await sessionRequest({
         action: "create",
+        token: requestedToken.length === 9 ? requestedToken : undefined,
         deviceId,
         name: displayName,
       });

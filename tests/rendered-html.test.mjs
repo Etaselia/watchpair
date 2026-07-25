@@ -82,6 +82,64 @@ test("production session API supports join-in-progress state", async () => {
   const created = await createdResponse.json();
   assert.match(created.session.token, /^[A-Z2-9]{4}-[A-Z2-9]{4}$/);
 
+  const customCreatedResponse = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      action: "create",
+      token: "PAIR-2468",
+      deviceId: "custom-host",
+      name: "Custom Host",
+    }),
+  });
+  assert.equal(customCreatedResponse.status, 201);
+  assert.equal((await customCreatedResponse.json()).session.token, "PAIR-2468");
+
+  const fallbackCreatedResponse = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      action: "create",
+      token: "HALF",
+      deviceId: "fallback-host",
+      name: "Fallback Host",
+    }),
+  });
+  assert.equal(fallbackCreatedResponse.status, 201);
+  assert.match((await fallbackCreatedResponse.json()).session.token, /^[A-Z2-9]{4}-[A-Z2-9]{4}$/);
+
+  const missingJoinResponse = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      action: "join",
+      token: "NEW2-ROOM",
+      deviceId: "missing-room-host",
+      name: "First arrival",
+    }),
+  });
+  assert.equal(missingJoinResponse.status, 200);
+  const missingJoin = await missingJoinResponse.json();
+  assert.equal(missingJoin.session.token, "NEW2-ROOM");
+  assert.equal(missingJoin.session.hostId, "missing-room-host");
+
+  const simultaneousJoins = await Promise.all(["first", "second"].map((suffix) =>
+    fetch(`http://127.0.0.1:${port}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        action: "join",
+        token: "RACE-2468",
+        deviceId: `race-${suffix}`,
+        name: suffix,
+      }),
+    })
+  ));
+  assert.deepEqual(simultaneousJoins.map((response) => response.status), [200, 200]);
+  const simultaneousSessions = await Promise.all(simultaneousJoins.map((response) => response.json()));
+  assert.equal(simultaneousSessions[0].session.token, "RACE-2468");
+  assert.equal(simultaneousSessions[0].session.hostId, simultaneousSessions[1].session.hostId);
+
   const joinedResponse = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -275,7 +333,8 @@ test("ships the coordination and companion surfaces", async () => {
   ]);
 
   assert.match(app, /Watch together/);
-  assert.match(app, /action: "create",\s+deviceId,\s+name: displayName/);
+  assert.match(app, /action: "create",\s+token: requestedToken\.length === 9/);
+  assert.match(app, /setAgentPlaybackPriority\(prioritySourceId\)/);
   assert.match(app, /getAgentDownloads/);
   assert.match(app, /Download queue/);
   assert.match(app, /const COMPANION_VERSION = "\d+\.\d+\.\d+"; \/\/ x-release-please-version/);
@@ -323,6 +382,8 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(route, /action === "select-media"/);
   assert.match(route, /action === "remove-source"/);
   assert.match(route, /action === "reorder-sources"/);
+  assert.match(route, /COMPLETE_TOKEN/);
+  assert.match(route, /!currentSession && action === "join"/);
   assert.match(route, /action === "rename-source"/);
   assert.match(route, /normalizeSources/);
   assert.match(route, /stableParticipants/);
@@ -340,6 +401,8 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(agent, /fileIdentityFingerprint/);
   assert.match(agent, /torrent\.once\("ready", \(\) => markServing\(torrent\)\)/);
   assert.match(agent, /restoreJobs/);
+  assert.match(agent, /preparation-priority/);
+  assert.match(agent, /setPreparationPriority/);
   assert.match(agentClient, /loopback-network/);
   assert.match(agentClient, /getAgentDownloads/);
   assert.match(agentClient, /getAgentPermissionState/);
