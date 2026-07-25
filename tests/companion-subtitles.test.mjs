@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import ffmpegPath from "ffmpeg-static";
+import { terminateChildProcess } from "./process-helpers.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const runFile = promisify(execFile);
@@ -131,13 +132,7 @@ test("companion serves original ASS, WebVTT fallback, and attached MKV fonts", {
   } catch (error) {
     throw new Error(`${error.message}\n${output}`, { cause: error });
   } finally {
-    if (companion && companion.exitCode === null) {
-      companion.kill("SIGTERM");
-      await Promise.race([
-        new Promise((resolve) => companion.once("close", resolve)),
-        new Promise((resolve) => setTimeout(resolve, 4_000)),
-      ]);
-    }
+    await terminateChildProcess(companion, { graceMs: 4_000 });
     await rm(directory, { recursive: true, force: true });
   }
 });

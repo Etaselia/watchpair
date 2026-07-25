@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { access, readFile, readdir } from "node:fs/promises";
 import { after, before, test } from "node:test";
 import { strFromU8, unzipSync } from "fflate";
+import { terminateChildProcess } from "./process-helpers.mjs";
 
 const port = 3199;
 let server;
@@ -40,8 +41,8 @@ before(async () => {
   throw new Error(`Production server did not become ready.\n${serverOutput}`);
 });
 
-after(() => {
-  server?.kill("SIGTERM");
+after(async () => {
+  await terminateChildProcess(server);
 });
 
 test("production-renders the WatchPair application", async () => {

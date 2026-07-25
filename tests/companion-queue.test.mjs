@@ -8,6 +8,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import ffmpegPath from "ffmpeg-static";
+import { terminateChildProcess } from "./process-helpers.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const packageVersion = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).version;
@@ -115,13 +116,7 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
     assert.equal((await (await fetch(base + "/health")).json()).jobs, 2);
     assert.match(output, /Transcoder: CPU \(libx264\)/);
   } finally {
-    if (companion && companion.exitCode === null) {
-      companion.kill("SIGTERM");
-      await Promise.race([
-        new Promise((resolve) => companion.once("close", resolve)),
-        new Promise((resolve) => setTimeout(resolve, 3_000)),
-      ]);
-    }
+    await terminateChildProcess(companion);
     await new Promise((resolve) => mediaServer.close(resolve));
     await rm(directory, { recursive: true, force: true });
   }

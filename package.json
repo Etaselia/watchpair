@@ -1,6 +1,6 @@
 {
   "name": "watchpair",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": true,
   "description": "Self-hosted synchronized video playback with local torrent and media support.",
   "license": "MIT",
@@ -32,7 +32,7 @@
     "desktop:icon": "node scripts/generate-desktop-icon.mjs",
     "test:desktop:e2e": "node tests/desktop-e2e.mjs",
     "prebuild": "npm run build:companion",
-    "test:unit": "node --test tests/desktop-settings.test.mjs tests/deployment-policy.test.mjs tests/hardware-acceleration.test.mjs tests/media-binding.test.mjs tests/media-chapters.test.mjs tests/cleanup-policy.test.mjs tests/storage-cleanup.test.mjs tests/media-fingerprint.test.mjs tests/subtitle-assets.test.mjs tests/torrent-download.test.mjs tests/torrent-runtime.test.mjs tests/wrangler-config.test.mjs",
+    "test:unit": "node --test tests/desktop-settings.test.mjs tests/process-helpers.test.mjs tests/deployment-policy.test.mjs tests/hardware-acceleration.test.mjs tests/media-binding.test.mjs tests/media-chapters.test.mjs tests/cleanup-policy.test.mjs tests/storage-cleanup.test.mjs tests/media-fingerprint.test.mjs tests/subtitle-assets.test.mjs tests/torrent-download.test.mjs tests/torrent-runtime.test.mjs tests/wrangler-config.test.mjs",
     "check": "npm run lint && npm run typecheck && npm run test:unit",
     "hooks:install": "node scripts/install-hooks.mjs",
     "prepare": "node scripts/install-hooks.mjs"

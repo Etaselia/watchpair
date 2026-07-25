@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/Etaselia/watchpair/compare/v0.6.0...v0.7.0) (2026-07-25)
+
+
+### Features
+
+* ship desktop companion and managed media ([#26](https://github.com/Etaselia/watchpair/issues/26)) ([e4008b8](https://github.com/Etaselia/watchpair/commit/e4008b81fe7fcc3eabd29796cbd72acd7e589bdd))
+
 ## [0.6.0](https://github.com/Etaselia/watchpair/compare/v0.5.4...v0.6.0) (2026-07-24)
 
 
