@@ -123,6 +123,7 @@ const libraryEntries = new Map();
 const jobStore = createJsonStore(JOBS_PATH);
 const preparationQueue = [];
 let preparationWorker = null;
+let activePreparationJobId = null;
 installWebTorrentSafetyGuards();
 const client = new WebTorrent({
   utp: false,
@@ -1528,11 +1529,24 @@ async function prepareQueuedJob(job) {
   }
 }
 
+function prioritizePreparationQueue() {
+  preparationQueue.sort((left, right) =>
+    Number(right.id === activePreparationJobId) - Number(left.id === activePreparationJobId)
+  );
+}
+
+function setPreparationPriority(jobId) {
+  activePreparationJobId = jobId || null;
+  prioritizePreparationQueue();
+  hlsPlayback.setPriorityJob(activePreparationJobId);
+}
+
 async function drainPreparationQueue() {
   while (preparationQueue.length) {
+    prioritizePreparationQueue();
     const job = preparationQueue.shift();
     if (!job || job.preparation.status !== "queued") continue;
-    await prepareQueuedJob(job);
+    void prepareQueuedJob(job);
   }
 }
 
@@ -1548,7 +1562,8 @@ function queueBackgroundPreparation(job) {
   if (job.selectedIndex === null || !["waiting", "error"].includes(job.preparation.status)) return;
   job.preparation = { status: "queued", error: null, encoder: null, fallback: false };
   job.updatedAt = Date.now();
-  preparationQueue.push(job);
+  if (!preparationQueue.includes(job)) preparationQueue.push(job);
+  prioritizePreparationQueue();
   startPreparationWorker();
 }
 
@@ -1817,6 +1832,24 @@ const server = createServer(async (request, response) => {
 
     if (request.method === "POST" && url.pathname === "/cleanup") {
       sendJson(response, 200, await runStorageCleanup({ force: true }), headers);
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/preparation-priority") {
+      const body = await readJson(request);
+      const sourceId = body.sourceId === null || body.sourceId === undefined
+        ? null
+        : String(body.sourceId);
+      if (sourceId && !/^[a-zA-Z0-9-]{8,80}$/.test(sourceId)) {
+        throw new Error("A valid priority source id is required.");
+      }
+      setPreparationPriority(sourceId);
+      sendJson(response, 200, {
+        ok: true,
+        sourceId: activePreparationJobId,
+        foregroundLoad: 0.85,
+        backgroundLoad: 0.25,
+      }, headers);
       return;
     }
 
