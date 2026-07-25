@@ -1,0 +1,7 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "The public session-token alphabet is not a credential."
+paths = ['''worker/session-api\.ts''']
+regexes = ['''const TOKEN_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";''']
