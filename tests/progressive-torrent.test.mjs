@@ -21,6 +21,7 @@ test("waits for a verified torrent before probing and preparing initial HLS segm
     lsd: false,
     natUpnp: false,
     natPmp: false,
+    utp: false,
   });
   const tracker = new TrackerServer({ udp: false, ws: false, stats: false });
   let companion;

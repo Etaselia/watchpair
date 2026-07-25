@@ -33,6 +33,11 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
+      - name: Validate release-compatible PR title
+        if: github.event_name == 'pull_request'
+        env:
+          WATCHPAIR_PR_TITLE: ${{ github.event.pull_request.title }}
+        run: node scripts/validate-pr-title.mjs
       - uses: actions/setup-node@v7
         with:
           node-version: 24
