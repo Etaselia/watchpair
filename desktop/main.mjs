@@ -159,7 +159,7 @@ async function startAgent() {
   sendState();
   const serverPath = path.join(applicationRoot, "agent", "server.mjs");
   agentProcess = utilityProcess.fork(serverPath, [], {
-    cwd: applicationRoot,
+    cwd: app.getPath("userData"),
     env: {
       ...process.env,
       ...settingsEnvironment(settings),
