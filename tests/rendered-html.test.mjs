@@ -426,6 +426,7 @@ test("packages the pairable magnet and subtitle companion", async () => {
     "WatchPair Companion/hardware-acceleration.mjs",
     "WatchPair Companion/media-governor.mjs",
     "WatchPair Companion/process-registry.mjs",
+    "WatchPair Companion/persistent-log.mjs",
     "WatchPair Companion/render-queue.mjs",
     "WatchPair Companion/scheduled-ffmpeg.mjs",
     "WatchPair Companion/subtitle-pipeline.mjs",

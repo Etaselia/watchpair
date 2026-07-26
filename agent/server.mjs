@@ -6,7 +6,7 @@ import { createReadStream, createWriteStream } from "node:fs";
 import { mkdir, readFile, readdir, realpath, rename, rm, stat, statfs, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { BlockList } from "node:net";
-import { homedir } from "node:os";
+import { availableParallelism, homedir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { load } from "cheerio";
@@ -47,6 +47,7 @@ import {
 } from "./subtitle-assets.mjs";
 import { isSupportedMagnet } from "./torrent-input.mjs";
 import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, verifiedTorrentFileProgress, verifyTorrentFilePieces } from "./webtorrent-safety.mjs";
+import { createPersistentLogger, installProcessDiagnostics } from "./persistent-log.mjs";
 
 const HOST = "127.0.0.1";
 const APP_VERSION = process.env.WATCHPAIR_APP_VERSION || "0.9.0"; // x-release-please-version
@@ -72,6 +73,26 @@ const DOWNLOAD_DIR = path.resolve(process.env.WATCHPAIR_DOWNLOAD_DIR || "./downl
 const CONFIG_PATH = path.resolve(
   process.env.WATCHPAIR_CONFIG_PATH || path.join(homedir(), ".watchpair", "companion.json")
 );
+const LOG_DIRECTORY = path.resolve(
+  process.env.WATCHPAIR_LOG_DIR || path.join(path.dirname(CONFIG_PATH), "logs")
+);
+const agentLogger = createPersistentLogger({
+  directory: LOG_DIRECTORY,
+  fileName: process.env.WATCHPAIR_LOG_FILE || "watchpair-agent.log",
+  component: "agent",
+});
+agentLogger.captureConsole();
+installProcessDiagnostics(agentLogger);
+agentLogger.info("agent_process_started", {
+  version: APP_VERSION,
+  protocolVersion: PROTOCOL_VERSION,
+  platform: process.platform,
+  architecture: process.arch,
+  node: process.version,
+  electron: process.versions.electron || null,
+  packaged: Boolean(process.versions.electron),
+  log: agentLogger.details(),
+});
 const JOBS_PATH = path.join(DOWNLOAD_DIR, ".watchpair-jobs.json");
 const IMPORT_DIR = path.join(DOWNLOAD_DIR, ".watchpair-imports");
 const HLS_DIR = path.join(DOWNLOAD_DIR, ".watchpair-hls");
@@ -102,6 +123,10 @@ const TRACKERS = configuredTrackers.length ? configuredTrackers : DEFAULT_TRACKE
 const TRANSCODE_RUNTIME = await selectTranscodeRuntime({ bundledPath: unpackedExecutablePath(ffmpegStaticPath) });
 const FFMPEG_PATH = TRANSCODE_RUNTIME.ffmpegPath;
 const TRANSCODER = publicTranscoder(TRANSCODE_RUNTIME);
+agentLogger.info("transcoder_selected", {
+  transcoder: TRANSCODER,
+  configuredPreference: process.env.WATCHPAIR_TRANSCODER || "auto",
+});
 const ALLOW_PRIVATE_DOWNLOADS = process.env.WATCHPAIR_ALLOW_PRIVATE_DOWNLOADS === "1";
 const CLEANUP_SETTINGS = cleanupSettingsFromEnvironment();
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
@@ -131,8 +156,17 @@ const jobStore = createJsonStore(JOBS_PATH);
 const preparationQueue = [];
 let preparationWorker = null;
 let activePreparationJobId = null;
-const mediaScheduler = createMediaTaskScheduler();
-const mediaProcessRegistry = createProcessRegistry();
+function mediaDiagnosticEvent(event, data) {
+  if (event.endsWith("_failed")) {
+    agentLogger.error(event, data);
+  } else if (event.endsWith("_deferred") || event.endsWith("_preempted")) {
+    agentLogger.warn(event, data);
+  } else {
+    agentLogger.info(event, data);
+  }
+}
+const mediaScheduler = createMediaTaskScheduler({ onEvent: mediaDiagnosticEvent });
+const mediaProcessRegistry = createProcessRegistry({ onEvent: mediaDiagnosticEvent });
 const runScheduledFfmpeg = createScheduledFfmpegRunner({
   ffmpegPath: FFMPEG_PATH,
   scheduler: mediaScheduler,
@@ -156,8 +190,13 @@ const hlsPlayback = createHlsPlaybackManager({
   scheduler: mediaScheduler,
   processRegistry: mediaProcessRegistry,
 });
-client.on("error", (error) => console.error(`WebTorrent client error: ${error.message}`));
+client.on("error", (error) => {
+  agentLogger.error("webtorrent_client_error", { error });
+  console.error(`WebTorrent client error: ${error.message}`);
+});
+client.on("warning", (warning) => agentLogger.warn("webtorrent_client_warning", { warning }));
 client.on("listening", () => {
+  agentLogger.info("torrent_listener_ready", { torrentPort: client.torrentPort, dhtPort: client.dhtPort });
   console.log(`Torrent listener ready on TCP ${client.torrentPort}; DHT uses UDP ${client.dhtPort}.`);
 });
 
@@ -472,10 +511,25 @@ async function verifySelectedTorrentFile(job, index) {
   job.status = "downloading";
   job.warning = "Verifying every torrent piece before playback.";
   job.updatedAt = Date.now();
+  const verificationStartedAt = Date.now();
+  agentLogger.info("torrent_verification_started", {
+    jobId: job.id,
+    fileIndex: index,
+    fileSize: file.length,
+    pieceLength: job.torrent.pieceLength,
+    pieceCount: file._endPiece - file._startPiece + 1,
+  });
 
   let promise;
   promise = verifyTorrentFilePieces(file)
     .then(({ verified, invalidPieces }) => {
+      agentLogger.info("torrent_verification_finished", {
+        jobId: job.id,
+        fileIndex: index,
+        durationMs: Date.now() - verificationStartedAt,
+        verified,
+        invalidPieces: invalidPieces.length,
+      });
       if (index !== job.selectedIndex || selectedFileKey(job) !== verificationKey) return false;
       if (!verified) {
         file.deselect();
@@ -491,6 +545,15 @@ async function verifySelectedTorrentFile(job, index) {
       job.warning = null;
       job.updatedAt = Date.now();
       return true;
+    })
+    .catch((error) => {
+      agentLogger.error("torrent_verification_failed", {
+        jobId: job.id,
+        fileIndex: index,
+        durationMs: Date.now() - verificationStartedAt,
+        error,
+      });
+      throw error;
     })
     .finally(() => {
       if (job.torrentVerificationPromise === promise) {
@@ -511,11 +574,16 @@ async function completeSelectedFile(job, index = job.selectedIndex) {
     if (index !== job.selectedIndex) return;
     job.status = "ready";
     markJobCompleted(job);
+    agentLogger.info("media_file_ready", {
+      jobId: job.id,
+      fileIndex: index,
+      fingerprint: job.identityFingerprint,
+    });
     if (activePreparationJobId === job.id) setPreparationPriority(job.id);
-    queueSubtitleAssetPreparation(job);
-    queueBackgroundPreparation(job);
+    queueMediaPreparation(job);
   } catch (error) {
     if (index !== job.selectedIndex) return;
+    agentLogger.error("media_file_completion_failed", { jobId: job.id, fileIndex: index, error });
     job.status = "error";
     job.error = error instanceof Error ? error.message : "Could not identify the completed media file.";
     job.updatedAt = Date.now();
@@ -570,6 +638,7 @@ function selectTorrentFile(job, index) {
 }
 
 function jobFile(job, index) {
+  if (job.seed && job.file && index === 0) return job.file;
   if (job.kind === "magnet") {
     const file = job.torrent?.files[index];
     if (!file) throw new Error("Torrent file not found.");
@@ -612,6 +681,13 @@ async function probeSubtitleTracks(job) {
   job.subtitleAssetPromiseKey = null;
   job.chapters = [];
   job.updatedAt = Date.now();
+  const probeStartedAt = Date.now();
+  agentLogger.info("media_probe_started", {
+    jobId: job.id,
+    fileIndex: job.selectedIndex,
+    fileSize: media.size,
+    extension: path.extname(media.name).toLowerCase(),
+  });
 
   const isStillSelected = () => {
     try {
@@ -682,9 +758,29 @@ async function probeSubtitleTracks(job) {
           fonts: styled ? subtitleFonts : [],
         };
       });
+    agentLogger.info("media_probe_finished", {
+      jobId: job.id,
+      fileIndex: job.selectedIndex,
+      durationMs: Date.now() - probeStartedAt,
+      video: {
+        codec: job.videoCodec,
+        pixelFormat: job.videoPixelFormat,
+        profile: job.videoProfile,
+      },
+      audioTracks: job.audioTracks.length,
+      subtitleTracks: job.subtitleTracks.length,
+      fontAttachments: subtitleFonts.length,
+      chapters: job.chapters.length,
+    });
     job.subtitleStatus = "ready";
   } catch (error) {
     if (!isStillSelected()) return;
+    agentLogger.error("media_probe_failed", {
+      jobId: job.id,
+      fileIndex: job.selectedIndex,
+      durationMs: Date.now() - probeStartedAt,
+      error,
+    });
     job.subtitleStatus = "error";
     job.subtitleError = error instanceof Error ? error.message : "Could not inspect embedded media tracks.";
   } finally {
@@ -713,11 +809,10 @@ function queueSubtitleProbe(job) {
   return promise;
 }
 
-async function preparedSubtitleAssets(job) {
+async function prepareSubtitleAssetsForSelection(job, selectionKey) {
   await queueSubtitleProbe(job);
-  const selectionKey = selectedFileKey(job);
-  if (job.subtitleAssetPromise && job.subtitleAssetPromiseKey === selectionKey) {
-    return job.subtitleAssetPromise;
+  if (selectedFileKey(job) !== selectionKey) {
+    throw new Error("The selected media file changed during subtitle preparation.");
   }
 
   const media = selectedJobFile(job);
@@ -725,26 +820,57 @@ async function preparedSubtitleAssets(job) {
   const schedulerJobId = `content-${mediaKey}-${media.size}`;
   job.subtitleAssetStatus = "preparing";
   job.subtitleAssetError = null;
-  let promise;
-  promise = subtitleAssetPipeline.prepare({
-    mediaPath: media.path,
-    mediaKey,
-    fileSize: media.size,
-    streams: job.mediaStreams,
-    schedulerJobId,
-  }).then((result) => {
+  const subtitleStartedAt = Date.now();
+  agentLogger.info("subtitle_assets_started", {
+    jobId: job.id,
+    fileIndex: job.selectedIndex,
+    subtitleTracks: job.subtitleTracks.length,
+    attachments: job.mediaStreams.filter((stream) => stream.codec_type === "attachment").length,
+  });
+
+  try {
+    const result = await subtitleAssetPipeline.prepare({
+      mediaPath: media.path,
+      mediaKey,
+      fileSize: media.size,
+      streams: job.mediaStreams,
+      schedulerJobId,
+    });
+    agentLogger.info("subtitle_assets_finished", {
+      jobId: job.id,
+      fileIndex: job.selectedIndex,
+      durationMs: Date.now() - subtitleStartedAt,
+      subtitleAssets: result.subtitles.size,
+      fontAssets: result.fonts.size,
+    });
     if (job.subtitleProbeKey === selectionKey) {
       job.subtitleAssetStatus = "ready";
       job.subtitleAssetError = null;
     }
     return result;
-  }).catch((error) => {
+  } catch (error) {
+    agentLogger.error("subtitle_assets_failed", {
+      jobId: job.id,
+      fileIndex: job.selectedIndex,
+      durationMs: Date.now() - subtitleStartedAt,
+      error,
+    });
     if (job.subtitleProbeKey === selectionKey) {
       job.subtitleAssetStatus = "error";
       job.subtitleAssetError = error instanceof Error ? error.message : "Subtitle preparation failed.";
     }
     throw error;
-  }).finally(() => {
+  }
+}
+
+function preparedSubtitleAssets(job) {
+  const selectionKey = selectedFileKey(job);
+  if (job.subtitleAssetPromise && job.subtitleAssetPromiseKey === selectionKey) {
+    return job.subtitleAssetPromise;
+  }
+
+  let promise;
+  promise = prepareSubtitleAssetsForSelection(job, selectionKey).finally(() => {
     if (job.subtitleAssetPromise === promise) {
       job.subtitleAssetPromise = null;
       job.subtitleAssetPromiseKey = null;
@@ -755,8 +881,12 @@ async function preparedSubtitleAssets(job) {
   return promise;
 }
 
-function queueSubtitleAssetPreparation(job) {
-  void preparedSubtitleAssets(job).catch(() => {});
+function queueMediaPreparation(job) {
+  void preparedSubtitleAssets(job)
+    .catch(() => null)
+    .then(() => {
+      if (jobs.get(job.id) === job) queueBackgroundPreparation(job);
+    });
 }
 
 async function subtitleFile(job, trackId, format = "vtt") {
@@ -812,6 +942,22 @@ function needsHlsPlayback(job, fileName) {
 }
 
 function torrentFiles(job) {
+  if (job.seed && job.file) {
+    return [{
+      index: 0,
+      name: job.file.name,
+      size: job.file.size,
+      downloaded: job.file.size,
+      progress: 100,
+      ready: job.status === "ready",
+      selected: job.selectedIndex === 0,
+      fingerprint: fileIdentityFingerprint(job, 0, job.file),
+      streamUrl: "http://" + HOST + ":" + PORT + "/stream/" + encodeURIComponent(job.id) + "/0",
+      hlsUrl: needsHlsPlayback(job, job.file.name)
+        ? "http://" + HOST + ":" + PORT + "/hls/" + encodeURIComponent(job.id) + "/0/h264/master.m3u8"
+        : null,
+    }];
+  }
   if (!job.torrent) return [];
   return job.torrent.files.map((file, index) => {
     const progress = verifiedTorrentFileProgress(file);
@@ -912,12 +1058,14 @@ function snapshot(job) {
 
 function startTorrent(job) {
   job.status = "metadata";
+  agentLogger.info("torrent_start_requested", { jobId: job.id, managed: Boolean(job.managed) });
   let torrent;
   try {
     torrent = client.add(job.value, { path: path.join(DOWNLOAD_DIR, job.id) });
   } catch (error) {
     job.status = "error";
     job.error = error instanceof Error ? error.message : "Torrent could not be started.";
+    agentLogger.error("torrent_start_failed", { jobId: job.id, error });
     job.updatedAt = Date.now();
     return;
   }
@@ -926,6 +1074,7 @@ function startTorrent(job) {
     torrent,
     () => torrent.files?.[job.selectedIndex],
     ({ reason, disconnected }) => {
+      agentLogger.warn("torrent_piece_recovery", { jobId: job.id, reason, disconnected });
       job.status = "downloading";
       if (reason === "disk-verification") job.diskInvalidations += 1;
       if (reason === "peer-verification") {
@@ -940,12 +1089,21 @@ function startTorrent(job) {
   );
 
   torrent.on("metadata", () => {
+    agentLogger.info("torrent_metadata_ready", {
+      jobId: job.id,
+      infoHash: torrent.infoHash,
+      length: torrent.length,
+      pieceLength: torrent.pieceLength,
+      pieceCount: torrent.pieces?.length || 0,
+      files: torrent.files.map((file, index) => ({ index, name: torrentFileName(file), size: file.length })),
+    });
     const videos = torrent.files
       .map((file, index) => ({ index, size: file.length, video: VIDEO_EXTENSIONS.test(file.name) }))
       .sort((a, b) => Number(b.video) - Number(a.video) || b.size - a.size);
     if (videos[0]) selectTorrentFile(job, videos[0].index);
     torrent.files.forEach((file, index) => {
       file.on("done", () => {
+        agentLogger.info("torrent_file_downloaded", { jobId: job.id, fileIndex: index, size: file.length });
         if (job.selectedIndex !== index) return;
         void completeSelectedFile(job, index);
       });
@@ -959,13 +1117,16 @@ function startTorrent(job) {
     job.updatedAt = Date.now();
   });
   torrent.on("done", () => {
+    agentLogger.info("torrent_download_complete", { jobId: job.id, infoHash: torrent.infoHash });
     void completeSelectedFile(job);
   });
   torrent.on("warning", (error) => {
+    agentLogger.warn("torrent_warning", { jobId: job.id, error });
     job.warning = error.message;
     job.updatedAt = Date.now();
   });
   torrent.on("error", (error) => {
+    agentLogger.error("torrent_error", { jobId: job.id, error });
     job.status = "error";
     job.error = error.message;
     job.updatedAt = Date.now();
@@ -1014,8 +1175,7 @@ async function startDirect(job) {
     markJobCompleted(job);
     if (activePreparationJobId === job.id) setPreparationPriority(job.id);
     await queueSubtitleProbe(job);
-    queueSubtitleAssetPreparation(job);
-    queueBackgroundPreparation(job);
+    queueMediaPreparation(job);
   } catch (error) {
     job.status = "error";
     job.error = error instanceof Error ? error.message : "Direct download failed.";
@@ -1215,6 +1375,12 @@ async function seedLocalFile({ id, filePath, label, managed = false, ...metadata
   job.status = "metadata";
   job.selectedIndex = 0;
   job.downloaded = info.size;
+  job.file = {
+    name: path.basename(resolvedPath),
+    size: info.size,
+    path: resolvedPath,
+    type: contentType(resolvedPath),
+  };
   job.seedStartedAt = Date.now();
   job.identityFingerprint = await fingerprintPath(resolvedPath);
   job.identityFingerprintKey = "0:" + path.basename(resolvedPath) + ":" + info.size;
@@ -1251,8 +1417,7 @@ async function seedLocalFile({ id, filePath, label, managed = false, ...metadata
       serving = true;
       job.status = "ready";
       markJobCompleted(job);
-      queueSubtitleAssetPreparation(job);
-      queueBackgroundPreparation(job);
+      queueMediaPreparation(job);
       persistJobs();
     };
     const torrent = client.seed(resolvedPath, options, markServing);
@@ -1374,8 +1539,7 @@ async function attachLibraryFile({ id, entry, label }) {
   job.identityFingerprintKey = selectedFileKey(job);
   job.status = "ready";
   markJobCompleted(job);
-  queueSubtitleAssetPreparation(job);
-  queueBackgroundPreparation(job);
+  queueMediaPreparation(job);
   persistJobs();
   return job;
 }
@@ -1446,8 +1610,7 @@ async function restoreJobs() {
         await identifySelectedFile(job);
         job.status = "ready";
         markJobCompleted(job);
-        queueSubtitleAssetPreparation(job);
-        queueBackgroundPreparation(job);
+        queueMediaPreparation(job);
       } else {
         await addDownload(record);
       }
@@ -1548,7 +1711,7 @@ async function renderAudioPlayback(job, fileIndex, track) {
 
 function torrentFileIsFullyVerified(job, fileIndex) {
   if (job.kind !== "magnet") return job.status === "ready";
-  if (job.seed) return Boolean(job.torrent?.files[fileIndex]?.done);
+  if (job.seed) return fileIndex === 0 && Boolean(job.file) && job.status === "ready";
   if (!job.torrent?.files[fileIndex]?.done || job.selectedIndex !== fileIndex) return false;
   return job.torrentVerifiedKey === selectedFileKey(job);
 }
@@ -1600,8 +1763,9 @@ async function hlsDescriptor(job, fileIndex, rendition = "h264") {
 
 async function prepareQueuedJob(job) {
   if (job.selectedIndex === null) return;
-  const selectionKey = selectedFileKey(job);
+  let selectionKey = null;
   const isStillSelected = () => {
+    if (selectionKey === null) return jobs.get(job.id) === job && job.selectedIndex !== null;
     try {
       return selectedFileKey(job) === selectionKey;
     } catch {
@@ -1610,6 +1774,7 @@ async function prepareQueuedJob(job) {
   };
 
   try {
+    selectionKey = selectedFileKey(job);
     await queueSubtitleProbe(job);
     if (!isStillSelected()) return;
     const media = selectedJobFile(job);
@@ -1674,7 +1839,16 @@ async function drainPreparationQueue() {
     prioritizePreparationQueue();
     const job = preparationQueue.shift();
     if (!job || job.preparation.status !== "queued") continue;
-    void prepareQueuedJob(job);
+    void prepareQueuedJob(job).catch((error) => {
+      agentLogger.error("media_preparation_unhandled", { jobId: job.id, error });
+      job.preparation = {
+        status: "error",
+        error: error instanceof Error ? error.message : "Browser preparation failed.",
+        encoder: null,
+        fallback: false,
+      };
+      job.updatedAt = Date.now();
+    });
   }
 }
 
@@ -1724,6 +1898,11 @@ async function streamFile(request, response, job, fileIndex, headers, audioTrack
     size = info.size;
     fallbackType = "video/mp4";
     createStream = (options) => createReadStream(audioPath, options);
+  } else if (job.seed && job.file && fileIndex === 0) {
+    fileName = job.file.name;
+    size = job.file.size;
+    fallbackType = job.file.type;
+    createStream = (options) => createReadStream(job.file.path, options);
   } else if (job.kind === "magnet") {
     const file = job.torrent?.files[fileIndex];
     if (!file) throw new Error("Torrent file not found.");
@@ -1882,9 +2061,101 @@ async function runStorageCleanup({ force = false } = {}) {
   return cleanupPromise;
 }
 
+let previousProcessCpu = process.cpuUsage();
+let previousProcessCpuAt = process.hrtime.bigint();
+let idleDiagnosticTicks = 0;
+
+function sampleProcessCpu() {
+  const now = process.hrtime.bigint();
+  const current = process.cpuUsage();
+  const elapsedMicros = Math.max(1, Number(now - previousProcessCpuAt) / 1_000);
+  const usedMicros = Math.max(
+    0,
+    current.user - previousProcessCpu.user + current.system - previousProcessCpu.system
+  );
+  const oneCorePercent = (usedMicros / elapsedMicros) * 100;
+  previousProcessCpu = current;
+  previousProcessCpuAt = now;
+  return {
+    oneCorePercent: Math.round(oneCorePercent * 10) / 10,
+    machinePercent: Math.round((oneCorePercent / availableParallelism()) * 10) / 10,
+    userMs: Math.round(current.user / 1_000),
+    systemMs: Math.round(current.system / 1_000),
+  };
+}
+
+function agentResourceSnapshot() {
+  const scheduler = mediaScheduler.snapshot();
+  const processes = mediaProcessRegistry.snapshot();
+  const memory = process.memoryUsage();
+  const jobStatuses = {};
+  for (const job of jobs.values()) {
+    jobStatuses[job.status] = (jobStatuses[job.status] || 0) + 1;
+  }
+  const activeResources = {};
+  for (const resource of process.getActiveResourcesInfo?.() || []) {
+    activeResources[resource] = (activeResources[resource] || 0) + 1;
+  }
+  return {
+    uptimeSeconds: Math.round(process.uptime()),
+    cpu: sampleProcessCpu(),
+    memory: {
+      rssBytes: memory.rss,
+      heapUsedBytes: memory.heapUsed,
+      heapTotalBytes: memory.heapTotal,
+      externalBytes: memory.external,
+      arrayBuffersBytes: memory.arrayBuffers,
+    },
+    responsiveness: scheduler.responsiveness,
+    scheduler: {
+      foregroundJobId: scheduler.foregroundJobId,
+      active: scheduler.active,
+      queuedTasks: scheduler.queued.length,
+    },
+    processes: processes.active.map((entry) => ({
+      pid: entry.pid,
+      jobId: entry.jobId,
+      taskId: entry.taskId,
+      stage: entry.stage,
+      encoder: entry.encoder,
+      decoder: entry.decoder,
+      hardware: entry.hardware,
+      profile: entry.profile,
+      runningMs: Date.now() - entry.startedAt,
+      progress: entry.progress,
+    })),
+    torrents: {
+      count: client.torrents.length,
+      peers: client.torrents.reduce((total, torrent) => total + torrent.numPeers, 0),
+      downloadSpeed: client.downloadSpeed,
+      uploadSpeed: client.uploadSpeed,
+      pendingVerifications: Array.from(jobs.values())
+        .filter((job) => Boolean(job.torrentVerificationPromise)).length,
+    },
+    jobs: jobStatuses,
+    activeResources,
+  };
+}
+
+function writeResourceSnapshot() {
+  const snapshot = agentResourceSnapshot();
+  const busy = Boolean(snapshot.scheduler.active) || snapshot.scheduler.queuedTasks > 0 ||
+    snapshot.processes.length > 0 || Object.entries(snapshot.jobs)
+      .some(([status, count]) => count > 0 && ["metadata", "downloading", "probing", "preparing"].includes(status));
+  const pressure = snapshot.responsiveness.systemCpuPercent > 85 ||
+    snapshot.responsiveness.eventLoopDelayMaxMs > 250;
+  idleDiagnosticTicks += 1;
+  if (!busy && !pressure && idleDiagnosticTicks < 12) return;
+  idleDiagnosticTicks = 0;
+  agentLogger.info("resource_snapshot", snapshot);
+}
+
 await restoreJobs();
 const persistenceTimer = setInterval(persistJobs, 2_000);
 persistenceTimer.unref?.();
+const resourceDiagnosticTimer = setInterval(writeResourceSnapshot, 5_000);
+resourceDiagnosticTimer.unref?.();
+writeResourceSnapshot();
 const cleanupTimer = setInterval(() => void runStorageCleanup().catch((error) => {
   console.warn(`Automatic cleanup failed: ${error.message}`);
 }), CLEANUP_INTERVAL_MS);
@@ -1895,6 +2166,17 @@ setTimeout(() => void runStorageCleanup().catch((error) => {
 
 const server = createServer(async (request, response) => {
   const url = new URL(request.url || "/", "http://" + HOST + ":" + PORT);
+  const requestStartedAt = Date.now();
+  response.once("finish", () => {
+    const durationMs = Date.now() - requestStartedAt;
+    if (durationMs < 2_000 || url.pathname.startsWith("/stream/") || url.pathname.startsWith("/hls/")) return;
+    agentLogger.warn("slow_agent_request", {
+      method: request.method,
+      path: url.pathname,
+      statusCode: response.statusCode,
+      durationMs,
+    });
+  });
 
   if (request.method === "GET" && url.pathname === "/pair") {
     try {
@@ -1961,11 +2243,18 @@ const server = createServer(async (request, response) => {
       const scheduler = mediaScheduler.snapshot();
       const processes = mediaProcessRegistry.snapshot();
       const activeProcess = processes.active[0] || null;
+      const logDetails = agentLogger.details();
       sendJson(response, 200, {
         ok: true,
         version: APP_VERSION,
         protocolVersion: PROTOCOL_VERSION,
         downloadDirectory: DOWNLOAD_DIR,
+        logging: {
+          enabled: logDetails.enabled,
+          fileName: logDetails.fileName,
+          maxBytes: logDetails.maxBytes,
+          maxFiles: logDetails.maxFiles,
+        },
         platform: process.platform,
         torrent: {
           port: client.torrentPort || TORRENT_PORT,
@@ -2000,6 +2289,7 @@ const server = createServer(async (request, response) => {
         transcoder: TRANSCODER,
         scheduler: mediaScheduler.snapshot(),
         processes: mediaProcessRegistry.snapshot(),
+        resources: agentResourceSnapshot(),
       }, headers);
       return;
     }
@@ -2221,6 +2511,12 @@ const server = createServer(async (request, response) => {
 
     sendJson(response, 404, { error: "Not found." }, headers);
   } catch (error) {
+    agentLogger.warn("agent_request_failed", {
+      method: request.method,
+      path: url.pathname,
+      durationMs: Date.now() - requestStartedAt,
+      error,
+    });
     sendJson(response, 400, {
       error: error instanceof Error ? error.message : "Agent request failed.",
     }, headers);
@@ -2231,14 +2527,24 @@ server.once("error", (error) => {
   const message = error?.code === "EADDRINUSE"
     ? `Another WatchPair companion is already using http://${HOST}:${PORT}.`
     : `WatchPair agent could not listen on http://${HOST}:${PORT}: ${error.message}`;
+  agentLogger.error("agent_listen_failed", { host: HOST, port: PORT, error });
   console.error(message);
   process.exitCode = error?.code === "EADDRINUSE" ? 72 : 1;
   void shutdown().finally(() => process.exit(process.exitCode || 1));
 });
 
 server.listen(PORT, HOST, () => {
+  agentLogger.info("agent_listening", {
+    host: HOST,
+    port: PORT,
+    downloadDirectory: DOWNLOAD_DIR,
+    allowedOrigins: ALLOWED_ORIGINS.size,
+    transcoder: TRANSCODER,
+    logging: agentLogger.details(),
+  });
   console.log(`WatchPair agent listening on http://${HOST}:${PORT}`);
   console.log(`Downloads: ${DOWNLOAD_DIR}`);
+  console.log(`Logs: ${agentLogger.details().filePath}`);
   console.log(`Transcoder: ${TRANSCODER.label} via ${TRANSCODER.ffmpegSource} FFmpeg`);
   console.log(`Allowed origins: ${Array.from(ALLOWED_ORIGINS).join(", ")}`);
 });
@@ -2247,7 +2553,9 @@ let shuttingDown = false;
 const shutdown = async () => {
   if (shuttingDown) return;
   shuttingDown = true;
+  agentLogger.info("agent_shutdown_started", agentResourceSnapshot());
   clearInterval(persistenceTimer);
+  clearInterval(resourceDiagnosticTimer);
   clearInterval(cleanupTimer);
   await hlsPlayback.shutdown();
   mediaScheduler.shutdown();
@@ -2260,6 +2568,7 @@ const shutdown = async () => {
       else client.destroy(resolve);
     }),
   ]);
+  agentLogger.info("agent_shutdown_finished", { uptimeSeconds: Math.round(process.uptime()) });
 };
 process.on("SIGINT", () => void shutdown());
 process.on("SIGTERM", () => void shutdown());

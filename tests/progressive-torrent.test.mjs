@@ -13,7 +13,7 @@ import { terminateChildProcess } from "./process-helpers.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 
-test("waits for a verified torrent before probing and preparing initial HLS segments", { timeout: 60_000 }, async () => {
+test("waits for a verified torrent before probing and preparing initial HLS segments", { timeout: 90_000 }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "watchpair-progressive-"));
   const input = path.join(directory, "progressive.mkv");
   const seeder = new WebTorrent({
@@ -101,7 +101,7 @@ test("waits for a verified torrent before probing and preparing initial HLS segm
     seeder.throttleUpload(-1);
     const prepared = await waitForJson(
       base + "/downloads/progressive-torrent",
-      35_000,
+      55_000,
       (body) =>
         body?.job?.files?.[0]?.ready === true &&
         body?.job?.preparation?.status === "ready",

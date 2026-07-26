@@ -69,6 +69,7 @@ export function createResponsivenessMonitor({ intervalMs = 250, sampleCount = 12
       return {
         eventLoopDelayP50Ms: Math.round(percentile(0.5) * 10) / 10,
         eventLoopDelayP95Ms: Math.round(percentile(0.95) * 10) / 10,
+        eventLoopDelayMaxMs: Math.round((sorted.at(-1) || 0) * 10) / 10,
         systemCpuPercent: Math.round(systemCpuPercent * 10) / 10,
       };
     },
@@ -80,12 +81,24 @@ export function createResponsivenessMonitor({ intervalMs = 250, sampleCount = 12
   };
 }
 
-export function createMediaTaskScheduler({ monitor = createResponsivenessMonitor(), retryDelayMs = 500 } = {}) {
+export function createMediaTaskScheduler({
+  monitor = createResponsivenessMonitor(),
+  retryDelayMs = 500,
+  onEvent = () => {},
+} = {}) {
   const pending = [];
   let activeTask = null;
   let foregroundJobId = null;
   let sequence = 0;
   let draining = false;
+  let lastDeferredLogAt = 0;
+  const emit = (event, data) => {
+    try {
+      onEvent(event, data);
+    } catch {
+      // Diagnostic reporting must never affect media scheduling.
+    }
+  };
   const sort = () => pending.sort((left, right) =>
     Number(right.jobId === foregroundJobId) - Number(left.jobId === foregroundJobId) ||
     Number(right.priority || 0) - Number(left.priority || 0) || left.sequence - right.sequence
@@ -96,6 +109,7 @@ export function createMediaTaskScheduler({ monitor = createResponsivenessMonitor
     if (activeTask.jobId === foregroundJobId &&
       Number(activeTask.priority || 0) >= Number(promoted.priority || 0)) return;
     activeTask.interrupted = true;
+    emit("media_task_preempted", { taskId: activeTask.taskId, jobId: activeTask.jobId, promotedJobId: foregroundJobId });
     void activeTask.interrupt();
   };
   const drain = async () => {
@@ -107,19 +121,53 @@ export function createMediaTaskScheduler({ monitor = createResponsivenessMonitor
         const task = pending[0];
         const foreground = task.jobId === foregroundJobId;
         if (!foreground && monitor.shouldDeferBackground()) {
+          const now = Date.now();
+          if (now - lastDeferredLogAt >= 5_000) {
+            lastDeferredLogAt = now;
+            emit("media_task_deferred", {
+              taskId: task.taskId,
+              jobId: task.jobId,
+              responsiveness: monitor.snapshot(),
+            });
+          }
           await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
           continue;
         }
         pending.shift();
         const profile = mediaResourceProfile(foreground ? "foreground" : "background");
+        const startedAt = Date.now();
         activeTask = { ...task, profile, interrupt: null, interrupted: false };
+        emit("media_task_started", {
+          taskId: task.taskId,
+          jobId: task.jobId,
+          stage: task.stage,
+          profile: `${profile.mode}:${profile.kind}`,
+          queuedMs: startedAt - task.queuedAt,
+        });
         try {
           const result = await task.run(profile);
           activeTask.interrupt = result?.interrupt || null;
           task.resolve(result?.value);
           interruptForForeground();
           await result?.completion;
-        } catch (error) { task.reject(error); } finally { activeTask = null; }
+          emit("media_task_finished", {
+            taskId: task.taskId,
+            jobId: task.jobId,
+            stage: task.stage,
+            durationMs: Date.now() - startedAt,
+          });
+        } catch (error) {
+          emit("media_task_failed", {
+            taskId: task.taskId,
+            jobId: task.jobId,
+            stage: task.stage,
+            durationMs: Date.now() - startedAt,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          task.reject(error);
+        } finally {
+          activeTask = null;
+        }
       }
     } finally {
       draining = false;
@@ -128,20 +176,39 @@ export function createMediaTaskScheduler({ monitor = createResponsivenessMonitor
   };
   return {
     enqueue({ taskId, jobId, stage, priority = 0, run }) {
+      const queuedAt = Date.now();
       const promise = new Promise((resolve, reject) => {
-        pending.push({ taskId, jobId, stage, priority, run, resolve, reject, sequence: sequence++ });
+        pending.push({ taskId, jobId, stage, priority, run, resolve, reject, queuedAt, sequence: sequence++ });
+        emit("media_task_queued", {
+          taskId,
+          jobId,
+          stage,
+          priority,
+          queueDepth: pending.length,
+        });
         sort(); interruptForForeground(); void drain();
       });
       void promise.catch(() => {});
       return promise;
     },
-    prioritize(jobId) { foregroundJobId = jobId || null; sort(); interruptForForeground(); },
+    prioritize(jobId) {
+      foregroundJobId = jobId || null;
+      emit("media_priority_changed", { foregroundJobId });
+      sort();
+      interruptForForeground();
+    },
     cancelJob(jobId, error = new Error("Media work was cancelled.")) {
       const cancelled = pending.filter((task) => task.jobId === jobId);
       for (let index = pending.length - 1; index >= 0; index -= 1) if (pending[index].jobId === jobId) pending.splice(index, 1);
       for (const task of cancelled) task.reject(error);
       if (activeTask?.jobId === jobId && activeTask.interrupt && !activeTask.interrupted) {
         activeTask.interrupted = true; void activeTask.interrupt();
+      }
+      if (cancelled.length || activeTask?.jobId === jobId) {
+        emit("media_job_cancelled", {
+          jobId,
+          queuedTasks: cancelled.length,
+        });
       }
       return cancelled.length;
     },
@@ -154,6 +221,7 @@ export function createMediaTaskScheduler({ monitor = createResponsivenessMonitor
       };
     },
     shutdown() {
+      emit("media_scheduler_stopping", { queuedTasks: pending.length, activeTask: activeTask?.taskId || null });
       for (const task of pending.splice(0)) task.reject(new Error("Media scheduler stopped."));
       if (activeTask?.interrupt && !activeTask.interrupted) void activeTask.interrupt();
       monitor.stop();

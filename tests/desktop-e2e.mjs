@@ -92,6 +92,10 @@ assert.equal(report.initial.agent.health.ok, true);
 assert.equal(report.initial.agent.health.protocolVersion, 1);
 assert.equal(report.initial.agent.health.version, report.initial.version);
 assert.equal(report.initial.version, packageVersion);
+assert.equal(report.initial.agent.health.logging.enabled, true);
+assert.equal(report.initial.logging.directory, path.join(userData, "logs"));
+assert.equal(report.initial.logging.mainFile, "watchpair-main.log");
+assert.equal(report.initial.logging.agentFile, "watchpair-agent.log");
 assert.equal(report.saved.settings.downloadDirectory, downloads);
 assert.equal(report.saved.settings.resourceMode, "eco");
 assert.equal(report.saved.settings.cleanup.downloadRetentionDays, 14);
@@ -109,12 +113,16 @@ assert.deepEqual(report.dom, {
   mediaWork: true,
   update: "Updates are disabled in development",
   downloadDirectory: downloads,
-  sections: 3,
+  logs: "watchpair-main.log · watchpair-agent.log",
+  openLogs: true,
+  sections: 4,
 });
 assert.ok(report.screenshotSize.width >= 650);
 assert.ok(report.screenshotSize.height >= 620);
 assert.ok(report.screenshotBytes > 10_000);
 assert.equal((await stat(report.screenshotPath)).size, report.screenshotBytes);
+assert.ok((await stat(path.join(report.initial.logging.directory, report.initial.logging.mainFile))).size > 0);
+assert.ok((await stat(path.join(report.initial.logging.directory, report.initial.logging.agentFile))).size > 0);
 await new Promise((resolve) => setTimeout(resolve, 1_000));
 terminateProcessTree(child);
 console.log(`Desktop self-test passed (${report.screenshotSize.width}x${report.screenshotSize.height}, ${report.screenshotBytes} bytes).`);

@@ -12,15 +12,33 @@ function publicCommand(value) {
   return parts.at(-1) || null;
 }
 function progressNumber(value) { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : null; }
-export function createProcessRegistry({ historyLimit = 30 } = {}) {
+export function createProcessRegistry({ historyLimit = 30, onEvent = () => {} } = {}) {
   const active = new Map();
   const history = [];
+  function emit(event, data) {
+    try {
+      onEvent(event, data);
+    } catch {
+      // Diagnostic reporting must never affect media processing.
+    }
+  }
   function finish(pid, code, signal, error = null) {
     const record = active.get(pid);
     if (!record) return;
     active.delete(pid);
-    history.unshift({ ...record, status: error ? "error" : code === 0 ? "completed" : "stopped", code, signal, error: error ? String(error.message || error).slice(0, 500) : null, finishedAt: Date.now() });
+    const finishedAt = Date.now();
+    const completed = {
+      ...record,
+      status: error ? "error" : code === 0 ? "completed" : "stopped",
+      code,
+      signal,
+      error: error ? String(error.message || error).slice(0, 500) : null,
+      finishedAt,
+      durationMs: finishedAt - record.startedAt,
+    };
+    history.unshift(completed);
     if (history.length > historyLimit) history.length = historyLimit;
+    emit("media_process_finished", completed);
   }
   return {
     track(child, metadata = {}) {
@@ -36,6 +54,7 @@ export function createProcessRegistry({ historyLimit = 30 } = {}) {
         startedAt: Date.now(), status: "running", progress: {},
       };
       active.set(child.pid, record);
+      emit("media_process_started", record);
       child.once("error", (error) => finish(child.pid, null, null, error));
       child.once("close", (code, signal) => finish(child.pid, code, signal));
       return { update(values) {
