@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.2](https://github.com/Etaselia/watchpair/compare/v0.9.1...v0.9.2) (2026-07-26)
+
+
+### Bug Fixes
+
+* keep browser-ready HLS generations playable ([#39](https://github.com/Etaselia/watchpair/issues/39)) ([1df4dfd](https://github.com/Etaselia/watchpair/commit/1df4dfd614b632ef8316bdadc46d71c9c8e029d2))
+
 ## [0.9.1](https://github.com/Etaselia/watchpair/compare/v0.9.0...v0.9.1) (2026-07-26)
 
 

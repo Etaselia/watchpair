@@ -50,7 +50,7 @@ import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, verifiedTor
 import { createPersistentLogger, installProcessDiagnostics } from "./persistent-log.mjs";
 
 const HOST = "127.0.0.1";
-const APP_VERSION = process.env.WATCHPAIR_APP_VERSION || "0.9.1"; // x-release-please-version
+const APP_VERSION = process.env.WATCHPAIR_APP_VERSION || "0.9.2"; // x-release-please-version
 const PROTOCOL_VERSION = 1;
 const CONTROL_TOKEN = String(process.env.WATCHPAIR_CONTROL_TOKEN || "");
 const PORT = Number(process.env.WATCHPAIR_AGENT_PORT || 41735);

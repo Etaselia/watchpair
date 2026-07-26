@@ -1,6 +1,6 @@
 {
   "name": "watchpair",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "private": true,
   "description": "Self-hosted synchronized video playback with local torrent and media support.",
   "license": "MIT",
