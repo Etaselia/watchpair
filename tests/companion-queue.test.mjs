@@ -86,6 +86,12 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
     assert.equal(acceptedPair.status, 200);
     const pairedHealth = await fetch(base + "/health", { headers: { origin: "https://watch.example" } });
     assert.equal(pairedHealth.headers.get("access-control-allow-origin"), "https://watch.example");
+    const browserDiagnostic = await fetch(base + "/diagnostics/client", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://watch.example" },
+      body: JSON.stringify({ event: "hls_fatal_error", level: "error", readyState: 0, networkState: 2 }),
+    });
+    assert.equal(browserDiagnostic.status, 202);
 
     const ids = ["queuejob-one", "queuejob-two"];
     const priorityResponse = await fetch(base + "/preparation-priority", {
@@ -133,6 +139,7 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
     assert.equal(diagnosticsResponse.status, 200);
     const diagnostics = await diagnosticsResponse.json();
     assert.equal(diagnostics.processes.active.length, 1);
+    assert.ok(Array.isArray(diagnostics.hls.generations));
     assert.equal(JSON.stringify(diagnostics).includes(directory), false);
 
     const completed = await Promise.all(ids.map((id) => waitForJson(
@@ -154,6 +161,7 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
     assert.match(logContents, /"event":"agent_process_started"/);
     assert.match(logContents, /"event":"media_process_started"/);
     assert.match(logContents, /"event":"media_process_finished"/);
+    assert.match(logContents, /"event":"browser_playback_event"/);
     assert.doesNotMatch(logContents, /test-control-token/);
   } finally {
     await terminateChildProcess(companion);

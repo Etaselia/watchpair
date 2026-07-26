@@ -362,6 +362,10 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /Preparing video for this browser/);
   assert.match(app, /HlsRuntime\.isSupported/);
   assert.match(app, /AUDIO_TRACKS_UPDATED/);
+  assert.match(app, /MANIFEST_PARSED/);
+  assert.match(app, /activeFile\?\.ready && activeItem\.ready/);
+  assert.match(app, /HTMLMediaElement\.HAVE_METADATA/);
+  assert.match(app, /HTMLMediaElement\.HAVE_FUTURE_DATA/);
   assert.match(voice, /new RTCPeerConnection/);
   assert.match(voice, /echoCancellation: true/);
   assert.match(voice, /noiseSuppression/);
@@ -403,9 +407,11 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(agent, /torrent\.once\("ready", \(\) => markServing\(torrent\)\)/);
   assert.match(agent, /restoreJobs/);
   assert.match(agent, /preparation-priority/);
+  assert.match(agent, /diagnostics\/client/);
   assert.match(agent, /setPreparationPriority/);
   assert.match(agentClient, /loopback-network/);
   assert.match(agentClient, /getAgentDownloads/);
+  assert.match(agentClient, /reportAgentPlaybackEvent/);
   assert.match(agentClient, /getAgentPermissionState/);
   assert.match(app, /file\.fingerprint === undefined/);
   assert.match(app, /!selectedMedia\.fingerprint/);

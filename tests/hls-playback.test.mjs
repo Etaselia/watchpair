@@ -201,10 +201,98 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
     const cachedVideo = await cachedManager.getAsset(equivalentDescriptor, "video/index.m3u8");
     assert.match(await readPlaylist(cachedVideo.filePath), /#EXT-X-ENDLIST/);
     await cachedManager.removeJob(equivalentDescriptor.jobId);
-    const sharedVideo = path.join(cacheRoot, "content", `${descriptor.contentFingerprint}-${descriptor.fileSize}`, "h264-hls-v6", "video", "index.m3u8");
-    assert.match(await readPlaylist(sharedVideo), /#EXT-X-ENDLIST/);
+    assert.match(await readPlaylist(cachedVideo.filePath), /#EXT-X-ENDLIST/);
     await assert.rejects(stat(path.join(cacheRoot, "jobs", equivalentDescriptor.jobId)), { code: "ENOENT" });
     await cachedManager.shutdown();
+  } finally {
+    await manager?.shutdown();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("keeps the promoted HLS generation playable while a preempted render is replaced", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchpair-hls-preempt-"));
+  const input = path.join(directory, "input.mkv");
+  const cacheRoot = path.join(directory, "cache");
+  const events = [];
+  const states = [];
+  let manager;
+
+  try {
+    await runFile(ffmpegPath, [
+      "-hide_banner", "-loglevel", "error", "-y",
+      "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=8",
+      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=8",
+      "-map", "0:v:0", "-map", "1:a:0",
+      "-c:v", "mpeg4", "-q:v", "6", "-c:a", "aac", "-shortest",
+      input,
+    ]);
+    const fileSize = (await stat(input)).size;
+    const common = {
+      fileIndex: 0,
+      fileSize,
+      inputPath: input,
+      videoCodec: "mpeg4",
+      videoPixelFormat: "yuv420p",
+      videoProfile: "Simple Profile",
+      audioTracks: [{
+        id: "1",
+        streamIndex: 1,
+        language: "eng",
+        label: "English",
+        codec: "aac",
+        channels: 1,
+        default: true,
+      }],
+    };
+    const background = {
+      ...common,
+      jobId: "background-preempt-test",
+      contentFingerprint: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      inputArguments: ["-readrate", "0.5"],
+      onState: (preparation, transition) => states.push({ preparation, transition }),
+    };
+    const foreground = {
+      ...common,
+      jobId: "foreground-preempt-test",
+      contentFingerprint: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      inputArguments: ["-readrate", "8"],
+    };
+
+    manager = createHlsPlaybackManager({
+      ffmpegPath,
+      cacheRoot,
+      segmentSeconds: 1,
+      playableSeconds: 1,
+      playlistWaitMs: 10_000,
+      onEvent: (event, data) => events.push({ event, data }),
+    });
+
+    const initialPreparation = await manager.prepare(background);
+    assert.equal(initialPreparation.status, "ready");
+    assert.ok(initialPreparation.generationId);
+    const initialAsset = await manager.getAsset(background, "video/index.m3u8");
+    assert.doesNotMatch(await readPlaylist(initialAsset.filePath), /#EXT-X-ENDLIST/);
+
+    const foregroundPreparation = manager.prepare(foreground);
+    manager.setPriorityJob(foreground.jobId);
+    assert.equal((await foregroundPreparation).status, "ready");
+
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (events.some(({ event }) => event === "hls_generation_preempted")) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    const retainedAsset = await manager.getAsset(background, "video/index.m3u8");
+    assert.equal(retainedAsset.filePath, initialAsset.filePath);
+    assert.match(await readPlaylist(retainedAsset.filePath), /segment-000000\.m4s/);
+    const firstReady = states.findIndex(({ preparation }) => preparation.status === "ready");
+    assert.ok(firstReady >= 0, JSON.stringify(states));
+    assert.ok(states.slice(firstReady).every(({ preparation }) => preparation.status === "ready"), JSON.stringify(states));
+    assert.ok(events.some(({ event }) => event === "hls_generation_preempted"), JSON.stringify(events));
+    assert.ok(manager.diagnostics().generations.some((generation) =>
+      generation.jobId === background.jobId && generation.servingGenerationId
+    ));
   } finally {
     await manager?.shutdown();
     await rm(directory, { recursive: true, force: true });

@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   CPU_ENCODER,
@@ -21,10 +22,16 @@ import {
   createProcessRegistry,
 } from "./process-registry.mjs";
 
-const CACHE_VERSION = "hls-v6";
+const CACHE_VERSION = "hls-v7";
 const DEFAULT_SEGMENT_SECONDS = 4;
 const DEFAULT_PLAYABLE_SECONDS = 120;
 const PLAYLIST_WAIT_MS = 15 * 60_000;
+const GENERATION_POINTER = "current.json";
+
+function playlistDuration(playlist) {
+  return Array.from(playlist.matchAll(/^#EXTINF:([\d.]+)/gm))
+    .reduce((total, match) => total + Number(match[1] || 0), 0);
+}
 
 function quoted(value) {
   return String(value || "")
@@ -140,14 +147,23 @@ export function createHlsPlaybackManager({
   playlistWaitMs = PLAYLIST_WAIT_MS,
   scheduler,
   processRegistry,
+  onEvent = () => {},
 }) {
   const sessions = new Map();
+  const activeStates = new Map();
   let shuttingDown = false;
   let priorityOwnerJobId = null;
   const ownsScheduler = !scheduler;
   const mediaScheduler = scheduler || createMediaTaskScheduler();
   const jobSchedulerIds = new Map();
   const registry = processRegistry || createProcessRegistry();
+  const emit = (event, data) => {
+    try {
+      onEvent(event, data);
+    } catch {
+      // Diagnostics must never affect media preparation.
+    }
+  };
 
   function validContentFingerprint(descriptor) {
     const value = String(descriptor.contentFingerprint || "").toLowerCase();
@@ -176,6 +192,10 @@ export function createHlsPlaybackManager({
     return path.join(cacheRoot, "jobs", descriptor.jobId, `${descriptor.fileIndex}-${descriptor.fileSize}-${descriptor.rendition || "h264"}-${CACHE_VERSION}`);
   }
 
+  function generationDirectory(directory, generationId) {
+    return path.join(directory, "generations", generationId);
+  }
+
   async function cacheIsComplete(directory, audioTracks) {
     if (!(await completePlaylist(path.join(directory, "video", "index.m3u8")))) return false;
     return Promise.all(
@@ -183,6 +203,130 @@ export function createHlsPlaybackManager({
         completePlaylist(path.join(directory, "audio", trackDirectory(track), "index.m3u8"))
       )
     ).then((values) => values.every(Boolean));
+  }
+
+  async function generationState(directory, audioTracks) {
+    const primaryAudioTrack = audioTracks.find((track) => track.default) || audioTracks[0] || null;
+    const requiredAssets = [
+      "master.m3u8",
+      "video/init.mp4",
+      "video/index.m3u8",
+      ...(primaryAudioTrack
+        ? [
+            `audio/${trackDirectory(primaryAudioTrack)}/init.mp4`,
+            `audio/${trackDirectory(primaryAudioTrack)}/index.m3u8`,
+          ]
+        : []),
+    ];
+    if (!(await Promise.all(requiredAssets.map((asset) => exists(path.join(directory, asset))))).every(Boolean)) {
+      return { playable: false, complete: false, bufferedSeconds: 0 };
+    }
+
+    const playlists = await Promise.all([
+      readFile(path.join(directory, "video", "index.m3u8"), "utf8"),
+      ...(primaryAudioTrack
+        ? [readFile(path.join(directory, "audio", trackDirectory(primaryAudioTrack), "index.m3u8"), "utf8")]
+        : []),
+    ]);
+    const bufferedSeconds = Math.min(...playlists.map(playlistDuration));
+    const complete = await cacheIsComplete(directory, audioTracks);
+    return {
+      playable: complete || bufferedSeconds >= playableSeconds,
+      complete,
+      bufferedSeconds: Math.round(bufferedSeconds * 1000) / 1000,
+    };
+  }
+
+  async function activeGeneration(directory, audioTracks) {
+    try {
+      const pointer = JSON.parse(await readFile(path.join(directory, GENERATION_POINTER), "utf8"));
+      const generationId = String(pointer.generationId || "");
+      if (!/^[a-f0-9-]{16,80}$/.test(generationId)) return null;
+      const generationPath = generationDirectory(directory, generationId);
+      const state = await generationState(generationPath, audioTracks);
+      return state.playable ? { generationId, directory: generationPath, ...state } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function persistActiveGeneration(directory, generationId) {
+    await mkdir(directory, { recursive: true });
+    const pointer = path.join(directory, GENERATION_POINTER);
+    const temporary = `${pointer}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temporary, JSON.stringify({ generationId }));
+    try {
+      await rename(temporary, pointer);
+    } catch (error) {
+      if (!["EEXIST", "EPERM"].includes(error?.code)) throw error;
+      await rm(pointer, { force: true });
+      await rename(temporary, pointer);
+    }
+  }
+
+  async function cleanupInactiveGenerations(directory, keep = new Set()) {
+    const root = path.join(directory, "generations");
+    const entries = await readdir(root, { withFileTypes: true }).catch((error) =>
+      error?.code === "ENOENT" ? [] : Promise.reject(error)
+    );
+    await Promise.all(entries
+      .filter((entry) => entry.isDirectory() && !keep.has(entry.name))
+      .map((entry) => rm(path.join(root, entry.name), { recursive: true, force: true })));
+  }
+
+  function observeState(state, descriptor) {
+    if (typeof descriptor.onState !== "function") return;
+    state.observers.set(descriptor.jobId, descriptor.onState);
+    try {
+      descriptor.onState(preparationState(state), { event: "observed" });
+    } catch {
+      // A stale job observer must not affect preparation shared by another job.
+    }
+  }
+
+  function notifyState(state, event, detail = {}) {
+    const snapshot = preparationState(state);
+    for (const observer of state.observers.values()) {
+      try {
+        observer(snapshot, { event, ...detail });
+      } catch {
+        // State reporting is best effort and must never interrupt FFmpeg.
+      }
+    }
+  }
+
+  async function promoteGeneration(state, reason) {
+    if (state.servingGenerationId === state.generationId) {
+      const rendered = await generationState(state.renderDirectory, state.audioTracks);
+      state.bufferedSeconds = rendered.bufferedSeconds;
+      state.complete = rendered.complete;
+      state.status = "ready";
+      notifyState(state, "generation-updated", { reason });
+      return;
+    }
+    if (state.promotion) return state.promotion;
+    state.promotion = (async () => {
+      const rendered = await generationState(state.renderDirectory, state.audioTracks);
+      if (!rendered.playable) throw new Error("The rendered HLS generation is not playable.");
+      await persistActiveGeneration(state.baseDirectory, state.generationId);
+      state.servingGenerationId = state.generationId;
+      state.servingDirectory = state.renderDirectory;
+      state.bufferedSeconds = rendered.bufferedSeconds;
+      state.complete = rendered.complete;
+      state.status = "ready";
+      emit("hls_generation_promoted", {
+        jobId: state.jobId,
+        schedulerJobId: state.schedulerJobId,
+        generationId: state.generationId,
+        reason,
+        bufferedSeconds: rendered.bufferedSeconds,
+        complete: rendered.complete,
+      });
+      notifyState(state, "generation-promoted", { reason });
+    })().finally(() => {
+      state.promotion = null;
+    });
+    return state.promotion;
   }
 
   function launch(state, label, args, cwd, metadata = {}) {
@@ -228,7 +372,11 @@ export function createHlsPlaybackManager({
   }
 
   async function initialize(descriptor) {
-    const directory = cacheDirectory(descriptor);
+    const baseDirectory = cacheDirectory(descriptor);
+    const active = await activeGeneration(baseDirectory, descriptor.audioTracks);
+    await cleanupInactiveGenerations(baseDirectory, new Set(active ? [active.generationId] : []));
+    const generationId = active?.complete ? null : randomUUID();
+    let renderDirectory = generationId ? generationDirectory(baseDirectory, generationId) : null;
     const primaryAudioTrack = descriptor.audioTracks.find((track) => track.default)
       || descriptor.audioTracks[0]
       || null;
@@ -244,12 +392,21 @@ export function createHlsPlaybackManager({
       ownerJobIds: new Set([descriptor.jobId]),
       taskId: `hls:${descriptor.fileIndex}:${descriptor.rendition || "h264"}`,
       inputPath: descriptor.inputPath,
-      directory,
+      baseDirectory,
+      generationId,
+      renderDirectory,
+      servingGenerationId: active?.generationId || null,
+      servingDirectory: active?.directory || null,
+      audioTracks: descriptor.audioTracks,
+      observers: new Map(),
+      promotion: null,
+      bufferedSeconds: active?.bufferedSeconds || 0,
+      complete: Boolean(active?.complete),
       children: new Set(),
       errors: new Map(),
       done: null,
       playable: null,
-      status: "preparing",
+      status: active?.playable ? "ready" : "preparing",
       encoder: selectedEncoder,
       hardwareDecode: Boolean(pipeline?.hardwareDecode),
       pipeline,
@@ -262,8 +419,7 @@ export function createHlsPlaybackManager({
       resourceProfile: descriptor.resourceProfile,
     };
 
-    if (await cacheIsComplete(directory, descriptor.audioTracks)) {
-      state.status = "ready";
+    if (active?.complete) {
       state.done = Promise.resolve();
       state.playable = Promise.resolve();
       return state;
@@ -281,13 +437,16 @@ export function createHlsPlaybackManager({
       if (!pipelineValidation.ok) state.pipelineDiagnostics.push(pipelineValidation.reason);
     }
 
-    await rm(directory, { recursive: true, force: true });
-    const videoDirectory = path.join(directory, "video");
-    await mkdir(videoDirectory, { recursive: true });
-    for (const track of descriptor.audioTracks) {
-      await mkdir(path.join(directory, "audio", trackDirectory(track)), { recursive: true });
-    }
-    await writeFile(path.join(directory, "master.m3u8"), masterPlaylist(descriptor.audioTracks));
+    let videoDirectory;
+    const initializeRenderDirectory = async (directory) => {
+      videoDirectory = path.join(directory, "video");
+      await mkdir(videoDirectory, { recursive: true });
+      for (const track of descriptor.audioTracks) {
+        await mkdir(path.join(directory, "audio", trackDirectory(track)), { recursive: true });
+      }
+      await writeFile(path.join(directory, "master.m3u8"), masterPlaylist(descriptor.audioTracks));
+    };
+    await initializeRenderDirectory(renderDirectory);
 
     const baseArguments = [
       "-hide_banner", "-loglevel", "error", "-y",
@@ -295,10 +454,27 @@ export function createHlsPlaybackManager({
     ];
 
     const clearPrimaryOutputs = async () => {
+      if (state.servingGenerationId === state.generationId) {
+        const replacedGenerationId = state.generationId;
+        state.generationId = randomUUID();
+        renderDirectory = generationDirectory(baseDirectory, state.generationId);
+        state.renderDirectory = renderDirectory;
+        state.complete = false;
+        await initializeRenderDirectory(renderDirectory);
+        emit("hls_generation_restarted", {
+          jobId: state.jobId,
+          schedulerJobId: state.schedulerJobId,
+          generationId: state.generationId,
+          replacingGenerationId: replacedGenerationId,
+          reason: "pipeline-fallback",
+        });
+        void watchGenerationPlayable(renderDirectory, state.generationId);
+        return;
+      }
       await rm(videoDirectory, { recursive: true, force: true });
       await mkdir(videoDirectory, { recursive: true });
       if (primaryAudioTrack) {
-        const audioDirectory = path.join(directory, "audio", trackDirectory(primaryAudioTrack));
+        const audioDirectory = path.join(renderDirectory, "audio", trackDirectory(primaryAudioTrack));
         await rm(audioDirectory, { recursive: true, force: true });
         await mkdir(audioDirectory, { recursive: true });
       }
@@ -343,7 +519,7 @@ export function createHlsPlaybackManager({
           }),
           ...primaryAudioArguments,
         ],
-        directory,
+        renderDirectory,
         {
           stage: primaryAudioTrack ? "video+audio" : "video",
           trackId: primaryAudioTrack ? String(primaryAudioTrack.id) : null,
@@ -395,7 +571,7 @@ export function createHlsPlaybackManager({
 
     const launchAlternateAudio = async (track) => {
       const id = trackDirectory(track);
-      const audioDirectory = path.join(directory, "audio", id);
+      const audioDirectory = path.join(renderDirectory, "audio", id);
       await launch(
         state,
         `audio track ${track.label}`,
@@ -425,6 +601,44 @@ export function createHlsPlaybackManager({
 
     const backgroundAudioTracks = descriptor.audioTracks.filter((track) => track !== primaryAudioTrack);
 
+    const playableAssets = [
+      "video/init.mp4",
+      ...(primaryAudioTrack ? [`audio/${trackDirectory(primaryAudioTrack)}/init.mp4`] : []),
+    ];
+    const playablePlaylists = [
+      "video/index.m3u8",
+      ...(primaryAudioTrack ? [`audio/${trackDirectory(primaryAudioTrack)}/index.m3u8`] : []),
+    ];
+    function watchGenerationPlayable(directory, generationId) {
+      const requiredSeconds = Math.max(
+        playableSeconds,
+        state.bufferedSeconds + segmentSeconds
+      );
+      const waiting = Promise.all(
+        playableAssets.map((asset) => waitForAsset(state, asset, directory))
+      )
+        .then(() => Promise.all(
+          playablePlaylists.map((playlist) =>
+            waitForPlaylistWindow(state, playlist, requiredSeconds, directory)
+          )
+        ))
+        .then(() => {
+          if (state.generationId !== generationId) return;
+          return promoteGeneration(state, "playable-window");
+        });
+      void waiting.catch(() => {});
+      return waiting;
+    }
+    const generationPlayable = watchGenerationPlayable(renderDirectory, state.generationId);
+
+    state.playable = active?.playable ? Promise.resolve() : generationPlayable;
+    emit("hls_generation_started", {
+      jobId: state.jobId,
+      schedulerJobId: state.schedulerJobId,
+      generationId: state.generationId,
+      replacingGenerationId: state.servingGenerationId,
+      profile: `${state.resourceProfile.mode}:${state.resourceProfile.kind}`,
+    });
     state.done = launchPrimary()
       .catch((error) => {
         state.errors.set("video", error);
@@ -443,34 +657,50 @@ export function createHlsPlaybackManager({
           }
         }
       })
-      .then(() => {
-        state.status = "ready";
+      .then(async () => {
+        const rendered = await generationState(renderDirectory, descriptor.audioTracks);
+        if (!rendered.complete) throw new Error("FFmpeg exited without completing every HLS playlist.");
+        await promoteGeneration(state, "complete");
+        state.complete = true;
+        emit("hls_generation_completed", {
+          jobId: state.jobId,
+          schedulerJobId: state.schedulerJobId,
+          generationId: state.generationId,
+          bufferedSeconds: state.bufferedSeconds,
+        });
+        notifyState(state, "generation-completed");
       })
       .catch((error) => {
-        if (state.stopping) return;
-        state.status = "error";
+        if (state.stopping) {
+          emit("hls_generation_preempted", {
+            jobId: state.jobId,
+            schedulerJobId: state.schedulerJobId,
+            generationId: state.generationId,
+            servingGenerationId: state.servingGenerationId,
+          });
+          if (state.servingDirectory) state.status = "ready";
+          notifyState(state, "generation-preempted");
+          return;
+        }
+        state.pipelineDiagnostics.push({
+          code: "hls_generation_failed",
+          stage: "browser-playback",
+          backend: state.encoder.id,
+          message: error instanceof Error ? error.message : String(error),
+        });
+        state.status = state.servingDirectory ? "ready" : "error";
+        emit("hls_generation_failed", {
+          jobId: state.jobId,
+          schedulerJobId: state.schedulerJobId,
+          generationId: state.generationId,
+          servingGenerationId: state.servingGenerationId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        notifyState(state, "generation-failed");
         console.error(`WatchPair ${error.message}`);
-        throw error;
+        if (!state.servingDirectory) throw error;
       });
     void state.done.catch(() => {});
-    const playableAssets = [
-      "video/init.mp4",
-      ...(primaryAudioTrack ? [`audio/${trackDirectory(primaryAudioTrack)}/init.mp4`] : []),
-    ];
-    const playablePlaylists = [
-      "video/index.m3u8",
-      ...(primaryAudioTrack ? [`audio/${trackDirectory(primaryAudioTrack)}/index.m3u8`] : []),
-    ];
-    state.playable = Promise.all(playableAssets.map((asset) => waitForAsset(state, asset)))
-      .then(() => Promise.all(
-        playablePlaylists.map((playlist) =>
-          waitForPlaylistWindow(state, playlist, playableSeconds)
-        )
-      ))
-      .then(() => {
-        if (state.status === "preparing") state.status = "ready";
-      });
-    void state.playable.catch(() => {});
     return state;
   }
 
@@ -489,12 +719,12 @@ export function createHlsPlaybackManager({
         stage: "browser-playback",
         priority: 50,
         run: async (resourceProfile) => {
-          descriptor.onStart?.();
           const state = await initialize({
             ...descriptor,
             schedulerJobId: schedulingId,
             resourceProfile,
           });
+          activeStates.set(key, state);
           return {
             value: state,
             completion: state.done,
@@ -502,6 +732,7 @@ export function createHlsPlaybackManager({
               if (state.stopping) return;
               state.preempted = true;
               state.stopping = true;
+              notifyState(state, "generation-preempting");
               for (const child of state.children) child.kill("SIGTERM");
               void state.done.finally(async () => {
                 if (await invalidatePreempted(descriptor, state) && !state.cancelled && !shuttingDown) await ensure(descriptor);
@@ -517,6 +748,7 @@ export function createHlsPlaybackManager({
     }
     const state = await pending;
     state.ownerJobIds.add(descriptor.jobId);
+    observeState(state, descriptor);
     return state;
   }
 
@@ -525,6 +757,7 @@ export function createHlsPlaybackManager({
     const pending = sessions.get(key);
     if (pending && await pending.catch(() => null) === state) {
       sessions.delete(key);
+      activeStates.delete(key);
       return true;
     }
     return false;
@@ -536,9 +769,10 @@ export function createHlsPlaybackManager({
     return match ? `audio:${match[1]}` : null;
   }
 
-  async function waitForAsset(state, relativePath) {
-    const target = path.resolve(state.directory, relativePath);
-    if (target !== state.directory && !target.startsWith(state.directory + path.sep)) {
+  async function waitForAsset(state, relativePath, directory = state.renderDirectory) {
+    if (!directory) throw new Error("No playable HLS generation is available.");
+    const target = path.resolve(directory, relativePath);
+    if (target !== directory && !target.startsWith(directory + path.sep)) {
       throw new Error("Invalid HLS asset path.");
     }
 
@@ -557,15 +791,14 @@ export function createHlsPlaybackManager({
     return target;
   }
 
-  async function waitForPlaylistWindow(state, relativePath, requiredSeconds) {
-    const filePath = await waitForAsset(state, relativePath);
+  async function waitForPlaylistWindow(state, relativePath, requiredSeconds, directory) {
+    const filePath = await waitForAsset(state, relativePath, directory);
     const started = Date.now();
     while (true) {
       if (state.cancelled) throw new Error("Render was cancelled.");
       if (state.preempted) throw renderPreemptedError();
       const playlist = await readFile(filePath, "utf8").catch(() => "");
-      const duration = Array.from(playlist.matchAll(/^#EXTINF:([\d.]+)/gm))
-        .reduce((total, match) => total + Number(match[1] || 0), 0);
+      const duration = playlistDuration(playlist);
       if (duration >= requiredSeconds || playlist.includes("#EXT-X-ENDLIST")) return filePath;
 
       const errorKey = assetErrorKey(relativePath);
@@ -585,7 +818,10 @@ export function createHlsPlaybackManager({
     while (true) {
       const state = await ensure(descriptor);
       try {
-        const filePath = await waitForAsset(state, relativePath);
+        await state.playable;
+        const servingDirectory = state.servingDirectory;
+        if (!servingDirectory) throw new Error("No playable HLS generation is available.");
+        const filePath = await waitForAsset(state, relativePath, servingDirectory);
         return {
           filePath,
           type: contentType(filePath),
@@ -629,6 +865,10 @@ export function createHlsPlaybackManager({
       },
       hardwareDecode: Boolean(state.hardwareDecode),
       fallback: state.fallback,
+      bufferedSeconds: state.bufferedSeconds,
+      complete: state.complete,
+      generationId: state.servingGenerationId,
+      rendering: Boolean(state.renderDirectory && !state.complete && !state.stopping),
       resourceProfile: state.resourceProfile.kind,
       pipeline: state.pipeline,
       diagnostics: state.pipelineDiagnostics,
@@ -650,10 +890,14 @@ export function createHlsPlaybackManager({
     for (const [key, pending] of matching) {
       const schedulingId = key.split(":", 1)[0];
       if (!orphaned.has(schedulingId)) {
-        void pending.then((state) => state.ownerJobIds.delete(jobId)).catch(() => {});
+        void pending.then((state) => {
+          state.ownerJobIds.delete(jobId);
+          state.observers.delete(jobId);
+        }).catch(() => {});
         continue;
       }
       sessions.delete(key);
+      activeStates.delete(key);
       stopping.push(pending.then(async (state) => {
         state.cancelled = true;
         state.stopping = true;
@@ -687,6 +931,7 @@ export function createHlsPlaybackManager({
       await state.done?.catch(() => {});
     })));
     if (ownsScheduler) mediaScheduler.shutdown();
+    activeStates.clear();
   }
 
   return {
@@ -696,7 +941,22 @@ export function createHlsPlaybackManager({
     removeJob,
     setPriorityJob,
     shutdown,
-    diagnostics: () => ({ scheduler: mediaScheduler.snapshot(), processes: registry.snapshot() }),
+    diagnostics: () => ({
+      scheduler: mediaScheduler.snapshot(),
+      processes: registry.snapshot(),
+      generations: Array.from(activeStates.values()).map((state) => ({
+        jobId: state.jobId,
+        schedulerJobId: state.schedulerJobId,
+        status: state.status,
+        generationId: state.generationId,
+        servingGenerationId: state.servingGenerationId,
+        bufferedSeconds: state.bufferedSeconds,
+        complete: state.complete,
+        preempted: state.preempted,
+        childProcesses: state.children.size,
+        resourceProfile: `${state.resourceProfile.mode}:${state.resourceProfile.kind}`,
+      })),
+    }),
   };
 }
 
