@@ -59,6 +59,7 @@ import {
   getAgentConnectUrl,
   getAgentSubtitle,
   getAgentSubtitleBytes,
+  reportAgentPlaybackEvent,
   resolveAgentSource,
   retryAgentDownload,
   scanAgentLibrary,
@@ -921,7 +922,7 @@ export default function WatchApp() {
         localFileBindingRef.current = null;
         readinessRef.current = next;
         setReadiness(next);
-        setMediaUrl(target.hlsUrl || target.streamUrl);
+        setMediaUrl(item.ready ? target.hlsUrl || target.streamUrl : "");
         if (!matchesCurrent) {
           await sendAction("select-media", {
             media: {
@@ -1227,12 +1228,14 @@ export default function WatchApp() {
         voice: readinessRef.current.voice,
       };
       const previous = readinessRef.current;
-      const becameReady = next.ready && (!previous.ready || previous.fingerprint !== next.fingerprint);
+      const readinessChanged =
+        next.ready !== previous.ready ||
+        (next.ready && previous.fingerprint !== next.fingerprint);
       readinessRef.current = next;
       setReadiness(next);
       if (usesLocalFile && localFileBinding) {
         if (mediaUrlRef.current !== localFileBinding.url) setMediaUrl(localFileBinding.url);
-      } else if (activeFile?.ready) {
+      } else if (activeFile?.ready && activeItem.ready) {
         setMediaUrl(activeFile.hlsUrl || activeFile.streamUrl);
       } else if (mediaUrlRef.current.startsWith(AGENT_URL)) {
         setMediaUrl("");
@@ -1247,7 +1250,7 @@ export default function WatchApp() {
           media: { ...selectedMedia, fingerprint: next.fingerprint },
         });
       }
-      if (becameReady) await sendAction("heartbeat", { readiness: next });
+      if (readinessChanged) await sendAction("heartbeat", { readiness: next });
     };
 
     void refresh();
@@ -1413,7 +1416,7 @@ export default function WatchApp() {
         fingerprint: item.fingerprint,
       } : null);
       localFileBindingRef.current = null;
-      setMediaUrl(selectedFile.hlsUrl || selectedFile.streamUrl);
+      setMediaUrl(item.ready ? selectedFile.hlsUrl || selectedFile.streamUrl : "");
       readinessRef.current = next;
       setReadiness(next);
       if (!matchesCurrent) {
@@ -2275,6 +2278,13 @@ interface SyncedPlayerProps {
 }
 
 type HlsVideoRendition = "h264" | "vp9";
+type PlaybackDiagnosticDetails = {
+  level?: "info" | "warn" | "error";
+  message?: string;
+  hlsType?: string;
+  hlsDetails?: string;
+  fatal?: boolean;
+};
 
 function preferredHlsVideoRendition(): HlsVideoRendition {
   if (typeof window === "undefined" || !window.MediaSource?.isTypeSupported) return "h264";
@@ -2373,6 +2383,28 @@ function SyncedPlayer({
     return url.toString();
   }, [hlsVideoRendition, mediaUrl, requestedAudioTrack]);
   const isHlsPlayback = playbackUrl.includes("/hls/") && playbackUrl.includes(".m3u8");
+  const reportPlaybackEvent = useCallback(
+    (event: string, details: PlaybackDiagnosticDetails = {}) => {
+      if (!playbackUrl.startsWith(AGENT_URL)) return;
+      const video = videoRef.current;
+      let playbackPath = "";
+      try {
+        playbackPath = new URL(playbackUrl).pathname;
+      } catch {
+        // Ignore malformed URLs while the selected media is changing.
+      }
+      void reportAgentPlaybackEvent({
+        event,
+        ...details,
+        playbackPath,
+        readyState: video?.readyState,
+        networkState: video?.networkState,
+        mediaErrorCode: video?.error?.code,
+        userAgent: navigator.userAgent,
+      });
+    },
+    [playbackUrl]
+  );
   const assTrackKey = requestedSubtitleTrack?.assUrl || "";
   const assFontKey = (requestedSubtitleTrack?.fonts || []).map((font) => font.url).join("|");
   const assFontUrls = useMemo(() => assFontKey ? assFontKey.split("|") : [], [assFontKey]);
@@ -2497,21 +2529,39 @@ function SyncedPlayer({
 
   const handlePlaybackFailure = useCallback(
     (caught: unknown) => {
-      const autoplayBlocked = caught instanceof DOMException && caught.name === "NotAllowedError";
+      const video = videoRef.current;
+      const exception = caught instanceof DOMException ? caught : null;
+      const transient =
+        exception &&
+        ["AbortError", "NotSupportedError"].includes(exception.name) &&
+        (!video?.currentSrc || (video?.readyState ?? 0) < HTMLMediaElement.HAVE_METADATA);
+      if (transient) {
+        setMediaLoading(true);
+        reportPlaybackEvent(
+          "playback_not_ready",
+          { level: "info", message: exception.message || exception.name }
+        );
+        return;
+      }
+      const autoplayBlocked = exception?.name === "NotAllowedError";
       if (autoplayBlocked) {
         setNeedsGesture(true);
+        reportPlaybackEvent("playback_gesture_required", { level: "info", message: exception.message });
       } else {
         setNeedsGesture(false);
         setMediaLoading(false);
-        setMediaError(
-          mediaUrl.startsWith(AGENT_URL)
-            ? "The companion could not prepare this video for browser playback."
-            : "This video could not be prepared for browser playback."
-        );
+        const message = mediaUrl.startsWith(AGENT_URL)
+          ? "The companion could not prepare this video for browser playback."
+          : "This video could not be prepared for browser playback.";
+        setMediaError(message);
+        reportPlaybackEvent("playback_rejected", {
+          level: "error",
+          message: caught instanceof Error ? caught.message : String(caught),
+        });
       }
       pinControls();
     },
-    [mediaUrl, pinControls]
+    [mediaUrl, pinControls, reportPlaybackEvent]
   );
 
   useEffect(() => {
@@ -2553,16 +2603,39 @@ function SyncedPlayer({
           });
           instance = hls;
           hlsRef.current = hls;
+          hls.on(Events.MANIFEST_PARSED, () => {
+            reportPlaybackEvent("hls_manifest_parsed", { level: "info" });
+          });
           hls.on(Events.AUDIO_TRACKS_UPDATED, () => {
             setHlsAudioRevision((revision) => revision + 1);
           });
           hls.on(Events.ERROR, (_event, data: ErrorData) => {
             if (!data.fatal) return;
             if (data.type === ErrorTypes.MEDIA_ERROR && !hlsRecoveryRef.current) {
+              reportPlaybackEvent(
+                "hls_media_error_recovery",
+                {
+                  level: "warn",
+                  message: data.error?.message || String(data.details),
+                  hlsType: String(data.type),
+                  hlsDetails: String(data.details),
+                  fatal: true,
+                }
+              );
               hlsRecoveryRef.current = true;
               hls.recoverMediaError();
               return;
             }
+            reportPlaybackEvent(
+              "hls_fatal_error",
+              {
+                level: "error",
+                message: data.error?.message || String(data.details),
+                hlsType: String(data.type),
+                hlsDetails: String(data.details),
+                fatal: true,
+              }
+            );
 
             const detail = data.error?.message ? ` ${data.error.message}` : "";
             fail(
@@ -2582,11 +2655,14 @@ function SyncedPlayer({
           return;
         }
 
+        reportPlaybackEvent("hls_unsupported", { level: "error" });
         fail("This browser does not support progressive HLS playback.");
       })
       .catch((caught) => {
         if (active) {
-          fail(caught instanceof Error ? caught.message : "The streaming player could not be loaded.");
+          const message = caught instanceof Error ? caught.message : "The streaming player could not be loaded.";
+          reportPlaybackEvent("hls_loader_failed", { level: "error", message });
+          fail(message);
         }
       });
 
@@ -2596,7 +2672,7 @@ function SyncedPlayer({
       instance?.destroy();
       video.removeAttribute("src");
     };
-  }, [isHlsPlayback, pinControls, playbackUrl]);
+  }, [isHlsPlayback, pinControls, playbackUrl, reportPlaybackEvent]);
 
   useEffect(() => {
     const hls = hlsRef.current;
@@ -2656,7 +2732,7 @@ function SyncedPlayer({
 
   const synchronizePlayback = useCallback((state: PlayerState) => {
     const video = videoRef.current;
-    if (!video) return;
+    if (!video || !video.currentSrc || video.readyState < HTMLMediaElement.HAVE_METADATA) return;
     const serverNow = Date.now() + clockOffsetRef.current;
     const expected = state.paused
       ? state.position
@@ -2676,7 +2752,7 @@ function SyncedPlayer({
 
     if (state.paused && !video.paused) {
       video.pause();
-    } else if (!state.paused && video.paused) {
+    } else if (!state.paused && video.paused && video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
       void video
         .play()
         .then(() => setNeedsGesture(false))
@@ -2868,11 +2944,19 @@ function SyncedPlayer({
             ? session.player.position
             : session.player.position + ((Date.now() - session.player.changedAt) / 1000) * session.player.playbackRate;
           video.currentTime = Math.max(0, expected);
+          reportPlaybackEvent("media_metadata_loaded", { level: "info" });
+          synchronizePlayback(playerStateRef.current);
         }}
-        onCanPlay={() => setMediaLoading(false)}
+        onCanPlay={() => {
+          setMediaLoading(false);
+          reportPlaybackEvent("media_can_play", { level: "info" });
+          synchronizePlayback(playerStateRef.current);
+        }}
         onPlaying={() => setMediaLoading(false)}
         onWaiting={() => setMediaLoading(true)}
-        onError={() => {
+        onError={(event) => {
+          const message = event.currentTarget.error?.message || "HTML media element reported an error.";
+          reportPlaybackEvent("media_element_error", { level: "error", message });
           if (hlsRef.current) return;
           setMediaLoading(false);
           setMediaError(

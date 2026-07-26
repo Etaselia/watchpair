@@ -189,6 +189,7 @@ const hlsPlayback = createHlsPlaybackManager({
   cacheRoot: HLS_DIR,
   scheduler: mediaScheduler,
   processRegistry: mediaProcessRegistry,
+  onEvent: mediaDiagnosticEvent,
 });
 client.on("error", (error) => {
   agentLogger.error("webtorrent_client_error", { error });
@@ -1789,10 +1790,15 @@ async function prepareQueuedJob(job) {
     }
 
     const descriptor = await hlsDescriptor(job, job.selectedIndex);
-    descriptor.onStart = () => {
+    descriptor.onState = (state, transition) => {
       if (!isStillSelected()) return;
-      job.preparation = { status: "preparing", error: null, encoder: null, fallback: false };
+      const diagnostic = state.diagnostics?.at(-1);
+      job.preparation = {
+        ...state,
+        error: state.status === "error" ? diagnostic?.message || "Browser preparation failed." : null,
+      };
       job.updatedAt = Date.now();
+      agentLogger.info("media_preparation_state", { jobId: job.id, status: state.status, transition });
     };
     const result = await hlsPlayback.prepare(descriptor);
     if (isStillSelected()) job.preparation = { ...result, error: null };
@@ -2289,8 +2295,28 @@ const server = createServer(async (request, response) => {
         transcoder: TRANSCODER,
         scheduler: mediaScheduler.snapshot(),
         processes: mediaProcessRegistry.snapshot(),
+        hls: hlsPlayback.diagnostics(),
         resources: agentResourceSnapshot(),
       }, headers);
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/diagnostics/client") {
+      const body = await readJson(request);
+      const level = ["info", "warn", "error"].includes(body.level) ? body.level : "warn";
+      const playbackPath = String(body.playbackPath || "").slice(0, 300);
+      agentLogger[level]("browser_playback_event", {
+        event: String(body.event || "unknown").slice(0, 80),
+        message: String(body.message || "").slice(0, 700),
+        playbackPath: playbackPath.startsWith("/") ? playbackPath : "",
+        readyState: Number.isFinite(body.readyState) ? body.readyState : null,
+        networkState: Number.isFinite(body.networkState) ? body.networkState : null,
+        mediaErrorCode: Number.isFinite(body.mediaErrorCode) ? body.mediaErrorCode : null,
+        hlsType: String(body.hlsType || "").slice(0, 100),
+        hlsDetails: String(body.hlsDetails || "").slice(0, 200),
+        fatal: Boolean(body.fatal),
+        userAgent: String(body.userAgent || "").slice(0, 300),
+      });
+      sendJson(response, 202, { ok: true }, headers);
       return;
     }
 

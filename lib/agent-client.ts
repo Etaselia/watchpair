@@ -136,6 +136,10 @@ export interface AgentPreparation {
   encoder: { id: string; label: string; hardware: boolean } | null;
   hardwareDecode?: boolean;
   fallback: boolean;
+  bufferedSeconds?: number;
+  complete?: boolean;
+  generationId?: string | null;
+  rendering?: boolean;
   pipeline?: AgentVideoPipeline | null;
   diagnostics?: AgentPipelineDiagnostic[];
 }
@@ -299,6 +303,31 @@ export async function selectAgentFile(sourceId: string, fileIndex: number) {
 export async function getAgentDownloads() {
   const result = await agentFetch<{ jobs: AgentJob[] }>("/downloads", { cache: "no-store" });
   return result.jobs;
+}
+
+export interface AgentPlaybackDiagnostic {
+  event: string;
+  level?: "info" | "warn" | "error";
+  message?: string;
+  playbackPath?: string;
+  readyState?: number;
+  networkState?: number;
+  mediaErrorCode?: number;
+  hlsType?: string;
+  hlsDetails?: string;
+  fatal?: boolean;
+  userAgent?: string;
+}
+
+export async function reportAgentPlaybackEvent(diagnostic: AgentPlaybackDiagnostic) {
+  try {
+    await agentFetch<{ ok: boolean }>("/diagnostics/client", {
+      method: "POST",
+      body: JSON.stringify(diagnostic),
+    });
+  } catch {
+    // Playback reporting is best effort, including while the companion reconnects.
+  }
 }
 
 export async function setAgentPlaybackPriority(sourceId: string | null) {
