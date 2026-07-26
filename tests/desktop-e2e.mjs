@@ -93,16 +93,20 @@ assert.equal(report.initial.agent.health.protocolVersion, 1);
 assert.equal(report.initial.agent.health.version, report.initial.version);
 assert.equal(report.initial.version, packageVersion);
 assert.equal(report.saved.settings.downloadDirectory, downloads);
+assert.equal(report.saved.settings.resourceMode, "eco");
 assert.equal(report.saved.settings.cleanup.downloadRetentionDays, 14);
 assert.equal(report.saved.settings.cleanup.cacheRetentionDays, 3);
 assert.equal(report.saved.agent.health.downloadDirectory, downloads);
 assert.equal(report.saved.agent.health.transcoder.preference, "cpu");
+assert.equal(report.saved.agent.health.media.mode, "eco");
 assert.equal(report.cleaned.agent.storage.directory, downloads);
 assert.equal(typeof report.cleaned.agent.storage.usage.bytes, "number");
 assert.deepEqual(report.dom, {
   title: "WatchPair Companion",
   status: "Running",
   transcoder: "CPU (libx264)",
+  resourceMode: "eco",
+  mediaWork: true,
   update: "Updates are disabled in development",
   downloadDirectory: downloads,
   sections: 3,

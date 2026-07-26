@@ -10,13 +10,16 @@ import {
 test("render profiles reserve foreground capacity and constrain background work", () => {
   const foreground = renderResourceProfile("foreground", 16);
   const background = renderResourceProfile("background", 16);
-  assert.equal(foreground.threads, 14);
-  assert.equal(background.threads, 4);
-  assert.equal(foreground.share, 0.85);
-  assert.equal(background.share, 0.25);
-  assert.deepEqual(renderInputArguments(background), ["-readrate", "1.5"]);
+  assert.equal(foreground.threads, 12);
+  assert.equal(background.threads, 3);
+  assert.equal(foreground.share, 0.75);
+  assert.equal(background.share, 0.2);
+  assert.deepEqual(renderInputArguments(background), [
+    "-readrate", "0.75",
+    "-threads:v", "3",
+  ]);
   assert.deepEqual(renderEncoderArguments({ id: "nvenc" }, background), [
-    "-threads", "4", "-surfaces", "2",
+    "-threads", "3", "-surfaces", "2",
   ]);
 });
 

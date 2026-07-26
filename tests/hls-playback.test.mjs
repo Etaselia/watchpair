@@ -47,9 +47,10 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
     jobId: "hls-test-job",
     fileIndex: 0,
     fileSize: 0,
+    contentFingerprint: "0123456789abcdef0123456789abcdef",
     inputPath: input,
     videoCodec: "mpeg4",
-    inputArguments: ["-readrate", "4"],
+    inputArguments: ["-readrate", "1"],
     audioTracks: [
       {
         id: "1",
@@ -72,12 +73,13 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
     ],
   };
 
+  let manager;
   try {
     await runFile(ffmpegPath, [
       "-hide_banner", "-loglevel", "error", "-y",
-      "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=12",
-      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=12",
-      "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000:duration=12",
+      "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=6",
+      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6",
+      "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000:duration=6",
       "-map", "0:v:0", "-map", "1:a:0", "-map", "2:a:0",
       "-c:v", "mpeg4", "-q:v", "6",
       "-c:a", "aac", "-shortest",
@@ -86,7 +88,7 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
 
     descriptor.fileSize = (await stat(input)).size;
 
-    const manager = createHlsPlaybackManager({
+    manager = createHlsPlaybackManager({
       ffmpegPath,
       cacheRoot,
       encoder: {
@@ -96,8 +98,8 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
         hardware: true,
         arguments: ["-c:v", "watchpair_missing_encoder"],
       },
-      segmentSeconds: 2,
-      playableSeconds: 4,
+      segmentSeconds: 1,
+      playableSeconds: 2,
       playlistWaitMs: 15_000,
     });
 
@@ -109,16 +111,22 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
     assert.match(master, /URI="audio\/2\/index\.m3u8"/);
     assert.equal((master.match(/EXT-X-STREAM-INF/g) || []).length, 1);
 
-    const [videoAsset, japaneseAsset, englishAsset] = await Promise.all([
-      manager.getAsset(descriptor, "video/index.m3u8"),
-      manager.getAsset(descriptor, "audio/1/index.m3u8"),
-      manager.getAsset(descriptor, "audio/2/index.m3u8"),
-    ]);
     const initialPreparation = await manager.prepare(descriptor);
     assert.equal(initialPreparation.status, "ready");
     assert.equal(initialPreparation.encoder.id, "cpu");
     assert.equal(initialPreparation.hardwareDecode, false);
     assert.equal(initialPreparation.fallback, true);
+    const initialDiagnostics = manager.diagnostics();
+    assert.ok(initialDiagnostics.processes.active.length <= 1);
+    assert.equal(initialDiagnostics.processes.active[0]?.stage, "video+audio", JSON.stringify(initialDiagnostics));
+
+    const videoAsset = await manager.getAsset(descriptor, "video/index.m3u8");
+    const earlyVideo = await readPlaylist(videoAsset.filePath);
+    assert.doesNotMatch(earlyVideo, /#EXT-X-ENDLIST/, "playback should unlock before conversion finishes");
+    const japaneseAsset = await manager.getAsset(descriptor, "audio/1/index.m3u8");
+    const earlyJapanese = await readPlaylist(japaneseAsset.filePath);
+    assert.match(earlyJapanese, /segment-000001\.m4s/);
+    const englishAsset = await manager.getAsset(descriptor, "audio/2/index.m3u8");
 
     const [video, japanese, english] = await Promise.all([
       readPlaylist(videoAsset.filePath),
@@ -128,11 +136,8 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
     assert.match(video, /#EXT-X-PLAYLIST-TYPE:EVENT/);
     assert.match(video, /segment-000000\.m4s/);
     assert.match(video, /segment-000001\.m4s/);
-    assert.doesNotMatch(video, /#EXT-X-ENDLIST/, "playback should unlock before conversion finishes");
     assert.match(japanese, /segment-000000\.m4s/);
-    assert.match(japanese, /segment-000001\.m4s/);
     assert.match(english, /segment-000000\.m4s/);
-    assert.match(english, /segment-000001\.m4s/);
 
     for (let attempt = 0; attempt < 200; attempt += 1) {
       const playlists = await Promise.all([
@@ -140,10 +145,18 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
         readPlaylist(japaneseAsset.filePath),
         readPlaylist(englishAsset.filePath),
       ]);
+      assert.ok(manager.diagnostics().processes.active.length <= 1);
       if (playlists.every((playlist) => playlist.includes("#EXT-X-ENDLIST"))) break;
       if (attempt === 199) assert.fail("HLS preparation did not finish");
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
+    const completedProcesses = manager.diagnostics().processes.recent
+      .filter((record) => record.jobId === descriptor.jobId)
+      .sort((left, right) => left.startedAt - right.startedAt);
+    for (let index = 1; index < completedProcesses.length; index += 1) {
+      assert.ok(completedProcesses[index - 1].finishedAt <= completedProcesses[index].startedAt);
+    }
+
     const preparation = await manager.prepare(descriptor);
     assert.equal(preparation.status, "ready");
     assert.equal(preparation.encoder.id, "cpu");
@@ -170,26 +183,30 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
     ]);
     assert.ok(videoProbe.streams.some((stream) => stream.codec_name === "h264"));
     assert.ok(audioProbe.streams.some((stream) => stream.codec_name === "aac"));
-    const vp9Descriptor = { ...descriptor, rendition: "vp9" };
+    const vp9Descriptor = { ...descriptor, rendition: "vp9", inputArguments: ["-readrate", "4"] };
     const vp9Preparation = await manager.prepare(vp9Descriptor);
     assert.equal(vp9Preparation.encoder.id, "vp9");
     const vp9Init = await manager.getAsset(vp9Descriptor, "video/init.mp4");
     const vp9Probe = await probeAsset(vp9Init.filePath);
     assert.ok(vp9Probe.streams.some((stream) => stream.codec_name === "vp9"));
 
-    manager.shutdown();
+    await manager.shutdown();
 
     const cachedManager = createHlsPlaybackManager({
       ffmpegPath: path.join(directory, "missing-ffmpeg"),
       cacheRoot,
       playlistWaitMs: 1_000,
     });
-    const cachedVideo = await cachedManager.getAsset(descriptor, "video/index.m3u8");
+    const equivalentDescriptor = { ...descriptor, jobId: "equivalent-job" };
+    const cachedVideo = await cachedManager.getAsset(equivalentDescriptor, "video/index.m3u8");
     assert.match(await readPlaylist(cachedVideo.filePath), /#EXT-X-ENDLIST/);
-    await cachedManager.removeJob(descriptor.jobId);
-    await assert.rejects(stat(path.join(cacheRoot, descriptor.jobId)), { code: "ENOENT" });
-    cachedManager.shutdown();
+    await cachedManager.removeJob(equivalentDescriptor.jobId);
+    const sharedVideo = path.join(cacheRoot, "content", `${descriptor.contentFingerprint}-${descriptor.fileSize}`, "h264-hls-v6", "video", "index.m3u8");
+    assert.match(await readPlaylist(sharedVideo), /#EXT-X-ENDLIST/);
+    await assert.rejects(stat(path.join(cacheRoot, "jobs", equivalentDescriptor.jobId)), { code: "ENOENT" });
+    await cachedManager.shutdown();
   } finally {
+    await manager?.shutdown();
     await rm(directory, { recursive: true, force: true });
   }
 });

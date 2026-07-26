@@ -401,6 +401,7 @@ async function runSelfTest() {
   await mainWindow.webContents.executeJavaScript(`(() => {
     document.querySelector("#download-directory").value = ${JSON.stringify(downloadDirectory)};
     document.querySelector("#transcoder").value = "cpu";
+    document.querySelector("#resource-mode").value = "eco";
     document.querySelector("#download-days").value = "14";
     document.querySelector("#cache-days").value = "3";
     document.querySelector("#max-storage").value = "12";
@@ -420,6 +421,8 @@ async function runSelfTest() {
     title: document.title,
     status: document.querySelector("#agent-status")?.textContent,
     transcoder: document.querySelector("#active-transcoder")?.textContent,
+    resourceMode: document.querySelector("#resource-mode")?.value,
+    mediaWork: Boolean(document.querySelector("#media-work")?.textContent),
     update: document.querySelector("#update-status")?.textContent,
     downloadDirectory: document.querySelector("#download-directory")?.value,
     sections: document.querySelectorAll("main section").length

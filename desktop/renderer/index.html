@@ -82,9 +82,25 @@
             <option value="cpu">CPU only</option>
           </select>
         </label>
+        <label class="field">
+          <span>Resource mode</span>
+          <select id="resource-mode">
+            <option value="eco">Eco</option>
+            <option value="balanced">Balanced</option>
+            <option value="fast">Fast</option>
+          </select>
+        </label>
         <div class="field">
           <span>Active transcoder</span>
           <output id="active-transcoder">Starting</output>
+        </div>
+        <div class="field">
+          <span>Media work</span>
+          <output id="media-work">Starting</output>
+        </div>
+        <div class="field">
+          <span>System pressure</span>
+          <output id="media-pressure">Measuring</output>
         </div>
       </div>
       <label class="toggle-label" for="start-login">
