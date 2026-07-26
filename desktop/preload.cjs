@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld("watchpair", {
   saveSettings: (settings) => invoke("companion:save-settings", settings),
   cleanup: () => invoke("companion:cleanup"),
   openDownloads: () => invoke("companion:open-downloads"),
+  openLogs: () => invoke("companion:open-logs"),
   checkForUpdates: () => invoke("companion:check-update"),
   downloadUpdate: () => invoke("companion:download-update"),
   installUpdate: () => invoke("companion:install-update"),

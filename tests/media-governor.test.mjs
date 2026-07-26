@@ -95,3 +95,35 @@ test("selected playback preempts lower-priority subtitle work for the same conte
   assert.deepEqual(events, ["subtitles:interrupt", "subtitles:stopped", "hls"]);
   scheduler.shutdown();
 });
+
+
+test("media scheduler emits queue lifecycle diagnostics", async () => {
+  const events = [];
+  const monitor = {
+    snapshot: () => ({ eventLoopDelayP95Ms: 0, systemCpuPercent: 0 }),
+    shouldDeferBackground: () => false,
+    stop() {},
+  };
+  const scheduler = createMediaTaskScheduler({
+    monitor,
+    onEvent: (event, data) => events.push({ event, data }),
+  });
+  const result = await scheduler.enqueue({
+    taskId: "diagnostic-task",
+    jobId: "diagnostic-job",
+    stage: "video",
+    run: async () => ({ value: "ready", completion: Promise.resolve() }),
+  });
+  assert.equal(result, "ready");
+  await new Promise((resolve) => setImmediate(resolve));
+  scheduler.shutdown();
+
+  assert.deepEqual(events.map((entry) => entry.event), [
+    "media_task_queued",
+    "media_task_started",
+    "media_task_finished",
+    "media_scheduler_stopping",
+  ]);
+  assert.ok(events[1].data.queuedMs >= 0);
+  assert.ok(events[2].data.durationMs >= 0);
+});

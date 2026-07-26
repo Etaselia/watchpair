@@ -18,6 +18,7 @@ test("imports, seeds, restores, and stops a local companion file", { timeout: 30
   const sourceId = "shared-local-video";
   const bytes = Buffer.alloc(1024 * 1024 + 37, 0x5a);
   let companion;
+  let output = "";
 
   const start = async () => {
     const child = spawn(process.execPath, ["agent/server.mjs"], {
@@ -33,7 +34,6 @@ test("imports, seeds, restores, and stops a local companion file", { timeout: 30
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
-    let output = "";
     child.stdout.on("data", (chunk) => { output += chunk.toString(); });
     child.stderr.on("data", (chunk) => { output += chunk.toString(); });
     await waitForJson(
@@ -56,7 +56,7 @@ test("imports, seeds, restores, and stops a local companion file", { timeout: 30
     const base = `http://127.0.0.1:${agentPort}`;
     const split = 600_000;
     for (const [offset, chunk] of [[0, bytes.subarray(0, split)], [split, bytes.subarray(split)]]) {
-      const response = await fetch(
+      const response = await localFetch(
         `${base}/imports/${sourceId}?offset=${offset}&total=${bytes.length}`,
         { method: "PUT", body: chunk, headers: { "content-type": "application/octet-stream" } },
       );
@@ -66,7 +66,7 @@ test("imports, seeds, restores, and stops a local companion file", { timeout: 30
     }
 
     const seedStarted = Date.now();
-    const seededResponse = await fetch(`${base}/imports/${sourceId}/seed`, {
+    const seededResponse = await localFetch(`${base}/imports/${sourceId}/seed`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "shared-video.mkv", size: bytes.length }),
@@ -96,10 +96,10 @@ test("imports, seeds, restores, and stops a local companion file", { timeout: 30
     assert.equal(seeded.job.files[0].fingerprint, expectedFingerprint);
     assert.equal(seeded.job.managed, true);
     assert.equal(seeded.job.pinned, false);
-    const storage = await (await fetch(base + "/storage")).json();
+    const storage = await (await localFetch(base + "/storage")).json();
     assert.equal(storage.usage.managedJobs, 1);
     assert.equal(storage.cleanup.downloadRetentionDays, 30);
-    const pinnedResponse = await fetch(base + "/downloads/" + sourceId + "/pin", {
+    const pinnedResponse = await localFetch(base + "/downloads/" + sourceId + "/pin", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ pinned: true }),
@@ -107,7 +107,7 @@ test("imports, seeds, restores, and stops a local companion file", { timeout: 30
     assert.equal(pinnedResponse.status, 200);
     assert.equal((await pinnedResponse.json()).job.pinned, true);
 
-    const bulk = await (await fetch(base + "/downloads")).json();
+    const bulk = await (await localFetch(base + "/downloads")).json();
     assert.equal(bulk.jobs.length, 1);
     assert.equal(bulk.jobs[0].id, sourceId);
 
@@ -131,16 +131,36 @@ test("imports, seeds, restores, and stops a local companion file", { timeout: 30
 
     assert.equal(restored.job.identityFingerprint, expectedFingerprint);
     assert.equal(restored.job.files[0].fingerprint, expectedFingerprint);
+    assert.equal(restored.job.files[0].ready, true);
     assert.equal(restored.job.pinned, true);
-    const stopped = await fetch(base + "/downloads/" + sourceId, { method: "DELETE" });
+    const streamed = await localFetch(base + "/stream/" + sourceId + "/0");
+    assert.equal(streamed.status, 200);
+    assert.deepEqual(Buffer.from(await streamed.arrayBuffer()), bytes);
+    const stopped = await localFetch(base + "/downloads/" + sourceId, { method: "DELETE" });
     assert.equal(stopped.status, 200);
-    const afterStop = await (await fetch(base + "/downloads")).json();
+    const afterStop = await (await localFetch(base + "/downloads")).json();
     assert.equal(afterStop.jobs.length, 0);
+  } catch (error) {
+    const diagnosticLog = await readFile(
+      path.join(directory, "logs", "watchpair-agent.log"),
+      "utf8",
+    ).catch(() => "");
+    throw new Error(
+      `${error.message}\nCompanion exit: ${companion?.exitCode ?? "running"}\n` +
+      `Companion output:\n${output}\nAgent log:\n${diagnosticLog.slice(-20_000)}`,
+      { cause: error },
+    );
   } finally {
     await stop(companion);
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+function localFetch(url, init = {}) {
+  const headers = new Headers(init.headers);
+  headers.set("connection", "close");
+  return fetch(url, { ...init, headers });
+}
 
 function listen(server) {
   return new Promise((resolve) => {
@@ -159,7 +179,7 @@ async function waitForJson(url, timeout, ready = (body) => Boolean(body), exited
   const started = Date.now();
   while (Date.now() - started < timeout) {
     try {
-      const response = await fetch(url);
+      const response = await localFetch(url);
       const body = response.ok ? await response.json() : null;
       if (response.ok && ready(body)) return body;
     } catch {

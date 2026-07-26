@@ -14,6 +14,7 @@ const inputs = [
   ["hardware-acceleration.mjs", resolve(root, "agent", "hardware-acceleration.mjs")],
   ["media-governor.mjs", resolve(root, "agent", "media-governor.mjs")],
   ["process-registry.mjs", resolve(root, "agent", "process-registry.mjs")],
+  ["persistent-log.mjs", resolve(root, "agent", "persistent-log.mjs")],
   ["render-queue.mjs", resolve(root, "agent", "render-queue.mjs")],
   ["scheduled-ffmpeg.mjs", resolve(root, "agent", "scheduled-ffmpeg.mjs")],
   ["job-store.mjs", resolve(root, "agent", "job-store.mjs")],

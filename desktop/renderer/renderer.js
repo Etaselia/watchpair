@@ -4,6 +4,7 @@ const elements = Object.fromEntries(
     "choose-directory", "cleanup-enabled", "cleanup-now", "download-days", "cache-days",
     "partial-hours", "max-storage", "min-free-space", "transcoder", "resource-mode", "active-transcoder",
     "media-work", "media-pressure", "start-login", "update-status", "check-update", "download-update",
+    "log-summary", "open-logs",
     "install-update",
     "automatic-checks", "automatic-downloads", "update-progress", "message", "save-settings",
   ].map((id) => [id, document.getElementById(id)])
@@ -84,6 +85,10 @@ function render(next, { populateForm = false } = {}) {
   elements["active-transcoder"].textContent = next.agent.health?.transcoder?.label || "Starting";
   elements["media-work"].textContent = mediaWorkLabel(next.agent.health?.media);
   elements["media-pressure"].textContent = mediaPressureLabel(next.agent.health?.media);
+  elements["log-summary"].textContent = next.logging
+    ? `${next.logging.mainFile} · ${next.logging.agentFile}`
+    : "Local logs unavailable";
+  elements["log-summary"].title = next.logging?.directory || "";
 
   if (populateForm) {
     const settings = next.settings;
@@ -150,6 +155,10 @@ elements["choose-directory"].addEventListener("click", async () => {
   if (selected) elements["download-directory"].value = selected;
 });
 elements["open-downloads"].addEventListener("click", () => window.watchpair.openDownloads());
+elements["open-logs"].addEventListener("click", () => action(
+  () => window.watchpair.openLogs(),
+  "Logs opened"
+));
 elements["save-settings"].addEventListener("click", () => action(
   () => window.watchpair.saveSettings(formSettings()),
   "Settings saved"

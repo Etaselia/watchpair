@@ -27,6 +27,12 @@ const SELF_TEST_RUN_ID = process.env.WATCHPAIR_SELF_TEST_RUN_ID || "";
 if (process.env.WATCHPAIR_TEST_USER_DATA) {
   app.setPath("userData", path.resolve(process.env.WATCHPAIR_TEST_USER_DATA));
 }
+const LOG_DIRECTORY = path.join(app.getPath("userData"), "logs");
+const MAIN_LOG_PATH = path.join(LOG_DIRECTORY, "watchpair-main.log");
+const AGENT_LOG_FILE = "watchpair-agent.log";
+electronLog.transports.file.resolvePathFn = () => MAIN_LOG_PATH;
+electronLog.transports.file.maxSize = 5 * 1024 * 1024;
+electronLog.transports.file.level = "info";
 const AGENT_PORT = Number(process.env.WATCHPAIR_AGENT_PORT || 41735);
 const AGENT_URL = "http://127.0.0.1:" + AGENT_PORT;
 const CONTROL_TOKEN = randomBytes(32).toString("hex");
@@ -46,6 +52,8 @@ let pendingDeepLink = process.argv.find((argument) => argument.startsWith("watch
 let settings;
 let agentState = { status: "starting", error: null, health: null, storage: null };
 let updateState = { status: "idle", version: null, percent: 0, error: null };
+let lastStorageRefreshAt = 0;
+let lastAgentDiagnosticStatus = null;
 
 const singleInstance = app.requestSingleInstanceLock();
 if (!singleInstance) app.quit();
@@ -91,30 +99,68 @@ function publicState() {
     settings,
     agent: agentState,
     update: updateState,
+    logging: {
+      directory: LOG_DIRECTORY,
+      mainFile: path.basename(MAIN_LOG_PATH),
+      agentFile: AGENT_LOG_FILE,
+    },
   };
 }
 
 async function agentFetch(route, init = {}) {
-  const headers = new Headers(init.headers);
-  const response = await fetch(AGENT_URL + route, { ...init, headers });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || `Companion returned ${response.status}.`);
-  return data;
+  const { timeoutMs = 5_000, ...requestInit } = init;
+  const headers = new Headers(requestInit.headers);
+  const startedAt = Date.now();
+  try {
+    const response = await fetch(AGENT_URL + route, {
+      ...requestInit,
+      headers,
+      signal: requestInit.signal || AbortSignal.timeout(timeoutMs),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `Companion returned ${response.status}.`);
+    return data;
+  } finally {
+    const durationMs = Date.now() - startedAt;
+    if (durationMs >= 2_000) electronLog.warn("Slow agent response", { route, durationMs });
+  }
 }
 
-async function refreshAgentState() {
+async function refreshAgentState({ forceStorage = false } = {}) {
+  const startedAt = Date.now();
   try {
-    const [health, storage] = await Promise.all([
+    const shouldRefreshStorage = forceStorage || !agentState.storage ||
+      Date.now() - lastStorageRefreshAt >= 60_000;
+    const storageRequest = shouldRefreshStorage
+      ? agentFetch("/storage")
+        .then((value) => ({ value, error: null }))
+        .catch((error) => ({ value: agentState.storage, error }))
+      : Promise.resolve({ value: agentState.storage, error: null });
+    const [health, storageResult] = await Promise.all([
       agentFetch("/health"),
-      agentFetch("/storage"),
+      storageRequest,
     ]);
-    agentState = { status: "ready", error: null, health, storage };
+    if (shouldRefreshStorage && !storageResult.error) lastStorageRefreshAt = Date.now();
+    if (storageResult.error) electronLog.warn("Storage diagnostics refresh failed", storageResult.error);
+    agentState = { status: "ready", error: null, health, storage: storageResult.value };
   } catch (error) {
     agentState = {
       ...agentState,
       status: agentProcess ? "starting" : "stopped",
       error: error instanceof Error ? error.message : "Companion is unavailable.",
     };
+  }
+  const diagnosticStatus = `${agentState.status}:${agentState.error || ""}`;
+  if (diagnosticStatus !== lastAgentDiagnosticStatus) {
+    const details = {
+      status: agentState.status,
+      error: agentState.error,
+      responseMs: Date.now() - startedAt,
+      media: agentState.health?.media || null,
+    };
+    if (agentState.status === "ready") electronLog.info("Agent connection ready", details);
+    else electronLog.warn("Agent connection changed", details);
+    lastAgentDiagnosticStatus = diagnosticStatus;
   }
   sendState();
   return agentState;
@@ -133,12 +179,59 @@ async function waitForAgent(timeoutMs = 30_000) {
   throw new Error("The companion service did not start in time.");
 }
 
+function safeAgentFatalReport(report) {
+  try {
+    const parsed = JSON.parse(report);
+    const header = parsed.header || {};
+    return {
+      header: {
+        reportVersion: header.reportVersion,
+        event: header.event,
+        trigger: header.trigger,
+        dumpEventTime: header.dumpEventTime,
+        dumpEventTimeStamp: header.dumpEventTimeStamp,
+        processId: header.processId,
+        componentVersions: header.componentVersions,
+        osName: header.osName,
+        osRelease: header.osRelease,
+        osVersion: header.osVersion,
+        arch: header.arch,
+      },
+      javascriptStack: parsed.javascriptStack,
+      nativeStack: parsed.nativeStack,
+      javascriptHeap: parsed.javascriptHeap,
+      resourceUsage: parsed.resourceUsage,
+      uvthreadResourceUsage: parsed.uvthreadResourceUsage,
+      libuv: parsed.libuv,
+      workers: parsed.workers,
+    };
+  } catch (error) {
+    return {
+      parseError: error instanceof Error ? error.message : String(error),
+      reportBytes: Buffer.byteLength(String(report || "")),
+    };
+  }
+}
+
+async function persistAgentFatalReport(type, location, report) {
+  try {
+    await mkdir(LOG_DIRECTORY, { recursive: true });
+    const timestamp = new Date().toISOString().replaceAll(":", "-").replaceAll(".", "-");
+    const reportPath = path.join(LOG_DIRECTORY, `watchpair-agent-fatal-${timestamp}.json`);
+    await writeFile(reportPath, JSON.stringify({ type, location, report: safeAgentFatalReport(report) }, null, 2));
+    electronLog.error("Companion agent fatal report saved", { type, location, reportPath });
+  } catch (error) {
+    electronLog.error("Could not save companion agent fatal report", error);
+  }
+}
+
 async function stopAgentNow() {
   if (agentRestartTimer) clearTimeout(agentRestartTimer);
   agentRestartTimer = null;
   const processToStop = agentProcess;
   agentProcess = null;
   if (!processToStop) return;
+  electronLog.info("Stopping companion agent", { pid: processToStop.pid });
   await new Promise((resolve) => {
     let settled = false;
     const finish = () => {
@@ -149,7 +242,10 @@ async function stopAgentNow() {
     processToStop.once("exit", finish);
     processToStop.postMessage("shutdown");
     setTimeout(() => {
-      if (!settled) processToStop.kill();
+      if (!settled) {
+        electronLog.warn("Companion agent did not stop within eight seconds; terminating it", { pid: processToStop.pid });
+        processToStop.kill();
+      }
       finish();
     }, 8_000).unref?.();
   });
@@ -158,8 +254,10 @@ async function stopAgentNow() {
 async function startAgentNow() {
   await stopAgentNow();
   agentState = { status: "starting", error: null, health: null, storage: null };
+  lastStorageRefreshAt = 0;
   sendState();
   const serverPath = path.join(applicationRoot, "agent", "server.mjs");
+  electronLog.info("Starting companion agent", { port: AGENT_PORT, logFile: AGENT_LOG_FILE });
   const spawnedAgent = utilityProcess.fork(serverPath, [], {
     cwd: app.getPath("userData"),
     env: {
@@ -169,25 +267,44 @@ async function startAgentNow() {
       WATCHPAIR_CONFIG_PATH: path.join(app.getPath("userData"), "agent.json"),
       WATCHPAIR_CONTROL_TOKEN: CONTROL_TOKEN,
       WATCHPAIR_FFPROBE_PATH: packagedFfprobePath(),
+      WATCHPAIR_LOG_DIR: LOG_DIRECTORY,
+      WATCHPAIR_LOG_FILE: AGENT_LOG_FILE,
     },
     stdio: "pipe",
     serviceName: "WatchPair Companion Agent",
   });
   agentProcess = spawnedAgent;
-  spawnedAgent.stdout?.on("data", (chunk) => electronLog.info(String(chunk).trimEnd()));
-  spawnedAgent.stderr?.on("data", (chunk) => electronLog.error(String(chunk).trimEnd()));
+  spawnedAgent.stdout?.on("data", (chunk) => {
+    const message = String(chunk).trimEnd();
+    if (message) electronLog.info("[agent]", message);
+  });
+  spawnedAgent.stderr?.on("data", (chunk) => {
+    const message = String(chunk).trimEnd();
+    if (message) electronLog.error("[agent]", message);
+  });
+  spawnedAgent.on("error", (type, location, report) => {
+    electronLog.error("Companion agent fatal utility-process error", { type, location, pid: spawnedAgent.pid });
+    void persistAgentFatalReport(type, location, report);
+  });
   spawnedAgent.once("exit", (code) => {
-    if (!ownsAgentProcess(agentProcess, spawnedAgent)) return;
+    const owned = ownsAgentProcess(agentProcess, spawnedAgent);
+    const expected = !owned || quitting || restartingAgent;
+    const details = { code, pid: spawnedAgent.pid, expected, quitting, restartingAgent };
+    if (expected) electronLog.info("Companion agent exited", details);
+    else electronLog.error("Companion agent exited unexpectedly", details);
+    if (!owned) return;
     agentProcess = null;
     agentState = { ...agentState, status: "stopped", error: `Companion service exited (${code}).` };
     sendState();
     if (!quitting && !restartingAgent) {
+      electronLog.warn("Scheduling companion agent restart", { delayMs: 3_000 });
       agentRestartTimer = setTimeout(() => void startAgent(), 3_000);
     }
   });
   try {
     await waitForAgent();
   } catch (error) {
+    electronLog.error("Companion agent did not become healthy", error);
     agentState = { ...agentState, status: "error", error: error.message };
     sendState();
   }
@@ -264,6 +381,11 @@ function createWindow() {
   mainWindow.webContents.on("will-navigate", (event, url) => {
     if (url !== mainWindow.webContents.getURL()) event.preventDefault();
   });
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    electronLog.error("Companion renderer process exited", details);
+  });
+  mainWindow.on("unresponsive", () => electronLog.warn("Companion window became unresponsive"));
+  mainWindow.on("responsive", () => electronLog.info("Companion window became responsive again"));
   return mainWindow;
 }
 
@@ -274,6 +396,7 @@ function createTray() {
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: "Open WatchPair Companion", click: () => createWindow() },
     { label: "Open downloads", click: () => void shell.openPath(settings.downloadDirectory) },
+    { label: "Open logs", click: () => void shell.openPath(LOG_DIRECTORY) },
     { type: "separator" },
     { label: "Quit", click: () => { quitting = true; app.quit(); } },
   ]));
@@ -425,6 +548,8 @@ async function runSelfTest() {
     mediaWork: Boolean(document.querySelector("#media-work")?.textContent),
     update: document.querySelector("#update-status")?.textContent,
     downloadDirectory: document.querySelector("#download-directory")?.value,
+    logs: document.querySelector("#log-summary")?.textContent,
+    openLogs: Boolean(document.querySelector("#open-logs")),
     sections: document.querySelectorAll("main section").length
   })`);
   const image = await mainWindow.webContents.capturePage();
@@ -465,15 +590,24 @@ function registerIpc() {
   });
   ipcMain.handle("companion:cleanup", async () => {
     await agentFetch("/cleanup", { method: "POST" });
-    await refreshAgentState();
+    await refreshAgentState({ forceStorage: true });
     return publicState();
   });
   ipcMain.handle("companion:open-downloads", () => shell.openPath(settings.downloadDirectory));
+  ipcMain.handle("companion:open-logs", async () => {
+    await mkdir(LOG_DIRECTORY, { recursive: true });
+    const error = await shell.openPath(LOG_DIRECTORY);
+    if (error) throw new Error(error);
+    return true;
+  });
   ipcMain.handle("companion:check-update", () => checkForUpdates());
   ipcMain.handle("companion:download-update", () => downloadUpdate());
   ipcMain.handle("companion:install-update", () => installUpdate());
 }
 
+app.on("child-process-gone", (_event, details) => {
+  electronLog.error("Electron child process exited", details);
+});
 app.on("second-instance", (_event, argv) => {
   const link = argv.find((argument) => argument.startsWith("watchpair://"));
   if (link) void pairOriginFromLink(link);
@@ -500,7 +634,18 @@ app.on("before-quit", (event) => {
 
 async function initialize() {
   if (TEST_MODE) console.error("WatchPair self-test: Electron ready");
+  await mkdir(LOG_DIRECTORY, { recursive: true });
   electronLog.initialize();
+  electronLog.errorHandler.startCatching({ showDialog: false });
+  electronLog.info("WatchPair Companion initialized", {
+    version: app.getVersion(),
+    platform: process.platform,
+    architecture: process.arch,
+    electron: process.versions.electron,
+    node: process.version,
+    packaged: app.isPackaged,
+    logFile: MAIN_LOG_PATH,
+  });
   await loadSettings();
   app.setAboutPanelOptions({
     applicationName: "WatchPair Companion",

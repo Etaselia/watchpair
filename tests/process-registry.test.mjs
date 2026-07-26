@@ -6,7 +6,10 @@ import { createProcessRegistry } from "../agent/process-registry.mjs";
 test("process registry reports active work without exposing media paths", () => {
   const child = new EventEmitter();
   child.pid = 42;
-  const registry = createProcessRegistry();
+  const events = [];
+  const registry = createProcessRegistry({
+    onEvent: (event, data) => events.push({ event, data }),
+  });
   const tracker = registry.track(child, {
     jobId: "job", stage: "video", command: "C:\\tools\\ffmpeg.exe",
     arguments: ["-i", "C:\\private\\episode.mkv", "C:\\private\\cache\\output.m3u8"],
@@ -22,4 +25,10 @@ test("process registry reports active work without exposing media paths", () => 
   child.emit("close", 0, null);
   assert.equal(registry.snapshot().active.length, 0);
   assert.equal(registry.snapshot().recent[0].status, "completed");
+  assert.deepEqual(events.map((entry) => entry.event), [
+    "media_process_started",
+    "media_process_finished",
+  ]);
+  assert.equal(events[0].data.arguments.at(-2), "<media>");
+  assert.ok(events[1].data.durationMs >= 0);
 });

@@ -70,6 +70,8 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
     assert.equal(health.version, packageVersion);
     assert.equal(health.transcoder.encoder, "cpu");
     assert.equal(health.protocolVersion, 1);
+    assert.equal(health.logging.enabled, true);
+    assert.equal(health.logging.fileName, "watchpair-agent.log");
     const rejectedPair = await fetch(base + "/control/pair", {
       method: "POST",
       headers: { "content-type": "application/json", "x-watchpair-control": "wrong" },
@@ -148,6 +150,11 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
     assert.equal(completed[1].job.preparation.resourceProfile, "foreground");
     assert.equal((await (await fetch(base + "/health")).json()).jobs, 2);
     assert.match(output, /Transcoder: CPU \(libx264\)/);
+    const logContents = await readFile(path.join(directory, "logs", "watchpair-agent.log"), "utf8");
+    assert.match(logContents, /"event":"agent_process_started"/);
+    assert.match(logContents, /"event":"media_process_started"/);
+    assert.match(logContents, /"event":"media_process_finished"/);
+    assert.doesNotMatch(logContents, /test-control-token/);
   } finally {
     await terminateChildProcess(companion);
     await new Promise((resolve) => mediaServer.close(resolve));
