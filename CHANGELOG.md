@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/Etaselia/watchpair/compare/v0.9.0...v0.9.1) (2026-07-26)
+
+
+### Bug Fixes
+
+* **companion:** persist diagnostics and prevent load disconnects ([#37](https://github.com/Etaselia/watchpair/issues/37)) ([5450a8a](https://github.com/Etaselia/watchpair/commit/5450a8aada33e940d01560061a04bfe4bdac7750))
+
 ## [0.9.0](https://github.com/Etaselia/watchpair/compare/v0.8.0...v0.9.0) (2026-07-26)
 
 
