@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.4](https://github.com/Etaselia/watchpair/compare/v0.9.3...v0.9.4) (2026-07-26)
+
+
+### Bug Fixes
+
+* preserve forward seeks and library queue entries ([#43](https://github.com/Etaselia/watchpair/issues/43)) ([fdab6cd](https://github.com/Etaselia/watchpair/commit/fdab6cd2576757df306318aa15698fe6416c0788))
+
 ## [0.9.3](https://github.com/Etaselia/watchpair/compare/v0.9.2...v0.9.3) (2026-07-26)
 
 
