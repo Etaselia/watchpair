@@ -340,6 +340,11 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /const COMPANION_VERSION = "\d+\.\d+\.\d+"; \/\/ x-release-please-version/);
   assert.match(app, /github.com\/Etaselia\/WatchPair\/releases\/tag\/v\$\{COMPANION_VERSION\}/);
   assert.match(app, /getAgentConnectUrl/);
+  assert.match(
+    app,
+    /const chooseLibraryFile[\s\S]*const sourceId = crypto\.randomUUID\(\);[\s\S]*seedAgentLibraryFile/
+  );
+  assert.doesNotMatch(app, /attachAgentLibraryFile/);
   assert.match(app, /toggleQueuedSourcePin/);
   assert.match(app, /embeddedChapters/);
   assert.match(app, /queueReadinessForJob/);
@@ -350,6 +355,9 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /Seeding \/ waiting for peers/);
   assert.match(app, /downloadMode === "automatic"/);
   assert.match(app, /synchronizePlayback/);
+  assert.match(app, /shouldHoldLocalSeek/);
+  assert.match(app, /seek_remote_sync_deferred/);
+  assert.match(app, /onPointerUp=\{finishSeek\}/);
   assert.match(app, /5_000/);
   assert.match(app, /subtitleOffset/);
   assert.match(app, /autoOpenedMediaRef/);
@@ -369,6 +377,7 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /HLS_STARTUP_FLOOR_SECONDS = 0\.15/);
   assert.match(app, /seekableStart: finiteMediaValue/);
   assert.match(agent, /clientEvent: String\(body\.event/);
+  assert.match(agent, /seekTarget: Number\.isFinite/);
   assert.match(voice, /new RTCPeerConnection/);
   assert.match(voice, /echoCancellation: true/);
   assert.match(voice, /noiseSuppression/);

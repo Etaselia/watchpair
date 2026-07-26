@@ -99,6 +99,12 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
         paused: true,
         seekableStart: 0,
         seekableEnd: 8,
+        bufferedStart: 0,
+        bufferedEnd: 4,
+        seekTarget: 18,
+        seekSource: "keyboard",
+        roomPosition: 8,
+        roomActorId: "device-2",
       }),
     });
     assert.equal(browserDiagnostic.status, 202);
@@ -181,6 +187,11 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
     assert.equal(browserRecord.currentTime, 0.15);
     assert.equal(browserRecord.paused, true);
     assert.equal(browserRecord.seekableEnd, 8);
+    assert.equal(browserRecord.bufferedEnd, 4);
+    assert.equal(browserRecord.seekTarget, 18);
+    assert.equal(browserRecord.seekSource, "keyboard");
+    assert.equal(browserRecord.roomPosition, 8);
+    assert.equal(browserRecord.roomActorId, "device-2");
     assert.match(logContents, /"event":"browser_playback_event"/);
     assert.doesNotMatch(logContents, /test-control-token/);
   } finally {
