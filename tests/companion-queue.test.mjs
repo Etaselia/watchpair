@@ -95,8 +95,8 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
     assert.deepEqual(await priorityResponse.json(), {
       ok: true,
       sourceId: ids[1],
-      foregroundLoad: 0.85,
-      backgroundLoad: 0.25,
+      foregroundLoad: 0.75,
+      backgroundLoad: 0.2,
     });
 
     for (let index = 0; index < ids.length; index += 1) {
@@ -114,6 +114,24 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
       });
       assert.equal(response.status, 202);
     }
+
+    const activeHealth = await waitForJson(
+      base + "/health",
+      20_000,
+      (body) => body?.media?.activeProcesses === 1
+    );
+    assert.ok(activeHealth.media.scheduler.active);
+    assert.equal(activeHealth.media.scheduler.queued.length > 0, true);
+    const healthStarted = performance.now();
+    const responsiveHealth = await fetch(base + "/health");
+    assert.equal(responsiveHealth.status, 200);
+    assert.ok(performance.now() - healthStarted < 250);
+
+    const diagnosticsResponse = await fetch(base + "/diagnostics/media");
+    assert.equal(diagnosticsResponse.status, 200);
+    const diagnostics = await diagnosticsResponse.json();
+    assert.equal(diagnostics.processes.active.length, 1);
+    assert.equal(JSON.stringify(diagnostics).includes(directory), false);
 
     const completed = await Promise.all(ids.map((id) => waitForJson(
       base + "/downloads/" + id,

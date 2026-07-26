@@ -1,28 +1,14 @@
-import { availableParallelism, constants, setPriority } from "node:os";
+import { applyMediaProcessPriority, mediaResourceProfile } from "./media-governor.mjs";
 
-const FOREGROUND_SHARE = 0.85;
-const BACKGROUND_SHARE = 0.25;
-
-export function renderResourceProfile(kind, logicalCores = availableParallelism()) {
-  const foreground = kind === "foreground";
-  const share = foreground ? FOREGROUND_SHARE : BACKGROUND_SHARE;
-  const cores = Math.max(1, Number(logicalCores) || 1);
-  return {
-    kind: foreground ? "foreground" : "background",
-    share,
-    threads: Math.max(1, Math.min(cores, Math.round(cores * share))),
-    filterThreads: Math.max(1, Math.min(4, Math.round(cores * share))),
-    inputRate: foreground ? 8 : 1.5,
-    processPriority: foreground
-      ? constants.priority.PRIORITY_BELOW_NORMAL
-      : constants.priority.PRIORITY_LOW,
-    gpuSurfaces: foreground ? 8 : 2,
-    qsvAsyncDepth: foreground ? 4 : 1,
-  };
+export function renderResourceProfile(kind, logicalCores) {
+  return mediaResourceProfile(kind, { logicalCores });
 }
 
 export function renderInputArguments(profile) {
-  return ["-readrate", String(profile.inputRate)];
+  return [
+    "-readrate", String(profile.inputRate),
+    "-threads:v", String(profile.threads),
+  ];
 }
 
 export function renderEncoderArguments(encoder, profile) {
@@ -34,13 +20,7 @@ export function renderEncoderArguments(encoder, profile) {
 }
 
 export function applyRenderProcessPriority(child, profile) {
-  if (!child?.pid) return false;
-  try {
-    setPriority(child.pid, profile.processPriority);
-    return true;
-  } catch {
-    return false;
-  }
+  return applyMediaProcessPriority(child, profile);
 }
 
 export function createSerialRenderQueue() {

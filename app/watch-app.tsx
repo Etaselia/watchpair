@@ -217,6 +217,53 @@ function queueReadinessForJob(job: AgentJob, file: AgentFile | null): QueueReadi
   };
 }
 
+function preparationSummary(job?: AgentJob) {
+  if (!job) return { label: "Waiting for download", title: "", hardware: false };
+  const preparation = job.preparation;
+  const encoder = preparation.encoder?.label || job.transcoder.label;
+  const hardwareDecode = preparation.pipeline?.hardwareDecode ?? preparation.hardwareDecode;
+  let label = "Waiting for download";
+
+  switch (preparation.status) {
+    case "ready":
+      label = preparation.encoder?.hardware
+        ? `${encoder} + ${hardwareDecode ? "GPU" : "CPU"} decode`
+        : encoder || "Browser ready";
+      break;
+    case "direct":
+      label = "Direct playback";
+      break;
+    case "preparing":
+      label = `Preparing with ${job.transcoder.label}`;
+      break;
+    case "queued":
+      label = "Preparation queued";
+      break;
+    case "error":
+      label = "Preparation failed";
+      break;
+  }
+
+  const pipeline = preparation.pipeline;
+  const stages = pipeline
+    ? [pipeline.decode.name, pipeline.filter.name, pipeline.upload.name, pipeline.encode.name]
+        .filter((stage, index, values) => stage !== "none" && values.indexOf(stage) === index)
+        .join(" -> ")
+    : "";
+  const diagnostics = (preparation.diagnostics || [])
+    .map((diagnostic) => diagnostic.message)
+    .filter(Boolean)
+    .join(" ");
+  return {
+    label,
+    title: [stages, diagnostics].filter(Boolean).join(" · "),
+    hardware: Boolean(
+      preparation.encoder?.hardware ||
+      (["queued", "preparing"].includes(preparation.status) && job.transcoder.hardware)
+    ),
+  };
+}
+
 type SubtitleFont =
   | "proportional-sans"
   | "proportional-serif"
@@ -1825,19 +1872,7 @@ export default function WatchApp() {
                 const readyCount = session?.participants.filter(
                   (participant) => participant.queue?.[source.id]?.ready
                 ).length || 0;
-                const preparationLabel = job?.preparation.status === "ready"
-                  ? job.preparation.hardwareDecode
-                    ? `${job.preparation.encoder?.label || "GPU"} + GPU decode`
-                    : job.preparation.encoder?.label || "Browser ready"
-                  : job?.preparation.status === "direct"
-                    ? "Direct playback"
-                    : job?.preparation.status === "preparing"
-                      ? `Preparing with ${job.transcoder.label}`
-                      : job?.preparation.status === "queued"
-                        ? "Preparation queued"
-                        : job?.preparation.status === "error"
-                          ? "Preparation failed"
-                          : "Waiting for download";
+                const preparation = preparationSummary(job);
 
                 return (
                   <article className={`queue-item ${selected ? "selected" : ""}`} key={source.id}>
@@ -1871,12 +1906,10 @@ export default function WatchApp() {
                       )}
                     </div>
 
-                    <div className="queue-preparation">
+                    <div className="queue-preparation" title={preparation.title || undefined}>
                       <Cpu />
-                      <span>{preparationLabel}</span>
-                      {(job?.preparation.encoder?.hardware ||
-                        (["queued", "preparing"].includes(job?.preparation.status || "") && job?.transcoder.hardware)) &&
-                        <strong>GPU</strong>}
+                      <span>{preparation.label}</span>
+                      {preparation.hardware && <strong>GPU</strong>}
                     </div>
 
                     <div className="queue-actions">
@@ -2334,11 +2367,11 @@ function SyncedPlayer({
         return url.toString();
       }
     }
-    if (!playbackAudioTrack) return mediaUrl;
+    if (!requestedAudioTrack) return mediaUrl;
     const url = new URL(mediaUrl);
-    url.searchParams.set("audio", playbackAudioTrack.id);
+    url.searchParams.set("audio", requestedAudioTrack.id);
     return url.toString();
-  }, [hlsVideoRendition, mediaUrl, playbackAudioTrack]);
+  }, [hlsVideoRendition, mediaUrl, requestedAudioTrack]);
   const isHlsPlayback = playbackUrl.includes("/hls/") && playbackUrl.includes(".m3u8");
   const assTrackKey = requestedSubtitleTrack?.assUrl || "";
   const assFontKey = (requestedSubtitleTrack?.fonts || []).map((font) => font.url).join("|");

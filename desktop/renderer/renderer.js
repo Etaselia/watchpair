@@ -2,8 +2,9 @@ const elements = Object.fromEntries(
   [
     "version", "agent-status", "storage-summary", "open-downloads", "download-directory",
     "choose-directory", "cleanup-enabled", "cleanup-now", "download-days", "cache-days",
-    "partial-hours", "max-storage", "min-free-space", "transcoder", "active-transcoder",
-    "start-login", "update-status", "check-update", "download-update", "install-update",
+    "partial-hours", "max-storage", "min-free-space", "transcoder", "resource-mode", "active-transcoder",
+    "media-work", "media-pressure", "start-login", "update-status", "check-update", "download-update",
+    "install-update",
     "automatic-checks", "automatic-downloads", "update-progress", "message", "save-settings",
   ].map((id) => [id, document.getElementById(id)])
 );
@@ -48,6 +49,29 @@ function updateLabel(update) {
   return labels[update.status] || update.status;
 }
 
+function mediaWorkLabel(media) {
+  const scheduler = media?.scheduler;
+  const process = media?.activeProcess;
+  const queued = scheduler?.queued?.length || 0;
+  if (scheduler?.active) {
+    const work = process?.encoder || scheduler.active.stage || "Media processing";
+    return `${work} · ${scheduler.active.profile}${queued ? ` · ${queued} queued` : ""}`;
+  }
+  return queued ? `${queued} queued` : "Idle";
+}
+
+function mediaPressureLabel(media) {
+  const responsiveness = media?.scheduler?.responsiveness;
+  if (!responsiveness) return "Measuring";
+  const cpu = Number.isFinite(responsiveness.systemCpuPercent)
+    ? `${Math.round(responsiveness.systemCpuPercent)}% CPU`
+    : null;
+  const delay = Number.isFinite(responsiveness.eventLoopDelayP95Ms)
+    ? `${Math.round(responsiveness.eventLoopDelayP95Ms)} ms response delay`
+    : null;
+  return [cpu, delay].filter(Boolean).join(" · ") || "Measuring";
+}
+
 function render(next, { populateForm = false } = {}) {
   elements.version.textContent = `Version ${next.version}`;
   elements["agent-status"].textContent = next.agent.status === "ready" ? "Running" : next.agent.status;
@@ -58,6 +82,8 @@ function render(next, { populateForm = false } = {}) {
     ? `${formatBytes(storage.bytes)} used · ${formatBytes(storage.availableBytes)} free · ${storage.pinnedJobs} pinned`
     : next.agent.error || "Reading storage usage";
   elements["active-transcoder"].textContent = next.agent.health?.transcoder?.label || "Starting";
+  elements["media-work"].textContent = mediaWorkLabel(next.agent.health?.media);
+  elements["media-pressure"].textContent = mediaPressureLabel(next.agent.health?.media);
 
   if (populateForm) {
     const settings = next.settings;
@@ -69,6 +95,7 @@ function render(next, { populateForm = false } = {}) {
     elements["max-storage"].value = settings.cleanup.maxStorageGb;
     elements["min-free-space"].value = settings.cleanup.minFreeSpaceGb;
     elements.transcoder.value = settings.transcoder;
+    elements["resource-mode"].value = settings.resourceMode;
     elements["start-login"].checked = settings.startAtLogin;
     elements["automatic-checks"].checked = settings.updates.automaticChecks;
     elements["automatic-downloads"].checked = settings.updates.automaticDownloads;
@@ -87,6 +114,7 @@ function formSettings() {
     downloadDirectory: elements["download-directory"].value,
     startAtLogin: elements["start-login"].checked,
     transcoder: elements.transcoder.value,
+    resourceMode: elements["resource-mode"].value,
     cleanup: {
       enabled: elements["cleanup-enabled"].checked,
       downloadRetentionDays: Number(elements["download-days"].value),

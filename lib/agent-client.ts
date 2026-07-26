@@ -90,6 +90,34 @@ export interface AgentSubtitleFont {
   url: string;
 }
 
+export interface AgentPipelineStage {
+  name: string;
+  hardware: boolean;
+}
+
+export interface AgentVideoPipeline {
+  id: string;
+  backend: string;
+  platform: string;
+  hardwareDecode: boolean;
+  hardwareFilter: boolean;
+  hardwareUpload: boolean;
+  hardwareEncode: boolean;
+  decode: AgentPipelineStage;
+  filter: AgentPipelineStage;
+  upload: AgentPipelineStage;
+  encode: AgentPipelineStage;
+}
+
+export interface AgentPipelineDiagnostic {
+  code: string;
+  stage: string;
+  backend?: string;
+  candidate?: string;
+  message: string;
+  detail?: string;
+}
+
 export interface AgentTranscoder {
   encoder: string;
   label: string;
@@ -97,6 +125,8 @@ export interface AgentTranscoder {
   hardwareDecode?: boolean;
   ffmpegSource: "configured" | "system" | "bundled";
   preference?: string;
+  pipeline?: AgentVideoPipeline;
+  diagnostics?: AgentPipelineDiagnostic[];
 }
 
 export interface AgentPreparation {
@@ -106,6 +136,8 @@ export interface AgentPreparation {
   encoder: { id: string; label: string; hardware: boolean } | null;
   hardwareDecode?: boolean;
   fallback: boolean;
+  pipeline?: AgentVideoPipeline | null;
+  diagnostics?: AgentPipelineDiagnostic[];
 }
 
 export interface AgentJob {
@@ -132,6 +164,8 @@ export interface AgentJob {
   error: string | null;
   subtitleStatus: "waiting" | "probing" | "ready" | "error";
   subtitleError: string | null;
+  subtitleAssetStatus?: "waiting" | "preparing" | "ready" | "error";
+  subtitleAssetError?: string | null;
   audioTracks: AgentAudioTrack[];
   chapters: AgentChapter[];
   subtitles: AgentSubtitleTrack[];

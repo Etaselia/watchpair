@@ -12,6 +12,7 @@ test("desktop settings apply safe retention and update defaults", () => {
   assert.equal(settings.downloadDirectory, path.resolve("downloads"));
   assert.equal(settings.startAtLogin, true);
   assert.equal(settings.transcoder, "auto");
+  assert.equal(settings.resourceMode, "balanced");
   assert.deepEqual(settings.cleanup, {
     enabled: true,
     downloadRetentionDays: 30,
@@ -29,6 +30,7 @@ test("desktop settings apply safe retention and update defaults", () => {
 test("desktop settings clamp invalid values and expose agent environment", () => {
   const settings = normalizeDesktopSettings({
     transcoder: "not-real",
+    resourceMode: "not-real",
     cleanup: {
       enabled: false,
       downloadRetentionDays: -2,
@@ -45,6 +47,7 @@ test("desktop settings clamp invalid values and expose agent environment", () =>
   assert.deepEqual(settingsEnvironment(settings), {
     WATCHPAIR_DOWNLOAD_DIR: "",
     WATCHPAIR_TRANSCODER: "auto",
+    WATCHPAIR_RESOURCE_MODE: "balanced",
     WATCHPAIR_CLEANUP_ENABLED: "0",
     WATCHPAIR_DOWNLOAD_RETENTION_DAYS: "1",
     WATCHPAIR_CACHE_RETENTION_DAYS: "365",
@@ -52,6 +55,15 @@ test("desktop settings clamp invalid values and expose agent environment", () =>
     WATCHPAIR_MAX_STORAGE_GB: "20",
     WATCHPAIR_MIN_FREE_GB: "2",
   });
+});
+
+test("desktop settings preserve supported resource modes", () => {
+  for (const resourceMode of ["eco", "balanced", "fast"]) {
+    const settings = normalizeDesktopSettings({ resourceMode });
+    assert.equal(settings.resourceMode, resourceMode);
+    assert.equal(settingsEnvironment(settings).WATCHPAIR_RESOURCE_MODE, resourceMode);
+  }
+  assert.equal(normalizeDesktopSettings({ resourceMode: " FAST " }).resourceMode, "fast");
 });
 
 test("deep links accept HTTPS and loopback origins only", () => {

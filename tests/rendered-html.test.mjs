@@ -344,7 +344,8 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /embeddedChapters/);
   assert.match(app, /queueReadinessForJob/);
   assert.match(app, /file\.ready && Boolean\(fingerprint\) && \(preparation === "ready" \|\| preparation === "direct"\)/);
-  assert.match(app, /GPU decode/);
+  assert.match(app, /preparation\.pipeline\?\.hardwareDecode/);
+  assert.match(app, /preparation\.diagnostics/);
   assert.match(app, /uploadAndSeedAgentFile/);
   assert.match(app, /Seeding \/ waiting for peers/);
   assert.match(app, /downloadMode === "automatic"/);
@@ -423,6 +424,11 @@ test("packages the pairable magnet and subtitle companion", async () => {
     "WatchPair Companion/server.mjs",
     "WatchPair Companion/hls-playback.mjs",
     "WatchPair Companion/hardware-acceleration.mjs",
+    "WatchPair Companion/media-governor.mjs",
+    "WatchPair Companion/process-registry.mjs",
+    "WatchPair Companion/render-queue.mjs",
+    "WatchPair Companion/scheduled-ffmpeg.mjs",
+    "WatchPair Companion/subtitle-pipeline.mjs",
     "WatchPair Companion/job-store.mjs",
     "WatchPair Companion/torrent-input.mjs",
     "WatchPair Companion/webtorrent-safety.mjs",
@@ -433,6 +439,17 @@ test("packages the pairable magnet and subtitle companion", async () => {
     "WatchPair Companion/pnpm-workspace.yaml",
   ];
   for (const path of expected) assert.ok(archive[path], `Missing ${path}`);
+  for (const [archivePath, contents] of Object.entries(archive)) {
+    if (!archivePath.endsWith(".mjs")) continue;
+    const source = strFromU8(contents);
+    for (const match of source.matchAll(/from\s+["']\.\/(.+?\.mjs)["']/g)) {
+      const dependency = "WatchPair Companion/" + match[1];
+      assert.ok(
+        archive[dependency],
+        `${archivePath} imports missing ${dependency}`
+      );
+    }
+  }
 
   const bundledAgent = strFromU8(archive["WatchPair Companion/server.mjs"]);
   const bundledHls = strFromU8(archive["WatchPair Companion/hls-playback.mjs"]);
@@ -450,7 +467,8 @@ test("packages the pairable magnet and subtitle companion", async () => {
   assert.match(bundledAgent, /window\.close/);
   assert.match(bundledHls, /hls_playlist_type/);
   assert.match(bundledHls, /watchpair-audio/);
-  assert.match(bundledHls, /videoEncoderArguments/);
+  assert.match(bundledHls, /videoPipeline/);
+  assert.match(bundledHls, /pipelineDiagnostics/);
   assert.match(bundledHls, /DEFAULT_PLAYABLE_SECONDS = 120/);
   assert.match(bundledHardware, /h264_nvenc/);
   assert.match(bundledHardware, /h264_qsv/);

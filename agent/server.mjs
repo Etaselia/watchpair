@@ -20,9 +20,19 @@ function unpackedExecutablePath(value) {
     : value;
 }
 import { canCopyH264Video, createHlsPlaybackManager, streamHlsAsset } from "./hls-playback.mjs";
-import { publicTranscoder, selectTranscodeRuntime } from "./hardware-acceleration.mjs";
+import { createMediaTaskScheduler, mediaResourceProfile } from "./media-governor.mjs";
+import { createProcessRegistry } from "./process-registry.mjs";
+import {
+  CPU_ENCODER,
+  publicTranscoder,
+  selectTranscodeRuntime,
+  videoPipeline,
+} from "./hardware-acceleration.mjs";
+import { renderEncoderArguments, renderInputArguments } from "./render-queue.mjs";
+import { createScheduledFfmpegRunner } from "./scheduled-ffmpeg.mjs";
 import { createJsonStore } from "./job-store.mjs";
 import { cacheExpired, cleanupSettingsFromEnvironment, jobCanBeCleaned, jobCleanupReason } from "./cleanup-policy.mjs";
+import { createSubtitleAssetPipeline } from "./subtitle-pipeline.mjs";
 import { chapterProbeArguments, normalizeMediaChapters } from "./media-chapters.mjs";
 import { fingerprintPath } from "./media-fingerprint.mjs";
 import {
@@ -34,9 +44,6 @@ import {
   STYLED_SUBTITLE_CODECS,
   TEXT_SUBTITLE_CODECS,
   fontAttachmentMetadata,
-  fontExtractionArgs,
-  safeFontExtension,
-  subtitleExtractionArgs,
 } from "./subtitle-assets.mjs";
 import { isSupportedMagnet } from "./torrent-input.mjs";
 import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, verifiedTorrentFileProgress, verifyTorrentFilePieces } from "./webtorrent-safety.mjs";
@@ -124,6 +131,17 @@ const jobStore = createJsonStore(JOBS_PATH);
 const preparationQueue = [];
 let preparationWorker = null;
 let activePreparationJobId = null;
+const mediaScheduler = createMediaTaskScheduler();
+const mediaProcessRegistry = createProcessRegistry();
+const runScheduledFfmpeg = createScheduledFfmpegRunner({
+  ffmpegPath: FFMPEG_PATH,
+  scheduler: mediaScheduler,
+  processRegistry: mediaProcessRegistry,
+});
+const subtitleAssetPipeline = createSubtitleAssetPipeline({
+  cacheRoot: SUBTITLE_DIR,
+  runScheduledFfmpeg,
+});
 installWebTorrentSafetyGuards();
 const client = new WebTorrent({
   utp: false,
@@ -135,6 +153,8 @@ const hlsPlayback = createHlsPlaybackManager({
   ffmpegPath: FFMPEG_PATH,
   encoder: TRANSCODE_RUNTIME.encoder,
   cacheRoot: HLS_DIR,
+  scheduler: mediaScheduler,
+  processRegistry: mediaProcessRegistry,
 });
 client.on("error", (error) => console.error(`WebTorrent client error: ${error.message}`));
 client.on("listening", () => {
@@ -491,7 +511,8 @@ async function completeSelectedFile(job, index = job.selectedIndex) {
     if (index !== job.selectedIndex) return;
     job.status = "ready";
     markJobCompleted(job);
-    void queueSubtitleProbe(job);
+    if (activePreparationJobId === job.id) setPreparationPriority(job.id);
+    queueSubtitleAssetPreparation(job);
     queueBackgroundPreparation(job);
   } catch (error) {
     if (index !== job.selectedIndex) return;
@@ -502,6 +523,19 @@ async function completeSelectedFile(job, index = job.selectedIndex) {
 }
 
 function selectTorrentFile(job, index) {
+  if (job.selectedIndex !== null && job.selectedIndex !== index) {
+    try {
+      const previousMedia = selectedJobFile(job);
+      const previousFingerprint = fileIdentityFingerprint(job, job.selectedIndex, previousMedia);
+      if (previousFingerprint) {
+        mediaScheduler.cancelJob(`content-${previousFingerprint}-${previousMedia.size}`);
+      }
+    } catch {
+      // The previous torrent selection may not have metadata yet.
+    }
+    mediaScheduler.cancelJob(job.id);
+    void hlsPlayback.removeJob(job.id).catch(() => {});
+  }
   const file = job.torrent?.files[index];
   if (!file) throw new Error("Torrent file not found.");
   job.torrent.files.forEach((item) => {
@@ -517,6 +551,11 @@ function selectTorrentFile(job, index) {
   job.torrentVerificationPromiseKey = null;
   job.audioTracks = [];
   job.subtitleTracks = [];
+  job.mediaStreams = [];
+  job.subtitleAssetStatus = "waiting";
+  job.subtitleAssetError = null;
+  job.subtitleAssetPromise = null;
+  job.subtitleAssetPromiseKey = null;
   job.chapters = [];
   job.videoCodec = null;
   job.videoPixelFormat = null;
@@ -566,6 +605,11 @@ async function probeSubtitleTracks(job) {
   job.subtitleError = null;
   job.audioTracks = [];
   job.subtitleTracks = [];
+  job.mediaStreams = [];
+  job.subtitleAssetStatus = "waiting";
+  job.subtitleAssetError = null;
+  job.subtitleAssetPromise = null;
+  job.subtitleAssetPromiseKey = null;
   job.chapters = [];
   job.updatedAt = Date.now();
 
@@ -603,6 +647,7 @@ async function probeSubtitleTracks(job) {
         default: Boolean(stream.disposition?.default),
       }));
     const streams = metadata.streams || [];
+    job.mediaStreams = streams;
     const selectionVersion = encodeURIComponent(selectionKey);
     const subtitleFonts = fontAttachmentMetadata(
       streams,
@@ -668,6 +713,52 @@ function queueSubtitleProbe(job) {
   return promise;
 }
 
+async function preparedSubtitleAssets(job) {
+  await queueSubtitleProbe(job);
+  const selectionKey = selectedFileKey(job);
+  if (job.subtitleAssetPromise && job.subtitleAssetPromiseKey === selectionKey) {
+    return job.subtitleAssetPromise;
+  }
+
+  const media = selectedJobFile(job);
+  const mediaKey = await identifySelectedFile(job, job.selectedIndex);
+  const schedulerJobId = `content-${mediaKey}-${media.size}`;
+  job.subtitleAssetStatus = "preparing";
+  job.subtitleAssetError = null;
+  let promise;
+  promise = subtitleAssetPipeline.prepare({
+    mediaPath: media.path,
+    mediaKey,
+    fileSize: media.size,
+    streams: job.mediaStreams,
+    schedulerJobId,
+  }).then((result) => {
+    if (job.subtitleProbeKey === selectionKey) {
+      job.subtitleAssetStatus = "ready";
+      job.subtitleAssetError = null;
+    }
+    return result;
+  }).catch((error) => {
+    if (job.subtitleProbeKey === selectionKey) {
+      job.subtitleAssetStatus = "error";
+      job.subtitleAssetError = error instanceof Error ? error.message : "Subtitle preparation failed.";
+    }
+    throw error;
+  }).finally(() => {
+    if (job.subtitleAssetPromise === promise) {
+      job.subtitleAssetPromise = null;
+      job.subtitleAssetPromiseKey = null;
+    }
+  });
+  job.subtitleAssetPromise = promise;
+  job.subtitleAssetPromiseKey = selectionKey;
+  return promise;
+}
+
+function queueSubtitleAssetPreparation(job) {
+  void preparedSubtitleAssets(job).catch(() => {});
+}
+
 async function subtitleFile(job, trackId, format = "vtt") {
   await queueSubtitleProbe(job);
   const track = job.subtitleTracks.find((item) => item.id === trackId);
@@ -679,20 +770,9 @@ async function subtitleFile(job, trackId, format = "vtt") {
     throw new Error("This subtitle track does not contain ASS/SSA styling.");
   }
 
-  const media = selectedJobFile(job);
-  const directory = path.join(DOWNLOAD_DIR, ".watchpair-subtitles", job.id);
-  const extension = format === "ass" ? ".ass" : ".vtt";
-  const output = path.join(directory, String(job.selectedIndex) + "-" + track.id + extension);
-  await mkdir(directory, { recursive: true });
-  try {
-    await stat(output);
-  } catch {
-    await runFile(
-      FFMPEG_PATH,
-      subtitleExtractionArgs(media.path, track.streamIndex, format, output),
-      { maxBuffer: 8 * 1024 * 1024 }
-    );
-  }
+  const prepared = await preparedSubtitleAssets(job);
+  const output = prepared.subtitles.get(`${track.id}:${format === "ass" ? "ass" : "webvtt"}`);
+  if (!output) throw new Error("The requested subtitle asset was not prepared.");
   return output;
 }
 
@@ -703,28 +783,9 @@ async function subtitleFontFile(job, fontId) {
     .find((item) => item.id === fontId);
   if (!font) throw new Error("Embedded subtitle font not found.");
 
-  const media = selectedJobFile(job);
-  const directory = path.join(DOWNLOAD_DIR, ".watchpair-subtitles", job.id);
-  const output = path.join(
-    directory,
-    String(job.selectedIndex) + "-font-" + font.id + safeFontExtension(font.name)
-  );
-  await mkdir(directory, { recursive: true });
-  try {
-    const info = await stat(output);
-    if (!info.size) throw new Error("Empty cached font");
-  } catch {
-    await runFile(
-      FFMPEG_PATH,
-      fontExtractionArgs(
-        media.path,
-        font.streamIndex,
-        output,
-        process.platform === "win32" ? "NUL" : "/dev/null"
-      ),
-      { maxBuffer: 8 * 1024 * 1024 }
-    );
-  }
+  const prepared = await preparedSubtitleAssets(job);
+  const output = prepared.fonts.get(font.id);
+  if (!output) throw new Error("The requested embedded font was not prepared.");
   return { path: output, mimeType: font.mimeType };
 }
 
@@ -827,6 +888,8 @@ function snapshot(job) {
     error: job.error || null,
     subtitleStatus: job.subtitleStatus,
     subtitleError: job.subtitleError,
+    subtitleAssetStatus: job.subtitleAssetStatus,
+    subtitleAssetError: job.subtitleAssetError,
     audioTracks: job.audioTracks || [],
     chapters: job.chapters || [],
     subtitles: job.subtitleTracks || [],
@@ -949,7 +1012,9 @@ async function startDirect(job) {
     await identifySelectedFile(job);
     job.status = "ready";
     markJobCompleted(job);
+    if (activePreparationJobId === job.id) setPreparationPriority(job.id);
     await queueSubtitleProbe(job);
+    queueSubtitleAssetPreparation(job);
     queueBackgroundPreparation(job);
   } catch (error) {
     job.status = "error";
@@ -989,6 +1054,11 @@ function createJob(source) {
     audioTracks: [],
     chapters: [],
     subtitleTracks: [],
+    mediaStreams: [],
+    subtitleAssetStatus: "waiting",
+    subtitleAssetError: null,
+    subtitleAssetPromise: null,
+    subtitleAssetPromiseKey: null,
     videoCodec: null,
     videoPixelFormat: null,
     videoProfile: null,
@@ -1181,7 +1251,7 @@ async function seedLocalFile({ id, filePath, label, managed = false, ...metadata
       serving = true;
       job.status = "ready";
       markJobCompleted(job);
-      void queueSubtitleProbe(job);
+      queueSubtitleAssetPreparation(job);
       queueBackgroundPreparation(job);
       persistJobs();
     };
@@ -1304,7 +1374,7 @@ async function attachLibraryFile({ id, entry, label }) {
   job.identityFingerprintKey = selectedFileKey(job);
   job.status = "ready";
   markJobCompleted(job);
-  void queueSubtitleProbe(job);
+  queueSubtitleAssetPreparation(job);
   queueBackgroundPreparation(job);
   persistJobs();
   return job;
@@ -1376,7 +1446,7 @@ async function restoreJobs() {
         await identifySelectedFile(job);
         job.status = "ready";
         markJobCompleted(job);
-        void queueSubtitleProbe(job);
+        queueSubtitleAssetPreparation(job);
         queueBackgroundPreparation(job);
       } else {
         await addDownload(record);
@@ -1415,23 +1485,62 @@ async function renderAudioPlayback(job, fileIndex, track) {
   }
 
   await rm(partial, { force: true });
-  try {
-    const videoArgs = canCopyH264Video(job)
-      ? ["-c:v", "copy"]
-      : ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"];
-    await runFile(
-      FFMPEG_PATH,
-      [
-        "-v", "error", "-y", "-i", media.path,
+  const copyVideo = canCopyH264Video(job);
+  const runWithEncoder = async (selectedEncoder, hardwareDecode = Boolean(selectedEncoder.hardware)) => {
+    const pipeline = copyVideo ? null : videoPipeline(selectedEncoder, { hardwareDecode });
+    return runScheduledFfmpeg({
+      jobId: job.id,
+      taskId: `audio-file:${fileIndex}:${track.id}`,
+      stage: "alternate-audio-file",
+      trackId: track.id,
+      encoder: copyVideo ? "Direct stream copy" : selectedEncoder.label,
+      decoder: pipeline?.decode.name || "stream copy",
+      hardware: Boolean(selectedEncoder.hardware),
+      inputPath: media.path,
+      priority: 40,
+      argumentsForProfile: (profile) => [
+        "-hide_banner", "-loglevel", "error", "-y",
+        ...(pipeline?.arguments.decode || []),
+        ...renderInputArguments(profile),
+        "-i", media.path,
         "-map", "0:v:0", "-map", "0:" + track.streamIndex,
-        "-sn", "-dn", ...videoArgs, "-c:a", "aac", "-b:a", "192k",
+        "-sn", "-dn",
+        ...(copyVideo ? ["-c:v", "copy"] : []),
+        ...(pipeline ? [...pipeline.arguments.filter, ...pipeline.arguments.upload] : []),
+        ...(!copyVideo ? selectedEncoder.arguments : []),
+        ...(!copyVideo ? renderEncoderArguments(selectedEncoder, profile) : []),
+        "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart", partial,
       ],
-      { maxBuffer: 8 * 1024 * 1024 }
-    );
+    });
+  };
+
+  try {
+    const initialEncoder = copyVideo
+      ? { id: "copy", label: "Direct stream copy", hardware: false, arguments: [] }
+      : TRANSCODE_RUNTIME.encoder;
+    await runWithEncoder(initialEncoder);
     await rename(partial, output);
     return output;
   } catch (error) {
+    if (!copyVideo && TRANSCODE_RUNTIME.encoder.hardware) {
+      await rm(partial, { force: true });
+      try {
+        await runWithEncoder(TRANSCODE_RUNTIME.encoder, false);
+        await rename(partial, output);
+        return output;
+      } catch {
+        await rm(partial, { force: true });
+      }
+      try {
+        await runWithEncoder(CPU_ENCODER);
+        await rename(partial, output);
+        return output;
+      } catch (fallbackError) {
+        await rm(partial, { force: true });
+        throw fallbackError;
+      }
+    }
     await rm(partial, { force: true });
     throw error;
   }
@@ -1474,10 +1583,12 @@ async function hlsDescriptor(job, fileIndex, rendition = "h264") {
   }
   await queueSubtitleProbe(job);
   const media = jobFile(job, fileIndex);
+  const contentFingerprint = await identifySelectedFile(job, fileIndex);
   return {
     jobId: job.id,
     fileIndex,
     fileSize: media.size,
+    contentFingerprint,
     inputPath: media.path,
     videoCodec: job.videoCodec,
     videoPixelFormat: job.videoPixelFormat,
@@ -1499,8 +1610,6 @@ async function prepareQueuedJob(job) {
   };
 
   try {
-    job.preparation = { status: "preparing", error: null, encoder: null, fallback: false };
-    job.updatedAt = Date.now();
     await queueSubtitleProbe(job);
     if (!isStillSelected()) return;
     const media = selectedJobFile(job);
@@ -1514,7 +1623,13 @@ async function prepareQueuedJob(job) {
       return;
     }
 
-    const result = await hlsPlayback.prepare(await hlsDescriptor(job, job.selectedIndex));
+    const descriptor = await hlsDescriptor(job, job.selectedIndex);
+    descriptor.onStart = () => {
+      if (!isStillSelected()) return;
+      job.preparation = { status: "preparing", error: null, encoder: null, fallback: false };
+      job.updatedAt = Date.now();
+    };
+    const result = await hlsPlayback.prepare(descriptor);
     if (isStillSelected()) job.preparation = { ...result, error: null };
   } catch (error) {
     if (!isStillSelected()) return;
@@ -1535,10 +1650,23 @@ function prioritizePreparationQueue() {
   );
 }
 
+function contentSchedulerIdForJob(job) {
+  if (!job?.identityFingerprint || job.selectedIndex === null) return null;
+  try {
+    const media = selectedJobFile(job);
+    if (job.identityFingerprintKey !== fileIdentityKey(job.selectedIndex, media)) return null;
+    return `content-${job.identityFingerprint}-${media.size}`;
+  } catch {
+    return null;
+  }
+}
+
 function setPreparationPriority(jobId) {
   activePreparationJobId = jobId || null;
   prioritizePreparationQueue();
   hlsPlayback.setPriorityJob(activePreparationJobId);
+  const contentSchedulerId = contentSchedulerIdForJob(jobs.get(activePreparationJobId));
+  if (contentSchedulerId) mediaScheduler.prioritize(contentSchedulerId);
 }
 
 async function drainPreparationQueue() {
@@ -1714,7 +1842,35 @@ async function runStorageCleanup({ force = false } = {}) {
       maxAgeMs: settings.partialRetentionHours * 60 * 60 * 1000,
       include: (entry) => entry.isFile() && /^[a-zA-Z0-9-]{8,80}\.part$/.test(entry.name),
     });
-    for (const entry of [...expiredOwned, ...expiredPartials]) {
+    const mediaWork = mediaScheduler.snapshot();
+    const protectedContentNames = new Set([mediaWork.active, ...mediaWork.queued]
+      .map((task) => task?.jobId)
+      .filter((jobId) => String(jobId || "").startsWith("content-"))
+      .map((jobId) => jobId.slice("content-".length)));
+    for (const job of jobs.values()) {
+      if (cacheExpired(job.lastAccessedAt, settings, now) || !job.identityFingerprint) continue;
+      let media;
+      try {
+        media = selectedJobFile(job);
+      } catch {
+        continue;
+      }
+      if (job.identityFingerprintKey !== fileIdentityKey(job.selectedIndex, media)) continue;
+      protectedContentNames.add(`${job.identityFingerprint}-${media.size}`);
+    }
+    const expiredHlsContent = await pruneExpiredChildren(path.join(HLS_DIR, "content"), {
+      now,
+      maxAgeMs: settings.cacheRetentionDays * 24 * 60 * 60 * 1000,
+      include: (entry) => entry.isDirectory() && /^[a-f0-9]{16,128}-\d+$/.test(entry.name),
+      protectedNames: protectedContentNames,
+    });
+    const expiredSubtitleContent = await pruneExpiredChildren(path.join(SUBTITLE_DIR, "content"), {
+      now,
+      maxAgeMs: settings.cacheRetentionDays * 24 * 60 * 60 * 1000,
+      include: (entry) => entry.isDirectory() && /^[a-f0-9]{16,128}-\d+$/.test(entry.name),
+      protectedNames: protectedContentNames,
+    });
+    for (const entry of [...expiredOwned, ...expiredPartials, ...expiredHlsContent, ...expiredSubtitleContent]) {
       result.removedEntries.push(entry.name);
       result.bytes += entry.bytes;
     }
@@ -1802,6 +1958,9 @@ const server = createServer(async (request, response) => {
   try {
 
     if (request.method === "GET" && url.pathname === "/health") {
+      const scheduler = mediaScheduler.snapshot();
+      const processes = mediaProcessRegistry.snapshot();
+      const activeProcess = processes.active[0] || null;
       sendJson(response, 200, {
         ok: true,
         version: APP_VERSION,
@@ -1817,6 +1976,30 @@ const server = createServer(async (request, response) => {
         jobs: jobs.size,
         cleanup: CLEANUP_SETTINGS,
         transcoder: TRANSCODER,
+        media: {
+          mode: mediaResourceProfile("foreground").mode,
+          scheduler,
+          activeProcesses: processes.active.length,
+          activeProcess: activeProcess
+            ? {
+                stage: activeProcess.stage,
+                encoder: activeProcess.encoder,
+                decoder: activeProcess.decoder,
+                hardware: activeProcess.hardware,
+                profile: activeProcess.profile,
+                progress: activeProcess.progress,
+              }
+            : null,
+        },
+      }, headers);
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/diagnostics/media") {
+      sendJson(response, 200, {
+        transcoder: TRANSCODER,
+        scheduler: mediaScheduler.snapshot(),
+        processes: mediaProcessRegistry.snapshot(),
       }, headers);
       return;
     }
@@ -1847,8 +2030,8 @@ const server = createServer(async (request, response) => {
       sendJson(response, 200, {
         ok: true,
         sourceId: activePreparationJobId,
-        foregroundLoad: 0.85,
-        backgroundLoad: 0.25,
+        foregroundLoad: mediaResourceProfile("foreground").share,
+        backgroundLoad: mediaResourceProfile("background").share,
       }, headers);
       return;
     }
@@ -2066,7 +2249,8 @@ const shutdown = async () => {
   shuttingDown = true;
   clearInterval(persistenceTimer);
   clearInterval(cleanupTimer);
-  hlsPlayback.shutdown();
+  await hlsPlayback.shutdown();
+  mediaScheduler.shutdown();
   persistJobs();
   await Promise.all([
     jobStore.flush(),
