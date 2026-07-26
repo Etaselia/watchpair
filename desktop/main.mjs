@@ -16,7 +16,12 @@ import {
 import electronLog from "electron-log";
 import electronUpdater from "electron-updater";
 import { createSerialTaskQueue, ownsAgentProcess } from "./agent-lifecycle.mjs";
-import { deepLinkOrigin, normalizeDesktopSettings, settingsEnvironment } from "./settings.mjs";
+import {
+  deepLinkOrigin,
+  normalizeDesktopSettings,
+  settingsEnvironment,
+  settingsRequireAgentRestart,
+} from "./settings.mjs";
 
 const { autoUpdater } = electronUpdater;
 const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -54,6 +59,7 @@ let agentState = { status: "starting", error: null, health: null, storage: null 
 let updateState = { status: "idle", version: null, percent: 0, error: null };
 let lastStorageRefreshAt = 0;
 let lastAgentDiagnosticStatus = null;
+let agentRefreshPromise = null;
 
 const singleInstance = app.requestSingleInstanceLock();
 if (!singleInstance) app.quit();
@@ -126,11 +132,12 @@ async function agentFetch(route, init = {}) {
   }
 }
 
-async function refreshAgentState({ forceStorage = false } = {}) {
+async function refreshAgentStateNow({ forceStorage = false } = {}) {
   const startedAt = Date.now();
   try {
     const shouldRefreshStorage = forceStorage || !agentState.storage ||
       Date.now() - lastStorageRefreshAt >= 60_000;
+    if (shouldRefreshStorage) lastStorageRefreshAt = Date.now();
     const storageRequest = shouldRefreshStorage
       ? agentFetch("/storage")
         .then((value) => ({ value, error: null }))
@@ -140,7 +147,6 @@ async function refreshAgentState({ forceStorage = false } = {}) {
       agentFetch("/health"),
       storageRequest,
     ]);
-    if (shouldRefreshStorage && !storageResult.error) lastStorageRefreshAt = Date.now();
     if (storageResult.error) electronLog.warn("Storage diagnostics refresh failed", storageResult.error);
     agentState = { status: "ready", error: null, health, storage: storageResult.value };
   } catch (error) {
@@ -164,6 +170,18 @@ async function refreshAgentState({ forceStorage = false } = {}) {
   }
   sendState();
   return agentState;
+}
+
+function refreshAgentState(options = {}) {
+  if (agentRefreshPromise) {
+    return agentRefreshPromise.then(() =>
+      options.forceStorage ? refreshAgentState(options) : agentState
+    );
+  }
+  agentRefreshPromise = refreshAgentStateNow(options).finally(() => {
+    agentRefreshPromise = null;
+  });
+  return agentRefreshPromise;
 }
 
 async function waitForAgent(timeoutMs = 30_000) {
@@ -583,9 +601,13 @@ function registerIpc() {
     return selection.canceled ? null : selection.filePaths[0];
   });
   ipcMain.handle("companion:save-settings", async (_event, next) => {
-    await saveSettings(next);
+    const previousSettings = settings;
+    const savedSettings = await saveSettings(next);
+    const restartRequired = settingsRequireAgentRestart(previousSettings, savedSettings);
     scheduleUpdater();
-    await restartAgent();
+    electronLog.info("Companion settings saved", { restartRequired });
+    if (restartRequired) await restartAgent();
+    else await refreshAgentState();
     return publicState();
   });
   ipcMain.handle("companion:cleanup", async () => {

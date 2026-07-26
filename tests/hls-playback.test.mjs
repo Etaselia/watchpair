@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -183,6 +183,31 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
     ]);
     assert.ok(videoProbe.streams.some((stream) => stream.codec_name === "h264"));
     assert.ok(audioProbe.streams.some((stream) => stream.codec_name === "aac"));
+    const firstVideoSegment = await manager.getAsset(descriptor, "video/segment-000000.m4s");
+    const firstVideoFragment = path.join(directory, "first-video-fragment.mp4");
+    await writeFile(firstVideoFragment, Buffer.concat([
+      await readFile(videoInit.filePath),
+      await readFile(firstVideoSegment.filePath),
+    ]));
+    const firstPacketProbe = JSON.parse(
+      (
+        await runFile(ffprobeStatic.path, [
+          "-v", "error",
+          "-select_streams", "v:0",
+          "-show_entries", "packet=pts_time,dts_time,flags",
+          "-of", "json",
+          firstVideoFragment,
+        ])
+      ).stdout
+    );
+    const firstPacket = firstPacketProbe.packets?.[0];
+    assert.ok(firstPacket, JSON.stringify(firstPacketProbe));
+    assert.match(firstPacket.flags, /K/);
+    assert.ok(
+      Math.abs(Number(firstPacket.pts_time)) <= 0.001,
+      `First HLS video packet starts at ${firstPacket.pts_time}s instead of zero.`
+    );
+    assert.ok(Math.abs(Number(firstPacket.dts_time)) <= 0.001);
     const vp9Descriptor = { ...descriptor, rendition: "vp9", inputArguments: ["-readrate", "4"] };
     const vp9Preparation = await manager.prepare(vp9Descriptor);
     assert.equal(vp9Preparation.encoder.id, "vp9");

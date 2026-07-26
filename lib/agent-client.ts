@@ -228,7 +228,7 @@ async function agentFetch<T>(path: string, init?: RequestInit) {
 
 export async function detectAgent() {
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 1_200);
+  const timeout = window.setTimeout(() => controller.abort(), 5_000);
   try {
     const result = await agentFetch<{ ok: boolean }>("/health", { signal: controller.signal });
     return result.ok;
@@ -313,6 +313,11 @@ export interface AgentPlaybackDiagnostic {
   readyState?: number;
   networkState?: number;
   mediaErrorCode?: number;
+  currentTime?: number;
+  duration?: number;
+  paused?: boolean;
+  seekableStart?: number;
+  seekableEnd?: number;
   hlsType?: string;
   hlsDetails?: string;
   fatal?: boolean;

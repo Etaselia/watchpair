@@ -366,6 +366,9 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /activeFile\?\.ready && activeItem\.ready/);
   assert.match(app, /HTMLMediaElement\.HAVE_METADATA/);
   assert.match(app, /HTMLMediaElement\.HAVE_FUTURE_DATA/);
+  assert.match(app, /HLS_STARTUP_FLOOR_SECONDS = 0\.15/);
+  assert.match(app, /seekableStart: finiteMediaValue/);
+  assert.match(agent, /clientEvent: String\(body\.event/);
   assert.match(voice, /new RTCPeerConnection/);
   assert.match(voice, /echoCancellation: true/);
   assert.match(voice, /noiseSuppression/);
@@ -438,6 +441,7 @@ test("packages the pairable magnet and subtitle companion", async () => {
     "WatchPair Companion/subtitle-pipeline.mjs",
     "WatchPair Companion/job-store.mjs",
     "WatchPair Companion/torrent-input.mjs",
+    "WatchPair Companion/torrent-pressure.mjs",
     "WatchPair Companion/webtorrent-safety.mjs",
     "WatchPair Companion/package.json",
     "WatchPair Companion/install-and-start.cmd",

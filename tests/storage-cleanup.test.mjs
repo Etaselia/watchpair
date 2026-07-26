@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  createSingleFlightCache,
   MANAGED_JOB_DIRECTORY,
   pathSize,
   pruneExpiredChildren,
@@ -43,4 +44,38 @@ test("prunes only expired, unprotected, matching children", async () => {
 
   assert.deepEqual(removed, [{ name: oldId, bytes: 5 }]);
   assert.equal((await stat(path.join(root, unrelated))).isDirectory(), true);
+});
+
+test("coalesces storage scans and reuses the cached measurement", async () => {
+  let clock = 1_000;
+  let loads = 0;
+  let finishLoad = () => {};
+  const cache = createSingleFlightCache({
+    ttlMs: 100,
+    retryDelayMs: 100,
+    now: () => clock,
+    load() {
+      loads += 1;
+      return new Promise((resolve) => {
+        finishLoad = resolve;
+      });
+    },
+  });
+
+  const first = cache.get();
+  const second = cache.get();
+  assert.strictEqual(first, second);
+  await Promise.resolve();
+  assert.equal(loads, 1);
+  finishLoad({ bytes: 7 });
+  assert.deepEqual(await Promise.all([first, second]), [{ bytes: 7 }, { bytes: 7 }]);
+  assert.deepEqual(await cache.get(), { bytes: 7 });
+  assert.equal(loads, 1);
+
+  clock += 101;
+  const refreshed = cache.get();
+  await Promise.resolve();
+  assert.equal(loads, 2);
+  finishLoad({ bytes: 9 });
+  assert.deepEqual(await refreshed, { bytes: 9 });
 });

@@ -22,7 +22,7 @@ import {
   createProcessRegistry,
 } from "./process-registry.mjs";
 
-const CACHE_VERSION = "hls-v7";
+const CACHE_VERSION = "hls-v8";
 const DEFAULT_SEGMENT_SECONDS = 4;
 const DEFAULT_PLAYABLE_SECONDS = 120;
 const PLAYLIST_WAIT_MS = 15 * 60_000;
@@ -385,7 +385,9 @@ export function createHlsPlaybackManager({
       : canCopyH264Video(descriptor)
         ? { id: "copy", label: "Direct stream copy", hardware: false }
         : encoder;
-    const pipeline = selectedEncoder.id === "copy" ? null : videoPipeline(selectedEncoder);
+    const pipeline = selectedEncoder.id === "copy"
+      ? null
+      : videoPipeline(selectedEncoder, { disableFrameReordering: true });
     const state = {
       jobId: descriptor.jobId,
       schedulerJobId: descriptor.schedulerJobId,
@@ -430,7 +432,10 @@ export function createHlsPlaybackManager({
         ffmpegPath,
         selectedEncoder,
         { path: descriptor.inputPath, codec: descriptor.videoCodec, pixelFormat: descriptor.videoPixelFormat },
-        { threadLimit: descriptor.resourceProfile.threads }
+        {
+          threadLimit: descriptor.resourceProfile.threads,
+          disableFrameReordering: true,
+        }
       );
       state.pipeline = pipelineValidation.pipeline;
       state.hardwareDecode = Boolean(state.pipeline.hardwareDecode);
@@ -536,7 +541,10 @@ export function createHlsPlaybackManager({
         if (state.hardwareDecode) {
           console.warn(`WatchPair ${state.encoder.label} hardware decoding failed for this file; retrying GPU encoding with CPU decoding.`);
           state.hardwareDecode = false;
-          state.pipeline = videoPipeline(state.encoder, { hardwareDecode: false });
+          state.pipeline = videoPipeline(state.encoder, {
+            hardwareDecode: false,
+            disableFrameReordering: true,
+          });
           state.pipelineDiagnostics.push({
             code: "runtime_hardware_decode_failed",
             stage: "decode/filter/upload",
@@ -556,7 +564,7 @@ export function createHlsPlaybackManager({
         console.warn(`WatchPair ${state.encoder.label} encoding failed for this file; retrying with CPU encoding.`);
         state.encoder = CPU_ENCODER;
         state.hardwareDecode = false;
-        state.pipeline = videoPipeline(CPU_ENCODER);
+        state.pipeline = videoPipeline(CPU_ENCODER, { disableFrameReordering: true });
         state.pipelineDiagnostics.push({
           code: "runtime_hardware_encode_failed",
           stage: "encode",

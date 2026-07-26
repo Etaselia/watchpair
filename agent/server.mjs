@@ -36,6 +36,7 @@ import { createSubtitleAssetPipeline } from "./subtitle-pipeline.mjs";
 import { chapterProbeArguments, normalizeMediaChapters } from "./media-chapters.mjs";
 import { fingerprintPath } from "./media-fingerprint.mjs";
 import {
+  createSingleFlightCache,
   MANAGED_JOB_DIRECTORY,
   pathSize,
   pruneExpiredChildren,
@@ -47,6 +48,7 @@ import {
 } from "./subtitle-assets.mjs";
 import { isSupportedMagnet } from "./torrent-input.mjs";
 import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, verifiedTorrentFileProgress, verifyTorrentFilePieces } from "./webtorrent-safety.mjs";
+import { applyTorrentConnectionPlan, torrentConnectionPlan } from "./torrent-pressure.mjs";
 import { createPersistentLogger, installProcessDiagnostics } from "./persistent-log.mjs";
 
 const HOST = "127.0.0.1";
@@ -56,6 +58,10 @@ const CONTROL_TOKEN = String(process.env.WATCHPAIR_CONTROL_TOKEN || "");
 const PORT = Number(process.env.WATCHPAIR_AGENT_PORT || 41735);
 const REQUESTED_TORRENT_PORT = Number(process.env.WATCHPAIR_TORRENT_PORT || PORT + 1);
 const DHT_PORT = Number(process.env.WATCHPAIR_DHT_PORT || 0);
+const RESOURCE_MODE = String(process.env.WATCHPAIR_RESOURCE_MODE || "balanced");
+const TORRENT_CONNECTION_BUDGET = process.env.WATCHPAIR_TORRENT_CONNECTION_BUDGET;
+const INITIAL_TORRENT_PRESSURE = torrentConnectionPlan(
+  RESOURCE_MODE, 0, { totalBudget: TORRENT_CONNECTION_BUDGET });
 
 async function availableTcpPort(preferredPort) {
   if (!preferredPort) return 0;
@@ -178,11 +184,32 @@ const subtitleAssetPipeline = createSubtitleAssetPipeline({
 });
 installWebTorrentSafetyGuards();
 const client = new WebTorrent({
+  maxConns: INITIAL_TORRENT_PRESSURE.perTorrentLimit,
   utp: false,
   torrentPort: TORRENT_PORT,
   dhtPort: DHT_PORT,
   seedOutgoingConnections: true,
 });
+let torrentPressure = { ...INITIAL_TORRENT_PRESSURE, trimmedPeers: 0 };
+function refreshTorrentPressure(reason) {
+  const previousLimit = torrentPressure.perTorrentLimit;
+  torrentPressure = applyTorrentConnectionPlan(client, {
+    mode: RESOURCE_MODE,
+    totalBudget: TORRENT_CONNECTION_BUDGET,
+  });
+  if (previousLimit !== torrentPressure.perTorrentLimit || torrentPressure.trimmedPeers > 0) {
+    agentLogger.info("torrent_pressure_adjusted", {
+      reason,
+      torrentCount: torrentPressure.torrentCount,
+      totalBudget: torrentPressure.totalBudget,
+      perTorrentLimit: torrentPressure.perTorrentLimit,
+      trimmedPeers: torrentPressure.trimmedPeers,
+    });
+  }
+}
+client.on("add", () => queueMicrotask(() => refreshTorrentPressure("torrent-added")));
+client.on("remove", () => queueMicrotask(() => refreshTorrentPressure("torrent-removed")));
+client.on("torrent", () => refreshTorrentPressure("torrent-ready"));
 const hlsPlayback = createHlsPlaybackManager({
   ffmpegPath: FFMPEG_PATH,
   encoder: TRANSCODE_RUNTIME.encoder,
@@ -1961,12 +1988,30 @@ async function streamFile(request, response, job, fileIndex, headers, audioTrack
 }
 
 
-async function storageUsage() {
-  const filesystem = await statfs(DOWNLOAD_DIR).catch(() => null);
+const storageDiskUsage = createSingleFlightCache({
+  ttlMs: 60_000,
+  retryDelayMs: 60_000,
+  async load() {
+    const startedAt = Date.now();
+    agentLogger.info("storage_scan_started", { concurrency: 8 });
+    const filesystem = await statfs(DOWNLOAD_DIR).catch(() => null);
+    const usage = {
+      bytes: await pathSize(DOWNLOAD_DIR, { concurrency: 8 }),
+      availableBytes: filesystem ? filesystem.bavail * filesystem.bsize : null,
+      totalBytes: filesystem ? filesystem.blocks * filesystem.bsize : null,
+    };
+    agentLogger.info("storage_scan_finished", {
+      durationMs: Date.now() - startedAt,
+      bytes: usage.bytes,
+    });
+    return usage;
+  },
+});
+
+async function storageUsage({ fresh = false } = {}) {
+  const disk = await storageDiskUsage.get({ fresh });
   return {
-    bytes: await pathSize(DOWNLOAD_DIR),
-    availableBytes: filesystem ? filesystem.bavail * filesystem.bsize : null,
-    totalBytes: filesystem ? filesystem.blocks * filesystem.bsize : null,
+    ...disk,
     managedJobs: Array.from(jobs.values()).filter((job) => job.managed).length,
     pinnedJobs: Array.from(jobs.values()).filter((job) => job.pinned).length,
   };
@@ -1996,11 +2041,21 @@ async function runStorageCleanup({ force = false } = {}) {
     }
 
     const gibibyte = 1024 ** 3;
-    const overLimit = async () => {
-      const usage = await storageUsage();
+    const hasStorageLimit = settings.maxStorageGb > 0 || settings.minFreeSpaceGb > 0;
+    let usage = hasStorageLimit ? await storageUsage({ fresh: true }) : null;
+    const overLimit = () => {
+      if (!usage) return false;
       return (settings.maxStorageGb > 0 && usage.bytes > settings.maxStorageGb * gibibyte) ||
         (settings.minFreeSpaceGb > 0 && usage.availableBytes !== null &&
           usage.availableBytes < settings.minFreeSpaceGb * gibibyte);
+    };
+    const accountForRemoval = (bytes) => {
+      if (!usage) return;
+      usage = {
+        ...usage,
+        bytes: Math.max(0, usage.bytes - bytes),
+        availableBytes: usage.availableBytes === null ? null : usage.availableBytes + bytes,
+      };
     };
     const cleanupCandidates = Array.from(jobs.values())
       .filter((job) => jobCanBeCleaned(job, settings))
@@ -2009,10 +2064,12 @@ async function runStorageCleanup({ force = false } = {}) {
         Number(right.lastAccessedAt || right.completedAt || right.updatedAt || 0)
       );
     for (const job of cleanupCandidates) {
-      if (!(await overLimit())) break;
-      result.bytes += await pathSize(path.join(DOWNLOAD_DIR, job.id));
+      if (!overLimit()) break;
+      const removedBytes = await pathSize(path.join(DOWNLOAD_DIR, job.id));
+      result.bytes += removedBytes;
       await stopJob(job.id, { deleteFiles: true });
       result.removedJobs.push(job.id);
+      accountForRemoval(removedBytes);
     }
 
     const protectedNames = new Set(jobs.keys());
@@ -2058,7 +2115,12 @@ async function runStorageCleanup({ force = false } = {}) {
     for (const entry of [...expiredOwned, ...expiredPartials, ...expiredHlsContent, ...expiredSubtitleContent]) {
       result.removedEntries.push(entry.name);
       result.bytes += entry.bytes;
+      accountForRemoval(entry.bytes);
     }
+    if (usage) storageDiskUsage.set({
+      bytes: usage.bytes, availableBytes: usage.availableBytes, totalBytes: usage.totalBytes,
+    });
+    else storageDiskUsage.invalidate();
     persistJobs();
     return result;
   })().finally(() => {
@@ -2137,6 +2199,9 @@ function agentResourceSnapshot() {
       uploadSpeed: client.uploadSpeed,
       pendingVerifications: Array.from(jobs.values())
         .filter((job) => Boolean(job.torrentVerificationPromise)).length,
+      connectionBudget: torrentPressure.totalBudget,
+      perTorrentLimit: torrentPressure.perTorrentLimit,
+      trimmedPeers: torrentPressure.trimmedPeers,
     },
     jobs: jobStatuses,
     activeResources,
@@ -2267,6 +2332,9 @@ const server = createServer(async (request, response) => {
           dhtPort: client.dhtPort || DHT_PORT,
           webRtcSupported: WebTorrent.WEBRTC_SUPPORT,
           trackers: TRACKERS,
+          connectionBudget: torrentPressure.totalBudget,
+          perTorrentLimit: torrentPressure.perTorrentLimit,
+          trimmedPeers: torrentPressure.trimmedPeers,
         },
         jobs: jobs.size,
         cleanup: CLEANUP_SETTINGS,
@@ -2305,12 +2373,17 @@ const server = createServer(async (request, response) => {
       const level = ["info", "warn", "error"].includes(body.level) ? body.level : "warn";
       const playbackPath = String(body.playbackPath || "").slice(0, 300);
       agentLogger[level]("browser_playback_event", {
-        event: String(body.event || "unknown").slice(0, 80),
+        clientEvent: String(body.event || "unknown").slice(0, 80),
         message: String(body.message || "").slice(0, 700),
         playbackPath: playbackPath.startsWith("/") ? playbackPath : "",
         readyState: Number.isFinite(body.readyState) ? body.readyState : null,
         networkState: Number.isFinite(body.networkState) ? body.networkState : null,
         mediaErrorCode: Number.isFinite(body.mediaErrorCode) ? body.mediaErrorCode : null,
+        currentTime: Number.isFinite(body.currentTime) ? body.currentTime : null,
+        duration: Number.isFinite(body.duration) ? body.duration : null,
+        paused: typeof body.paused === "boolean" ? body.paused : null,
+        seekableStart: Number.isFinite(body.seekableStart) ? body.seekableStart : null,
+        seekableEnd: Number.isFinite(body.seekableEnd) ? body.seekableEnd : null,
         hlsType: String(body.hlsType || "").slice(0, 100),
         hlsDetails: String(body.hlsDetails || "").slice(0, 200),
         fatal: Boolean(body.fatal),
@@ -2325,6 +2398,7 @@ const server = createServer(async (request, response) => {
         directory: DOWNLOAD_DIR,
         cleanup: CLEANUP_SETTINGS,
         usage: await storageUsage(),
+        measurement: storageDiskUsage.details(),
       }, headers);
       return;
     }

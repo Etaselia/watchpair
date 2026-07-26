@@ -66,6 +66,14 @@ export function settingsEnvironment(settings) {
   };
 }
 
+export function settingsRequireAgentRestart(previous, next) {
+  const previousEnvironment = settingsEnvironment(previous);
+  const nextEnvironment = settingsEnvironment(next);
+  return Object.entries(nextEnvironment).some(
+    ([name, value]) => previousEnvironment[name] !== value
+  );
+}
+
 export function deepLinkOrigin(value) {
   const url = new URL(String(value || ""));
   if (url.protocol !== "watchpair:" || url.hostname !== "connect") {
