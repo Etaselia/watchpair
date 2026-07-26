@@ -318,6 +318,12 @@ export interface AgentPlaybackDiagnostic {
   paused?: boolean;
   seekableStart?: number;
   seekableEnd?: number;
+  bufferedStart?: number;
+  bufferedEnd?: number;
+  seekTarget?: number;
+  seekSource?: string;
+  roomPosition?: number;
+  roomActorId?: string;
   hlsType?: string;
   hlsDetails?: string;
   fatal?: boolean;

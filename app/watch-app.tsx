@@ -52,7 +52,6 @@ import {
 import {
   AGENT_URL,
   addAgentDownload,
-  attachAgentLibraryFile,
   detectAgent,
   getAgentDownloads,
   getAgentPermissionState,
@@ -94,6 +93,12 @@ import {
   findLocalAgentMedia,
   type LocalAgentBinding,
 } from "../lib/media-binding.mjs";
+import {
+  clampSeekTarget,
+  isSeekAcknowledgement,
+  shouldHoldLocalSeek,
+  type LocalSeekTransaction,
+} from "../lib/player-seek.mjs";
 import {
   type LocalReadiness,
   type QueueReadiness,
@@ -1541,28 +1546,19 @@ export default function WatchApp() {
     setLibraryBusy(true);
     setError("");
     try {
-      const source = activeSource;
-      if (source) {
-        const job = await attachAgentLibraryFile(source.id, libraryFile.id, libraryFile.name);
-        setAgentJobs((current) => ({ ...current, [source.id]: job }));
-        const target = preferredAgentFile(job);
-        if (target) await chooseAgentMedia(source.id, job, target);
-      } else {
-        const sourceId = crypto.randomUUID();
-        const published = await seedAgentLibraryFile(sourceId, libraryFile.id, libraryFile.name);
-        await sendAction("source", {
-          source: {
-            id: sourceId,
-            kind: "magnet",
-            value: published.magnetURI,
-            label: libraryFile.name,
-          },
-        });
-        setAgentJobs((current) => ({ ...current, [sourceId]: published.job }));
-        const target = preferredAgentFile(published.job);
-        if (target) await chooseAgentMedia(sourceId, published.job, target);
-      }
-      setLibraryOpen(false);
+      const sourceId = crypto.randomUUID();
+      const published = await seedAgentLibraryFile(sourceId, libraryFile.id, libraryFile.name);
+      await sendAction("source", {
+        source: {
+          id: sourceId,
+          kind: "magnet",
+          value: published.magnetURI,
+          label: libraryFile.name,
+        },
+      });
+      setAgentJobs((current) => ({ ...current, [sourceId]: published.job }));
+      const target = preferredAgentFile(published.job);
+      if (target) await chooseAgentMedia(sourceId, published.job, target);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not use that library file.");
     } finally {
@@ -1651,6 +1647,7 @@ export default function WatchApp() {
       <>
       <SyncedPlayer
         session={session}
+        deviceId={deviceId}
         mediaUrl={mediaUrl}
         subtitleCues={subtitleCues}
         localSubtitleName={localSubtitleName}
@@ -2266,6 +2263,7 @@ export default function WatchApp() {
 
 interface SyncedPlayerProps {
   session: WatchSession;
+  deviceId: string;
   mediaUrl: string;
   subtitleCues: SubtitleCue[];
   localSubtitleName: string;
@@ -2284,6 +2282,10 @@ type PlaybackDiagnosticDetails = {
   hlsType?: string;
   hlsDetails?: string;
   fatal?: boolean;
+  seekTarget?: number;
+  seekSource?: string;
+  roomPosition?: number;
+  roomActorId?: string;
 };
 
 const HLS_STARTUP_FLOOR_SECONDS = 0.15;
@@ -2313,6 +2315,7 @@ function playbackTarget(video: HTMLVideoElement, expected: number, isHlsPlayback
 
 function SyncedPlayer({
   session,
+  deviceId,
   mediaUrl,
   subtitleCues,
   localSubtitleName,
@@ -2331,7 +2334,10 @@ function SyncedPlayer({
   const hlsRecoveryRef = useRef(false);
   const lastSeqRef = useRef(-1);
   const playerStateRef = useRef(session.player);
-  const clockOffsetRef = useRef(session.serverTime - Date.now());
+  const clockOffsetRef = useRef(0);
+  const clockOffsetInitializedRef = useRef(false);
+  const pendingSeekRef = useRef<LocalSeekTransaction | null>(null);
+  const scrubbingRef = useRef(false);
   const controlsHideTimerRef = useRef<number | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -2408,9 +2414,15 @@ function SyncedPlayer({
       }
       let seekableStart: number | undefined;
       let seekableEnd: number | undefined;
+      let bufferedStart: number | undefined;
+      let bufferedEnd: number | undefined;
       if (video?.seekable.length) {
         seekableStart = video.seekable.start(0);
         seekableEnd = video.seekable.end(video.seekable.length - 1);
+      }
+      if (video?.buffered.length) {
+        bufferedStart = video.buffered.start(0);
+        bufferedEnd = video.buffered.end(video.buffered.length - 1);
       }
       void reportAgentPlaybackEvent({
         event,
@@ -2424,6 +2436,8 @@ function SyncedPlayer({
         paused: video?.paused,
         seekableStart: finiteMediaValue(seekableStart),
         seekableEnd: finiteMediaValue(seekableEnd),
+        bufferedStart: finiteMediaValue(bufferedStart),
+        bufferedEnd: finiteMediaValue(bufferedEnd),
         userAgent: navigator.userAgent,
       });
     },
@@ -2432,7 +2446,6 @@ function SyncedPlayer({
   const assTrackKey = requestedSubtitleTrack?.assUrl || "";
   const assFontKey = (requestedSubtitleTrack?.fonts || []).map((font) => font.url).join("|");
   const assFontUrls = useMemo(() => assFontKey ? assFontKey.split("|") : [], [assFontKey]);
-  subtitleOffsetRef.current = session.player.subtitleOffset;
   const wantsOriginalAss = Boolean(
     subtitleSelection !== "off" &&
     requestedSubtitleTrack?.styled &&
@@ -2507,6 +2520,7 @@ function SyncedPlayer({
   }, [assFontUrls, assTrackKey, wantsOriginalAss]);
 
   useEffect(() => {
+    subtitleOffsetRef.current = session.player.subtitleOffset;
     const renderer = assRendererRef.current;
     if (!renderer) return;
     renderer.timeOffset = -session.player.subtitleOffset / 1000;
@@ -2595,6 +2609,8 @@ function SyncedPlayer({
     setMediaLoading(true);
     setMediaError("");
     setNeedsGesture(false);
+    pendingSeekRef.current = null;
+    scrubbingRef.current = false;
     hlsRecoveryRef.current = false;
 
     const fail = (message: string) => {
@@ -2776,24 +2792,77 @@ function SyncedPlayer({
     (values: Partial<PlayerState>) => {
       const video = videoRef.current;
       return onSend({
-        ...session.player,
-        paused: video?.paused ?? session.player.paused,
-        position: video?.currentTime ?? session.player.position,
+        ...playerStateRef.current,
+        paused: video?.paused ?? playerStateRef.current.paused,
+        position: video?.currentTime ?? playerStateRef.current.position,
         ...values,
       });
     },
-    [onSend, session.player]
+    [onSend]
   );
 
   useEffect(() => {
+    const pending = pendingSeekRef.current;
+    if (pending && isSeekAcknowledgement(pending, session.player, deviceId)) {
+      pendingSeekRef.current = null;
+      scrubbingRef.current = false;
+      reportPlaybackEvent("seek_acknowledged", {
+        level: "info",
+        seekTarget: pending.target,
+        seekSource: pending.source,
+        roomPosition: session.player.position,
+        roomActorId: session.player.actorId,
+      });
+    }
     playerStateRef.current = session.player;
     const sample = session.serverTime - Date.now();
-    clockOffsetRef.current = clockOffsetRef.current * 0.8 + sample * 0.2;
-  }, [session.player, session.serverTime]);
+    if (clockOffsetInitializedRef.current) {
+      clockOffsetRef.current = clockOffsetRef.current * 0.8 + sample * 0.2;
+    } else {
+      clockOffsetRef.current = sample;
+      clockOffsetInitializedRef.current = true;
+    }
+  }, [deviceId, reportPlaybackEvent, session.player, session.serverTime]);
 
   const synchronizePlayback = useCallback((state: PlayerState) => {
     const video = videoRef.current;
     if (!video || !video.currentSrc || video.readyState < HTMLMediaElement.HAVE_METADATA) return;
+    const pending = pendingSeekRef.current;
+    if (pending) {
+      if (isSeekAcknowledgement(pending, state, deviceId)) {
+        pendingSeekRef.current = null;
+        scrubbingRef.current = false;
+        reportPlaybackEvent("seek_acknowledged", {
+          level: "info",
+          seekTarget: pending.target,
+          seekSource: pending.source,
+          roomPosition: state.position,
+          roomActorId: state.actorId,
+        });
+      } else if (shouldHoldLocalSeek(pending, state, deviceId)) {
+        if (!pending.suppressionReported) {
+          pending.suppressionReported = true;
+          reportPlaybackEvent("seek_remote_sync_deferred", {
+            level: "info",
+            seekTarget: pending.target,
+            seekSource: pending.source,
+            roomPosition: state.position,
+            roomActorId: state.actorId,
+          });
+        }
+        return;
+      } else {
+        pendingSeekRef.current = null;
+        scrubbingRef.current = false;
+        reportPlaybackEvent("seek_acknowledgement_timeout", {
+          level: "warn",
+          seekTarget: pending.target,
+          seekSource: pending.source,
+          roomPosition: state.position,
+          roomActorId: state.actorId,
+        });
+      }
+    }
     const serverNow = Date.now() + clockOffsetRef.current;
     const expected = state.paused
       ? state.position
@@ -2821,7 +2890,7 @@ function SyncedPlayer({
         .then(() => setNeedsGesture(false))
         .catch(handlePlaybackFailure);
     }
-  }, [handlePlaybackFailure, isHlsPlayback]);
+  }, [deviceId, handlePlaybackFailure, isHlsPlayback, reportPlaybackEvent]);
 
   useEffect(() => {
     if (lastSeqRef.current === session.seq) return;
@@ -2855,35 +2924,6 @@ function SyncedPlayer({
     return () => window.clearInterval(timer);
   }, [session.player.subtitleLanguage, session.player.subtitleOffset, subtitleCues]);
 
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      revealControls();
-      if (event.key === "Escape" && captionSettingsOpen) {
-        setCaptionSettingsOpen(false);
-        scheduleControlsHide(true);
-        return;
-      }
-      const target = event.target as HTMLElement;
-      if (["INPUT", "SELECT", "TEXTAREA", "BUTTON"].includes(target.tagName)) return;
-      const video = videoRef.current;
-      if (!video) return;
-
-      if (event.code === "Space") {
-        event.preventDefault();
-        void togglePlayback();
-      } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
-        const next = Math.max(0, video.currentTime + (event.key === "ArrowRight" ? 10 : -10));
-        video.currentTime = next;
-        void send({ position: next, paused: video.paused });
-      } else if (event.key.toLowerCase() === "f") {
-        void playerRef.current?.requestFullscreen();
-      }
-    };
-
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  });
-
   async function togglePlayback() {
     const video = videoRef.current;
     if (!video) return;
@@ -2902,26 +2942,66 @@ function SyncedPlayer({
     }
   }
 
-  const seekTo = (value: number) => {
+  const stageSeek = useCallback((value: number, source: string) => {
     const video = videoRef.current;
     if (!video) return;
-    video.currentTime = value;
-    setCurrentTime(value);
-  };
+    const target = clampSeekTarget(value, mediaDuration(video));
+    const current = pendingSeekRef.current;
+    pendingSeekRef.current = {
+      target,
+      startedAt: current && !current.committed ? current.startedAt : Date.now(),
+      committed: false,
+      source,
+      suppressionReported: current?.suppressionReported ?? false,
+    };
+    video.currentTime = target;
+    setCurrentTime(target);
+  }, []);
 
-  const commitSeek = () => {
+  const commitSeek = useCallback(() => {
+    scrubbingRef.current = false;
     const video = videoRef.current;
-    if (video) void send({ position: video.currentTime, paused: video.paused });
-  };
+    const transaction = pendingSeekRef.current;
+    if (!video || !transaction || transaction.committed) return;
+    transaction.committed = true;
+    transaction.startedAt = Date.now();
+    transaction.suppressionReported = false;
+    reportPlaybackEvent("seek_requested", {
+      level: "info",
+      seekTarget: transaction.target,
+      seekSource: transaction.source,
+      roomPosition: playerStateRef.current.position,
+      roomActorId: playerStateRef.current.actorId,
+    });
+    void send({ position: transaction.target, paused: video.paused }).catch((caught) => {
+      if (pendingSeekRef.current === transaction) pendingSeekRef.current = null;
+      reportPlaybackEvent("seek_request_failed", {
+        level: "error",
+        message: caught instanceof Error ? caught.message : String(caught),
+        seekTarget: transaction.target,
+        seekSource: transaction.source,
+        roomPosition: playerStateRef.current.position,
+        roomActorId: playerStateRef.current.actorId,
+      });
+      synchronizePlayback(playerStateRef.current);
+    });
+  }, [reportPlaybackEvent, send, synchronizePlayback]);
 
-  const seekToChapter = (index: number) => {
+  const finishSeek = useCallback(() => {
+    scrubbingRef.current = false;
+    window.setTimeout(commitSeek, 0);
+  }, [commitSeek]);
+
+  const seekImmediately = useCallback((value: number, source: string) => {
+    stageSeek(value, source);
+    commitSeek();
+  }, [commitSeek, stageSeek]);
+
+  const seekToChapter = useCallback((index: number) => {
     const chapter = chapters[index];
-    const video = videoRef.current;
-    if (!chapter || !video) return;
-    video.currentTime = chapter.start;
-    setCurrentTime(chapter.start);
-    void send({ position: chapter.start, paused: video.paused });
-  };
+    if (!chapter) return;
+    seekImmediately(chapter.start, "chapter");
+  }, [chapters, seekImmediately]);
 
   const previousChapter = () => {
     if (!chapters.length) return;
@@ -2935,6 +3015,49 @@ function SyncedPlayer({
     const current = currentChapterIndex >= 0 ? currentChapterIndex : -1;
     seekToChapter(Math.min(chapters.length - 1, current + 1));
   };
+
+  useEffect(() => {
+    const finishPointerSeek = () => {
+      if (scrubbingRef.current) finishSeek();
+    };
+    window.addEventListener("pointerup", finishPointerSeek);
+    window.addEventListener("pointercancel", finishPointerSeek);
+    return () => {
+      window.removeEventListener("pointerup", finishPointerSeek);
+      window.removeEventListener("pointercancel", finishPointerSeek);
+    };
+  }, [finishSeek]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      revealControls();
+      if (event.key === "Escape" && captionSettingsOpen) {
+        setCaptionSettingsOpen(false);
+        scheduleControlsHide(true);
+        return;
+      }
+      const target = event.target as HTMLElement;
+      if (["INPUT", "SELECT", "TEXTAREA", "BUTTON"].includes(target.tagName)) return;
+      const video = videoRef.current;
+      if (!video) return;
+
+      if (event.code === "Space") {
+        event.preventDefault();
+        void togglePlayback();
+      } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+        event.preventDefault();
+        seekImmediately(
+          video.currentTime + (event.key === "ArrowRight" ? 10 : -10),
+          "keyboard"
+        );
+      } else if (event.key.toLowerCase() === "f") {
+        void playerRef.current?.requestFullscreen();
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
 
   const changeVolume = (value: number) => {
     const video = videoRef.current;
@@ -3017,6 +3140,26 @@ function SyncedPlayer({
         }}
         onPlaying={() => setMediaLoading(false)}
         onWaiting={() => setMediaLoading(true)}
+        onSeeking={() => {
+          const pending = pendingSeekRef.current;
+          reportPlaybackEvent("media_seeking", {
+            level: "info",
+            seekTarget: pending?.target,
+            seekSource: pending?.source,
+            roomPosition: playerStateRef.current.position,
+            roomActorId: playerStateRef.current.actorId,
+          });
+        }}
+        onSeeked={() => {
+          const pending = pendingSeekRef.current;
+          reportPlaybackEvent("media_seeked", {
+            level: "info",
+            seekTarget: pending?.target,
+            seekSource: pending?.source,
+            roomPosition: playerStateRef.current.position,
+            roomActorId: playerStateRef.current.actorId,
+          });
+        }}
         onError={(event) => {
           const message = event.currentTarget.error?.message || "HTML media element reported an error.";
           reportPlaybackEvent("media_element_error", { level: "error", message });
@@ -3218,8 +3361,13 @@ function SyncedPlayer({
             max={duration || 0}
             step={0.05}
             value={Math.min(currentTime, duration || 0)}
-            onChange={(event) => seekTo(Number(event.target.value))}
-            onPointerUp={commitSeek}
+            onPointerDown={() => {
+              scrubbingRef.current = true;
+            }}
+            onChange={(event) => stageSeek(Number(event.target.value), "timeline")}
+            onPointerUp={finishSeek}
+            onPointerCancel={finishSeek}
+            onBlur={commitSeek}
             onKeyUp={commitSeek}
             aria-label="Seek"
             style={{ "--progress": `${duration ? (currentTime / duration) * 100 : 0}%` } as React.CSSProperties}
