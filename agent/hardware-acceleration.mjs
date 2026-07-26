@@ -173,10 +173,13 @@ export function encoderCandidates(platform = process.platform, preference = "aut
   return available;
 }
 
-export function videoEncoderArguments(encoder, segmentSeconds) {
+export function videoEncoderArguments(encoder, segmentSeconds, {
+  disableFrameReordering = false,
+} = {}) {
   return [
     ...encoder.arguments,
     ...(encoder.id === "cpu" ? ["-sc_threshold", "0"] : []),
+    ...(disableFrameReordering && encoder.id !== "vp9" ? ["-bf", "0"] : []),
     "-force_key_frames", `expr:gte(t,n_forced*${segmentSeconds})`,
   ];
 }
@@ -192,6 +195,7 @@ function pipelineStage(name, hardware, argumentsList) {
 export function videoPipeline(encoder, {
   segmentSeconds = 4,
   hardwareDecode = isHardwareEncoder(encoder),
+  disableFrameReordering = false,
 } = {}) {
   const definition = PIPELINE_DEFINITIONS[encoder?.id] || PIPELINE_DEFINITIONS.cpu;
   const useHardwareDecode = Boolean(hardwareDecode && isHardwareEncoder(encoder));
@@ -207,7 +211,7 @@ export function videoPipeline(encoder, {
   const encode = pipelineStage(
     encoder?.label || "software",
     Boolean(encoder?.hardware),
-    videoEncoderArguments(encoder || CPU_ENCODER, segmentSeconds)
+    videoEncoderArguments(encoder || CPU_ENCODER, segmentSeconds, { disableFrameReordering })
   );
   return {
     id: useHardwareDecode ? encoder.id + "-hardware" : (encoder?.id || "cpu") + "-software-decode",
@@ -310,19 +314,29 @@ function sourceCompatibility(encoder, source) {
   return null;
 }
 
-export async function validateVideoPipeline(ffmpegPath, encoder, source, { run = runFile, threadLimit = 0 } = {}) {
+export async function validateVideoPipeline(ffmpegPath, encoder, source, {
+  run = runFile,
+  threadLimit = 0,
+  disableFrameReordering = false,
+} = {}) {
   const normalized = normalizedSource(source);
   const staticReason = sourceCompatibility(encoder, normalized);
   if (staticReason) {
     return {
       ok: false,
       reason: staticReason,
-      pipeline: videoPipeline(encoder, { hardwareDecode: false }),
+      pipeline: videoPipeline(encoder, { hardwareDecode: false, disableFrameReordering }),
     };
   }
-  if (!normalized.path) return { ok: true, method: "static", pipeline: videoPipeline(encoder) };
+  if (!normalized.path) {
+    return {
+      ok: true,
+      method: "static",
+      pipeline: videoPipeline(encoder, { disableFrameReordering }),
+    };
+  }
 
-  const pipeline = videoPipeline(encoder);
+  const pipeline = videoPipeline(encoder, { disableFrameReordering });
   try {
     await commandOutput(ffmpegPath, [
       "-hide_banner", "-loglevel", "error", "-y",
@@ -345,7 +359,7 @@ export async function validateVideoPipeline(ffmpegPath, encoder, source, { run =
         backend: encoder.id,
         message: encoder.label + " hardware decode validation failed" + (detail ? ": " + detail : "."),
       },
-      pipeline: videoPipeline(encoder, { hardwareDecode: false }),
+      pipeline: videoPipeline(encoder, { hardwareDecode: false, disableFrameReordering }),
     };
   }
 }

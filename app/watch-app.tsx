@@ -538,7 +538,7 @@ export default function WatchApp() {
       } catch {
         if (!active) return;
         failures += 1;
-        if (failures >= 3) setAgentAvailable(false);
+        if (failures >= 4) setAgentAvailable(false);
       }
     };
 
@@ -2286,6 +2286,8 @@ type PlaybackDiagnosticDetails = {
   fatal?: boolean;
 };
 
+const HLS_STARTUP_FLOOR_SECONDS = 0.15;
+
 function preferredHlsVideoRendition(): HlsVideoRendition {
   if (typeof window === "undefined" || !window.MediaSource?.isTypeSupported) return "h264";
   if (window.MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"')) return "h264";
@@ -2296,6 +2298,17 @@ function preferredHlsVideoRendition(): HlsVideoRendition {
 function mediaDuration(video: HTMLVideoElement) {
   if (Number.isFinite(video.duration)) return video.duration;
   return video.seekable.length ? video.seekable.end(video.seekable.length - 1) : 0;
+}
+
+function finiteMediaValue(value: number | undefined) {
+  return Number.isFinite(value) ? value : undefined;
+}
+
+function playbackTarget(video: HTMLVideoElement, expected: number, isHlsPlayback: boolean) {
+  const target = Math.max(0, expected);
+  if (!isHlsPlayback || target >= HLS_STARTUP_FLOOR_SECONDS) return target;
+  const seekableStart = video.seekable.length ? video.seekable.start(0) : 0;
+  return Math.max(target, seekableStart, HLS_STARTUP_FLOOR_SECONDS);
 }
 
 function SyncedPlayer({
@@ -2393,6 +2406,12 @@ function SyncedPlayer({
       } catch {
         // Ignore malformed URLs while the selected media is changing.
       }
+      let seekableStart: number | undefined;
+      let seekableEnd: number | undefined;
+      if (video?.seekable.length) {
+        seekableStart = video.seekable.start(0);
+        seekableEnd = video.seekable.end(video.seekable.length - 1);
+      }
       void reportAgentPlaybackEvent({
         event,
         ...details,
@@ -2400,6 +2419,11 @@ function SyncedPlayer({
         readyState: video?.readyState,
         networkState: video?.networkState,
         mediaErrorCode: video?.error?.code,
+        currentTime: finiteMediaValue(video?.currentTime),
+        duration: finiteMediaValue(video?.duration),
+        paused: video?.paused,
+        seekableStart: finiteMediaValue(seekableStart),
+        seekableEnd: finiteMediaValue(seekableEnd),
         userAgent: navigator.userAgent,
       });
     },
@@ -2590,6 +2614,8 @@ function SyncedPlayer({
 
     let active = true;
     let instance: Hls | null = null;
+    let networkRecoveryTimer: number | null = null;
+    let networkRecoveryAttempts = 0;
     void import("hls.js")
       .then(({ default: HlsRuntime, ErrorTypes, Events }) => {
         if (!active) return;
@@ -2606,11 +2632,45 @@ function SyncedPlayer({
           hls.on(Events.MANIFEST_PARSED, () => {
             reportPlaybackEvent("hls_manifest_parsed", { level: "info" });
           });
+          hls.on(Events.FRAG_LOADED, () => {
+            networkRecoveryAttempts = 0;
+          });
           hls.on(Events.AUDIO_TRACKS_UPDATED, () => {
             setHlsAudioRevision((revision) => revision + 1);
           });
           hls.on(Events.ERROR, (_event, data: ErrorData) => {
             if (!data.fatal) return;
+            if (
+              data.type === ErrorTypes.NETWORK_ERROR &&
+              playbackUrl.startsWith(AGENT_URL) &&
+              networkRecoveryAttempts < 12
+            ) {
+              if (networkRecoveryTimer !== null) return;
+              networkRecoveryAttempts += 1;
+              const retryDelayMs = Math.min(
+                5_000,
+                500 * (2 ** Math.min(networkRecoveryAttempts - 1, 4))
+              );
+              reportPlaybackEvent(
+                "hls_network_error_retry",
+                {
+                  level: "warn",
+                  message: data.error?.message || String(data.details),
+                  hlsType: String(data.type),
+                  hlsDetails: `${String(data.details)}; retry ${networkRecoveryAttempts} in ${retryDelayMs}ms`,
+                  fatal: false,
+                }
+              );
+              setMediaLoading(true);
+              setMediaError("");
+              networkRecoveryTimer = window.setTimeout(() => {
+                networkRecoveryTimer = null;
+                if (!active || instance !== hls) return;
+                hls.stopLoad();
+                hls.loadSource(playbackUrl);
+              }, retryDelayMs);
+              return;
+            }
             if (data.type === ErrorTypes.MEDIA_ERROR && !hlsRecoveryRef.current) {
               reportPlaybackEvent(
                 "hls_media_error_recovery",
@@ -2668,6 +2728,7 @@ function SyncedPlayer({
 
     return () => {
       active = false;
+      if (networkRecoveryTimer !== null) window.clearTimeout(networkRecoveryTimer);
       if (hlsRef.current === instance) hlsRef.current = null;
       instance?.destroy();
       video.removeAttribute("src");
@@ -2737,10 +2798,12 @@ function SyncedPlayer({
     const expected = state.paused
       ? state.position
       : state.position + ((serverNow - state.changedAt) / 1000) * state.playbackRate;
-    const drift = expected - video.currentTime;
+    const target = playbackTarget(video, expected, isHlsPlayback);
+    if (target > expected && video.currentTime < target) video.currentTime = target;
+    const drift = target - video.currentTime;
 
     if (Math.abs(drift) > 0.75) {
-      video.currentTime = Math.max(0, expected);
+      video.currentTime = target;
     } else if (!state.paused && Math.abs(drift) > 0.2) {
       video.playbackRate = Math.max(0.5, Math.min(2, state.playbackRate + Math.sign(drift) * 0.05));
       window.setTimeout(() => {
@@ -2758,7 +2821,7 @@ function SyncedPlayer({
         .then(() => setNeedsGesture(false))
         .catch(handlePlaybackFailure);
     }
-  }, [handlePlaybackFailure]);
+  }, [handlePlaybackFailure, isHlsPlayback]);
 
   useEffect(() => {
     if (lastSeqRef.current === session.seq) return;
@@ -2943,7 +3006,7 @@ function SyncedPlayer({
           const expected = session.player.paused
             ? session.player.position
             : session.player.position + ((Date.now() - session.player.changedAt) / 1000) * session.player.playbackRate;
-          video.currentTime = Math.max(0, expected);
+          video.currentTime = playbackTarget(video, expected, isHlsPlayback);
           reportPlaybackEvent("media_metadata_loaded", { level: "info" });
           synchronizePlayback(playerStateRef.current);
         }}

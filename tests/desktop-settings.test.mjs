@@ -5,6 +5,7 @@ import {
   deepLinkOrigin,
   normalizeDesktopSettings,
   settingsEnvironment,
+  settingsRequireAgentRestart,
 } from "../desktop/settings.mjs";
 
 test("desktop settings apply safe retention and update defaults", () => {
@@ -64,6 +65,28 @@ test("desktop settings preserve supported resource modes", () => {
     assert.equal(settingsEnvironment(settings).WATCHPAIR_RESOURCE_MODE, resourceMode);
   }
   assert.equal(normalizeDesktopSettings({ resourceMode: " FAST " }).resourceMode, "fast");
+});
+
+test("desktop-only settings do not restart the companion agent", () => {
+  const current = normalizeDesktopSettings({ downloadDirectory: "downloads" });
+  const desktopOnly = {
+    ...current,
+    startAtLogin: false,
+    updates: { automaticChecks: false, automaticDownloads: false },
+  };
+
+  assert.equal(settingsRequireAgentRestart(current, desktopOnly), false);
+  assert.equal(
+    settingsRequireAgentRestart(current, { ...current, resourceMode: "eco" }),
+    true
+  );
+  assert.equal(
+    settingsRequireAgentRestart(current, {
+      ...current,
+      cleanup: { ...current.cleanup, cacheRetentionDays: 9 },
+    }),
+    true
+  );
 });
 
 test("deep links accept HTTPS and loopback origins only", () => {

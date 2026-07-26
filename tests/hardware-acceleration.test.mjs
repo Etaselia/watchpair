@@ -43,6 +43,12 @@ test("orders platform hardware encoders and builds segment-aligned arguments", (
   const argumentsList = videoEncoderArguments(CPU_ENCODER, 4);
   assert.ok(argumentsList.includes("libx264"));
   assert.ok(argumentsList.includes("expr:gte(t,n_forced*4)"));
+  const exactStartArguments = videoEncoderArguments(
+    CPU_ENCODER, 4, { disableFrameReordering: true }
+  );
+  const bFrameIndex = exactStartArguments.indexOf("-bf");
+  assert.deepEqual(exactStartArguments.slice(bFrameIndex, bFrameIndex + 2), ["-bf", "0"]);
+  assert.equal(videoEncoderArguments({ id: "vp9", arguments: [] }, 4, { disableFrameReordering: true }).includes("-bf"), false);
 });
 
 test("falls back to the bundled CPU encoder when no platform GPU encoder exists", async () => {

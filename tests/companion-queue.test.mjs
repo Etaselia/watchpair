@@ -89,7 +89,17 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
     const browserDiagnostic = await fetch(base + "/diagnostics/client", {
       method: "POST",
       headers: { "content-type": "application/json", origin: "https://watch.example" },
-      body: JSON.stringify({ event: "hls_fatal_error", level: "error", readyState: 0, networkState: 2 }),
+      body: JSON.stringify({
+        event: "hls_fatal_error",
+        level: "error",
+        readyState: 0,
+        networkState: 2,
+        currentTime: 0.15,
+        duration: 24,
+        paused: true,
+        seekableStart: 0,
+        seekableEnd: 8,
+      }),
     });
     assert.equal(browserDiagnostic.status, 202);
 
@@ -161,6 +171,16 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
     assert.match(logContents, /"event":"agent_process_started"/);
     assert.match(logContents, /"event":"media_process_started"/);
     assert.match(logContents, /"event":"media_process_finished"/);
+    const browserRecord = logContents
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .find((record) => record.event === "browser_playback_event");
+    assert.ok(browserRecord);
+    assert.equal(browserRecord.clientEvent, "hls_fatal_error");
+    assert.equal(browserRecord.currentTime, 0.15);
+    assert.equal(browserRecord.paused, true);
+    assert.equal(browserRecord.seekableEnd, 8);
     assert.match(logContents, /"event":"browser_playback_event"/);
     assert.doesNotMatch(logContents, /test-control-token/);
   } finally {
