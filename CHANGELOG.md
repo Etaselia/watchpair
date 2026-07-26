@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.3](https://github.com/Etaselia/watchpair/compare/v0.9.2...v0.9.3) (2026-07-26)
+
+
+### Bug Fixes
+
+* **companion:** stabilize load and playback startup ([#41](https://github.com/Etaselia/watchpair/issues/41)) ([7fd2a72](https://github.com/Etaselia/watchpair/commit/7fd2a7219bbe1a32dbc18d8d790f3dde9c717645))
+
 ## [0.9.2](https://github.com/Etaselia/watchpair/compare/v0.9.1...v0.9.2) (2026-07-26)
 
 
