@@ -146,6 +146,28 @@ function timestampToSeconds(value: string) {
   return parts[0];
 }
 
+function stripSubtitleTags(rawText: string): string {
+  let result = "";
+
+  for (let i = 0; i < rawText.length; i++) {
+    if (rawText[i] === "<") {
+      const closingIndex = rawText.indexOf(">", i);
+      
+      if (closingIndex !== -1) {
+        i = closingIndex;
+      } else {.
+        result += "&lt;";
+      }
+    } else if (rawText[i] === ">") {
+      result += "&gt;";
+    } else {
+      result += rawText[i];
+    }
+  }
+
+  return result;
+}
+
 export function parseSubtitles(contents: string): SubtitleCue[] {
   const blocks = contents
     .replace(/^\uFEFF/, "")
@@ -165,13 +187,7 @@ export function parseSubtitles(contents: string): SubtitleCue[] {
     return [{
       start,
       end,
-      text: lines.slice(timingIndex + 1)
-        .join("\n")
-        .replace(/<[^>]*>|[<>]/g, (match) => {
-          if (match === "<") return "&lt;";
-          if (match === ">") return "&gt;";
-          return "";
-        })
+      text: stripSubtitleTags(lines.slice(timingIndex + 1).join("\n")),
     }];
   });
 }
