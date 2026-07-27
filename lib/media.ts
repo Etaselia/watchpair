@@ -166,10 +166,12 @@ export function parseSubtitles(contents: string): SubtitleCue[] {
       start,
       end,
       text: lines.slice(timingIndex + 1)
-      .join("\n")
-        .replace(/<[^>]+>/g, "")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;"),
+        .join("\n")
+        .replace(/<[^>]*>|[<>]/g, (match) => {
+          if (match === "<") return "&lt;";
+          if (match === ">") return "&gt;";
+          return "";
+        })
     }];
   });
 }
