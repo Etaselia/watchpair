@@ -155,7 +155,7 @@ function stripSubtitleTags(rawText: string): string {
       
       if (closingIndex !== -1) {
         i = closingIndex;
-      } else {.
+      } else {
         result += "&lt;";
       }
     } else if (rawText[i] === ">") {
