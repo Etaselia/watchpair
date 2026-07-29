@@ -162,6 +162,7 @@ const jobStore = createJsonStore(JOBS_PATH);
 const preparationQueue = [];
 let preparationWorker = null;
 let activePreparationJobId = null;
+let preparationOrderJobIds = [];
 function mediaDiagnosticEvent(event, data) {
   if (event.endsWith("_failed")) {
     agentLogger.error(event, data);
@@ -607,7 +608,7 @@ async function completeSelectedFile(job, index = job.selectedIndex) {
       fileIndex: index,
       fingerprint: job.identityFingerprint,
     });
-    if (activePreparationJobId === job.id) setPreparationPriority(job.id);
+    refreshPreparationScheduling();
     queueMediaPreparation(job);
   } catch (error) {
     if (index !== job.selectedIndex) return;
@@ -1201,7 +1202,7 @@ async function startDirect(job) {
     await identifySelectedFile(job);
     job.status = "ready";
     markJobCompleted(job);
-    if (activePreparationJobId === job.id) setPreparationPriority(job.id);
+    refreshPreparationScheduling();
     await queueSubtitleProbe(job);
     queueMediaPreparation(job);
   } catch (error) {
@@ -1843,8 +1844,12 @@ async function prepareQueuedJob(job) {
 }
 
 function prioritizePreparationQueue() {
+  const order = new Map(preparationOrderJobIds.map((jobId, index) => [jobId, index]));
   preparationQueue.sort((left, right) =>
-    Number(right.id === activePreparationJobId) - Number(left.id === activePreparationJobId)
+    Number(right.id === activePreparationJobId) - Number(left.id === activePreparationJobId) ||
+    (order.get(left.id) ?? Number.MAX_SAFE_INTEGER) -
+      (order.get(right.id) ?? Number.MAX_SAFE_INTEGER) ||
+    left.createdAt - right.createdAt
   );
 }
 
@@ -1859,20 +1864,50 @@ function contentSchedulerIdForJob(job) {
   }
 }
 
-function setPreparationPriority(jobId) {
-  activePreparationJobId = jobId || null;
+function refreshPreparationScheduling() {
   prioritizePreparationQueue();
+  mediaScheduler.setJobOrder(preparationOrderJobIds.map((jobId) =>
+    contentSchedulerIdForJob(jobs.get(jobId)) || jobId
+  ));
   hlsPlayback.setPriorityJob(activePreparationJobId);
-  const contentSchedulerId = contentSchedulerIdForJob(jobs.get(activePreparationJobId));
-  if (contentSchedulerId) mediaScheduler.prioritize(contentSchedulerId);
+}
+
+function setPreparationPriority(jobId, orderedJobIds) {
+  activePreparationJobId = jobId || null;
+  if (orderedJobIds) {
+    preparationOrderJobIds = Array.from(new Set(orderedJobIds.filter(Boolean)));
+  }
+  refreshPreparationScheduling();
+}
+
+function preparationBlockedByWatchOrder(job) {
+  const rank = preparationOrderJobIds.indexOf(job.id);
+  if (rank <= 0) return false;
+  return preparationOrderJobIds.slice(0, rank).some((jobId) => {
+    const earlier = jobs.get(jobId);
+    if (!earlier) return true;
+    if (earlier.status === "error" || earlier.preparation.status === "error") return false;
+    return !["ready", "direct"].includes(earlier.preparation.status);
+  });
 }
 
 async function drainPreparationQueue() {
   while (preparationQueue.length) {
     prioritizePreparationQueue();
-    const job = preparationQueue.shift();
-    if (!job || job.preparation.status !== "queued") continue;
-    void prepareQueuedJob(job).catch((error) => {
+    const job = preparationQueue[0];
+    if (!job) break;
+    if (job.preparation.status !== "queued") {
+      preparationQueue.shift();
+      continue;
+    }
+    if (preparationBlockedByWatchOrder(job)) {
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      continue;
+    }
+    preparationQueue.shift();
+    try {
+      await prepareQueuedJob(job);
+    } catch (error) {
       agentLogger.error("media_preparation_unhandled", { jobId: job.id, error });
       job.preparation = {
         status: "error",
@@ -1881,7 +1916,7 @@ async function drainPreparationQueue() {
         fallback: false,
       };
       job.updatedAt = Date.now();
-    });
+    }
   }
 }
 
@@ -1899,6 +1934,7 @@ function queueBackgroundPreparation(job) {
   job.updatedAt = Date.now();
   if (!preparationQueue.includes(job)) preparationQueue.push(job);
   prioritizePreparationQueue();
+  refreshPreparationScheduling();
   startPreparationWorker();
 }
 
@@ -2416,16 +2452,28 @@ const server = createServer(async (request, response) => {
 
     if (request.method === "POST" && url.pathname === "/preparation-priority") {
       const body = await readJson(request);
+      const validSourceId = (value) => /^[a-zA-Z0-9-]{8,80}$/.test(value);
       const sourceId = body.sourceId === null || body.sourceId === undefined
         ? null
         : String(body.sourceId);
-      if (sourceId && !/^[a-zA-Z0-9-]{8,80}$/.test(sourceId)) {
+      if (sourceId && !validSourceId(sourceId)) {
         throw new Error("A valid priority source id is required.");
       }
-      setPreparationPriority(sourceId);
+      let sourceIds;
+      if (body.sourceIds !== undefined) {
+        if (!Array.isArray(body.sourceIds) || body.sourceIds.length > 200) {
+          throw new Error("A valid preparation order is required.");
+        }
+        sourceIds = body.sourceIds.map(String);
+        if (sourceIds.some((id) => !validSourceId(id))) {
+          throw new Error("Every preparation source id must be valid.");
+        }
+      }
+      setPreparationPriority(sourceId, sourceIds);
       sendJson(response, 200, {
         ok: true,
         sourceId: activePreparationJobId,
+        sourceIds: preparationOrderJobIds,
         foregroundLoad: mediaResourceProfile("foreground").share,
         backgroundLoad: mediaResourceProfile("background").share,
       }, headers);

@@ -341,15 +341,16 @@ export async function reportAgentPlaybackEvent(diagnostic: AgentPlaybackDiagnost
   }
 }
 
-export async function setAgentPlaybackPriority(sourceId: string | null) {
+export async function setAgentPlaybackPriority(sourceId: string | null, sourceIds: string[] = []) {
   return agentFetch<{
     ok: boolean;
     sourceId: string | null;
+    sourceIds: string[];
     foregroundLoad: number;
     backgroundLoad: number;
   }>("/preparation-priority", {
     method: "POST",
-    body: JSON.stringify({ sourceId }),
+    body: JSON.stringify({ sourceId, sourceIds }),
   });
 }
 

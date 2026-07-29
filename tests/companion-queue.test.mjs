@@ -113,12 +113,13 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
     const priorityResponse = await fetch(base + "/preparation-priority", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ sourceId: ids[1] }),
+      body: JSON.stringify({ sourceId: ids[1], sourceIds: [ids[1], ids[0]] }),
     });
     assert.equal(priorityResponse.status, 200);
     assert.deepEqual(await priorityResponse.json(), {
       ok: true,
       sourceId: ids[1],
+      sourceIds: [ids[1], ids[0]],
       foregroundLoad: 0.75,
       backgroundLoad: 0.2,
     });
@@ -145,7 +146,7 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
       (body) => body?.media?.activeProcesses === 1
     );
     assert.ok(activeHealth.media.scheduler.active);
-    assert.equal(activeHealth.media.scheduler.queued.length > 0, true);
+    assert.equal(activeHealth.media.scheduler.orderedJobIds.length, 2);
     const healthStarted = performance.now();
     const responsiveHealth = await fetch(base + "/health");
     assert.equal(responsiveHealth.status, 200);
@@ -177,6 +178,12 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
     assert.match(logContents, /"event":"agent_process_started"/);
     assert.match(logContents, /"event":"media_process_started"/);
     assert.match(logContents, /"event":"media_process_finished"/);
+    const mediaStarts = logContents
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((record) => record.event === "media_process_started" && record.stage === "video+audio");
+    assert.equal(mediaStarts[0]?.jobId, ids[1], JSON.stringify(mediaStarts));
     const browserRecord = logContents
       .trim()
       .split("\n")

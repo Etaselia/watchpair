@@ -334,7 +334,7 @@ test("ships the coordination and companion surfaces", async () => {
 
   assert.match(app, /Watch together/);
   assert.match(app, /action: "create",\s+token: requestedToken\.length === 9/);
-  assert.match(app, /setAgentPlaybackPriority\(prioritySourceId\)/);
+  assert.match(app, /setAgentPlaybackPriority\(prioritySourceId, orderedSourceIds\)/);
   assert.match(app, /getAgentDownloads/);
   assert.match(app, /Download queue/);
   assert.match(app, /const COMPANION_VERSION = "\d+\.\d+\.\d+"; \/\/ x-release-please-version/);
@@ -356,6 +356,8 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /downloadMode === "automatic"/);
   assert.match(app, /synchronizePlayback/);
   assert.match(app, /shouldHoldLocalSeek/);
+  assert.match(app, /shouldHoldLocalPlayback/);
+  assert.match(app, /playback_remote_sync_deferred/);
   assert.match(app, /seek_remote_sync_deferred/);
   assert.match(app, /onPointerUp=\{finishSeek\}/);
   assert.match(app, /5_000/);
@@ -366,6 +368,11 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /Caption options/);
   assert.match(app, /Background opacity/);
   assert.match(app, /Character edge/);
+  assert.match(app, /aria-label="Select video"/);
+  assert.match(app, /aria-label="Next video"/);
+  assert.match(app, /isTrustedPlaybackUrl/);
+  assert.match(app, /event\.currentTarget\.selectedIndex/);
+  assert.match(app, /Preparing selected video/);
   assert.match(app, /applySession/);
   assert.match(app, /Preparing video for this browser/);
   assert.match(app, /HlsRuntime\.isSupported/);
@@ -420,8 +427,11 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(agent, /restoreJobs/);
   assert.match(agent, /preparation-priority/);
   assert.match(agent, /diagnostics\/client/);
+  assert.match(agent, /preparationBlockedByWatchOrder/);
+  assert.match(agent, /sourceIds: preparationOrderJobIds/);
   assert.match(agent, /setPreparationPriority/);
   assert.match(agentClient, /loopback-network/);
+  assert.match(agentClient, /JSON\.stringify\(\{ sourceId, sourceIds \}\)/);
   assert.match(agentClient, /getAgentDownloads/);
   assert.match(agentClient, /reportAgentPlaybackEvent/);
   assert.match(agentClient, /getAgentPermissionState/);

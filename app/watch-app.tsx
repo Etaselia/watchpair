@@ -15,6 +15,7 @@ import {
   FileVideo2,
   Headphones,
   Link2,
+  ListVideo,
   LoaderCircle,
   Minus,
   MonitorUp,
@@ -95,8 +96,11 @@ import {
 } from "../lib/media-binding.mjs";
 import {
   clampSeekTarget,
+  isPlaybackAcknowledgement,
   isSeekAcknowledgement,
+  shouldHoldLocalPlayback,
   shouldHoldLocalSeek,
+  type LocalPlaybackTransaction,
   type LocalSeekTransaction,
 } from "../lib/player-seek.mjs";
 import {
@@ -459,6 +463,20 @@ export default function WatchApp() {
   const playbackSourceId = localAgentMedia?.sourceId || activeSourceId;
   const agentJob = localAgentMedia?.job || (activeSource ? agentJobs[activeSource.id] || null : null);
   const prioritySourceId = localAgentMedia?.job.id || session?.selectedMedia?.sourceId || null;
+  const selectedSourceIndex = sources.findIndex(
+    (source) => source.id === session?.selectedMedia?.sourceId
+  );
+  const watchOrderedSources = selectedSourceIndex >= 0
+    ? [...sources.slice(selectedSourceIndex), ...sources.slice(0, selectedSourceIndex)]
+    : sources;
+  const preparationSourceIds = watchOrderedSources
+    .map((source) =>
+      source.id === session?.selectedMedia?.sourceId
+        ? prioritySourceId
+        : agentJobs[source.id]?.id || null
+    )
+    .filter((sourceId): sourceId is string => Boolean(sourceId));
+  const preparationOrderKey = preparationSourceIds.join(":");
   const embeddedAudioTracks = agentJob?.audioTracks || EMPTY_AUDIO_TRACKS;
   const embeddedChapters = agentJob?.chapters || EMPTY_CHAPTERS;
   const embeddedSubtitles = agentJob?.subtitles || EMPTY_SUBTITLE_TRACKS;
@@ -466,8 +484,9 @@ export default function WatchApp() {
 
   useEffect(() => {
     if (!agentAvailable) return;
-    void setAgentPlaybackPriority(prioritySourceId).catch(() => {});
-  }, [agentAvailable, prioritySourceId]);
+    const orderedSourceIds = preparationOrderKey ? preparationOrderKey.split(":") : [];
+    void setAgentPlaybackPriority(prioritySourceId, orderedSourceIds).catch(() => {});
+  }, [agentAvailable, preparationOrderKey, prioritySourceId]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -1596,19 +1615,31 @@ export default function WatchApp() {
     [sendAction]
   );
 
+  const sourceReadyForEveryone = (sourceId: string) => Boolean(
+    readiness.queue[sourceId]?.ready &&
+    session?.participants.every((participant) => participant.queue?.[sourceId]?.ready)
+  );
+
+  const selectPlaylistSource = async (sourceId: string) => {
+    if (sourceId === session?.selectedMedia?.sourceId) return;
+    const job = agentJobs[sourceId];
+    const target = job ? preferredAgentFile(job) : null;
+    if (!job || !target || !sourceReadyForEveryone(sourceId)) return;
+    await chooseAgentMedia(sourceId, job, target);
+  };
+
+  const playbackQueue: PlayerQueueItem[] = sources.map((source) => ({
+    sourceId: source.id,
+    label: source.label,
+    selected: source.id === session?.selectedMedia?.sourceId,
+    ready: source.id === session?.selectedMedia?.sourceId || sourceReadyForEveryone(source.id),
+  }));
+
   const advancePlaylist = async () => {
     if (!session || deviceId !== session.hostId || !session.selectedMedia?.sourceId) return;
     const currentIndex = sources.findIndex((source) => source.id === session.selectedMedia?.sourceId);
-    for (const source of sources.slice(currentIndex + 1)) {
-      const job = agentJobs[source.id];
-      const target = job ? preferredAgentFile(job) : null;
-      const readyForEveryone = session.participants.every(
-        (participant) => participant.queue?.[source.id]?.ready
-      );
-      if (!job || !target || !readyForEveryone) continue;
-      await chooseAgentMedia(source.id, job, target);
-      return;
-    }
+    const nextSource = currentIndex >= 0 ? sources[currentIndex + 1] : null;
+    if (nextSource) await selectPlaylistSource(nextSource.id);
   };
 
   const readyParticipants = session?.participants.filter((participant) => participant.ready) ?? [];
@@ -1642,7 +1673,7 @@ export default function WatchApp() {
     return () => window.clearTimeout(timer);
   }, [everyoneReady, joined, mediaUrl, playerMediaKey, view]);
 
-  if (joined && session && view === "player" && mediaUrl) {
+  if (joined && session && view === "player") {
     return (
       <>
       <SyncedPlayer
@@ -1654,6 +1685,8 @@ export default function WatchApp() {
         audioTracks={embeddedAudioTracks}
         chapters={embeddedChapters}
         subtitleTracks={embeddedSubtitles}
+        queue={playbackQueue}
+        onSelectVideo={selectPlaylistSource}
         onBack={() => setView("lobby")}
         onEnded={deviceId === session.hostId ? () => void advancePlaylist() : undefined}
         onSend={sendPlayerState}
@@ -2260,6 +2293,12 @@ export default function WatchApp() {
     </>
   );
 }
+interface PlayerQueueItem {
+  sourceId: string;
+  label: string;
+  ready: boolean;
+  selected: boolean;
+}
 
 interface SyncedPlayerProps {
   session: WatchSession;
@@ -2269,6 +2308,8 @@ interface SyncedPlayerProps {
   localSubtitleName: string;
   audioTracks: AgentAudioTrack[];
   chapters: AgentChapter[];
+  queue: PlayerQueueItem[];
+  onSelectVideo: (sourceId: string) => Promise<void>;
   subtitleTracks: AgentSubtitleTrack[];
   onBack: () => void;
   onEnded?: () => void;
@@ -2297,6 +2338,16 @@ function preferredHlsVideoRendition(): HlsVideoRendition {
   return "h264";
 }
 
+function isTrustedPlaybackUrl(value: string) {
+  try {
+    const url = new URL(value);
+    return url.origin === AGENT_URL ||
+      (url.protocol === "blob:" && url.origin === window.location.origin);
+  } catch {
+    return false;
+  }
+}
+
 function mediaDuration(video: HTMLVideoElement) {
   if (Number.isFinite(video.duration)) return video.duration;
   return video.seekable.length ? video.seekable.end(video.seekable.length - 1) : 0;
@@ -2322,6 +2373,8 @@ function SyncedPlayer({
   audioTracks,
   chapters,
   subtitleTracks,
+  queue,
+  onSelectVideo,
   onBack,
   onEnded,
   onSend,
@@ -2337,6 +2390,7 @@ function SyncedPlayer({
   const clockOffsetRef = useRef(0);
   const clockOffsetInitializedRef = useRef(false);
   const pendingSeekRef = useRef<LocalSeekTransaction | null>(null);
+  const pendingPlaybackRef = useRef<LocalPlaybackTransaction | null>(null);
   const scrubbingRef = useRef(false);
   const controlsHideTimerRef = useRef<number | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
@@ -2353,11 +2407,27 @@ function SyncedPlayer({
   const [readyAssTrack, setReadyAssTrack] = useState("");
   const [controlsVisible, setControlsVisible] = useState(true);
   const [captionSettingsOpen, setCaptionSettingsOpen] = useState(false);
+  const [switchingVideo, setSwitchingVideo] = useState(false);
   const [subtitleAppearance, setSubtitleAppearance] = useState(defaultSubtitleAppearance);
   const currentChapterIndex = chapters.findIndex(
     (chapter) => currentTime >= chapter.start && currentTime < chapter.end
   );
   const currentChapter = currentChapterIndex >= 0 ? chapters[currentChapterIndex] : null;
+  const selectedVideoIndex = queue.findIndex((item) => item.selected);
+  const nextVideo = selectedVideoIndex >= 0 ? queue[selectedVideoIndex + 1] : null;
+
+  const switchVideo = async (sourceId: string) => {
+    const target = queue.find((item) => item.sourceId === sourceId);
+    if (!target || target.selected || !target.ready || switchingVideo) return;
+    setSwitchingVideo(true);
+    setMediaLoading(true);
+    setMediaError("");
+    try {
+      await onSelectVideo(sourceId);
+    } finally {
+      setSwitchingVideo(false);
+    }
+  };
 
   const defaultAudioTrack = audioTracks.find((track) => track.default) || audioTracks[0];
   const requestedAudioTrackId = session.player.audioLanguage.startsWith("embedded:")
@@ -2396,7 +2466,7 @@ function SyncedPlayer({
         return url.toString();
       }
     }
-    if (!requestedAudioTrack) return mediaUrl;
+    if (!mediaUrl || !requestedAudioTrack) return mediaUrl;
     const url = new URL(mediaUrl);
     url.searchParams.set("audio", requestedAudioTrack.id);
     return url.toString();
@@ -2610,6 +2680,7 @@ function SyncedPlayer({
     setMediaError("");
     setNeedsGesture(false);
     pendingSeekRef.current = null;
+    pendingPlaybackRef.current = null;
     scrubbingRef.current = false;
     hlsRecoveryRef.current = false;
 
@@ -2619,6 +2690,21 @@ function SyncedPlayer({
       setMediaError(message);
       pinControls();
     };
+
+    if (!playbackUrl) {
+      video.removeAttribute("src");
+      video.load();
+      return () => {
+        video.removeAttribute("src");
+      };
+    }
+
+    if (!isTrustedPlaybackUrl(playbackUrl)) {
+      fail("The selected video returned an invalid playback address.");
+      video.removeAttribute("src");
+      video.load();
+      return;
+    }
 
     if (!isHlsPlayback) {
       video.src = playbackUrl;
@@ -2802,6 +2888,15 @@ function SyncedPlayer({
   );
 
   useEffect(() => {
+    const pendingPlayback = pendingPlaybackRef.current;
+    if (pendingPlayback && isPlaybackAcknowledgement(pendingPlayback, session.player, deviceId)) {
+      pendingPlaybackRef.current = null;
+      reportPlaybackEvent("playback_acknowledged", {
+        level: "info",
+        roomPosition: session.player.position,
+        roomActorId: session.player.actorId,
+      });
+    }
     const pending = pendingSeekRef.current;
     if (pending && isSeekAcknowledgement(pending, session.player, deviceId)) {
       pendingSeekRef.current = null;
@@ -2827,6 +2922,35 @@ function SyncedPlayer({
   const synchronizePlayback = useCallback((state: PlayerState) => {
     const video = videoRef.current;
     if (!video || !video.currentSrc || video.readyState < HTMLMediaElement.HAVE_METADATA) return;
+    const pendingPlayback = pendingPlaybackRef.current;
+    let holdLocalPlayback = false;
+    if (pendingPlayback) {
+      if (isPlaybackAcknowledgement(pendingPlayback, state, deviceId)) {
+        pendingPlaybackRef.current = null;
+        reportPlaybackEvent("playback_acknowledged", {
+          level: "info",
+          roomPosition: state.position,
+          roomActorId: state.actorId,
+        });
+      } else if (shouldHoldLocalPlayback(pendingPlayback, state, deviceId)) {
+        holdLocalPlayback = true;
+        if (!pendingPlayback.suppressionReported) {
+          pendingPlayback.suppressionReported = true;
+          reportPlaybackEvent("playback_remote_sync_deferred", {
+            level: "info",
+            roomPosition: state.position,
+            roomActorId: state.actorId,
+          });
+        }
+      } else {
+        pendingPlaybackRef.current = null;
+        reportPlaybackEvent("playback_acknowledgement_timeout", {
+          level: "warn",
+          roomPosition: state.position,
+          roomActorId: state.actorId,
+        });
+      }
+    }
     const pending = pendingSeekRef.current;
     if (pending) {
       if (isSeekAcknowledgement(pending, state, deviceId)) {
@@ -2864,9 +2988,11 @@ function SyncedPlayer({
       }
     }
     const serverNow = Date.now() + clockOffsetRef.current;
-    const expected = state.paused
-      ? state.position
-      : state.position + ((serverNow - state.changedAt) / 1000) * state.playbackRate;
+    const expected = holdLocalPlayback
+      ? video.currentTime
+      : state.paused
+        ? state.position
+        : state.position + ((serverNow - state.changedAt) / 1000) * state.playbackRate;
     const target = playbackTarget(video, expected, isHlsPlayback);
     if (target > expected && video.currentTime < target) video.currentTime = target;
     const drift = target - video.currentTime;
@@ -2882,9 +3008,9 @@ function SyncedPlayer({
       video.playbackRate = state.playbackRate;
     }
 
-    if (state.paused && !video.paused) {
+    if (!holdLocalPlayback && state.paused && !video.paused) {
       video.pause();
-    } else if (!state.paused && video.paused && video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
+    } else if (!holdLocalPlayback && !state.paused && video.paused && video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
       void video
         .play()
         .then(() => setNeedsGesture(false))
@@ -2927,18 +3053,40 @@ function SyncedPlayer({
   async function togglePlayback() {
     const video = videoRef.current;
     if (!video) return;
-    if (video.paused) {
+    const paused = !video.paused;
+    const transaction: LocalPlaybackTransaction = {
+      paused,
+      startedAt: Date.now(),
+      suppressionReported: false,
+    };
+    pendingPlaybackRef.current = transaction;
+    const publish = send({ paused, position: video.currentTime });
+    void publish.catch(() => {});
+    if (!paused) {
       try {
         await video.play();
         setNeedsGesture(false);
         setMediaError("");
-        await send({ paused: false, position: video.currentTime });
       } catch (caught) {
+        if (pendingPlaybackRef.current === transaction) pendingPlaybackRef.current = null;
+        void publish
+          .then(() => send({ paused: true, position: video.currentTime }))
+          .catch(() => {});
         handlePlaybackFailure(caught);
+        return;
       }
     } else {
       video.pause();
-      await send({ paused: true, position: video.currentTime });
+    }
+    try {
+      await publish;
+    } catch (caught) {
+      if (pendingPlaybackRef.current === transaction) pendingPlaybackRef.current = null;
+      reportPlaybackEvent("playback_request_failed", {
+        level: "error",
+        message: caught instanceof Error ? caught.message : String(caught),
+      });
+      synchronizePlayback(playerStateRef.current);
     }
   }
 
@@ -3186,12 +3334,42 @@ function SyncedPlayer({
           <strong>{session.selectedMedia?.name || "Local preview"}</strong>
           <span><span className="live-dot" /> Synced with {Math.max(0, session.participants.length - 1)} partner</span>
         </div>
-        <div className="player-avatars">
-          {session.participants.slice(0, 4).map((participant) => (
-            <span key={participant.deviceId} title={participant.name}>
-              {participant.name.slice(0, 1).toUpperCase()}
-            </span>
-          ))}
+        <div className="player-top-actions">
+          <label className="player-video-select" title="Playlist">
+            <ListVideo />
+            <select
+              value={queue.find((item) => item.selected)?.sourceId || ""}
+              onChange={(event) => {
+                const selected = queue[event.currentTarget.selectedIndex];
+                if (selected) void switchVideo(selected.sourceId);
+              }}
+              disabled={switchingVideo}
+              aria-label="Select video"
+            >
+              {queue.map((item) => (
+                <option key={item.sourceId} value={item.sourceId} disabled={!item.ready}>
+                  {item.label}{item.ready ? "" : " (preparing)"}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            className="player-icon-button"
+            onClick={() => { if (nextVideo) void switchVideo(nextVideo.sourceId); }}
+            disabled={!nextVideo?.ready || switchingVideo}
+            title={nextVideo?.ready ? "Next video" : "Next video is still preparing"}
+            aria-label="Next video"
+          >
+            {switchingVideo ? <LoaderCircle className="spin" /> : <SkipForward />}
+          </button>
+          <div className="player-avatars">
+            {session.participants.slice(0, 4).map((participant) => (
+              <span key={participant.deviceId} title={participant.name}>
+                {participant.name.slice(0, 1).toUpperCase()}
+              </span>
+            ))}
+          </div>
         </div>
       </div>
 
@@ -3206,7 +3384,7 @@ function SyncedPlayer({
       {(mediaLoading || mediaError) && !needsGesture && (
         <div className={"media-state-overlay" + (mediaError ? " error" : "")} role={mediaError ? "alert" : "status"}>
           {mediaError ? <X /> : <LoaderCircle className="spin" />}
-          <strong>{mediaError || (isHlsPlayback ? "Preparing first video segments" : "Preparing video for this browser")}</strong>
+          <strong>{mediaError || (!mediaUrl ? "Preparing selected video" : isHlsPlayback ? "Preparing first video segments" : "Preparing video for this browser")}</strong>
           {mediaError && (
             <button type="button" onClick={onBack}>
               <ArrowLeft />

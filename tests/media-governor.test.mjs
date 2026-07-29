@@ -34,6 +34,101 @@ test("media scheduler runs one heavy task and prioritizes selected work", async 
   scheduler.shutdown();
 });
 
+test("media scheduler follows explicit watch order instead of task arrival order", async () => {
+  const order = [];
+  let releaseCurrent;
+  const monitor = {
+    snapshot: () => ({ eventLoopDelayP95Ms: 0, systemCpuPercent: 0 }),
+    shouldDeferBackground: () => false,
+    stop() {},
+  };
+  const scheduler = createMediaTaskScheduler({ monitor });
+  const current = scheduler.enqueue({
+    taskId: "current",
+    jobId: "episode-one",
+    stage: "browser-playback",
+    run: async () => ({
+      value: "current",
+      completion: new Promise((resolve) => {
+        releaseCurrent = () => {
+          order.push("episode-one");
+          resolve();
+        };
+      }),
+    }),
+  });
+  await current;
+
+  scheduler.setJobOrder(["episode-two", "episode-three", "episode-eight"]);
+  const enqueueEpisode = (jobId) => scheduler.enqueue({
+    taskId: jobId,
+    jobId,
+    stage: "browser-playback",
+    run: async () => ({
+      value: jobId,
+      completion: Promise.resolve().then(() => order.push(jobId)),
+    }),
+  });
+  const episodeEight = enqueueEpisode("episode-eight");
+  const episodeThree = enqueueEpisode("episode-three");
+  const episodeTwo = enqueueEpisode("episode-two");
+  releaseCurrent();
+  await Promise.all([episodeEight, episodeThree, episodeTwo]);
+
+  assert.deepEqual(order, [
+    "episode-one",
+    "episode-two",
+    "episode-three",
+    "episode-eight",
+  ]);
+  scheduler.shutdown();
+});
+
+test("selected work waits for a non-preemptible HLS render instead of discarding it", async () => {
+  const events = [];
+  let releaseActive;
+  let interrupted = false;
+  let selectedStarted = false;
+  const monitor = {
+    snapshot: () => ({ eventLoopDelayP95Ms: 0, systemCpuPercent: 0 }),
+    shouldDeferBackground: () => false,
+    stop() {},
+  };
+  const scheduler = createMediaTaskScheduler({
+    monitor,
+    onEvent: (event, data) => events.push({ event, data }),
+  });
+  const active = scheduler.enqueue({
+    taskId: "active-hls",
+    jobId: "episode-one",
+    stage: "browser-playback",
+    preemptible: false,
+    run: async () => ({
+      value: "active",
+      completion: new Promise((resolve) => { releaseActive = resolve; }),
+      interrupt: () => { interrupted = true; releaseActive(); },
+    }),
+  });
+  await active;
+  const selected = scheduler.enqueue({
+    taskId: "selected-hls",
+    jobId: "episode-two",
+    stage: "browser-playback",
+    run: async () => {
+      selectedStarted = true;
+      return { value: "selected", completion: Promise.resolve() };
+    },
+  });
+  scheduler.prioritize("episode-two");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(interrupted, false);
+  assert.equal(selectedStarted, false);
+  assert.ok(events.some(({ event }) => event === "media_task_preemption_deferred"));
+  releaseActive();
+  assert.equal(await selected, "selected");
+  scheduler.shutdown();
+});
+
 test("media scheduler defers background work under pressure but admits selected work", async () => {
   let started = false;
   const monitor = {

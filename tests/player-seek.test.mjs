@@ -3,8 +3,11 @@ import test from "node:test";
 
 import {
   clampSeekTarget,
+  isPlaybackAcknowledgement,
   isSeekAcknowledgement,
+  PLAYBACK_TRANSACTION_TIMEOUT_MS,
   SEEK_TRANSACTION_TIMEOUT_MS,
+  shouldHoldLocalPlayback,
   shouldHoldLocalSeek,
 } from "../lib/player-seek.mjs";
 
@@ -13,6 +16,13 @@ const transaction = (values = {}) => ({
   startedAt: 1_000,
   committed: true,
   source: "timeline",
+  suppressionReported: false,
+  ...values,
+});
+
+const playbackTransaction = (values = {}) => ({
+  paused: false,
+  startedAt: 1_000,
   suppressionReported: false,
   ...values,
 });
@@ -84,6 +94,44 @@ test("releases a seek after acknowledgement or timeout", () => {
       player(),
       "local-device",
       pending.startedAt + SEEK_TRANSACTION_TIMEOUT_MS
+    ),
+    false
+  );
+});
+
+test("holds local playback intent until the room acknowledges the same state", () => {
+  const pending = playbackTransaction();
+  assert.equal(
+    shouldHoldLocalPlayback(pending, player({ paused: true }), "local-device", 1_500),
+    true
+  );
+  assert.equal(
+    isPlaybackAcknowledgement(
+      pending,
+      player({ actorId: "local-device", paused: false }),
+      "local-device"
+    ),
+    true
+  );
+  assert.equal(
+    shouldHoldLocalPlayback(
+      pending,
+      player({ actorId: "local-device", paused: false }),
+      "local-device",
+      1_500
+    ),
+    false
+  );
+});
+
+test("releases unacknowledged playback intent after its timeout", () => {
+  const pending = playbackTransaction({ paused: true });
+  assert.equal(
+    shouldHoldLocalPlayback(
+      pending,
+      player({ paused: false }),
+      "local-device",
+      pending.startedAt + PLAYBACK_TRANSACTION_TIMEOUT_MS
     ),
     false
   );
