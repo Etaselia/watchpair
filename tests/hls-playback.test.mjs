@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -235,7 +235,86 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
   }
 });
 
-test("keeps the promoted HLS generation playable while a preempted render is replaced", { timeout: 30_000 }, async () => {
+test("does not promote a cached HLS window whose first segment is missing", { timeout: 5_000 }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchpair-hls-invalid-start-"));
+  const cacheRoot = path.join(directory, "cache");
+  const fingerprint = "cccccccccccccccccccccccccccccccc";
+  const fileSize = 12345;
+  const generationId = "11111111-1111-1111-1111-111111111111";
+  const baseDirectory = path.join(
+    cacheRoot,
+    "content",
+    `${fingerprint}-${fileSize}`,
+    "h264-hls-v9"
+  );
+  const generationDirectory = path.join(baseDirectory, "generations", generationId);
+  const videoDirectory = path.join(generationDirectory, "video");
+  const audioDirectory = path.join(generationDirectory, "audio", "1");
+  const playlist = [
+    "#EXTM3U",
+    "#EXT-X-VERSION:7",
+    "#EXT-X-MEDIA-SEQUENCE:0",
+    "#EXT-X-MAP:URI=\"init.mp4\"",
+    "#EXTINF:2.0,",
+    "segment-000000.m4s",
+    "#EXTINF:2.0,",
+    "segment-000001.m4s",
+    "",
+  ].join("\n");
+  const events = [];
+  let manager;
+
+  try {
+    await Promise.all([
+      mkdir(videoDirectory, { recursive: true }),
+      mkdir(audioDirectory, { recursive: true }),
+    ]);
+    await Promise.all([
+      writeFile(path.join(generationDirectory, "master.m3u8"), "#EXTM3U\nvideo/index.m3u8\n"),
+      writeFile(path.join(videoDirectory, "init.mp4"), "video-init"),
+      writeFile(path.join(audioDirectory, "init.mp4"), "audio-init"),
+      writeFile(path.join(videoDirectory, "index.m3u8"), playlist),
+      writeFile(path.join(audioDirectory, "index.m3u8"), playlist),
+      writeFile(path.join(videoDirectory, "segment-000001.m4s"), "late-video"),
+      writeFile(path.join(audioDirectory, "segment-000001.m4s"), "late-audio"),
+      writeFile(path.join(baseDirectory, "current.json"), JSON.stringify({ generationId })),
+    ]);
+
+    manager = createHlsPlaybackManager({
+      ffmpegPath,
+      cacheRoot,
+      playableSeconds: 2,
+      playlistWaitMs: 1_000,
+      onEvent: (event, data) => events.push({ event, data }),
+    });
+    await assert.rejects(manager.prepare({
+      jobId: "invalid-start-job",
+      fileIndex: 0,
+      fileSize,
+      contentFingerprint: fingerprint,
+      inputPath: path.join(directory, "missing-input.mkv"),
+      videoCodec: "hevc",
+      videoPixelFormat: "yuv420p10le",
+      videoProfile: "Main 10",
+      audioTracks: [{
+        id: "1",
+        streamIndex: 1,
+        language: "eng",
+        label: "English",
+        codec: "aac",
+        channels: 2,
+        default: true,
+      }],
+    }));
+    assert.ok(events.some(({ event }) => event === "hls_generation_started"));
+    assert.equal(events.some(({ event }) => event === "hls_generation_promoted"), false);
+  } finally {
+    await manager?.shutdown();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("finishes an active HLS generation before starting newly selected work", { timeout: 30_000 }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "watchpair-hls-preempt-"));
   const input = path.join(directory, "input.mkv");
   const cacheRoot = path.join(directory, "cache");
@@ -274,7 +353,7 @@ test("keeps the promoted HLS generation playable while a preempted render is rep
       ...common,
       jobId: "background-preempt-test",
       contentFingerprint: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      inputArguments: ["-readrate", "0.5"],
+      inputArguments: ["-readrate", "1"],
       onState: (preparation, transition) => states.push({ preparation, transition }),
     };
     const foreground = {
@@ -303,20 +382,15 @@ test("keeps the promoted HLS generation playable while a preempted render is rep
     manager.setPriorityJob(foreground.jobId);
     assert.equal((await foregroundPreparation).status, "ready");
 
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      if (events.some(({ event }) => event === "hls_generation_preempted")) break;
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-
     const retainedAsset = await manager.getAsset(background, "video/index.m3u8");
     assert.equal(retainedAsset.filePath, initialAsset.filePath);
-    assert.match(await readPlaylist(retainedAsset.filePath), /segment-000000\.m4s/);
+    assert.match(await readPlaylist(retainedAsset.filePath), /#EXT-X-ENDLIST/);
     const firstReady = states.findIndex(({ preparation }) => preparation.status === "ready");
     assert.ok(firstReady >= 0, JSON.stringify(states));
     assert.ok(states.slice(firstReady).every(({ preparation }) => preparation.status === "ready"), JSON.stringify(states));
-    assert.ok(events.some(({ event }) => event === "hls_generation_preempted"), JSON.stringify(events));
+    assert.equal(events.some(({ event }) => event === "hls_generation_preempted"), false, JSON.stringify(events));
     assert.ok(manager.diagnostics().generations.some((generation) =>
-      generation.jobId === background.jobId && generation.servingGenerationId
+      generation.jobId === background.jobId && generation.complete
     ));
   } finally {
     await manager?.shutdown();

@@ -89,9 +89,12 @@ export function createMediaTaskScheduler({
   const pending = [];
   let activeTask = null;
   let foregroundJobId = null;
+  let orderedJobIds = [];
+  let jobOrder = new Map();
   let sequence = 0;
   let draining = false;
   let lastDeferredLogAt = 0;
+  let deferredPreemptionKey = "";
   const emit = (event, data) => {
     try {
       onEvent(event, data);
@@ -99,8 +102,10 @@ export function createMediaTaskScheduler({
       // Diagnostic reporting must never affect media scheduling.
     }
   };
+  const rank = (jobId) => jobOrder.get(jobId) ?? Number.MAX_SAFE_INTEGER;
   const sort = () => pending.sort((left, right) =>
     Number(right.jobId === foregroundJobId) - Number(left.jobId === foregroundJobId) ||
+    rank(left.jobId) - rank(right.jobId) ||
     Number(right.priority || 0) - Number(left.priority || 0) || left.sequence - right.sequence
   );
   const interruptForForeground = () => {
@@ -108,6 +113,20 @@ export function createMediaTaskScheduler({
     if (!activeTask?.interrupt || activeTask.interrupted || !promoted) return;
     if (activeTask.jobId === foregroundJobId &&
       Number(activeTask.priority || 0) >= Number(promoted.priority || 0)) return;
+    if (activeTask.preemptible === false) {
+      const key = `${activeTask.jobId}:${promoted.jobId}`;
+      if (deferredPreemptionKey !== key) {
+        deferredPreemptionKey = key;
+        emit("media_task_preemption_deferred", {
+          taskId: activeTask.taskId,
+          jobId: activeTask.jobId,
+          promotedJobId: promoted.jobId,
+          stage: activeTask.stage,
+        });
+      }
+      return;
+    }
+    deferredPreemptionKey = "";
     activeTask.interrupted = true;
     emit("media_task_preempted", { taskId: activeTask.taskId, jobId: activeTask.jobId, promotedJobId: foregroundJobId });
     void activeTask.interrupt();
@@ -175,15 +194,27 @@ export function createMediaTaskScheduler({
     }
   };
   return {
-    enqueue({ taskId, jobId, stage, priority = 0, run }) {
+    enqueue({ taskId, jobId, stage, priority = 0, preemptible = true, run }) {
       const queuedAt = Date.now();
       const promise = new Promise((resolve, reject) => {
-        pending.push({ taskId, jobId, stage, priority, run, resolve, reject, queuedAt, sequence: sequence++ });
+        pending.push({
+          taskId,
+          jobId,
+          stage,
+          priority,
+          preemptible,
+          run,
+          resolve,
+          reject,
+          queuedAt,
+          sequence: sequence++,
+        });
         emit("media_task_queued", {
           taskId,
           jobId,
           stage,
           priority,
+          preemptible,
           queueDepth: pending.length,
         });
         sort(); interruptForForeground(); void drain();
@@ -192,10 +223,26 @@ export function createMediaTaskScheduler({
       return promise;
     },
     prioritize(jobId) {
-      foregroundJobId = jobId || null;
+      const nextJobId = jobId || null;
+      if (foregroundJobId === nextJobId) return false;
+      foregroundJobId = nextJobId;
       emit("media_priority_changed", { foregroundJobId });
       sort();
       interruptForForeground();
+      return true;
+    },
+    setJobOrder(jobIds = []) {
+      const nextOrder = Array.from(new Set(jobIds.filter(Boolean)));
+      if (
+        nextOrder.length === orderedJobIds.length &&
+        nextOrder.every((jobId, index) => jobId === orderedJobIds[index])
+      ) return false;
+      orderedJobIds = nextOrder;
+      jobOrder = new Map(orderedJobIds.map((jobId, index) => [jobId, index]));
+      emit("media_queue_order_changed", { jobIds: orderedJobIds });
+      sort();
+      interruptForForeground();
+      return true;
     },
     cancelJob(jobId, error = new Error("Media work was cancelled.")) {
       const cancelled = pending.filter((task) => task.jobId === jobId);
@@ -216,7 +263,14 @@ export function createMediaTaskScheduler({
       return {
         foregroundJobId,
         active: activeTask ? { taskId: activeTask.taskId, jobId: activeTask.jobId, stage: activeTask.stage, profile: activeTask.profile.kind, mode: activeTask.profile.mode } : null,
-        queued: pending.map((task) => ({ taskId: task.taskId, jobId: task.jobId, stage: task.stage, foreground: task.jobId === foregroundJobId })),
+        orderedJobIds,
+        queued: pending.map((task) => ({
+          taskId: task.taskId,
+          jobId: task.jobId,
+          stage: task.stage,
+          foreground: task.jobId === foregroundJobId,
+          rank: jobOrder.get(task.jobId) ?? null,
+        })),
         responsiveness: monitor.snapshot(),
       };
     },

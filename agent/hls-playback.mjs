@@ -22,15 +22,61 @@ import {
   createProcessRegistry,
 } from "./process-registry.mjs";
 
-const CACHE_VERSION = "hls-v8";
+const CACHE_VERSION = "hls-v9";
 const DEFAULT_SEGMENT_SECONDS = 4;
 const DEFAULT_PLAYABLE_SECONDS = 120;
 const PLAYLIST_WAIT_MS = 15 * 60_000;
 const GENERATION_POINTER = "current.json";
 
-function playlistDuration(playlist) {
-  return Array.from(playlist.matchAll(/^#EXTINF:([\d.]+)/gm))
-    .reduce((total, match) => total + Number(match[1] || 0), 0);
+function mediaPlaylistSegments(playlist) {
+  const mediaSequence = Number(/^#EXT-X-MEDIA-SEQUENCE:(\d+)$/m.exec(playlist)?.[1] || 0);
+  const segments = [];
+  let duration = null;
+  let sequence = mediaSequence;
+  for (const rawLine of playlist.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const durationMatch = /^#EXTINF:([\d.]+)/.exec(line);
+    if (durationMatch) {
+      duration = Number(durationMatch[1]);
+      continue;
+    }
+    if (duration === null || !line || line.startsWith("#")) continue;
+    segments.push({ sequence, duration, uri: line });
+    sequence += 1;
+    duration = null;
+  }
+  return { mediaSequence, segments, complete: playlist.includes("#EXT-X-ENDLIST") };
+}
+
+async function playlistWindow(directory, relativePath, playlist) {
+  const parsed = mediaPlaylistSegments(playlist);
+  if (parsed.mediaSequence !== 0 || !parsed.segments.length) {
+    return { duration: 0, complete: false };
+  }
+
+  const playlistDirectory = path.dirname(path.join(directory, relativePath));
+  let duration = 0;
+  for (const [index, segment] of parsed.segments.entries()) {
+    const expectedName = `segment-${String(index).padStart(6, "0")}.m4s`;
+    const uriPath = segment.uri.split(/[?#]/, 1)[0];
+    const segmentPath = path.resolve(playlistDirectory, uriPath);
+    if (
+      segment.sequence !== index ||
+      path.basename(uriPath) !== expectedName ||
+      (segmentPath !== playlistDirectory && !segmentPath.startsWith(playlistDirectory + path.sep))
+    ) return { duration, complete: false };
+    duration += segment.duration;
+  }
+
+  const firstPath = path.join(playlistDirectory, "segment-000000.m4s");
+  const lastPath = path.join(
+    playlistDirectory,
+    `segment-${String(parsed.segments.length - 1).padStart(6, "0")}.m4s`
+  );
+  if (!(await exists(firstPath)) || !(await exists(lastPath))) {
+    return { duration: 0, complete: false };
+  }
+  return { duration, complete: parsed.complete };
 }
 
 function quoted(value) {
@@ -222,14 +268,35 @@ export function createHlsPlaybackManager({
       return { playable: false, complete: false, bufferedSeconds: 0 };
     }
 
-    const playlists = await Promise.all([
-      readFile(path.join(directory, "video", "index.m3u8"), "utf8"),
+    const playablePlaylistPaths = [
+      "video/index.m3u8",
       ...(primaryAudioTrack
-        ? [readFile(path.join(directory, "audio", trackDirectory(primaryAudioTrack), "index.m3u8"), "utf8")]
+        ? [`audio/${trackDirectory(primaryAudioTrack)}/index.m3u8`]
         : []),
-    ]);
-    const bufferedSeconds = Math.min(...playlists.map(playlistDuration));
-    const complete = await cacheIsComplete(directory, audioTracks);
+    ];
+    const playablePlaylists = await Promise.all(playablePlaylistPaths.map(async (relativePath) => ({
+      relativePath,
+      contents: await readFile(path.join(directory, relativePath), "utf8"),
+    })));
+    const playableWindows = await Promise.all(playablePlaylists.map(({ relativePath, contents }) =>
+      playlistWindow(directory, relativePath, contents)
+    ));
+    const bufferedSeconds = Math.min(...playableWindows.map((window) => window.duration));
+    let complete = false;
+    if (await cacheIsComplete(directory, audioTracks)) {
+      const completePlaylistPaths = [
+        "video/index.m3u8",
+        ...audioTracks.map((track) => `audio/${trackDirectory(track)}/index.m3u8`),
+      ];
+      const completeWindows = await Promise.all(completePlaylistPaths.map(async (relativePath) =>
+        playlistWindow(
+          directory,
+          relativePath,
+          await readFile(path.join(directory, relativePath), "utf8")
+        )
+      ));
+      complete = completeWindows.every((window) => window.complete);
+    }
     return {
       playable: complete || bufferedSeconds >= playableSeconds,
       complete,
@@ -726,6 +793,7 @@ export function createHlsPlaybackManager({
         jobId: schedulingId,
         stage: "browser-playback",
         priority: 50,
+        preemptible: false,
         run: async (resourceProfile) => {
           const state = await initialize({
             ...descriptor,
@@ -806,8 +874,8 @@ export function createHlsPlaybackManager({
       if (state.cancelled) throw new Error("Render was cancelled.");
       if (state.preempted) throw renderPreemptedError();
       const playlist = await readFile(filePath, "utf8").catch(() => "");
-      const duration = playlistDuration(playlist);
-      if (duration >= requiredSeconds || playlist.includes("#EXT-X-ENDLIST")) return filePath;
+      const window = await playlistWindow(directory, relativePath, playlist);
+      if (window.duration >= requiredSeconds || window.complete) return filePath;
 
       const errorKey = assetErrorKey(relativePath);
       const error = errorKey ? state.errors.get(errorKey) : null;
