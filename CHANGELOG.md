@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.5](https://github.com/Etaselia/watchpair/compare/v0.9.4...v0.9.5) (2026-07-29)
+
+
+### Bug Fixes
+
+* stabilize ordered Linux playback preparation ([#49](https://github.com/Etaselia/watchpair/issues/49)) ([31ecc8d](https://github.com/Etaselia/watchpair/commit/31ecc8dafb4c08e0c3d6ee36f16c2b8fb1c4c06f))
+
 ## [0.9.4](https://github.com/Etaselia/watchpair/compare/v0.9.3...v0.9.4) (2026-07-26)
 
 
