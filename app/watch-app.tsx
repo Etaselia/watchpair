@@ -2338,6 +2338,16 @@ function preferredHlsVideoRendition(): HlsVideoRendition {
   return "h264";
 }
 
+function isTrustedPlaybackUrl(value: string) {
+  try {
+    const url = new URL(value);
+    return url.origin === AGENT_URL ||
+      (url.protocol === "blob:" && url.origin === window.location.origin);
+  } catch {
+    return false;
+  }
+}
+
 function mediaDuration(video: HTMLVideoElement) {
   if (Number.isFinite(video.duration)) return video.duration;
   return video.seekable.length ? video.seekable.end(video.seekable.length - 1) : 0;
@@ -2687,6 +2697,13 @@ function SyncedPlayer({
       return () => {
         video.removeAttribute("src");
       };
+    }
+
+    if (!isTrustedPlaybackUrl(playbackUrl)) {
+      fail("The selected video returned an invalid playback address.");
+      video.removeAttribute("src");
+      video.load();
+      return;
     }
 
     if (!isHlsPlayback) {
@@ -3322,7 +3339,10 @@ function SyncedPlayer({
             <ListVideo />
             <select
               value={queue.find((item) => item.selected)?.sourceId || ""}
-              onChange={(event) => void switchVideo(event.target.value)}
+              onChange={(event) => {
+                const selected = queue[event.currentTarget.selectedIndex];
+                if (selected) void switchVideo(selected.sourceId);
+              }}
               disabled={switchingVideo}
               aria-label="Select video"
             >

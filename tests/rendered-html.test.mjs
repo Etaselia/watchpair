@@ -370,6 +370,8 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /Character edge/);
   assert.match(app, /aria-label="Select video"/);
   assert.match(app, /aria-label="Next video"/);
+  assert.match(app, /isTrustedPlaybackUrl/);
+  assert.match(app, /event\.currentTarget\.selectedIndex/);
   assert.match(app, /Preparing selected video/);
   assert.match(app, /applySession/);
   assert.match(app, /Preparing video for this browser/);
