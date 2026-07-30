@@ -1,4 +1,5 @@
 import type { SharedSource, SourceKind } from "./session-types";
+import { load } from "cheerio";
 
 export interface SubtitleCue {
   start: number;
@@ -157,15 +158,19 @@ export function parseSubtitles(contents: string): SubtitleCue[] {
     const timingIndex = lines.findIndex((line) => line.includes("-->"));
     if (timingIndex < 0) return [];
 
-    const [startValue, endValue] = lines[timingIndex].split("-->").map((part) => part.trim().split(/\s+/)[0]);
+    const [startValue, endValue] = lines[timingIndex]
+      .split("-->")
+      .map((part) => part.trim().split(/\s+/)[0]);
     const start = timestampToSeconds(startValue);
     const end = timestampToSeconds(endValue);
     if (!Number.isFinite(start) || !Number.isFinite(end)) return [];
 
+    const rawText = lines.slice(timingIndex + 1).join("\n");
+
     return [{
       start,
       end,
-      text: lines.slice(timingIndex + 1).join("\n").replace(/<[^>]+>/g, ""),
+      text: load(`<body>${rawText}</body>`)("body").text(),
     }];
   });
 }
