@@ -356,9 +356,16 @@ function sourceLabel(value) {
 
 function decodedCandidates(rawValue) {
   const value = String(rawValue || "")
-    .replace(/\\u0026/gi, "&")
-    .replace(/\\u003d/gi, "=")
-    .replaceAll("&amp;", "&");
+      // Match any of the three targets in a single pass
+      .replace(/\\u0026|\\u003d|&amp;/gi, (match) => {
+        switch (match.toLowerCase()) {
+          case "\\u0026": return "&";
+          case "\\u003d": return "=";
+          case "&amp;": return "&";
+          default: return match;
+        }
+      });
+
   const values = [value];
   try {
     const decoded = decodeURIComponent(value);
