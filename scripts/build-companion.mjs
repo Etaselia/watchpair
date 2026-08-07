@@ -13,6 +13,7 @@ const inputs = [
   ["hls-playback.mjs", resolve(root, "agent", "hls-playback.mjs")],
   ["hardware-acceleration.mjs", resolve(root, "agent", "hardware-acceleration.mjs")],
   ["media-governor.mjs", resolve(root, "agent", "media-governor.mjs")],
+  ["media-priority.mjs", resolve(root, "agent", "media-priority.mjs")],
   ["process-registry.mjs", resolve(root, "agent", "process-registry.mjs")],
   ["persistent-log.mjs", resolve(root, "agent", "persistent-log.mjs")],
   ["render-queue.mjs", resolve(root, "agent", "render-queue.mjs")],

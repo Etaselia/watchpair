@@ -106,9 +106,17 @@ test("companion serves original ASS, WebVTT fallback, and attached MKV fonts", {
       (body) => body?.job?.status === "ready" && body?.job?.subtitleStatus === "ready",
     );
     const track = snapshot.job.subtitles[0];
+    const mediaFile = snapshot.job.files[0];
+    assert.equal(mediaFile.path, "fixture.mkv");
+    assert.equal(path.isAbsolute(mediaFile.path), false);
+    assert.equal(mediaFile.path.includes(directory), false);
     assert.equal(track.styled, true);
     assert.match(track.assUrl, /\.ass\?v=/);
+    assert.match(new URL(track.assUrl).pathname, /\/media\/0\/subtitles\//);
+    assert.equal(new URL(track.assUrl).searchParams.get("v"), mediaFile.fingerprint);
     assert.equal(track.fonts.length, 1);
+    assert.match(new URL(track.fonts[0].url).pathname, /\/media\/0\/subtitle-fonts\//);
+    assert.equal(new URL(track.fonts[0].url).searchParams.get("v"), mediaFile.fingerprint);
     assert.deepEqual(snapshot.job.chapters.map(({ title, start, end }) => ({ title, start, end })), [
       { title: "Opening", start: 0, end: 1 },
       { title: "Second half", start: 1, end: 2 },

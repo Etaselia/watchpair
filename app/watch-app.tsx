@@ -31,6 +31,7 @@ import {
   Settings2,
   Share2,
   SkipBack,
+  Star,
   SkipForward,
   Subtitles,
   Trash2,
@@ -66,13 +67,14 @@ import {
   seedAgentLibraryFile,
   selectAgentFile,
   setAgentDownloadPinned,
-  setAgentPlaybackPriority,
+  setAgentMediaPriority,
   stopAgentDownload,
   uploadAndSeedAgentFile,
   type AgentAudioTrack,
   type AgentChapter,
   type AgentFile,
   type AgentLibraryFile,
+  type AgentMediaTarget,
   type AgentPermissionState,
   type AgentJob,
   type AgentSubtitleTrack,
@@ -94,6 +96,11 @@ import {
   findLocalAgentMedia,
   type LocalAgentBinding,
 } from "../lib/media-binding.mjs";
+import {
+  mediaManifest,
+  mediaQueue,
+  orderedMediaQueue,
+} from "../lib/media-queue.mjs";
 import {
   clampSeekTarget,
   isPlaybackAcknowledgement,
@@ -168,9 +175,11 @@ function preferredAgentFile(job: AgentJob, selectedMedia?: WatchSession["selecte
     : null;
   const selected = selectedMedia?.sourceId === job.id
     ? job.files.find((file) =>
-        (selectedMedia.fileIndex === undefined || file.index === selectedMedia.fileIndex) &&
-        file.name === selectedMedia.name &&
-        file.size === selectedMedia.size
+        (selectedMedia.itemId
+          ? file.itemId === selectedMedia.itemId
+          : (selectedMedia.fileIndex === undefined || file.index === selectedMedia.fileIndex) &&
+            file.name === selectedMedia.name &&
+            file.size === selectedMedia.size)
       )
     : null;
   return matchingFingerprint
@@ -186,7 +195,7 @@ function preferredAgentFile(job: AgentJob, selectedMedia?: WatchSession["selecte
 }
 
 function queueReadinessForJob(job: AgentJob, file: AgentFile | null): QueueReadiness {
-  const preparation = job.preparation?.status || "waiting";
+  const preparation = file?.preparation?.status || job.preparation?.status || "waiting";
   if (!file) {
     return {
       ready: false,
@@ -209,7 +218,7 @@ function queueReadinessForJob(job: AgentJob, file: AgentFile | null): QueueReadi
       : !fingerprint
         ? "Verifying file identity"
       : preparation === "error"
-        ? job.preparation.error || "Browser preparation failed"
+        ? file?.preparation.error || job.preparation.error || "Browser preparation failed"
         : preparation === "queued"
           ? "Queued for browser preparation"
           : preparation === "preparing"
@@ -227,9 +236,9 @@ function queueReadinessForJob(job: AgentJob, file: AgentFile | null): QueueReadi
   };
 }
 
-function preparationSummary(job?: AgentJob) {
+function preparationSummary(job?: AgentJob, file?: AgentFile | null) {
   if (!job) return { label: "Waiting for download", title: "", hardware: false };
-  const preparation = job.preparation;
+  const preparation = file?.preparation || job.preparation;
   const encoder = preparation.encoder?.label || job.transcoder.label;
   const hardwareDecode = preparation.pipeline?.hardwareDecode ?? preparation.hardwareDecode;
   let label = "Waiting for download";
@@ -443,6 +452,7 @@ export default function WatchApp() {
   const sessionRef = useRef<WatchSession | null>(null);
   const selectionSentRef = useRef("");
   const filenameSyncedRef = useRef(new Set<string>());
+  const manifestSyncedRef = useRef(new Set<string>());
   const loadedSubtitleRef = useRef("");
   const initializedMediaTracksRef = useRef("");
   const autoOpenedMediaRef = useRef("");
@@ -462,31 +472,53 @@ export default function WatchApp() {
   const localAgentMedia = findLocalAgentMedia(agentJobs, session?.selectedMedia, localAgentBinding);
   const playbackSourceId = localAgentMedia?.sourceId || activeSourceId;
   const agentJob = localAgentMedia?.job || (activeSource ? agentJobs[activeSource.id] || null : null);
-  const prioritySourceId = localAgentMedia?.job.id || session?.selectedMedia?.sourceId || null;
-  const selectedSourceIndex = sources.findIndex(
-    (source) => source.id === session?.selectedMedia?.sourceId
-  );
-  const watchOrderedSources = selectedSourceIndex >= 0
-    ? [...sources.slice(selectedSourceIndex), ...sources.slice(0, selectedSourceIndex)]
-    : sources;
-  const preparationSourceIds = watchOrderedSources
-    .map((source) =>
-      source.id === session?.selectedMedia?.sourceId
-        ? prioritySourceId
-        : agentJobs[source.id]?.id || null
-    )
-    .filter((sourceId): sourceId is string => Boolean(sourceId));
-  const preparationOrderKey = preparationSourceIds.join(":");
-  const embeddedAudioTracks = agentJob?.audioTracks || EMPTY_AUDIO_TRACKS;
-  const embeddedChapters = agentJob?.chapters || EMPTY_CHAPTERS;
-  const embeddedSubtitles = agentJob?.subtitles || EMPTY_SUBTITLE_TRACKS;
+  const selectedAgentFile = localAgentMedia?.file
+    || (agentJob ? preferredAgentFile(agentJob, session?.selectedMedia) : null);
+  const synchronizedMedia = mediaQueue(sources);
+  const selectedItemId = session?.selectedMedia?.itemId
+    || synchronizedMedia.find((item) =>
+      item.sourceId === session?.selectedMedia?.sourceId &&
+      item.fileIndex === session?.selectedMedia?.fileIndex
+    )?.id
+    || null;
+  const orderedSynchronizedMedia = orderedMediaQueue(sources, selectedItemId);
+  const episodeTargets: AgentMediaTarget[] = orderedSynchronizedMedia.flatMap((item) => {
+    const job = agentJobs[item.sourceId];
+    const file = job?.files.find((candidate) =>
+      candidate.index === item.fileIndex &&
+      candidate.size === item.size
+    );
+    return file ? [{ jobId: job.id, fileIndex: file.index, itemId: item.id }] : [];
+  });
+  let selectedTarget = episodeTargets.find((target) => target.itemId === selectedItemId) || null;
+  if (localAgentMedia && session?.selectedMedia) {
+    selectedTarget = {
+      jobId: localAgentMedia.job.id,
+      fileIndex: localAgentMedia.file.index,
+      itemId: selectedItemId,
+    };
+    const existingIndex = episodeTargets.findIndex((target) =>
+      (Boolean(selectedItemId) && target.itemId === selectedItemId) ||
+      (target.jobId === selectedTarget?.jobId &&
+        target.fileIndex === selectedTarget.fileIndex)
+    );
+    if (existingIndex >= 0) episodeTargets.splice(existingIndex, 1);
+    episodeTargets.unshift(selectedTarget);
+  }
+  const priorityPlanKey = JSON.stringify({ selected: selectedTarget, targets: episodeTargets });
+  const embeddedAudioTracks = selectedAgentFile?.audioTracks || agentJob?.audioTracks || EMPTY_AUDIO_TRACKS;
+  const embeddedChapters = selectedAgentFile?.chapters || agentJob?.chapters || EMPTY_CHAPTERS;
+  const embeddedSubtitles = selectedAgentFile?.subtitles || agentJob?.subtitles || EMPTY_SUBTITLE_TRACKS;
   const sourcesKey = sources.map((source) => source.id).join(":");
 
   useEffect(() => {
     if (!agentAvailable) return;
-    const orderedSourceIds = preparationOrderKey ? preparationOrderKey.split(":") : [];
-    void setAgentPlaybackPriority(prioritySourceId, orderedSourceIds).catch(() => {});
-  }, [agentAvailable, preparationOrderKey, prioritySourceId]);
+    const plan = JSON.parse(priorityPlanKey) as {
+      selected: AgentMediaTarget | null;
+      targets: AgentMediaTarget[];
+    };
+    void setAgentMediaPriority(plan.selected, plan.targets).catch(() => {});
+  }, [agentAvailable, priorityPlanKey]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -867,6 +899,7 @@ export default function WatchApp() {
           await sendAction("select-media", {
             media: {
               sourceId,
+              itemId: `${sourceId}-f0`,
               fileIndex: 0,
               name: preferredName,
               size: playableFile.size,
@@ -951,6 +984,7 @@ export default function WatchApp() {
           await sendAction("select-media", {
             media: {
               sourceId,
+              itemId: target.itemId || `${sourceId}-f${target.index}`,
               fileIndex: target.index,
               name: target.name,
               size: target.size,
@@ -1143,6 +1177,31 @@ export default function WatchApp() {
 
       for (const source of queueSources) {
         const job = jobsById[source.id];
+        if (!job || source.mediaItems?.length) continue;
+        const manifest = mediaManifest(job.files, source.id);
+        if (!manifest.length) continue;
+        const manifestKey = JSON.stringify({
+          sourceId: source.id,
+          infoHash: job.infoHash,
+          files: manifest.map((item) => [item.fileIndex, item.path, item.size]),
+        });
+        if (manifestSyncedRef.current.has(manifestKey)) continue;
+        manifestSyncedRef.current.add(manifestKey);
+        try {
+          await sendAction("source-manifest", {
+            sourceId: source.id,
+            infoHash: job.infoHash,
+            mediaItems: manifest,
+          });
+        } catch {
+          manifestSyncedRef.current.delete(manifestKey);
+        }
+      }
+
+      for (const source of queueSources) {
+        const job = jobsById[source.id];
+        const videoFiles = job ? mediaManifest(job.files, source.id) : [];
+        if (videoFiles.length !== 1) continue;
         const target = job ? preferredAgentFile(job) : null;
         const renameKey = target ? `${source.id}:${target.name}` : "";
         if (!target?.name || source.label === target.name || filenameSyncedRef.current.has(renameKey)) {
@@ -1180,42 +1239,69 @@ export default function WatchApp() {
           const selectionKey = `${source.id}:${target.index}`;
           if (selectionSentRef.current === selectionKey) break;
           selectionSentRef.current = selectionKey;
-          const nextSession = await sendAction("select-media", {
-            media: {
-              sourceId: source.id,
-              fileIndex: target.index,
-              name: target.name,
-              size: target.size,
-              fingerprint: queueReadinessForJob(job, target).fingerprint || undefined,
-            },
-          });
-          selectedMedia = nextSession.selectedMedia;
+          try {
+            const nextSession = await sendAction("select-media", {
+              media: {
+                sourceId: source.id,
+                itemId: target.itemId || `${source.id}-f${target.index}`,
+                fileIndex: target.index,
+                name: target.name,
+                size: target.size,
+                fingerprint: queueReadinessForJob(job, target).fingerprint || undefined,
+              },
+            });
+            selectedMedia = nextSession.selectedMedia;
+          } catch {
+            if (selectionSentRef.current === selectionKey) {
+              selectionSentRef.current = "";
+            }
+          }
           break;
         }
       }
 
       const queue: Record<string, QueueReadiness> = {};
+      const unavailable = (): QueueReadiness => ({
+        ready: false,
+        progress: 0,
+        status:
+          downloadMode === "automatic"
+            ? "Waiting for companion"
+            : downloadMode === "manual"
+              ? "Ready to start locally"
+              : "Use an external client or local file",
+        fileName: null,
+        fileSize: null,
+        fingerprint: null,
+        preparation: "waiting",
+      });
       for (const source of queueSources) {
         const job = jobsById[source.id];
-        queue[source.id] = job
-          ? queueReadinessForJob(job, preferredAgentFile(job, selectedMedia))
-          : {
-              ready: false,
-              progress: 0,
-              status:
-                downloadMode === "automatic"
-                  ? "Waiting for companion"
-                  : downloadMode === "manual"
-                    ? "Ready to start locally"
-                    : "Use an external client or local file",
-              fileName: null,
-              fileSize: null,
-              fingerprint: null,
-              preparation: "waiting",
-            };
+        const manifest = source.mediaItems?.length
+          ? source.mediaItems
+          : job ? mediaManifest(job.files, source.id) : [];
+        let sourceState = unavailable();
+        for (const mediaItem of manifest) {
+          const file = job?.files.find((candidate) =>
+            candidate.index === mediaItem.fileIndex &&
+            candidate.size === mediaItem.size
+          ) || null;
+          const itemState = job ? queueReadinessForJob(job, file) : unavailable();
+          queue[mediaItem.id] = itemState;
+          if (
+            !sourceState.fileName ||
+            mediaItem.id === selectedMedia?.itemId ||
+            (
+              source.id === selectedMedia?.sourceId &&
+              mediaItem.fileIndex === selectedMedia?.fileIndex
+            )
+          ) sourceState = itemState;
+        }
+        queue[source.id] = sourceState;
       }
 
       const logicalSourceId = selectedMedia?.sourceId || queueSources[0]?.id;
+      const logicalItemId = selectedMedia?.itemId || logicalSourceId;
       const localFileBinding = localFileBindingRef.current;
       let localMatch = findLocalAgentMedia(jobsById, selectedMedia, localAgentBinding);
       if (localMatch?.job.kind === "magnet" && !localMatch.file.selected) {
@@ -1239,11 +1325,13 @@ export default function WatchApp() {
       if (!activeItem && localMatch) {
         activeFile = localMatch.file;
         activeItem = queueReadinessForJob(localMatch.job, localMatch.file);
-        queue[localMatch.sourceId] = activeItem;
+        queue[localMatch.file.itemId || localMatch.sourceId] = activeItem;
       }
+      if (!activeItem && logicalItemId) activeItem = queue[logicalItemId] || null;
       if (!activeItem && logicalSourceId) activeItem = queue[logicalSourceId] || null;
       if (!activeItem) return;
       // Readiness belongs to the logical movie, even when this participant uses another source.
+      if (logicalItemId) queue[logicalItemId] = activeItem;
       if (logicalSourceId) queue[logicalSourceId] = activeItem;
 
       const next: LocalReadiness = {
@@ -1252,9 +1340,24 @@ export default function WatchApp() {
         voice: readinessRef.current.voice,
       };
       const previous = readinessRef.current;
+      const queueKeys = Object.keys(queue);
+      const queueChanged =
+        queueKeys.length !== Object.keys(previous.queue).length ||
+        queueKeys.some((key) => {
+          const current = queue[key];
+          const prior = previous.queue[key];
+          return !prior || current.ready !== prior.ready ||
+            current.progress !== prior.progress ||
+            current.preparation !== prior.preparation ||
+            current.status !== prior.status ||
+            current.fileName !== prior.fileName ||
+            current.fileSize !== prior.fileSize ||
+            current.fingerprint !== prior.fingerprint;
+        });
       const readinessChanged =
         next.ready !== previous.ready ||
-        (next.ready && previous.fingerprint !== next.fingerprint);
+        (next.ready && previous.fingerprint !== next.fingerprint) ||
+        queueChanged;
       readinessRef.current = next;
       setReadiness(next);
       if (usesLocalFile && localFileBinding) {
@@ -1447,6 +1550,7 @@ export default function WatchApp() {
         await sendAction("select-media", {
           media: {
             sourceId,
+            itemId: file.itemId || `${sourceId}-f${file.index}`,
             fileIndex: file.index,
             name: file.name,
             size: file.size,
@@ -1516,6 +1620,24 @@ export default function WatchApp() {
       setAgentJobs((current) => ({ ...current, [sourceId]: job }));
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not update download retention.");
+    }
+  };
+
+  const updateQueuedMedia = async (
+    action: "prioritize-media" | "include-media",
+    itemId: string,
+    value: boolean
+  ) => {
+    try {
+      await sendAction(action, action === "prioritize-media"
+        ? { itemId, priority: value }
+        : { itemId, included: value });
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : "Could not update the synchronized episode queue."
+      );
     }
   };
 
@@ -1615,31 +1737,48 @@ export default function WatchApp() {
     [sendAction]
   );
 
-  const sourceReadyForEveryone = (sourceId: string) => Boolean(
-    readiness.queue[sourceId]?.ready &&
-    session?.participants.every((participant) => participant.queue?.[sourceId]?.ready)
+  const mediaReadyForEveryone = (itemId: string) => Boolean(
+    readiness.queue[itemId]?.ready &&
+    session?.participants.every((participant) => participant.queue?.[itemId]?.ready)
   );
 
-  const selectPlaylistSource = async (sourceId: string) => {
-    if (sourceId === session?.selectedMedia?.sourceId) return;
+  const selectPlaylistMedia = async (itemId: string) => {
+    if (itemId === selectedItemId) return;
+    const mediaItem = synchronizedMedia.find((item) => item.id === itemId);
+    const sourceId = mediaItem?.sourceId || itemId;
     const job = agentJobs[sourceId];
-    const target = job ? preferredAgentFile(job) : null;
-    if (!job || !target || !sourceReadyForEveryone(sourceId)) return;
+    const target = mediaItem
+      ? job?.files.find((file) =>
+          file.index === mediaItem.fileIndex && file.size === mediaItem.size
+        ) || null
+      : job ? preferredAgentFile(job) : null;
+    if (!job || !target || !mediaReadyForEveryone(itemId)) return;
     await chooseAgentMedia(sourceId, job, target);
   };
 
-  const playbackQueue: PlayerQueueItem[] = sources.map((source) => ({
-    sourceId: source.id,
-    label: source.label,
-    selected: source.id === session?.selectedMedia?.sourceId,
-    ready: source.id === session?.selectedMedia?.sourceId || sourceReadyForEveryone(source.id),
-  }));
+  const playbackQueue: PlayerQueueItem[] = synchronizedMedia.length
+    ? synchronizedMedia.map((item) => ({
+        itemId: item.id,
+        sourceId: item.sourceId,
+        label: item.path,
+        selected: item.id === selectedItemId,
+        ready: item.id === selectedItemId || mediaReadyForEveryone(item.id),
+      }))
+    : sources.map((source) => ({
+        itemId: source.id,
+        sourceId: source.id,
+        label: source.label,
+        selected: source.id === session?.selectedMedia?.sourceId,
+        ready:
+          source.id === session?.selectedMedia?.sourceId ||
+          mediaReadyForEveryone(source.id),
+      }));
 
   const advancePlaylist = async () => {
-    if (!session || deviceId !== session.hostId || !session.selectedMedia?.sourceId) return;
-    const currentIndex = sources.findIndex((source) => source.id === session.selectedMedia?.sourceId);
-    const nextSource = currentIndex >= 0 ? sources[currentIndex + 1] : null;
-    if (nextSource) await selectPlaylistSource(nextSource.id);
+    if (!session || deviceId !== session.hostId || !session.selectedMedia) return;
+    const currentIndex = playbackQueue.findIndex((item) => item.selected);
+    const nextMedia = currentIndex >= 0 ? playbackQueue[currentIndex + 1] : null;
+    if (nextMedia) await selectPlaylistMedia(nextMedia.itemId);
   };
 
   const readyParticipants = session?.participants.filter((participant) => participant.ready) ?? [];
@@ -1686,7 +1825,7 @@ export default function WatchApp() {
         chapters={embeddedChapters}
         subtitleTracks={embeddedSubtitles}
         queue={playbackQueue}
-        onSelectVideo={selectPlaylistSource}
+        onSelectVideo={selectPlaylistMedia}
         onBack={() => setView("lobby")}
         onEnded={deviceId === session.hostId ? () => void advancePlaylist() : undefined}
         onSend={sendPlayerState}
@@ -1897,15 +2036,32 @@ export default function WatchApp() {
             <div className="queue-list" aria-label="Synchronized download queue">
               {sources.map((source, queueIndex) => {
                 const job = agentJobs[source.id];
-                const target = job ? preferredAgentFile(job, session?.selectedMedia) : null;
-                const localState = readiness.queue[source.id];
+                const manifestItems = source.mediaItems?.length
+                  ? source.mediaItems
+                  : job ? mediaManifest(job.files, source.id) : [];
+                const mediaRows = manifestItems.map((item) => ({
+                  item,
+                  file: job?.files.find((candidate) =>
+                    candidate.index === item.fileIndex && candidate.size === item.size
+                  ) || null,
+                }));
+                const selectedRow = mediaRows.find(({ item }) =>
+                  item.id === selectedItemId ||
+                  (
+                    source.id === session?.selectedMedia?.sourceId &&
+                    item.fileIndex === session?.selectedMedia?.fileIndex
+                  )
+                );
+                const target = selectedRow?.file || (job ? preferredAgentFile(job, session?.selectedMedia) : null);
+                const activeReadinessKey = selectedRow?.item.id || source.id;
+                const localState = readiness.queue[activeReadinessKey] || readiness.queue[source.id];
                 const selected = localAgentMedia
                   ? localAgentMedia.sourceId === source.id
                   : activeSource?.id === source.id;
                 const readyCount = session?.participants.filter(
-                  (participant) => participant.queue?.[source.id]?.ready
+                  (participant) => participant.queue?.[activeReadinessKey]?.ready
                 ).length || 0;
-                const preparation = preparationSummary(job);
+                const preparation = preparationSummary(job, target);
 
                 return (
                   <article className={`queue-item ${selected ? "selected" : ""}`} key={source.id}>
@@ -2073,33 +2229,76 @@ export default function WatchApp() {
                       </button>
                     </div>
 
-                    {job && job.files.length > 1 && (
+                    {mediaRows.length > 1 && (
                       <div className="agent-files" aria-label={`Files in ${source.label}`}>
-                        {job.files
-                          .filter((file) => /\.(mp4|m4v|webm|ogv|mov|mkv|avi|ts)$/i.test(file.name))
-                          .slice(0, 12)
-                          .map((file) => {
-                            const fileSelected = selected && (localAgentMedia?.sourceId === source.id
-                              ? localAgentMedia.file.index === file.index
-                              : session?.selectedMedia?.fileIndex === file.index ||
-                                (session?.selectedMedia?.name === file.name &&
-                                  session.selectedMedia.size === file.size));
-                            return (
+                        {mediaRows.map(({ item, file }) => {
+                          const fileSelected = selected && (
+                            item.id === selectedItemId ||
+                            (
+                              localAgentMedia?.sourceId === source.id &&
+                              localAgentMedia.file.index === item.fileIndex
+                            )
+                          );
+                          const itemState = readiness.queue[item.id];
+                          const itemPreparation = preparationSummary(job, file);
+                          return (
+                            <div
+                              className={`agent-file-row ${fileSelected ? "selected" : ""} ${item.included ? "" : "excluded"}`}
+                              key={item.id}
+                            >
+                              <label
+                                className="agent-file-include"
+                                title={item.included ? "Exclude from synchronized queue" : "Include in synchronized queue"}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={item.included}
+                                  disabled={fileSelected}
+                                  onChange={(event) => void updateQueuedMedia(
+                                    "include-media",
+                                    item.id,
+                                    event.currentTarget.checked
+                                  )}
+                                  aria-label={`Include ${item.name}`}
+                                />
+                              </label>
                               <button
-                                className={fileSelected ? "selected" : ""}
+                                className="agent-file-select"
                                 type="button"
-                                key={file.index}
-                                onClick={() => void chooseAgentMedia(source.id, job, file)}
+                                disabled={!job || !file || !item.included}
+                                onClick={() => {
+                                  if (job && file) void chooseAgentMedia(source.id, job, file);
+                                }}
                               >
                                 <FileVideo2 />
                                 <span>
-                                  <strong>{file.name}</strong>
-                                  <small>{formatBytes(file.size)} / {Math.round(file.progress)}%</small>
+                                  <strong>{item.name}</strong>
+                                  <small title={item.path}>
+                                    {item.path !== item.name ? `${item.path} / ` : ""}
+                                    {formatBytes(item.size)} / {Math.round(file?.progress || itemState?.progress || 0)}%
+                                    {" / "}{itemPreparation.label}
+                                  </small>
                                 </span>
                                 {fileSelected && <Check />}
                               </button>
-                            );
-                          })}
+                              <button
+                                className={item.priority ? "icon-button selected" : "icon-button"}
+                                type="button"
+                                disabled={!item.included || fileSelected}
+                                aria-pressed={item.priority}
+                                title={item.priority ? "Use normal watch order" : "Prioritize this episode"}
+                                aria-label={item.priority ? "Use normal watch order" : "Prioritize this episode"}
+                                onClick={() => void updateQueuedMedia(
+                                  "prioritize-media",
+                                  item.id,
+                                  !item.priority
+                                )}
+                              >
+                                <Star fill={item.priority ? "currentColor" : "none"} />
+                              </button>
+                            </div>
+                          );
+                        })}
                       </div>
                     )}
                   </article>
@@ -2295,6 +2494,7 @@ export default function WatchApp() {
 }
 interface PlayerQueueItem {
   sourceId: string;
+  itemId: string;
   label: string;
   ready: boolean;
   selected: boolean;
@@ -2309,7 +2509,7 @@ interface SyncedPlayerProps {
   audioTracks: AgentAudioTrack[];
   chapters: AgentChapter[];
   queue: PlayerQueueItem[];
-  onSelectVideo: (sourceId: string) => Promise<void>;
+  onSelectVideo: (itemId: string) => Promise<void>;
   subtitleTracks: AgentSubtitleTrack[];
   onBack: () => void;
   onEnded?: () => void;
@@ -2328,8 +2528,6 @@ type PlaybackDiagnosticDetails = {
   roomPosition?: number;
   roomActorId?: string;
 };
-
-const HLS_STARTUP_FLOOR_SECONDS = 0.15;
 
 function preferredHlsVideoRendition(): HlsVideoRendition {
   if (typeof window === "undefined" || !window.MediaSource?.isTypeSupported) return "h264";
@@ -2359,9 +2557,9 @@ function finiteMediaValue(value: number | undefined) {
 
 function playbackTarget(video: HTMLVideoElement, expected: number, isHlsPlayback: boolean) {
   const target = Math.max(0, expected);
-  if (!isHlsPlayback || target >= HLS_STARTUP_FLOOR_SECONDS) return target;
+  if (!isHlsPlayback) return target;
   const seekableStart = video.seekable.length ? video.seekable.start(0) : 0;
-  return Math.max(target, seekableStart, HLS_STARTUP_FLOOR_SECONDS);
+  return Math.max(target, seekableStart);
 }
 
 function SyncedPlayer({
@@ -2416,14 +2614,14 @@ function SyncedPlayer({
   const selectedVideoIndex = queue.findIndex((item) => item.selected);
   const nextVideo = selectedVideoIndex >= 0 ? queue[selectedVideoIndex + 1] : null;
 
-  const switchVideo = async (sourceId: string) => {
-    const target = queue.find((item) => item.sourceId === sourceId);
+  const switchVideo = async (itemId: string) => {
+    const target = queue.find((item) => item.itemId === itemId);
     if (!target || target.selected || !target.ready || switchingVideo) return;
     setSwitchingVideo(true);
     setMediaLoading(true);
     setMediaError("");
     try {
-      await onSelectVideo(sourceId);
+      await onSelectVideo(itemId);
     } finally {
       setSwitchingVideo(false);
     }
@@ -3338,16 +3536,16 @@ function SyncedPlayer({
           <label className="player-video-select" title="Playlist">
             <ListVideo />
             <select
-              value={queue.find((item) => item.selected)?.sourceId || ""}
+              value={queue.find((item) => item.selected)?.itemId || ""}
               onChange={(event) => {
                 const selected = queue[event.currentTarget.selectedIndex];
-                if (selected) void switchVideo(selected.sourceId);
+                if (selected) void switchVideo(selected.itemId);
               }}
               disabled={switchingVideo}
               aria-label="Select video"
             >
               {queue.map((item) => (
-                <option key={item.sourceId} value={item.sourceId} disabled={!item.ready}>
+                <option key={item.itemId} value={item.itemId} disabled={!item.ready}>
                   {item.label}{item.ready ? "" : " (preparing)"}
                 </option>
               ))}
@@ -3356,7 +3554,7 @@ function SyncedPlayer({
           <button
             type="button"
             className="player-icon-button"
-            onClick={() => { if (nextVideo) void switchVideo(nextVideo.sourceId); }}
+            onClick={() => { if (nextVideo) void switchVideo(nextVideo.itemId); }}
             disabled={!nextVideo?.ready || switchingVideo}
             title={nextVideo?.ready ? "Next video" : "Next video is still preparing"}
             aria-label="Next video"

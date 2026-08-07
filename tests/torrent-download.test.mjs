@@ -8,6 +8,7 @@ import test from "node:test";
 import WebTorrent from "webtorrent";
 import Torrent from "webtorrent/lib/torrent.js";
 import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, stabilizeWireBitfieldWrites, verifiedTorrentFileProgress, verifyTorrentFilePieces } from "../agent/webtorrent-safety.mjs";
+import { replaceTorrentSelections } from "../agent/media-priority.mjs";
 
 installWebTorrentSafetyGuards();
 
@@ -92,6 +93,83 @@ test("piece recovery rewinds the selected file", () => {
   ]);
 });
 
+
+test("downloads nested torrent episodes in the requested order", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchpair-multifile-torrent-"));
+  const seedDirectory = path.join(directory, "Show Collection");
+  const downloadDirectory = path.join(directory, "download");
+  const episodeSpecs = [
+    {
+      relativePath: path.join("Season 1", "Episode 1.mkv"),
+      contents: randomBytes(1024 * 1024),
+    },
+    {
+      relativePath: path.join("Season 1", "Episode 2.mkv"),
+      contents: randomBytes(1024 * 1024),
+    },
+    {
+      relativePath: path.join("Season 2", "Episode 10.mkv"),
+      contents: randomBytes(1024 * 1024),
+    },
+  ];
+  const seeder = createLocalClient();
+  const leecher = createLocalClient();
+
+  try {
+    await mkdir(downloadDirectory);
+    for (const episode of episodeSpecs) {
+      const target = path.join(seedDirectory, episode.relativePath);
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, episode.contents);
+    }
+
+    const seeded = await seedFile(seeder, seedDirectory);
+    const torrent = leecher.add(seeded.torrentFile, {
+      path: downloadDirectory,
+      deselect: true,
+    });
+    await waitForEvent(torrent, "metadata");
+
+    const planned = episodeSpecs.map((episode) => {
+      const normalizedSuffix = episode.relativePath.replaceAll(path.sep, "/");
+      const fileIndex = torrent.files.findIndex((file) =>
+        file.path.replaceAll("\\", "/").endsWith(normalizedSuffix)
+      );
+      assert.notEqual(fileIndex, -1, `Expected torrent metadata for ${normalizedSuffix}`);
+      return { ...episode, fileIndex };
+    });
+    assert.equal(
+      torrent.files.some((file) => file.path.replaceAll("\\", "/").includes("Season 2/")),
+      true,
+      "Expected nested torrent folders to be preserved",
+    );
+
+    torrent.addPeer(`127.0.0.1:${seeder.torrentPort}`);
+    const completed = [];
+    for (let index = 0; index < planned.length; index += 1) {
+      const episode = planned[index];
+      replaceTorrentSelections(torrent, [{ fileIndex: episode.fileIndex, priority: 100 }]);
+      await waitForCondition(() => torrent.files[episode.fileIndex].done, 15_000);
+      completed.push(episode.relativePath);
+
+      for (const pending of planned.slice(index + 1)) {
+        assert.equal(
+          torrent.files[pending.fileIndex].done,
+          false,
+          `${pending.relativePath} downloaded before it was selected`,
+        );
+      }
+
+      const downloaded = path.join(downloadDirectory, torrent.files[episode.fileIndex].path);
+      assert.equal(Buffer.compare(await readFile(downloaded), episode.contents), 0);
+    }
+
+    assert.deepEqual(completed, episodeSpecs.map((episode) => episode.relativePath));
+  } finally {
+    await Promise.all([destroyClient(leecher), destroyClient(seeder)]);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 test("downloads and verifies missing pieces when resuming a partial file", { timeout: 30_000 }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "watchpair-torrent-"));
   const seedDirectory = path.join(directory, "seed");
@@ -165,6 +243,7 @@ function waitForEvent(emitter, event, timeout = 10_000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       cleanup();
+
       reject(new Error(`Timed out waiting for ${event}`));
     }, timeout);
     const onEvent = (...values) => {
@@ -185,6 +264,15 @@ function waitForEvent(emitter, event, timeout = 10_000) {
   });
 }
 
+
+async function waitForCondition(predicate, timeout) {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error("Timed out waiting for torrent file completion");
+}
 function destroyClient(client) {
   if (client.destroyed) return Promise.resolve();
   return new Promise((resolve) => client.destroy(resolve));

@@ -2,9 +2,9 @@ import { availableParallelism, constants, cpus, setPriority } from "node:os";
 import { performance } from "node:perf_hooks";
 
 const MODES = Object.freeze({
-  eco: Object.freeze({ foregroundShare: 0.55, backgroundShare: 0.2, foregroundReadRate: 1.5, backgroundReadRate: 0.5 }),
-  balanced: Object.freeze({ foregroundShare: 0.75, backgroundShare: 0.2, foregroundReadRate: 3, backgroundReadRate: 0.75 }),
-  fast: Object.freeze({ foregroundShare: 0.9, backgroundShare: 0.35, foregroundReadRate: 6, backgroundReadRate: 1.25 }),
+  eco: Object.freeze({ foregroundShare: 0.6, backgroundShare: 0.2 }),
+  balanced: Object.freeze({ foregroundShare: 0.85, backgroundShare: 0.3 }),
+  fast: Object.freeze({ foregroundShare: 1, backgroundShare: 0.55 }),
 });
 
 export function normalizeResourceMode(value) {
@@ -16,19 +16,22 @@ export function mediaResourceProfile(kind, { mode = process.env.WATCHPAIR_RESOUR
   const normalizedMode = normalizeResourceMode(mode);
   const settings = MODES[normalizedMode];
   const foreground = kind === "foreground";
-  const share = foreground ? settings.foregroundShare : settings.backgroundShare;
   const cores = Math.max(1, Number(logicalCores) || 1);
+  const systemTier = cores >= 16 ? "high" : cores >= 8 ? "standard" : "low";
+  const tierBoost = systemTier === "high" ? (foreground ? 0.1 : 0.15) : 0;
+  const share = Math.min(1, (foreground ? settings.foregroundShare : settings.backgroundShare) + tierBoost);
   const workerCeiling = Math.max(1, cores - 1);
   return {
     mode: normalizedMode,
     kind: foreground ? "foreground" : "background",
+    systemTier,
     share,
     threads: Math.max(1, Math.min(workerCeiling, Math.floor(cores * share))),
-    filterThreads: Math.max(1, Math.min(2, Math.floor(cores * share))),
-    inputRate: foreground ? settings.foregroundReadRate : settings.backgroundReadRate,
+    filterThreads: Math.max(1, Math.min(systemTier === "high" ? 4 : 2, Math.floor(cores * share))),
+    inputRate: null,
     processPriority: foreground ? constants.priority.PRIORITY_BELOW_NORMAL : constants.priority.PRIORITY_LOW,
-    gpuSurfaces: foreground ? 6 : 2,
-    qsvAsyncDepth: foreground ? 3 : 1,
+    gpuSurfaces: foreground ? (systemTier === "high" ? 20 : 8) : (systemTier === "high" ? 12 : 3),
+    qsvAsyncDepth: foreground ? (systemTier === "high" ? 10 : 4) : (systemTier === "high" ? 6 : 1),
   };
 }
 
@@ -110,17 +113,27 @@ export function createMediaTaskScheduler({
   );
   const interruptForForeground = () => {
     const promoted = pending.find((task) => task.jobId === foregroundJobId);
-    if (!activeTask?.interrupt || activeTask.interrupted || !promoted) return;
-    if (activeTask.jobId === foregroundJobId &&
+    const restartPromotedActive = Boolean(
+      activeTask?.restartOnPromotion &&
+      activeTask.jobId === foregroundJobId &&
+      activeTask.profile?.kind === "background"
+    );
+    if (
+      !activeTask?.interrupt ||
+      activeTask.interrupted ||
+      (!promoted && !restartPromotedActive)
+    ) return;
+    if (!restartPromotedActive && activeTask.jobId === foregroundJobId &&
       Number(activeTask.priority || 0) >= Number(promoted.priority || 0)) return;
     if (activeTask.preemptible === false) {
-      const key = `${activeTask.jobId}:${promoted.jobId}`;
+      const promotedJobId = promoted?.jobId || foregroundJobId;
+      const key = `${activeTask.jobId}:${promotedJobId}`;
       if (deferredPreemptionKey !== key) {
         deferredPreemptionKey = key;
         emit("media_task_preemption_deferred", {
           taskId: activeTask.taskId,
           jobId: activeTask.jobId,
-          promotedJobId: promoted.jobId,
+          promotedJobId,
           stage: activeTask.stage,
         });
       }
@@ -128,7 +141,12 @@ export function createMediaTaskScheduler({
     }
     deferredPreemptionKey = "";
     activeTask.interrupted = true;
-    emit("media_task_preempted", { taskId: activeTask.taskId, jobId: activeTask.jobId, promotedJobId: foregroundJobId });
+    emit("media_task_preempted", {
+      taskId: activeTask.taskId,
+      jobId: activeTask.jobId,
+      promotedJobId: foregroundJobId,
+      reason: restartPromotedActive ? "foreground-profile" : "selected-work",
+    });
     void activeTask.interrupt();
   };
   const drain = async () => {
@@ -194,7 +212,7 @@ export function createMediaTaskScheduler({
     }
   };
   return {
-    enqueue({ taskId, jobId, stage, priority = 0, preemptible = true, run }) {
+    enqueue({ taskId, jobId, stage, priority = 0, preemptible = true, restartOnPromotion = false, run }) {
       const queuedAt = Date.now();
       const promise = new Promise((resolve, reject) => {
         pending.push({
@@ -203,6 +221,7 @@ export function createMediaTaskScheduler({
           stage,
           priority,
           preemptible,
+          restartOnPromotion,
           run,
           resolve,
           reject,
@@ -215,6 +234,7 @@ export function createMediaTaskScheduler({
           stage,
           priority,
           preemptible,
+          restartOnPromotion,
           queueDepth: pending.length,
         });
         sort(); interruptForForeground(); void drain();

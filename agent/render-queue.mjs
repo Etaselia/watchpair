@@ -6,7 +6,7 @@ export function renderResourceProfile(kind, logicalCores) {
 
 export function renderInputArguments(profile) {
   return [
-    "-readrate", String(profile.inputRate),
+    ...(profile.inputRate ? ["-readrate", String(profile.inputRate)] : []),
     "-threads:v", String(profile.threads),
   ];
 }

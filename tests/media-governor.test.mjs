@@ -10,9 +10,67 @@ test("resource modes reserve control-plane capacity", () => {
   assert.equal(eco.threads, 4);
   assert.equal(balanced.threads, 6);
   assert.equal(fast.threads, 7);
-  assert.ok(eco.inputRate < balanced.inputRate);
-  assert.ok(balanced.inputRate < fast.inputRate);
+  assert.equal(eco.inputRate, null);
+  assert.equal(balanced.inputRate, null);
+  assert.equal(fast.inputRate, null);
+  const ecoBackground = mediaResourceProfile("background", { mode: "eco", logicalCores: 8 });
+  const balancedBackground = mediaResourceProfile("background", { mode: "balanced", logicalCores: 8 });
+  const fastBackground = mediaResourceProfile("background", { mode: "fast", logicalCores: 8 });
+  assert.equal(ecoBackground.inputRate, null);
+  assert.equal(balancedBackground.inputRate, null);
+  assert.equal(fastBackground.inputRate, null);
+  assert.equal(mediaResourceProfile("background", { mode: "balanced", logicalCores: 16 }).inputRate, null);
   assert.equal(mediaResourceProfile("background", { mode: "fast", logicalCores: 2 }).threads, 1);
+  const highEndForeground = mediaResourceProfile("foreground", { mode: "balanced", logicalCores: 16 });
+  const highEndBackground = mediaResourceProfile("background", { mode: "balanced", logicalCores: 16 });
+  assert.equal(highEndForeground.systemTier, "high");
+  assert.equal(highEndForeground.threads, 15);
+  assert.equal(highEndForeground.gpuSurfaces, 20);
+  assert.equal(highEndBackground.threads, 7);
+  assert.equal(highEndBackground.gpuSurfaces, 12);
+});
+
+test("promoting an active background render restarts it with foreground resources", async () => {
+  const events = [];
+  let release;
+  let interrupted = false;
+  const completion = new Promise((resolve) => {
+    release = resolve;
+  });
+  const monitor = {
+    snapshot: () => ({ eventLoopDelayP95Ms: 0, systemCpuPercent: 0 }),
+    shouldDeferBackground: () => false,
+    stop() {},
+  };
+  const scheduler = createMediaTaskScheduler({
+    monitor,
+    onEvent: (event, data) => events.push({ event, data }),
+  });
+  const task = scheduler.enqueue({
+    taskId: "episode-render",
+    jobId: "episode",
+    stage: "browser-playback",
+    restartOnPromotion: true,
+    run: async (profile) => ({
+      value: profile,
+      completion,
+      interrupt: () => {
+        interrupted = true;
+        release();
+      },
+    }),
+  });
+
+  assert.equal((await task).kind, "background");
+  scheduler.prioritize("episode");
+  for (let attempt = 0; attempt < 20 && !interrupted; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(interrupted, true);
+  assert.ok(events.some(({ event, data }) =>
+    event === "media_task_preempted" && data.reason === "foreground-profile"
+  ));
+  scheduler.shutdown();
 });
 
 test("media scheduler runs one heavy task and prioritizes selected work", async () => {

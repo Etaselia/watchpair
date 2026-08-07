@@ -1,5 +1,15 @@
 export type SourceKind = "magnet" | "direct";
 
+export interface SharedMediaItem {
+  id: string;
+  fileIndex: number;
+  path: string;
+  name: string;
+  size: number;
+  included: boolean;
+  priority: boolean;
+}
+
 export interface SharedSource {
   id: string;
   kind: SourceKind;
@@ -7,9 +17,12 @@ export interface SharedSource {
   label: string;
   addedBy: string;
   addedAt: number;
+  infoHash?: string;
+  mediaItems?: SharedMediaItem[];
 }
 
 export interface SelectedMedia {
+  itemId?: string;
   sourceId?: string;
   fileIndex?: number;
   name: string;

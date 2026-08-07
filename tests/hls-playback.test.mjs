@@ -10,6 +10,7 @@ import ffprobeStatic from "ffprobe-static";
 import {
   canCopyH264Video,
   createHlsPlaybackManager,
+  startsAtBrowserZero,
 } from "../agent/hls-playback.mjs";
 
 const runFile = promisify(execFile);
@@ -27,15 +28,34 @@ async function readPlaylist(filePath) {
 }
 
 test("copies only browser-compatible eight-bit H.264 video", () => {
+  assert.equal(startsAtBrowserZero({ videoStartTime: 0 }), true);
+  assert.equal(startsAtBrowserZero({ videoStartTime: -0.25 }), true);
+  assert.equal(startsAtBrowserZero({ videoStartTime: 0.05 }), true);
+  assert.equal(startsAtBrowserZero({ videoStartTime: 0.051 }), false);
+  assert.equal(startsAtBrowserZero({ videoStartTime: null }), false);
+  assert.equal(startsAtBrowserZero({}), false);
   assert.equal(canCopyH264Video({
     videoCodec: "h264",
     videoPixelFormat: "yuv420p",
     videoProfile: "High",
+    videoStartTime: 0,
   }), true);
   assert.equal(canCopyH264Video({
     videoCodec: "h264",
     videoPixelFormat: "yuv420p10le",
     videoProfile: "High 10",
+    videoStartTime: 0,
+  }), false);
+  assert.equal(canCopyH264Video({
+    videoCodec: "h264",
+    videoPixelFormat: "yuv420p",
+    videoProfile: "High",
+  }), false);
+  assert.equal(canCopyH264Video({
+    videoCodec: "h264",
+    videoPixelFormat: "yuv420p",
+    videoProfile: "High",
+    videoStartTime: 5,
   }), false);
 });
 
@@ -49,7 +69,10 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
     fileSize: 0,
     contentFingerprint: "0123456789abcdef0123456789abcdef",
     inputPath: input,
-    videoCodec: "mpeg4",
+    videoCodec: "h264",
+    videoPixelFormat: "yuv420p",
+    videoProfile: "High",
+    videoStartTime: 5,
     inputArguments: ["-readrate", "1"],
     audioTracks: [
       {
@@ -81,8 +104,10 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
       "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6",
       "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000:duration=6",
       "-map", "0:v:0", "-map", "1:a:0", "-map", "2:a:0",
-      "-c:v", "mpeg4", "-q:v", "6",
+      "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+      "-g", "24", "-keyint_min", "24", "-sc_threshold", "0",
       "-c:a", "aac", "-shortest",
+      "-output_ts_offset", "5",
       input,
     ]);
 
@@ -90,6 +115,7 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
 
     manager = createHlsPlaybackManager({
       ffmpegPath,
+      ffprobePath: ffprobeStatic.path,
       cacheRoot,
       encoder: {
         id: "test-gpu",
@@ -245,7 +271,7 @@ test("does not promote a cached HLS window whose first segment is missing", { ti
     cacheRoot,
     "content",
     `${fingerprint}-${fileSize}`,
-    "h264-hls-v9"
+    "h264-hls-v10"
   );
   const generationDirectory = path.join(baseDirectory, "generations", generationId);
   const videoDirectory = path.join(generationDirectory, "video");
@@ -282,6 +308,7 @@ test("does not promote a cached HLS window whose first segment is missing", { ti
 
     manager = createHlsPlaybackManager({
       ffmpegPath,
+      ffprobePath: ffprobeStatic.path,
       cacheRoot,
       playableSeconds: 2,
       playlistWaitMs: 1_000,
@@ -314,7 +341,7 @@ test("does not promote a cached HLS window whose first segment is missing", { ti
   }
 });
 
-test("finishes an active HLS generation before starting newly selected work", { timeout: 30_000 }, async () => {
+test("preempts background HLS work and resumes its existing generation", { timeout: 30_000 }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "watchpair-hls-preempt-"));
   const input = path.join(directory, "input.mkv");
   const cacheRoot = path.join(directory, "cache");
@@ -365,6 +392,7 @@ test("finishes an active HLS generation before starting newly selected work", { 
 
     manager = createHlsPlaybackManager({
       ffmpegPath,
+      ffprobePath: ffprobeStatic.path,
       cacheRoot,
       segmentSeconds: 1,
       playableSeconds: 1,
@@ -384,14 +412,37 @@ test("finishes an active HLS generation before starting newly selected work", { 
 
     const retainedAsset = await manager.getAsset(background, "video/index.m3u8");
     assert.equal(retainedAsset.filePath, initialAsset.filePath);
-    assert.match(await readPlaylist(retainedAsset.filePath), /#EXT-X-ENDLIST/);
+    assert.ok(
+      events.some(({ event, data }) =>
+        event === "hls_generation_preempted" && data.jobId === background.jobId
+      ),
+      JSON.stringify(events)
+    );
+
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if ((await readPlaylist(retainedAsset.filePath)).includes("#EXT-X-ENDLIST")) break;
+      if (attempt === 199) assert.fail("Preempted HLS generation did not resume and finish");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if (manager.diagnostics().generations.some((generation) =>
+        generation.jobId === background.jobId && generation.complete
+      )) break;
+      if (attempt === 199) {
+        assert.fail("Resumed HLS generation was not validated as complete");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const backgroundStarts = events.filter(({ event, data }) =>
+      event === "hls_generation_started" && data.jobId === background.jobId
+    );
+    assert.ok(backgroundStarts.length >= 2, JSON.stringify(events));
+    assert.equal(backgroundStarts[0].data.resumed, false);
+    assert.equal(backgroundStarts.at(-1).data.resumed, true);
+    assert.ok(backgroundStarts.at(-1).data.resumeSeconds >= 1, JSON.stringify(backgroundStarts));
     const firstReady = states.findIndex(({ preparation }) => preparation.status === "ready");
     assert.ok(firstReady >= 0, JSON.stringify(states));
     assert.ok(states.slice(firstReady).every(({ preparation }) => preparation.status === "ready"), JSON.stringify(states));
-    assert.equal(events.some(({ event }) => event === "hls_generation_preempted"), false, JSON.stringify(events));
-    assert.ok(manager.diagnostics().generations.some((generation) =>
-      generation.jobId === background.jobId && generation.complete
-    ));
   } finally {
     await manager?.shutdown();
     await rm(directory, { recursive: true, force: true });

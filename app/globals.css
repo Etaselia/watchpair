@@ -640,29 +640,75 @@ svg {
 
 .agent-files {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
+  max-height: 460px;
   margin-top: 10px;
+  overflow-y: auto;
+  border: 1px solid #d2d5cc;
+  border-radius: 5px;
+  background: #d2d5cc;
+  gap: 1px;
 }
 
-.agent-files button {
+.agent-file-row {
   min-width: 0;
+  min-height: 48px;
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) 34px;
+  align-items: center;
+  background: var(--white);
+}
+
+.agent-file-row.selected {
+  background: #f0f7db;
+  box-shadow: inset 3px 0 0 #72901e;
+}
+
+.agent-file-row.excluded {
+  opacity: 0.58;
+}
+
+.agent-file-include {
+  width: 32px;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+
+.agent-file-include input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: #6b8d19;
+}
+
+.agent-file-select {
+  min-width: 0;
+  height: 100%;
   display: flex;
   align-items: center;
   gap: 9px;
-  border: 1px solid #d2d5cc;
-  border-radius: 5px;
-  background: var(--white);
-  padding: 10px;
+  border: 0;
+  background: transparent;
+  padding: 8px 6px;
   text-align: left;
 }
 
-.agent-files button:hover,
-.agent-files button.selected {
-  border-color: #6b8d19;
+.agent-file-select:not(:disabled):hover {
+  background: #f4f8e9;
 }
 
-.agent-files button > span {
+.agent-file-select:disabled {
+  cursor: default;
+}
+
+.agent-file-select > svg {
+  width: 17px;
+  height: 17px;
+  flex: none;
+}
+
+.agent-file-select > span {
   min-width: 0;
   display: grid;
   flex: 1;
@@ -670,6 +716,7 @@ svg {
 }
 
 .agent-files strong {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -677,8 +724,23 @@ svg {
 }
 
 .agent-files small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--muted);
   font-size: 10px;
+}
+
+.agent-file-row > .icon-button {
+  width: 28px;
+  height: 28px;
+  justify-self: center;
+}
+
+.agent-file-row > .icon-button svg {
+  width: 14px;
+  height: 14px;
 }
 
 .queue-list {

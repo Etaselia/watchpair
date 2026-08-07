@@ -37,13 +37,25 @@ async function waitForAgentSeed(
 
 export interface AgentFile {
   index: number;
+  itemId: string;
+  path: string;
   name: string;
   size: number;
   downloaded: number;
   progress: number;
+  downloadReady: boolean;
   ready: boolean;
   selected: boolean;
+  status: "waiting" | "downloading" | "verifying" | "ready" | "error";
   fingerprint?: string | null;
+  subtitleStatus: "waiting" | "probing" | "ready" | "error";
+  subtitleError: string | null;
+  subtitleAssetStatus?: "waiting" | "preparing" | "ready" | "error";
+  subtitleAssetError?: string | null;
+  audioTracks: AgentAudioTrack[];
+  chapters: AgentChapter[];
+  subtitles: AgentSubtitleTrack[];
+  preparation: AgentPreparation;
   streamUrl: string;
   hlsUrl?: string | null;
 }
@@ -139,6 +151,9 @@ export interface AgentPreparation {
   bufferedSeconds?: number;
   complete?: boolean;
   generationId?: string | null;
+  resumed?: boolean;
+  resumeSeconds?: number;
+  resumeSegments?: number;
   rendering?: boolean;
   pipeline?: AgentVideoPipeline | null;
   diagnostics?: AgentPipelineDiagnostic[];
@@ -359,6 +374,31 @@ export async function stopAgentDownload(sourceId: string, deleteFiles = false) {
     `/downloads/${encodeURIComponent(sourceId)}?deleteFiles=${deleteFiles ? "1" : "0"}`,
     { method: "DELETE" }
   );
+}
+
+export interface AgentMediaTarget {
+  jobId: string;
+  fileIndex: number;
+  itemId?: string | null;
+}
+
+export async function setAgentMediaPriority(
+  selected: AgentMediaTarget | null,
+  targets: AgentMediaTarget[]
+) {
+  return agentFetch<{
+    ok: boolean;
+    selected: AgentMediaTarget | null;
+    targets: AgentMediaTarget[];
+    foregroundLoad: number;
+    backgroundLoad: number;
+    systemTier: "low" | "standard" | "high";
+    foregroundThreads: number;
+    backgroundThreads: number;
+  }>("/media-priority", {
+    method: "POST",
+    body: JSON.stringify({ selected, targets }),
+  });
 }
 
 export async function setAgentDownloadPinned(sourceId: string, pinned: boolean) {

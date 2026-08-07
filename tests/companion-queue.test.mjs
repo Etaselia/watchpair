@@ -110,19 +110,24 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
     assert.equal(browserDiagnostic.status, 202);
 
     const ids = ["queuejob-one", "queuejob-two"];
-    const priorityResponse = await fetch(base + "/preparation-priority", {
+    const targets = ids.map((jobId) => ({ jobId, fileIndex: 0 }));
+    const selected = targets[1];
+    const priorityResponse = await fetch(base + "/media-priority", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ sourceId: ids[1], sourceIds: [ids[1], ids[0]] }),
+      body: JSON.stringify({ selected, targets: [targets[1], targets[0]] }),
     });
     assert.equal(priorityResponse.status, 200);
-    assert.deepEqual(await priorityResponse.json(), {
-      ok: true,
-      sourceId: ids[1],
-      sourceIds: [ids[1], ids[0]],
-      foregroundLoad: 0.75,
-      backgroundLoad: 0.2,
-    });
+    const priority = await priorityResponse.json();
+    assert.equal(priority.ok, true);
+    assert.deepEqual(priority.selected, { ...selected, itemId: null });
+    assert.deepEqual(priority.targets, [
+      { ...targets[1], itemId: null },
+      { ...targets[0], itemId: null },
+    ]);
+    assert.ok(priority.foregroundLoad > priority.backgroundLoad);
+    assert.ok(priority.foregroundThreads > priority.backgroundThreads);
+    assert.match(priority.systemTier, /^(low|standard|high)$/);
 
     for (let index = 0; index < ids.length; index += 1) {
       const response = await fetch(base + "/downloads", {
@@ -157,13 +162,26 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
     const diagnostics = await diagnosticsResponse.json();
     assert.equal(diagnostics.processes.active.length, 1);
     assert.ok(Array.isArray(diagnostics.hls.generations));
+    assert.equal(typeof diagnostics.resources.torrents.pendingVerifications, "number");
     assert.equal(JSON.stringify(diagnostics).includes(directory), false);
 
-    const completed = await Promise.all(ids.map((id) => waitForJson(
-      base + "/downloads/" + id,
-      20_000,
-      (body) => body?.job?.preparation?.status === "ready"
-    )));
+    const completed = await Promise.all(ids.map(async (id) => {
+      try {
+        return await waitForJson(
+          base + "/downloads/" + id,
+          20_000,
+          (body) => body?.job?.preparation?.status === "ready"
+        );
+      } catch (error) {
+        const agentLog = await readFile(
+          path.join(directory, "logs", "watchpair-agent.log"),
+          "utf8"
+        ).catch(() => "");
+        throw new Error((error instanceof Error ? error.message : String(error)) +
+          "\nCompanion output:\n" + output.slice(-8_000) +
+          "\nAgent log:\n" + agentLog.slice(-16_000));
+      }
+    }));
     for (const result of completed) {
       assert.equal(result.job.status, "ready");
       assert.equal(result.job.files[0].ready, true);

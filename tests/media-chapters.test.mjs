@@ -11,6 +11,7 @@ test("chapter probe asks ffprobe for streams and chapters", () => {
     "-print_format", "json",
     "-show_streams",
     "-show_chapters",
+    "-show_format",
     "/videos/movie.mkv",
   ]);
 });
