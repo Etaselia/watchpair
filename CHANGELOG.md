@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.2](https://github.com/Etaselia/watchpair/compare/v0.10.1...v0.10.2) (2026-08-07)
+
+
+### Bug Fixes
+
+* prioritize foreground downloads and subtitles ([#61](https://github.com/Etaselia/watchpair/issues/61)) ([29018f0](https://github.com/Etaselia/watchpair/commit/29018f0d0f6ff3da89ed096123eb6fe80c4674a0))
+
 ## [0.10.1](https://github.com/Etaselia/watchpair/compare/v0.10.0...v0.10.1) (2026-08-07)
 
 
