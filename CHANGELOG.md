@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/Etaselia/watchpair/compare/v0.9.5...v0.10.0) (2026-08-07)
+
+
+### Features
+
+* prioritize multi-file torrent playback ([#55](https://github.com/Etaselia/watchpair/issues/55)) ([ee50433](https://github.com/Etaselia/watchpair/commit/ee50433e196f16c854b6c93ad1f05225d2c52278))
+
 ## [0.9.5](https://github.com/Etaselia/watchpair/compare/v0.9.4...v0.9.5) (2026-07-29)
 
 
