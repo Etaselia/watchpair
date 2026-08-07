@@ -301,6 +301,69 @@ test("production session API supports join-in-progress state", async () => {
     return (await response.json()).session;
   };
 
+
+  const manifestSourceId = "source-episode-one";
+  const manifestInput = [
+    { fileIndex: 3, path: "Show/Season 2/Episode 10.mkv", size: 310 },
+    { fileIndex: 1, path: "Show/Season 1/Episode 1.mkv", size: 110 },
+    { fileIndex: 2, path: "Show/Season 2/Episode 2.mkv", size: 210 },
+  ];
+  const manifested = await mutate("source-manifest", {
+    sourceId: manifestSourceId,
+    infoHash: "1111111111111111111111111111111111111111",
+    mediaItems: manifestInput,
+  });
+  const manifestedSource = manifested.sources.find((source) => source.id === manifestSourceId);
+  assert.deepEqual(
+    manifestedSource.mediaItems.map((item) => item.fileIndex),
+    [1, 2, 3],
+  );
+  assert.deepEqual(
+    manifestedSource.mediaItems.map((item) => item.path),
+    [
+      "Show/Season 1/Episode 1.mkv",
+      "Show/Season 2/Episode 2.mkv",
+      "Show/Season 2/Episode 10.mkv",
+    ],
+  );
+
+  const prioritizedId = `${manifestSourceId}-f3`;
+  const prioritized = await mutate("prioritize-media", {
+    itemId: prioritizedId,
+    priority: true,
+  });
+  assert.equal(
+    prioritized.sources
+      .find((source) => source.id === manifestSourceId)
+      .mediaItems.find((item) => item.id === prioritizedId)
+      .priority,
+    true,
+  );
+
+  const excludedId = `${manifestSourceId}-f2`;
+  const excluded = await mutate("include-media", {
+    itemId: excludedId,
+    included: false,
+  });
+  assert.equal(
+    excluded.sources
+      .find((source) => source.id === manifestSourceId)
+      .mediaItems.find((item) => item.id === excludedId)
+      .included,
+    false,
+  );
+
+  const manualOrder = [prioritizedId, `${manifestSourceId}-f1`, excludedId];
+  await mutate("reorder-media", { sourceId: manifestSourceId, itemIds: manualOrder });
+  const republished = await mutate("source-manifest", {
+    sourceId: manifestSourceId,
+    infoHash: "1111111111111111111111111111111111111111",
+    mediaItems: manifestInput,
+  });
+  const republishedSource = republished.sources.find((source) => source.id === manifestSourceId);
+  assert.deepEqual(republishedSource.mediaItems.map((item) => item.id), manualOrder);
+  assert.equal(republishedSource.mediaItems[0].priority, true);
+  assert.equal(republishedSource.mediaItems[2].included, false);
   const renamed = await mutate("rename-source", {
     sourceId: "source-episode-one",
     label: "Pilot",
@@ -334,7 +397,9 @@ test("ships the coordination and companion surfaces", async () => {
 
   assert.match(app, /Watch together/);
   assert.match(app, /action: "create",\s+token: requestedToken\.length === 9/);
-  assert.match(app, /setAgentPlaybackPriority\(prioritySourceId, orderedSourceIds\)/);
+  assert.match(app, /setAgentMediaPriority\(plan\.selected, plan\.targets\)/);
+  assert.match(app, /orderedMediaQueue\(sources, selectedItemId\)/);
+  assert.match(app, /source-manifest/);
   assert.match(app, /getAgentDownloads/);
   assert.match(app, /Download queue/);
   assert.match(app, /const COMPANION_VERSION = "\d+\.\d+\.\d+"; \/\/ x-release-please-version/);
@@ -381,7 +446,8 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /activeFile\?\.ready && activeItem\.ready/);
   assert.match(app, /HTMLMediaElement\.HAVE_METADATA/);
   assert.match(app, /HTMLMediaElement\.HAVE_FUTURE_DATA/);
-  assert.match(app, /HLS_STARTUP_FLOOR_SECONDS = 0\.15/);
+  assert.doesNotMatch(app, /HLS_STARTUP_FLOOR_SECONDS/);
+  assert.match(app, /return Math\.max\(target, seekableStart\)/);
   assert.match(app, /seekableStart: finiteMediaValue/);
   assert.match(agent, /clientEvent: String\(body\.event/);
   assert.match(agent, /seekTarget: Number\.isFinite/);
@@ -410,6 +476,9 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(route, /!currentSession && action === "join"/);
   assert.match(route, /action === "rename-source"/);
   assert.match(route, /normalizeSources/);
+  assert.match(route, /action === "source-manifest"/);
+  assert.match(route, /action === "prioritize-media"/);
+  assert.match(route, /action === "include-media"/);
   assert.match(route, /stableParticipants/);
   assert.match(agent, /new WebTorrent/);
   assert.match(agent, /content-range/);
@@ -425,13 +494,13 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(agent, /fileIdentityFingerprint/);
   assert.match(agent, /torrent\.once\("ready", \(\) => markServing\(torrent\)\)/);
   assert.match(agent, /restoreJobs/);
-  assert.match(agent, /preparation-priority/);
+  assert.match(agent, /media-priority/);
   assert.match(agent, /diagnostics\/client/);
   assert.match(agent, /preparationBlockedByWatchOrder/);
-  assert.match(agent, /sourceIds: preparationOrderJobIds/);
-  assert.match(agent, /setPreparationPriority/);
+  assert.match(agent, /queueSelectedPreparation/);
+  assert.match(agent, /replaceTorrentSelections/);
   assert.match(agentClient, /loopback-network/);
-  assert.match(agentClient, /JSON\.stringify\(\{ sourceId, sourceIds \}\)/);
+  assert.match(agentClient, /JSON\.stringify\(\{ selected, targets \}\)/);
   assert.match(agentClient, /getAgentDownloads/);
   assert.match(agentClient, /reportAgentPlaybackEvent/);
   assert.match(agentClient, /getAgentPermissionState/);
@@ -459,6 +528,7 @@ test("packages the pairable magnet and subtitle companion", async () => {
     "WatchPair Companion/scheduled-ffmpeg.mjs",
     "WatchPair Companion/subtitle-pipeline.mjs",
     "WatchPair Companion/job-store.mjs",
+    "WatchPair Companion/media-priority.mjs",
     "WatchPair Companion/torrent-input.mjs",
     "WatchPair Companion/torrent-pressure.mjs",
     "WatchPair Companion/webtorrent-safety.mjs",

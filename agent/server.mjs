@@ -19,7 +19,12 @@ function unpackedExecutablePath(value) {
     ? String(value).replace("app.asar", "app.asar.unpacked")
     : value;
 }
-import { canCopyH264Video, createHlsPlaybackManager, streamHlsAsset } from "./hls-playback.mjs";
+import {
+  canCopyH264Video,
+  createHlsPlaybackManager,
+  startsAtBrowserZero,
+  streamHlsAsset,
+} from "./hls-playback.mjs";
 import { createMediaTaskScheduler, mediaResourceProfile } from "./media-governor.mjs";
 import { createProcessRegistry } from "./process-registry.mjs";
 import {
@@ -30,6 +35,11 @@ import {
 } from "./hardware-acceleration.mjs";
 import { renderEncoderArguments, renderInputArguments } from "./render-queue.mjs";
 import { createScheduledFfmpegRunner } from "./scheduled-ffmpeg.mjs";
+import {
+  mediaTargetKey,
+  normalizeMediaTargets,
+  replaceTorrentSelections,
+} from "./media-priority.mjs";
 import { createJsonStore } from "./job-store.mjs";
 import { cacheExpired, cleanupSettingsFromEnvironment, jobCanBeCleaned, jobCleanupReason } from "./cleanup-policy.mjs";
 import { createSubtitleAssetPipeline } from "./subtitle-pipeline.mjs";
@@ -161,8 +171,10 @@ const libraryEntries = new Map();
 const jobStore = createJsonStore(JOBS_PATH);
 const preparationQueue = [];
 let preparationWorker = null;
-let activePreparationJobId = null;
-let preparationOrderJobIds = [];
+const selectedPreparationKeys = new Set();
+let activePreparationTargetKey = null;
+let mediaPriorityTargets = [];
+let preparationOrderTargetKeys = [];
 function mediaDiagnosticEvent(event, data) {
   if (event.endsWith("_failed")) {
     agentLogger.error(event, data);
@@ -213,6 +225,7 @@ client.on("remove", () => queueMicrotask(() => refreshTorrentPressure("torrent-r
 client.on("torrent", () => refreshTorrentPressure("torrent-ready"));
 const hlsPlayback = createHlsPlaybackManager({
   ffmpegPath: FFMPEG_PATH,
+  ffprobePath: FFPROBE_PATH,
   encoder: TRANSCODE_RUNTIME.encoder,
   cacheRoot: HLS_DIR,
   scheduler: mediaScheduler,
@@ -482,70 +495,147 @@ function torrentFileName(file) {
   return path.posix.basename(String(file?.path || file?.name || "video").replaceAll("\\", "/"));
 }
 
+function torrentFilePath(file) {
+  return String(file?.path || file?.name || "video")
+    .replaceAll("\\", "/")
+    .split("/")
+    .filter((part) => part && part !== "." && part !== "..")
+    .join("/")
+    .slice(0, 500);
+}
+
+function defaultPreparation() {
+  return { status: "waiting", error: null, encoder: null, fallback: false };
+}
+
+function createMediaAsset(index) {
+  return {
+    index,
+    status: "waiting",
+    identityFingerprint: null,
+    identityFingerprintKey: null,
+    identityFingerprintPromise: null,
+    identityFingerprintPromiseKey: null,
+    torrentVerifiedKey: null,
+    torrentVerificationPromise: null,
+    torrentVerificationPromiseKey: null,
+    audioTracks: [],
+    chapters: [],
+    subtitleTracks: [],
+    mediaStreams: [],
+    subtitleAssetStatus: "waiting",
+    subtitleAssetError: null,
+    subtitleAssetPromise: null,
+    subtitleAssetPromiseKey: null,
+    videoCodec: null,
+    videoPixelFormat: null,
+    videoStartTime: null,
+    videoProfile: null,
+    subtitleStatus: "waiting",
+    subtitleError: null,
+    subtitleProbeKey: null,
+    subtitleProbePromise: null,
+    subtitleProbePromiseKey: null,
+    audioRenderPromises: new Map(),
+    preparation: defaultPreparation(),
+    updatedAt: Date.now(),
+  };
+}
+
+function mediaAsset(job, index = job.selectedIndex) {
+  if (!Number.isInteger(index) || index < 0) throw new Error("Select a media file first.");
+  job.assets ||= new Map();
+  let asset = job.assets.get(index);
+  if (!asset) {
+    asset = createMediaAsset(index);
+    job.assets.set(index, asset);
+  }
+  return asset;
+}
+
+const MEDIA_ASSET_FIELDS = [
+  "identityFingerprint", "identityFingerprintKey", "torrentVerifiedKey",
+  "audioTracks", "chapters", "subtitleTracks", "mediaStreams",
+  "subtitleAssetStatus", "subtitleAssetError", "videoCodec", "videoPixelFormat",
+  "videoStartTime",
+  "videoProfile", "subtitleStatus", "subtitleError", "preparation",
+];
+
+function syncSelectedAsset(job) {
+  if (!Number.isInteger(job.selectedIndex)) return null;
+  const asset = mediaAsset(job, job.selectedIndex);
+  for (const field of MEDIA_ASSET_FIELDS) job[field] = asset[field];
+  return asset;
+}
+
 function fileIdentityKey(index, file) {
   return String(index) + ":" + file.name + ":" + file.size;
 }
 
-function selectedFileKey(job) {
-  const media = selectedJobFile(job);
-  return fileIdentityKey(job.selectedIndex, media);
-}
 
 function fileIdentityFingerprint(job, index, file) {
-  return job.identityFingerprintKey === fileIdentityKey(index, file)
-    ? job.identityFingerprint
+  const asset = mediaAsset(job, index);
+  return asset.identityFingerprintKey === fileIdentityKey(index, file)
+    ? asset.identityFingerprint
     : null;
 }
 
 async function identifySelectedFile(job, index = job.selectedIndex) {
-  if (index === null || index !== job.selectedIndex) return null;
-  const selectionKey = selectedFileKey(job);
-  if (job.identityFingerprint && job.identityFingerprintKey === selectionKey) {
-    return job.identityFingerprint;
+  if (!Number.isInteger(index)) return null;
+  const asset = mediaAsset(job, index);
+  const selectionKey = fileIdentityKey(index, jobFile(job, index));
+  if (asset.identityFingerprint && asset.identityFingerprintKey === selectionKey) {
+    return asset.identityFingerprint;
   }
-  if (job.identityFingerprintPromise && job.identityFingerprintPromiseKey === selectionKey) {
-    return job.identityFingerprintPromise;
+  if (asset.identityFingerprintPromise && asset.identityFingerprintPromiseKey === selectionKey) {
+    return asset.identityFingerprintPromise;
   }
 
   let promise;
   promise = fingerprintPath(jobFile(job, index).path)
     .then((fingerprint) => {
-      if (job.selectedIndex === index && selectedFileKey(job) === selectionKey) {
-        job.identityFingerprint = fingerprint;
-        job.identityFingerprintKey = selectionKey;
+      if (fileIdentityKey(index, jobFile(job, index)) === selectionKey) {
+        asset.identityFingerprint = fingerprint;
+        asset.identityFingerprintKey = selectionKey;
+        asset.updatedAt = Date.now();
+        if (job.selectedIndex === index) syncSelectedAsset(job);
         job.updatedAt = Date.now();
         persistJobs();
       }
       return fingerprint;
     })
     .finally(() => {
-      if (job.identityFingerprintPromise === promise) {
-        job.identityFingerprintPromise = null;
-        job.identityFingerprintPromiseKey = null;
+      if (asset.identityFingerprintPromise === promise) {
+        asset.identityFingerprintPromise = null;
+        asset.identityFingerprintPromiseKey = null;
       }
     });
-  job.identityFingerprintPromise = promise;
-  job.identityFingerprintPromiseKey = selectionKey;
+  asset.identityFingerprintPromise = promise;
+  asset.identityFingerprintPromiseKey = selectionKey;
   return promise;
 }
 
 async function verifySelectedTorrentFile(job, index) {
   if (job.kind !== "magnet") return true;
-  if (index === null || index !== job.selectedIndex) return false;
+  if (!Number.isInteger(index)) return false;
 
   const file = job.torrent?.files[index];
   if (!file) throw new Error("Torrent file not found.");
-  const verificationKey = selectedFileKey(job);
-  if (job.torrentVerifiedKey === verificationKey) return true;
+  const asset = mediaAsset(job, index);
+  const verificationKey = fileIdentityKey(index, jobFile(job, index));
+  if (asset.torrentVerifiedKey === verificationKey) return true;
   if (
-    job.torrentVerificationPromise &&
-    job.torrentVerificationPromiseKey === verificationKey
+    asset.torrentVerificationPromise &&
+    asset.torrentVerificationPromiseKey === verificationKey
   ) {
-    return job.torrentVerificationPromise;
+    return asset.torrentVerificationPromise;
   }
 
-  job.status = "downloading";
-  job.warning = "Verifying every torrent piece before playback.";
+  asset.status = "verifying";
+  if (job.selectedIndex === index) {
+    job.status = "downloading";
+    job.warning = "Verifying every torrent piece before playback.";
+  }
   job.updatedAt = Date.now();
   const verificationStartedAt = Date.now();
   agentLogger.info("torrent_verification_started", {
@@ -566,19 +656,21 @@ async function verifySelectedTorrentFile(job, index) {
         verified,
         invalidPieces: invalidPieces.length,
       });
-      if (index !== job.selectedIndex || selectedFileKey(job) !== verificationKey) return false;
+      if (fileIdentityKey(index, jobFile(job, index)) !== verificationKey) return false;
       if (!verified) {
         file.deselect();
-        file.select(10);
-        job.torrentVerifiedKey = null;
+        asset.torrentVerifiedKey = null;
+        asset.status = "downloading";
         job.warning =
           `Found ${invalidPieces.length} incomplete or corrupt torrent piece${invalidPieces.length === 1 ? "" : "s"}; downloading them again.`;
-        job.status = "downloading";
+        if (job.selectedIndex === index) job.status = "downloading";
+        refreshTorrentSelections("verification-retry");
         job.updatedAt = Date.now();
         return false;
       }
-      job.torrentVerifiedKey = verificationKey;
-      job.warning = null;
+      asset.torrentVerifiedKey = verificationKey;
+      asset.status = "ready";
+      if (job.selectedIndex === index) job.warning = null;
       job.updatedAt = Date.now();
       return true;
     })
@@ -592,85 +684,68 @@ async function verifySelectedTorrentFile(job, index) {
       throw error;
     })
     .finally(() => {
-      if (job.torrentVerificationPromise === promise) {
-        job.torrentVerificationPromise = null;
-        job.torrentVerificationPromiseKey = null;
+      if (asset.torrentVerificationPromise === promise) {
+        asset.torrentVerificationPromise = null;
+        asset.torrentVerificationPromiseKey = null;
       }
     });
-  job.torrentVerificationPromise = promise;
-  job.torrentVerificationPromiseKey = verificationKey;
+  asset.torrentVerificationPromise = promise;
+  asset.torrentVerificationPromiseKey = verificationKey;
   return promise;
 }
 
 async function completeSelectedFile(job, index = job.selectedIndex) {
-  if (index === null || index !== job.selectedIndex) return;
+  if (!Number.isInteger(index)) return;
+  const asset = mediaAsset(job, index);
   try {
     if (!(await verifySelectedTorrentFile(job, index))) return;
     await identifySelectedFile(job, index);
-    if (index !== job.selectedIndex) return;
-    job.status = "ready";
+    asset.status = "ready";
+    asset.updatedAt = Date.now();
+    if (index === job.selectedIndex) {
+      job.status = "ready";
+      syncSelectedAsset(job);
+    }
     markJobCompleted(job);
     agentLogger.info("media_file_ready", {
       jobId: job.id,
       fileIndex: index,
-      fingerprint: job.identityFingerprint,
+      fingerprint: asset.identityFingerprint,
     });
     refreshPreparationScheduling();
-    queueMediaPreparation(job);
+    queueMediaPreparation(job, index);
   } catch (error) {
-    if (index !== job.selectedIndex) return;
     agentLogger.error("media_file_completion_failed", { jobId: job.id, fileIndex: index, error });
-    job.status = "error";
-    job.error = error instanceof Error ? error.message : "Could not identify the completed media file.";
+    asset.status = "error";
+    asset.preparation = {
+      ...defaultPreparation(),
+      status: "error",
+      error: error instanceof Error ? error.message : "Could not identify the completed media file.",
+    };
+    if (index === job.selectedIndex) {
+      job.status = "error";
+      job.error = asset.preparation.error;
+      syncSelectedAsset(job);
+    }
     job.updatedAt = Date.now();
   }
 }
 
 function selectTorrentFile(job, index) {
-  if (job.selectedIndex !== null && job.selectedIndex !== index) {
-    try {
-      const previousMedia = selectedJobFile(job);
-      const previousFingerprint = fileIdentityFingerprint(job, job.selectedIndex, previousMedia);
-      if (previousFingerprint) {
-        mediaScheduler.cancelJob(`content-${previousFingerprint}-${previousMedia.size}`);
-      }
-    } catch {
-      // The previous torrent selection may not have metadata yet.
-    }
-    mediaScheduler.cancelJob(job.id);
-    void hlsPlayback.removeJob(job.id).catch(() => {});
-  }
-  const file = job.torrent?.files[index];
+  const localFile = index === 0 ? job.file : null;
+  const file = job.torrent?.files[index] || localFile;
   if (!file) throw new Error("Torrent file not found.");
-  job.torrent.files.forEach((item) => {
-    if (item === file) item.select(10);
-    else if (VIDEO_EXTENSIONS.test(item.name)) item.select(1);
-    else item.deselect();
-  });
   job.selectedIndex = index;
-  job.identityFingerprint = null;
-  job.identityFingerprintKey = null;
-  job.torrentVerifiedKey = null;
-  job.torrentVerificationPromise = null;
-  job.torrentVerificationPromiseKey = null;
-  job.audioTracks = [];
-  job.subtitleTracks = [];
-  job.mediaStreams = [];
-  job.subtitleAssetStatus = "waiting";
-  job.subtitleAssetError = null;
-  job.subtitleAssetPromise = null;
-  job.subtitleAssetPromiseKey = null;
-  job.chapters = [];
-  job.videoCodec = null;
-  job.videoPixelFormat = null;
-  job.videoProfile = null;
-  job.subtitleStatus = "waiting";
-  job.subtitleError = null;
-  job.subtitleProbeKey = null;
-  job.preparation = { status: "waiting", error: null, encoder: null, fallback: false };
-  job.status = "downloading";
+  const asset = syncSelectedAsset(job);
+  job.status = asset.status === "ready" ? "ready" : "downloading";
+  job.error = asset.preparation.error || null;
   touchJob(job);
-  if (file.done) void completeSelectedFile(job, index);
+  if (localFile) {
+    if (asset.status === "ready") queueMediaPreparation(job, index);
+  } else if (file.done) {
+    void completeSelectedFile(job, index);
+  }
+  refreshPreparationScheduling();
 }
 
 function jobFile(job, index) {
@@ -689,45 +764,43 @@ function jobFile(job, index) {
   return job.file;
 }
 
-function selectedJobFile(job) {
-  if (job.selectedIndex === null) throw new Error("Select a media file first.");
-  return jobFile(job, job.selectedIndex);
-}
-
 function streamTrackLabel(stream, fallback) {
   const title = String(stream.tags?.title || "").trim();
   const language = String(stream.tags?.language || "und").toLowerCase();
   return title || (language === "und" ? fallback : language.toUpperCase());
 }
 
-async function probeSubtitleTracks(job) {
-  const media = selectedJobFile(job);
-  const selectionKey = selectedFileKey(job);
-  if (job.subtitleProbeKey === selectionKey && job.subtitleStatus === "ready") return;
+async function probeSubtitleTracks(job, index = job.selectedIndex) {
+  const media = jobFile(job, index);
+  const asset = mediaAsset(job, index);
+  const selectionKey = fileIdentityKey(index, media);
+  if (asset.subtitleProbeKey === selectionKey && asset.subtitleStatus === "ready") return;
 
-  job.subtitleProbeKey = selectionKey;
-  job.subtitleStatus = "probing";
-  job.subtitleError = null;
-  job.audioTracks = [];
-  job.subtitleTracks = [];
-  job.mediaStreams = [];
-  job.subtitleAssetStatus = "waiting";
-  job.subtitleAssetError = null;
-  job.subtitleAssetPromise = null;
-  job.subtitleAssetPromiseKey = null;
-  job.chapters = [];
+  asset.subtitleProbeKey = selectionKey;
+  asset.subtitleStatus = "probing";
+  asset.subtitleError = null;
+  asset.audioTracks = [];
+  asset.subtitleTracks = [];
+  asset.mediaStreams = [];
+  asset.subtitleAssetStatus = "waiting";
+  asset.subtitleAssetError = null;
+  asset.subtitleAssetPromise = null;
+  asset.subtitleAssetPromiseKey = null;
+  asset.chapters = [];
+  asset.updatedAt = Date.now();
+  if (job.selectedIndex === index) syncSelectedAsset(job);
   job.updatedAt = Date.now();
   const probeStartedAt = Date.now();
   agentLogger.info("media_probe_started", {
     jobId: job.id,
-    fileIndex: job.selectedIndex,
+    fileIndex: index,
     fileSize: media.size,
     extension: path.extname(media.name).toLowerCase(),
   });
 
-  const isStillSelected = () => {
+  const isStillCurrent = () => {
     try {
-      return selectedFileKey(job) === selectionKey;
+      return fileIdentityKey(index, jobFile(job, index)) === selectionKey;
     } catch {
       return false;
     }
@@ -739,15 +812,17 @@ async function probeSubtitleTracks(job) {
       chapterProbeArguments(media.path),
       { maxBuffer: 8 * 1024 * 1024 }
     );
-    if (!isStillSelected()) return;
+    if (!isStillCurrent()) return;
 
     const metadata = JSON.parse(result.stdout || "{}");
     const videoStream = (metadata.streams || []).find((stream) => stream.codec_type === "video");
-    job.videoCodec = String(videoStream?.codec_name || "unknown");
-    job.videoPixelFormat = String(videoStream?.pix_fmt || "unknown");
-    job.videoProfile = String(videoStream?.profile || "unknown");
-    job.chapters = normalizeMediaChapters(metadata.chapters);
-    job.audioTracks = (metadata.streams || [])
+    asset.videoCodec = String(videoStream?.codec_name || "unknown");
+    asset.videoPixelFormat = String(videoStream?.pix_fmt || "unknown");
+    asset.videoProfile = String(videoStream?.profile || "unknown");
+    const rawVideoStart = Number(videoStream?.start_time ?? metadata.format?.start_time);
+    asset.videoStartTime = Number.isFinite(rawVideoStart) ? rawVideoStart : null;
+    asset.chapters = normalizeMediaChapters(metadata.chapters);
+    asset.audioTracks = (metadata.streams || [])
       .filter((stream) => stream.codec_type === "audio")
       .map((stream) => ({
         id: String(stream.index),
@@ -759,17 +834,17 @@ async function probeSubtitleTracks(job) {
         default: Boolean(stream.disposition?.default),
       }));
     const streams = metadata.streams || [];
-    job.mediaStreams = streams;
-    const selectionVersion = encodeURIComponent(selectionKey);
+    asset.mediaStreams = streams;
+    const selectionVersion = encodeURIComponent(asset.identityFingerprint || selectionKey);
     const subtitleFonts = fontAttachmentMetadata(
       streams,
       (stream) =>
         "http://" + HOST + ":" + PORT +
         "/downloads/" + encodeURIComponent(job.id) +
-        "/subtitle-fonts/" + stream.index +
+        "/media/" + index + "/subtitle-fonts/" + stream.index +
         "?v=" + selectionVersion
     );
-    job.subtitleTracks = streams
+    asset.subtitleTracks = streams
       .filter((stream) => stream.codec_type === "subtitle")
       .map((stream) => {
         const codec = String(stream.codec_name || "unknown");
@@ -778,7 +853,7 @@ async function probeSubtitleTracks(job) {
         const subtitleBase =
           "http://" + HOST + ":" + PORT +
           "/downloads/" + encodeURIComponent(job.id) +
-          "/subtitles/" + stream.index;
+          "/media/" + index + "/subtitles/" + stream.index;
         return {
           id: String(stream.index),
           streamIndex: Number(stream.index),
@@ -796,72 +871,79 @@ async function probeSubtitleTracks(job) {
       });
     agentLogger.info("media_probe_finished", {
       jobId: job.id,
-      fileIndex: job.selectedIndex,
+      fileIndex: index,
       durationMs: Date.now() - probeStartedAt,
       video: {
-        codec: job.videoCodec,
-        pixelFormat: job.videoPixelFormat,
-        profile: job.videoProfile,
+        codec: asset.videoCodec,
+        pixelFormat: asset.videoPixelFormat,
+        profile: asset.videoProfile,
       },
-      audioTracks: job.audioTracks.length,
-      subtitleTracks: job.subtitleTracks.length,
+      audioTracks: asset.audioTracks.length,
+      subtitleTracks: asset.subtitleTracks.length,
       fontAttachments: subtitleFonts.length,
-      chapters: job.chapters.length,
+      chapters: asset.chapters.length,
     });
-    job.subtitleStatus = "ready";
+    asset.subtitleStatus = "ready";
   } catch (error) {
-    if (!isStillSelected()) return;
+    if (!isStillCurrent()) return;
     agentLogger.error("media_probe_failed", {
       jobId: job.id,
-      fileIndex: job.selectedIndex,
+      fileIndex: index,
       durationMs: Date.now() - probeStartedAt,
       error,
     });
-    job.subtitleStatus = "error";
-    job.subtitleError = error instanceof Error ? error.message : "Could not inspect embedded media tracks.";
+    asset.subtitleStatus = "error";
+    asset.subtitleError = error instanceof Error ? error.message : "Could not inspect embedded media tracks.";
   } finally {
-    if (isStillSelected()) job.updatedAt = Date.now();
+    if (isStillCurrent()) {
+      asset.updatedAt = Date.now();
+      if (job.selectedIndex === index) syncSelectedAsset(job);
+      job.updatedAt = Date.now();
+    }
   }
 }
 
-function queueSubtitleProbe(job) {
-  const selectionKey = selectedFileKey(job);
-  if (job.subtitleProbeKey === selectionKey && job.subtitleStatus === "ready") {
+function queueSubtitleProbe(job, index = job.selectedIndex) {
+  const asset = mediaAsset(job, index);
+  const selectionKey = fileIdentityKey(index, jobFile(job, index));
+  if (asset.subtitleProbeKey === selectionKey && asset.subtitleStatus === "ready") {
     return Promise.resolve();
   }
-  if (job.subtitleProbePromise && job.subtitleProbePromiseKey === selectionKey) {
-    return job.subtitleProbePromise;
+  if (asset.subtitleProbePromise && asset.subtitleProbePromiseKey === selectionKey) {
+    return asset.subtitleProbePromise;
   }
 
   let promise;
-  promise = probeSubtitleTracks(job).finally(() => {
-    if (job.subtitleProbePromise === promise) {
-      job.subtitleProbePromise = null;
-      job.subtitleProbePromiseKey = null;
+  promise = probeSubtitleTracks(job, index).finally(() => {
+    if (asset.subtitleProbePromise === promise) {
+      asset.subtitleProbePromise = null;
+      asset.subtitleProbePromiseKey = null;
     }
   });
-  job.subtitleProbePromise = promise;
-  job.subtitleProbePromiseKey = selectionKey;
+  asset.subtitleProbePromise = promise;
+  asset.subtitleProbePromiseKey = selectionKey;
   return promise;
 }
 
-async function prepareSubtitleAssetsForSelection(job, selectionKey) {
-  await queueSubtitleProbe(job);
-  if (selectedFileKey(job) !== selectionKey) {
-    throw new Error("The selected media file changed during subtitle preparation.");
+async function prepareSubtitleAssetsForSelection(job, index, selectionKey) {
+  const asset = mediaAsset(job, index);
+  await queueSubtitleProbe(job, index);
+  if (fileIdentityKey(index, jobFile(job, index)) !== selectionKey) {
+    throw new Error("The media file changed during subtitle preparation.");
   }
 
-  const media = selectedJobFile(job);
-  const mediaKey = await identifySelectedFile(job, job.selectedIndex);
+  const media = jobFile(job, index);
+  const mediaKey = await identifySelectedFile(job, index);
   const schedulerJobId = `content-${mediaKey}-${media.size}`;
-  job.subtitleAssetStatus = "preparing";
-  job.subtitleAssetError = null;
+  asset.subtitleAssetStatus = "preparing";
+  asset.subtitleAssetError = null;
+  if (job.selectedIndex === index) syncSelectedAsset(job);
   const subtitleStartedAt = Date.now();
   agentLogger.info("subtitle_assets_started", {
     jobId: job.id,
-    fileIndex: job.selectedIndex,
-    subtitleTracks: job.subtitleTracks.length,
-    attachments: job.mediaStreams.filter((stream) => stream.codec_type === "attachment").length,
+    fileIndex: index,
+    subtitleTracks: asset.subtitleTracks.length,
+    attachments: asset.mediaStreams.filter((stream) => stream.codec_type === "attachment").length,
   });
 
   try {
@@ -869,65 +951,80 @@ async function prepareSubtitleAssetsForSelection(job, selectionKey) {
       mediaPath: media.path,
       mediaKey,
       fileSize: media.size,
-      streams: job.mediaStreams,
+      streams: asset.mediaStreams,
       schedulerJobId,
     });
     agentLogger.info("subtitle_assets_finished", {
       jobId: job.id,
-      fileIndex: job.selectedIndex,
+      fileIndex: index,
       durationMs: Date.now() - subtitleStartedAt,
       subtitleAssets: result.subtitles.size,
       fontAssets: result.fonts.size,
     });
-    if (job.subtitleProbeKey === selectionKey) {
-      job.subtitleAssetStatus = "ready";
-      job.subtitleAssetError = null;
+    if (asset.subtitleProbeKey === selectionKey) {
+      asset.subtitleAssetStatus = "ready";
+      asset.subtitleAssetError = null;
+      if (job.selectedIndex === index) syncSelectedAsset(job);
     }
     return result;
   } catch (error) {
     agentLogger.error("subtitle_assets_failed", {
       jobId: job.id,
-      fileIndex: job.selectedIndex,
+      fileIndex: index,
       durationMs: Date.now() - subtitleStartedAt,
       error,
     });
-    if (job.subtitleProbeKey === selectionKey) {
-      job.subtitleAssetStatus = "error";
-      job.subtitleAssetError = error instanceof Error ? error.message : "Subtitle preparation failed.";
+    if (asset.subtitleProbeKey === selectionKey) {
+      asset.subtitleAssetStatus = "error";
+      asset.subtitleAssetError = error instanceof Error ? error.message : "Subtitle preparation failed.";
+      if (job.selectedIndex === index) syncSelectedAsset(job);
     }
     throw error;
   }
 }
 
-function preparedSubtitleAssets(job) {
-  const selectionKey = selectedFileKey(job);
-  if (job.subtitleAssetPromise && job.subtitleAssetPromiseKey === selectionKey) {
-    return job.subtitleAssetPromise;
+function preparedSubtitleAssets(job, index = job.selectedIndex) {
+  const asset = mediaAsset(job, index);
+  const selectionKey = fileIdentityKey(index, jobFile(job, index));
+  if (asset.subtitleAssetPromise && asset.subtitleAssetPromiseKey === selectionKey) {
+    return asset.subtitleAssetPromise;
   }
 
   let promise;
-  promise = prepareSubtitleAssetsForSelection(job, selectionKey).finally(() => {
-    if (job.subtitleAssetPromise === promise) {
-      job.subtitleAssetPromise = null;
-      job.subtitleAssetPromiseKey = null;
+  promise = prepareSubtitleAssetsForSelection(job, index, selectionKey).finally(() => {
+    if (asset.subtitleAssetPromise === promise) {
+      asset.subtitleAssetPromise = null;
+      asset.subtitleAssetPromiseKey = null;
     }
   });
-  job.subtitleAssetPromise = promise;
-  job.subtitleAssetPromiseKey = selectionKey;
+  asset.subtitleAssetPromise = promise;
+  asset.subtitleAssetPromiseKey = selectionKey;
   return promise;
 }
 
-function queueMediaPreparation(job) {
-  void preparedSubtitleAssets(job)
-    .catch(() => null)
+function queueMediaPreparation(job, index = job.selectedIndex) {
+  void queueSubtitleProbe(job, index)
     .then(() => {
-      if (jobs.get(job.id) === job) queueBackgroundPreparation(job);
+      if (jobs.get(job.id) !== job) return;
+      const key = mediaTargetKey(job.id, index);
+      if (key === activePreparationTargetKey) queueSelectedPreparation(job, index);
+      else queueBackgroundPreparation(job, index);
+    })
+    .catch((error) => {
+      const asset = mediaAsset(job, index);
+      asset.preparation = {
+        ...defaultPreparation(),
+        status: "error",
+        error: error instanceof Error ? error.message : "Could not inspect the media file.",
+      };
+      if (job.selectedIndex === index) syncSelectedAsset(job);
     });
 }
 
-async function subtitleFile(job, trackId, format = "vtt") {
-  await queueSubtitleProbe(job);
-  const track = job.subtitleTracks.find((item) => item.id === trackId);
+async function subtitleFile(job, index, trackId, format = "vtt") {
+  const asset = mediaAsset(job, index);
+  await queueSubtitleProbe(job, index);
+  const track = asset.subtitleTracks.find((item) => item.id === trackId);
   if (!track) throw new Error("Embedded subtitle track not found.");
   if (!track.supported) {
     throw new Error("This image-based subtitle track cannot be converted to browser text.");
@@ -936,31 +1033,32 @@ async function subtitleFile(job, trackId, format = "vtt") {
     throw new Error("This subtitle track does not contain ASS/SSA styling.");
   }
 
-  const prepared = await preparedSubtitleAssets(job);
+  const prepared = await preparedSubtitleAssets(job, index);
   const output = prepared.subtitles.get(`${track.id}:${format === "ass" ? "ass" : "webvtt"}`);
   if (!output) throw new Error("The requested subtitle asset was not prepared.");
   return output;
 }
 
-async function subtitleFontFile(job, fontId) {
-  await queueSubtitleProbe(job);
-  const font = job.subtitleTracks
+async function subtitleFontFile(job, index, fontId) {
+  const asset = mediaAsset(job, index);
+  await queueSubtitleProbe(job, index);
+  const font = asset.subtitleTracks
     .flatMap((track) => track.fonts || [])
     .find((item) => item.id === fontId);
   if (!font) throw new Error("Embedded subtitle font not found.");
 
-  const prepared = await preparedSubtitleAssets(job);
+  const prepared = await preparedSubtitleAssets(job, index);
   const output = prepared.fonts.get(font.id);
   if (!output) throw new Error("The requested embedded font was not prepared.");
   return { path: output, mimeType: font.mimeType };
 }
 
-function needsHlsPlayback(job, fileName) {
+function needsHlsPlayback(asset, fileName) {
   const extension = path.extname(fileName).toLowerCase();
-  const audioTracks = job.audioTracks || [];
+  const audioTracks = asset.audioTracks || [];
   if (
     [".mp4", ".m4v", ".mov"].includes(extension) &&
-    canCopyH264Video(job) &&
+    canCopyH264Video(asset) &&
     audioTracks.length <= 1 &&
     (!audioTracks[0] || ["aac", "mp3", "opus"].includes(audioTracks[0].codec))
   ) {
@@ -968,7 +1066,8 @@ function needsHlsPlayback(job, fileName) {
   }
   if (
     extension === ".webm" &&
-    ["av1", "vp8", "vp9"].includes(job.videoCodec) &&
+    ["av1", "vp8", "vp9"].includes(asset.videoCodec) &&
+    startsAtBrowserZero(asset) &&
     audioTracks.length <= 1 &&
     (!audioTracks[0] || ["opus", "vorbis"].includes(audioTracks[0].codec))
   ) {
@@ -977,62 +1076,73 @@ function needsHlsPlayback(job, fileName) {
   return true;
 }
 
+function agentFileSnapshot(job, index, file, downloaded, progress, downloadReady) {
+  const asset = mediaAsset(job, index);
+  const name = file.name;
+  const relativePath = job.kind === "magnet" && !job.seed
+    ? torrentFilePath(file)
+    : torrentFileName(file);
+  const fingerprint = fileIdentityFingerprint(job, index, file);
+  return {
+    index,
+    itemId: `${job.id}-f${index}`,
+    path: relativePath,
+    name,
+    size: file.size,
+    downloaded,
+    progress,
+    downloadReady,
+    ready: downloadReady && asset.status === "ready" && Boolean(fingerprint),
+    selected: index === job.selectedIndex,
+    fingerprint,
+    status: asset.status,
+    subtitleStatus: asset.subtitleStatus,
+    subtitleError: asset.subtitleError,
+    subtitleAssetStatus: asset.subtitleAssetStatus,
+    subtitleAssetError: asset.subtitleAssetError,
+    audioTracks: asset.audioTracks,
+    chapters: asset.chapters,
+    subtitles: asset.subtitleTracks,
+    preparation: asset.preparation,
+    streamUrl: `http://${HOST}:${PORT}/stream/${encodeURIComponent(job.id)}/${index}`,
+    hlsUrl: needsHlsPlayback(asset, relativePath)
+      ? `http://${HOST}:${PORT}/hls/${encodeURIComponent(job.id)}/${index}/h264/master.m3u8`
+      : null,
+  };
+}
+
 function torrentFiles(job) {
   if (job.seed && job.file) {
-    return [{
-      index: 0,
-      name: job.file.name,
-      size: job.file.size,
-      downloaded: job.file.size,
-      progress: 100,
-      ready: job.status === "ready",
-      selected: job.selectedIndex === 0,
-      fingerprint: fileIdentityFingerprint(job, 0, job.file),
-      streamUrl: "http://" + HOST + ":" + PORT + "/stream/" + encodeURIComponent(job.id) + "/0",
-      hlsUrl: needsHlsPlayback(job, job.file.name)
-        ? "http://" + HOST + ":" + PORT + "/hls/" + encodeURIComponent(job.id) + "/0/h264/master.m3u8"
-        : null,
-    }];
+    return [agentFileSnapshot(job, 0, job.file, job.file.size, 100, job.status === "ready")];
   }
   if (!job.torrent) return [];
   return job.torrent.files.map((file, index) => {
     const progress = verifiedTorrentFileProgress(file);
-    return {
+    return agentFileSnapshot(
+      job,
       index,
-      name: torrentFileName(file),
-      size: file.length,
-      downloaded: Math.round(file.length * progress),
-      progress: Math.round(progress * 1000) / 10,
-      ready: Boolean(file.done),
-      selected: index === job.selectedIndex,
-      fingerprint: fileIdentityFingerprint(job, index, { name: torrentFileName(file), size: file.length }),
-      streamUrl: `http://${HOST}:${PORT}/stream/${encodeURIComponent(job.id)}/${index}`,
-      hlsUrl: needsHlsPlayback(job, file.path || file.name)
-        ? `http://${HOST}:${PORT}/hls/${encodeURIComponent(job.id)}/${index}/h264/master.m3u8`
-        : null,
-    };
+      { name: torrentFileName(file), path: torrentFilePath(file), size: file.length },
+      Math.round(file.length * progress),
+      Math.round(progress * 1000) / 10,
+      Boolean(file.done)
+    );
   });
 }
 
 function snapshot(job) {
+  syncSelectedAsset(job);
   const files =
     job.kind === "magnet"
       ? torrentFiles(job)
       : job.file
-        ? [{
-            index: 0,
-            name: job.file.name,
-            size: job.file.size,
-            downloaded: job.downloaded,
-            progress: job.file.size ? Math.round((job.downloaded / job.file.size) * 1000) / 10 : 0,
-            ready: job.status === "ready" && job.downloaded === job.file.size,
-            selected: true,
-            fingerprint: fileIdentityFingerprint(job, 0, job.file),
-            streamUrl: `http://${HOST}:${PORT}/stream/${encodeURIComponent(job.id)}/0`,
-            hlsUrl: needsHlsPlayback(job, job.file.name)
-              ? `http://${HOST}:${PORT}/hls/${encodeURIComponent(job.id)}/0/h264/master.m3u8`
-              : null,
-          }]
+        ? [agentFileSnapshot(
+            job,
+            0,
+            job.file,
+            job.downloaded,
+            job.file.size ? Math.round((job.downloaded / job.file.size) * 1000) / 10 : 0,
+            job.status === "ready" && job.downloaded === job.file.size
+          )]
         : [];
 
   const selected = files.find((file) => file.selected);
@@ -1092,12 +1202,74 @@ function snapshot(job) {
   };
 }
 
+function orderedTorrentVideoIndexes(torrent) {
+  return torrent.files
+    .map((file, index) => ({ index, path: torrentFilePath(file) }))
+    .filter((item) => VIDEO_EXTENSIONS.test(item.path))
+    .sort((left, right) =>
+      left.path.localeCompare(right.path, "en", { numeric: true, sensitivity: "base" }) ||
+      left.index - right.index
+    )
+    .map((item) => item.index);
+}
+
+function firstUnfinishedPriorityTarget() {
+  for (const target of mediaPriorityTargets) {
+    const job = jobs.get(target.jobId);
+    const file = job?.torrent?.files?.[target.fileIndex];
+    if (!job) continue;
+    if (job.kind !== "magnet" || job.seed) continue;
+    if (!job.torrent?.files?.length) return target;
+    if (!file) continue;
+    if (!file.done) return target;
+  }
+  return null;
+}
+
+function firstUnfinishedFallbackTarget() {
+  for (const job of jobs.values()) {
+    if (job.kind !== "magnet" || job.seed) continue;
+    if (!job.torrent?.files?.length) return null;
+    const fileIndex = orderedTorrentVideoIndexes(job.torrent)
+      .find((index) => !job.torrent.files[index].done);
+    if (fileIndex !== undefined) return { jobId: job.id, fileIndex };
+  }
+  return null;
+}
+
+function refreshTorrentSelections(reason = "priority-plan") {
+  const target = mediaPriorityTargets.length
+    ? firstUnfinishedPriorityTarget()
+    : firstUnfinishedFallbackTarget();
+  for (const job of jobs.values()) {
+    if (job.kind !== "magnet" || job.seed || !job.torrent?.files?.length) continue;
+    let selections = [];
+    if (target?.jobId === job.id && job.torrent.files[target.fileIndex]) {
+      selections = [{ fileIndex: target.fileIndex, priority: 100 }];
+    }
+    replaceTorrentSelections(job.torrent, selections);
+    const selectionKey = selections.length ? mediaTargetKey(job.id, selections[0].fileIndex) : "";
+    if (job.lastTorrentSelectionKey !== selectionKey) {
+      job.lastTorrentSelectionKey = selectionKey;
+      agentLogger.info("torrent_download_priority_changed", {
+        reason,
+        jobId: job.id,
+        fileIndex: selections[0]?.fileIndex ?? null,
+        targetKey: selectionKey || null,
+      });
+    }
+  }
+}
+
 function startTorrent(job) {
   job.status = "metadata";
   agentLogger.info("torrent_start_requested", { jobId: job.id, managed: Boolean(job.managed) });
   let torrent;
   try {
-    torrent = client.add(job.value, { path: path.join(DOWNLOAD_DIR, job.id) });
+    torrent = client.add(job.value, {
+      path: path.join(DOWNLOAD_DIR, job.id),
+      deselect: true,
+    });
   } catch (error) {
     job.status = "error";
     job.error = error instanceof Error ? error.message : "Torrent could not be started.";
@@ -1108,7 +1280,12 @@ function startTorrent(job) {
   job.torrent = torrent;
   installTorrentPieceRecovery(
     torrent,
-    () => torrent.files?.[job.selectedIndex],
+    () => {
+      const planned = mediaPriorityTargets.find((target) =>
+        target.jobId === job.id && !torrent.files?.[target.fileIndex]?.done
+      );
+      return torrent.files?.[planned?.fileIndex] || torrent.files?.[job.selectedIndex];
+    },
     ({ reason, disconnected }) => {
       agentLogger.warn("torrent_piece_recovery", { jobId: job.id, reason, disconnected });
       job.status = "downloading";
@@ -1133,19 +1310,22 @@ function startTorrent(job) {
       pieceCount: torrent.pieces?.length || 0,
       files: torrent.files.map((file, index) => ({ index, name: torrentFileName(file), size: file.length })),
     });
-    const videos = torrent.files
-      .map((file, index) => ({ index, size: file.length, video: VIDEO_EXTENSIONS.test(file.name) }))
-      .sort((a, b) => Number(b.video) - Number(a.video) || b.size - a.size);
-    if (videos[0]) selectTorrentFile(job, videos[0].index);
+    const videos = orderedTorrentVideoIndexes(torrent);
+    for (const index of videos) {
+      const asset = mediaAsset(job, index);
+      asset.status = torrent.files[index].done ? "verifying" : "downloading";
+    }
+    if (videos[0] !== undefined) selectTorrentFile(job, videos[0]);
     torrent.files.forEach((file, index) => {
       file.on("done", () => {
         agentLogger.info("torrent_file_downloaded", { jobId: job.id, fileIndex: index, size: file.length });
-        if (job.selectedIndex !== index) return;
-        void completeSelectedFile(job, index);
+        refreshTorrentSelections("file-downloaded");
+        if (VIDEO_EXTENSIONS.test(file.path || file.name)) void completeSelectedFile(job, index);
       });
     });
     job.status = "downloading";
     if (torrent.files[job.selectedIndex]?.done) void completeSelectedFile(job);
+    refreshTorrentSelections("metadata-ready");
     job.updatedAt = Date.now();
   });
   torrent.on("download", () => {
@@ -1154,7 +1334,10 @@ function startTorrent(job) {
   });
   torrent.on("done", () => {
     agentLogger.info("torrent_download_complete", { jobId: job.id, infoHash: torrent.infoHash });
-    void completeSelectedFile(job);
+    for (const index of orderedTorrentVideoIndexes(torrent)) {
+      if (torrent.files[index].done) void completeSelectedFile(job, index);
+    }
+    refreshTorrentSelections("torrent-complete");
   });
   torrent.on("warning", (error) => {
     agentLogger.warn("torrent_warning", { jobId: job.id, error });
@@ -1204,14 +1387,14 @@ async function startDirect(job) {
     job.file.size = completed.size;
     job.downloaded = completed.size;
     job.selectedIndex = 0;
-    job.identityFingerprint = null;
-    job.identityFingerprintKey = null;
-    await identifySelectedFile(job);
+    const asset = mediaAsset(job, 0);
+    asset.status = "ready";
+    await identifySelectedFile(job, 0);
+    syncSelectedAsset(job);
     job.status = "ready";
     markJobCompleted(job);
     refreshPreparationScheduling();
-    await queueSubtitleProbe(job);
-    queueMediaPreparation(job);
+    queueMediaPreparation(job, 0);
   } catch (error) {
     job.status = "error";
     job.error = error instanceof Error ? error.message : "Direct download failed.";
@@ -1236,15 +1419,13 @@ function createJob(source) {
     seedPath: source.seedPath || null,
     identityFingerprint: source.identityFingerprint || null,
     identityFingerprintKey: source.identityFingerprintKey || null,
-    identityFingerprintPromise: null,
-    identityFingerprintPromiseKey: null,
     torrentVerifiedKey: null,
-    torrentVerificationPromise: null,
-    torrentVerificationPromiseKey: null,
     status: "queued",
     error: null,
     downloaded: 0,
     selectedIndex: null,
+    assets: new Map(),
+    lastTorrentSelectionKey: null,
     torrent: null,
     file: null,
     audioTracks: [],
@@ -1253,20 +1434,15 @@ function createJob(source) {
     mediaStreams: [],
     subtitleAssetStatus: "waiting",
     subtitleAssetError: null,
-    subtitleAssetPromise: null,
-    subtitleAssetPromiseKey: null,
     videoCodec: null,
     videoPixelFormat: null,
     videoProfile: null,
+    videoStartTime: null,
     subtitleStatus: "waiting",
     subtitleError: null,
-    subtitleProbeKey: null,
-    subtitleProbePromise: null,
-    subtitleProbePromiseKey: null,
     diskInvalidations: 0,
     peerFailures: 0,
     peersRejected: 0,
-    audioRenderPromises: new Map(),
     torrentCreationProgress: 0,
     trackerAnnounces: 0,
     trackerWarnings: [],
@@ -1312,11 +1488,29 @@ function touchJob(job) {
   job.updatedAt = now;
 }
 
+function requiredTorrentMediaIndexes(job) {
+  const planned = mediaPriorityTargets
+    .filter((target) => target.jobId === job.id)
+    .map((target) => target.fileIndex)
+    .filter((index) => job.torrent?.files?.[index]);
+  return planned.length ? planned : orderedTorrentVideoIndexes(job.torrent);
+}
+
 function markJobCompleted(job) {
+  if (job.kind === "magnet" && !job.seed && job.torrent?.files?.length) {
+    const requiredIndexes = requiredTorrentMediaIndexes(job);
+    if (
+      !requiredIndexes.length ||
+      requiredIndexes.some((index) => mediaAsset(job, index).status !== "ready")
+    ) {
+      return false;
+    }
+  }
   const now = Date.now();
   job.completedAt ||= now;
   job.lastAccessedAt ||= now;
   job.updatedAt = now;
+  return true;
 }
 
 async function addDownload(source) {
@@ -1418,8 +1612,11 @@ async function seedLocalFile({ id, filePath, label, managed = false, ...metadata
     type: contentType(resolvedPath),
   };
   job.seedStartedAt = Date.now();
-  job.identityFingerprint = await fingerprintPath(resolvedPath);
-  job.identityFingerprintKey = "0:" + path.basename(resolvedPath) + ":" + info.size;
+  const asset = mediaAsset(job, 0);
+  asset.status = "ready";
+  asset.identityFingerprint = await fingerprintPath(resolvedPath);
+  asset.identityFingerprintKey = fileIdentityKey(0, job.file);
+  syncSelectedAsset(job);
 
   const options = {
     pieceLength: 1024 * 1024,
@@ -1453,7 +1650,7 @@ async function seedLocalFile({ id, filePath, label, managed = false, ...metadata
       serving = true;
       job.status = "ready";
       markJobCompleted(job);
-      queueMediaPreparation(job);
+      queueMediaPreparation(job, 0);
       persistJobs();
     };
     const torrent = client.seed(resolvedPath, options, markServing);
@@ -1571,11 +1768,14 @@ async function attachLibraryFile({ id, entry, label }) {
   };
   job.downloaded = info.size;
   job.selectedIndex = 0;
-  job.identityFingerprint = await fingerprintPath(entry.path);
-  job.identityFingerprintKey = selectedFileKey(job);
+  const asset = mediaAsset(job, 0);
+  asset.status = "ready";
+  asset.identityFingerprint = await fingerprintPath(entry.path);
+  asset.identityFingerprintKey = fileIdentityKey(0, job.file);
+  syncSelectedAsset(job);
   job.status = "ready";
   markJobCompleted(job);
-  queueMediaPreparation(job);
+  queueMediaPreparation(job, 0);
   persistJobs();
   return job;
 }
@@ -1597,8 +1797,10 @@ async function stopJob(id, { deleteFiles = false } = {}) {
     await new Promise((resolve) => job.torrent.destroy(resolve));
   }
   jobs.delete(id);
-  const queueIndex = preparationQueue.indexOf(job);
-  if (queueIndex >= 0) preparationQueue.splice(queueIndex, 1);
+  for (let index = preparationQueue.length - 1; index >= 0; index -= 1) {
+    if (preparationQueue[index].job === job) preparationQueue.splice(index, 1);
+  }
+  refreshTorrentSelections("job-stopped");
   await removeGeneratedArtifacts(id);
   if (deleteFiles && job.managed) {
     await rm(path.join(DOWNLOAD_DIR, id), { recursive: true, force: true });
@@ -1641,12 +1843,13 @@ async function restoreJobs() {
         job.file = { ...record.file, size: info.size };
         job.downloaded = info.size;
         job.selectedIndex = 0;
-        job.identityFingerprint = null;
-        job.identityFingerprintKey = null;
-        await identifySelectedFile(job);
+        const asset = mediaAsset(job, 0);
+        asset.status = "ready";
+        await identifySelectedFile(job, 0);
+        syncSelectedAsset(job);
         job.status = "ready";
         markJobCompleted(job);
-        queueMediaPreparation(job);
+        queueMediaPreparation(job, 0);
       } else {
         await addDownload(record);
       }
@@ -1671,6 +1874,8 @@ function contentType(fileName, fallback = "application/octet-stream") {
 
 async function renderAudioPlayback(job, fileIndex, track) {
   const media = jobFile(job, fileIndex);
+  const asset = mediaAsset(job, fileIndex);
+  const schedulerJobId = `content-${await identifySelectedFile(job, fileIndex)}-${media.size}`;
   const directory = path.join(DOWNLOAD_DIR, ".watchpair-media", job.id);
   const output = path.join(directory, String(fileIndex) + "-browser-v2-audio-" + track.id + ".mp4");
   const partial = output + ".partial.mp4";
@@ -1684,11 +1889,11 @@ async function renderAudioPlayback(job, fileIndex, track) {
   }
 
   await rm(partial, { force: true });
-  const copyVideo = canCopyH264Video(job);
+  const copyVideo = canCopyH264Video(asset);
   const runWithEncoder = async (selectedEncoder, hardwareDecode = Boolean(selectedEncoder.hardware)) => {
     const pipeline = copyVideo ? null : videoPipeline(selectedEncoder, { hardwareDecode });
     return runScheduledFfmpeg({
-      jobId: job.id,
+      jobId: schedulerJobId,
       taskId: `audio-file:${fileIndex}:${track.id}`,
       stage: "alternate-audio-file",
       trackId: track.id,
@@ -1746,41 +1951,42 @@ async function renderAudioPlayback(job, fileIndex, track) {
 }
 
 function torrentFileIsFullyVerified(job, fileIndex) {
-  if (job.kind !== "magnet") return job.status === "ready";
-  if (job.seed) return fileIndex === 0 && Boolean(job.file) && job.status === "ready";
-  if (!job.torrent?.files[fileIndex]?.done || job.selectedIndex !== fileIndex) return false;
-  return job.torrentVerifiedKey === selectedFileKey(job);
+  const asset = mediaAsset(job, fileIndex);
+  if (job.kind !== "magnet") return asset.status === "ready";
+  if (job.seed) return fileIndex === 0 && Boolean(job.file) && asset.status === "ready";
+  if (!job.torrent?.files[fileIndex]?.done) return false;
+  return asset.torrentVerifiedKey === fileIdentityKey(fileIndex, jobFile(job, fileIndex));
 }
 
 async function preparedAudioFile(job, fileIndex, trackId) {
-  if (job.selectedIndex !== fileIndex) throw new Error("That media file is no longer selected.");
   if (!torrentFileIsFullyVerified(job, fileIndex)) {
-    throw new Error("The selected media file has not passed full verification.");
+    throw new Error("The media file has not passed full verification.");
   }
-  await queueSubtitleProbe(job);
+  const asset = mediaAsset(job, fileIndex);
+  await queueSubtitleProbe(job, fileIndex);
 
-  const track = job.audioTracks.find((item) => item.id === trackId);
+  const track = asset.audioTracks.find((item) => item.id === trackId);
   if (!track) throw new Error("Embedded audio track not found.");
-  const key = String(fileIndex) + ":" + track.id;
-  let promise = job.audioRenderPromises.get(key);
+  const key = String(track.id);
+  let promise = asset.audioRenderPromises.get(key);
   if (!promise) {
     promise = renderAudioPlayback(job, fileIndex, track);
-    job.audioRenderPromises.set(key, promise);
+    asset.audioRenderPromises.set(key, promise);
   }
   try {
     return await promise;
   } finally {
-    if (job.audioRenderPromises.get(key) === promise) job.audioRenderPromises.delete(key);
+    if (asset.audioRenderPromises.get(key) === promise) asset.audioRenderPromises.delete(key);
   }
 }
 
 async function hlsDescriptor(job, fileIndex, rendition = "h264") {
-  if (job.selectedIndex !== fileIndex) throw new Error("That media file is no longer selected.");
   if (!["h264", "vp9"].includes(rendition)) throw new Error("Unsupported video rendition.");
   if (!torrentFileIsFullyVerified(job, fileIndex)) {
-    throw new Error("The selected media file has not passed full verification.");
+    throw new Error("The media file has not passed full verification.");
   }
-  await queueSubtitleProbe(job);
+  const asset = mediaAsset(job, fileIndex);
+  await queueSubtitleProbe(job, fileIndex);
   const media = jobFile(job, fileIndex);
   const contentFingerprint = await identifySelectedFile(job, fileIndex);
   return {
@@ -1789,83 +1995,100 @@ async function hlsDescriptor(job, fileIndex, rendition = "h264") {
     fileSize: media.size,
     contentFingerprint,
     inputPath: media.path,
-    videoCodec: job.videoCodec,
-    videoPixelFormat: job.videoPixelFormat,
-    videoProfile: job.videoProfile,
+    videoCodec: asset.videoCodec,
+    videoPixelFormat: asset.videoPixelFormat,
+    videoProfile: asset.videoProfile,
     rendition,
-    audioTracks: job.audioTracks,
+    audioTracks: asset.audioTracks,
+    videoStartTime: asset.videoStartTime,
   };
 }
 
-async function prepareQueuedJob(job) {
-  if (job.selectedIndex === null) return;
+async function prepareQueuedTarget(target) {
+  const { job, index } = target;
+  const asset = mediaAsset(job, index);
   let selectionKey = null;
-  const isStillSelected = () => {
-    if (selectionKey === null) return jobs.get(job.id) === job && job.selectedIndex !== null;
+  const isStillCurrent = () => {
+    if (selectionKey === null) return jobs.get(job.id) === job;
     try {
-      return selectedFileKey(job) === selectionKey;
+      return fileIdentityKey(index, jobFile(job, index)) === selectionKey;
     } catch {
       return false;
     }
   };
 
   try {
-    selectionKey = selectedFileKey(job);
-    await queueSubtitleProbe(job);
-    if (!isStillSelected()) return;
-    const media = selectedJobFile(job);
-    if (!needsHlsPlayback(job, media.name)) {
-      job.preparation = {
+    selectionKey = fileIdentityKey(index, jobFile(job, index));
+    await queueSubtitleProbe(job, index);
+    if (!isStillCurrent()) return;
+    const media = jobFile(job, index);
+    if (!needsHlsPlayback(asset, media.name)) {
+      asset.preparation = {
         status: "direct",
         error: null,
         encoder: { id: "copy", label: "Direct browser playback", hardware: false },
         fallback: false,
       };
+      if (job.selectedIndex === index) syncSelectedAsset(job);
       return;
     }
 
-    const descriptor = await hlsDescriptor(job, job.selectedIndex);
+    const descriptor = await hlsDescriptor(job, index);
     descriptor.onState = (state, transition) => {
-      if (!isStillSelected()) return;
+      if (!isStillCurrent()) return;
       const diagnostic = state.diagnostics?.at(-1);
-      job.preparation = {
+      asset.preparation = {
         ...state,
         error: state.status === "error" ? diagnostic?.message || "Browser preparation failed." : null,
       };
+      asset.updatedAt = Date.now();
+      if (job.selectedIndex === index) syncSelectedAsset(job);
       job.updatedAt = Date.now();
-      agentLogger.info("media_preparation_state", { jobId: job.id, status: state.status, transition });
+      agentLogger.info("media_preparation_state", {
+        jobId: job.id,
+        fileIndex: index,
+        status: state.status,
+        transition,
+      });
     };
     const result = await hlsPlayback.prepare(descriptor);
-    if (isStillSelected()) job.preparation = { ...result, error: null };
+    if (isStillCurrent()) asset.preparation = { ...result, error: null };
   } catch (error) {
-    if (!isStillSelected()) return;
-    job.preparation = {
+    if (!isStillCurrent()) return;
+    asset.preparation = {
       status: "error",
       error: error instanceof Error ? error.message : "Browser preparation failed.",
       encoder: null,
       fallback: false,
     };
   } finally {
+    asset.updatedAt = Date.now();
+    if (job.selectedIndex === index) syncSelectedAsset(job);
     job.updatedAt = Date.now();
   }
 }
 
 function prioritizePreparationQueue() {
-  const order = new Map(preparationOrderJobIds.map((jobId, index) => [jobId, index]));
+  const order = new Map(preparationOrderTargetKeys.map((key, index) => [key, index]));
   preparationQueue.sort((left, right) =>
-    Number(right.id === activePreparationJobId) - Number(left.id === activePreparationJobId) ||
-    (order.get(left.id) ?? Number.MAX_SAFE_INTEGER) -
-      (order.get(right.id) ?? Number.MAX_SAFE_INTEGER) ||
+    Number(right.key === activePreparationTargetKey) -
+      Number(left.key === activePreparationTargetKey) ||
+    (order.get(left.key) ?? Number.MAX_SAFE_INTEGER) -
+      (order.get(right.key) ?? Number.MAX_SAFE_INTEGER) ||
     left.createdAt - right.createdAt
   );
 }
 
-function contentSchedulerIdForJob(job) {
-  if (!job?.identityFingerprint || job.selectedIndex === null) return null;
+function contentSchedulerIdForTarget(target) {
+  const job = jobs.get(target?.jobId);
+  if (!job || !Number.isInteger(target?.fileIndex)) return null;
   try {
-    const media = selectedJobFile(job);
-    if (job.identityFingerprintKey !== fileIdentityKey(job.selectedIndex, media)) return null;
-    return `content-${job.identityFingerprint}-${media.size}`;
+    const media = jobFile(job, target.fileIndex);
+    const asset = mediaAsset(job, target.fileIndex);
+    if (asset.identityFingerprintKey !== fileIdentityKey(target.fileIndex, media)) return null;
+    return asset.identityFingerprint
+      ? `content-${asset.identityFingerprint}-${media.size}`
+      : null;
   } catch {
     return null;
   }
@@ -1873,56 +2096,123 @@ function contentSchedulerIdForJob(job) {
 
 function refreshPreparationScheduling() {
   prioritizePreparationQueue();
-  mediaScheduler.setJobOrder(preparationOrderJobIds.map((jobId) =>
-    contentSchedulerIdForJob(jobs.get(jobId)) || jobId
+  mediaScheduler.setJobOrder(mediaPriorityTargets.map((target) =>
+    contentSchedulerIdForTarget(target) || mediaTargetKey(target.jobId, target.fileIndex)
   ));
-  hlsPlayback.setPriorityJob(activePreparationJobId);
+  const activeTarget = mediaPriorityTargets.find(
+    (target) => mediaTargetKey(target.jobId, target.fileIndex) === activePreparationTargetKey
+  ) || null;
+  hlsPlayback.setPriorityTarget(
+    activeTarget?.jobId || null,
+    activeTarget?.fileIndex ?? null,
+    contentSchedulerIdForTarget(activeTarget)
+  );
 }
 
-function setPreparationPriority(jobId, orderedJobIds) {
-  activePreparationJobId = jobId || null;
-  if (orderedJobIds) {
-    preparationOrderJobIds = Array.from(new Set(orderedJobIds.filter(Boolean)));
+function setMediaPriority(selected, targets) {
+  mediaPriorityTargets = normalizeMediaTargets(targets || []);
+  for (const target of mediaPriorityTargets) {
+    const job = jobs.get(target.jobId);
+    if (!job) continue;
+    if (
+      (job.kind === "magnet" && job.torrent?.files?.length && !job.torrent.files[target.fileIndex]) ||
+      (job.kind !== "magnet" && target.fileIndex !== 0)
+    ) {
+      continue;
+    }
+    const asset = mediaAsset(job, target.fileIndex);
+    if (asset.status !== "ready") job.completedAt = null;
   }
+  preparationOrderTargetKeys = mediaPriorityTargets.map((target) =>
+    mediaTargetKey(target.jobId, target.fileIndex)
+  );
+  activePreparationTargetKey = selected
+    ? mediaTargetKey(selected.jobId, selected.fileIndex)
+    : null;
+
+  if (selected) {
+    const job = jobs.get(selected.jobId);
+    if (job?.torrent?.files[selected.fileIndex] || (job?.file && selected.fileIndex === 0)) {
+      selectTorrentFile(job, selected.fileIndex);
+      const asset = mediaAsset(job, selected.fileIndex);
+      if (asset.status === "ready") queueMediaPreparation(job, selected.fileIndex);
+    }
+  }
+  refreshTorrentSelections("media-priority");
   refreshPreparationScheduling();
 }
 
-function preparationBlockedByWatchOrder(job) {
-  const rank = preparationOrderJobIds.indexOf(job.id);
+function setPreparationPriority(jobId, orderedJobIds) {
+  const targets = (orderedJobIds || []).flatMap((id) => {
+    const job = jobs.get(id);
+    const fileIndex = job?.selectedIndex ?? orderedTorrentVideoIndexes(job?.torrent || { files: [] })[0];
+    return Number.isInteger(fileIndex) ? [{ jobId: id, fileIndex }] : [];
+  });
+  const selected = targets.find((target) => target.jobId === jobId) || null;
+  setMediaPriority(selected, targets);
+}
+
+function preparationBlockedByWatchOrder(target) {
+  if (target.key === activePreparationTargetKey) return false;
+  const rank = preparationOrderTargetKeys.indexOf(target.key);
   if (rank <= 0) return false;
-  return preparationOrderJobIds.slice(0, rank).some((jobId) => {
-    const earlier = jobs.get(jobId);
-    if (!earlier) return true;
-    if (earlier.status === "error" || earlier.preparation.status === "error") return false;
-    return !["ready", "direct"].includes(earlier.preparation.status);
+  return mediaPriorityTargets.slice(0, rank).some((earlierTarget) => {
+    const earlierJob = jobs.get(earlierTarget.jobId);
+    if (!earlierJob) return true;
+    try {
+      if (
+        (earlierJob.kind === "magnet" &&
+          earlierJob.torrent?.files?.length &&
+          !earlierJob.torrent.files[earlierTarget.fileIndex]) ||
+        (earlierJob.kind !== "magnet" && earlierTarget.fileIndex !== 0)
+      ) return false;
+      const earlierAsset = mediaAsset(earlierJob, earlierTarget.fileIndex);
+      if (earlierAsset.status === "error" || earlierAsset.preparation.status === "error") {
+        return false;
+      }
+      if (earlierAsset.status !== "ready") return true;
+      return !["ready", "direct"].includes(earlierAsset.preparation.status);
+    } catch {
+      return true;
+    }
   });
 }
 
 async function drainPreparationQueue() {
   while (preparationQueue.length) {
     prioritizePreparationQueue();
-    const job = preparationQueue[0];
-    if (!job) break;
-    if (job.preparation.status !== "queued") {
+    const target = preparationQueue[0];
+    if (!target) break;
+    if (jobs.get(target.job.id) !== target.job) {
       preparationQueue.shift();
       continue;
     }
-    if (preparationBlockedByWatchOrder(job)) {
+    const asset = mediaAsset(target.job, target.index);
+    if (asset.preparation.status !== "queued") {
+      preparationQueue.shift();
+      continue;
+    }
+    if (preparationBlockedByWatchOrder(target)) {
       await new Promise((resolve) => setTimeout(resolve, 1_000));
       continue;
     }
     preparationQueue.shift();
     try {
-      await prepareQueuedJob(job);
+      await prepareQueuedTarget(target);
     } catch (error) {
-      agentLogger.error("media_preparation_unhandled", { jobId: job.id, error });
-      job.preparation = {
+      agentLogger.error("media_preparation_unhandled", {
+        jobId: target.job.id,
+        fileIndex: target.index,
+        error,
+      });
+      asset.preparation = {
         status: "error",
         error: error instanceof Error ? error.message : "Browser preparation failed.",
         encoder: null,
         fallback: false,
       };
-      job.updatedAt = Date.now();
+      if (target.job.selectedIndex === target.index) syncSelectedAsset(target.job);
+      target.job.updatedAt = Date.now();
     }
   }
 }
@@ -1935,11 +2225,58 @@ function startPreparationWorker() {
   });
 }
 
-function queueBackgroundPreparation(job) {
-  if (job.selectedIndex === null || !["waiting", "error"].includes(job.preparation.status)) return;
-  job.preparation = { status: "queued", error: null, encoder: null, fallback: false };
+function queueSelectedPreparation(job, index = job.selectedIndex) {
+  if (!Number.isInteger(index)) return;
+  const key = mediaTargetKey(job.id, index);
+  const asset = mediaAsset(job, index);
+  if (["ready", "direct", "preparing"].includes(asset.preparation.status)) return;
+  if (selectedPreparationKeys.has(key)) return;
+  if (key !== activePreparationTargetKey) {
+    queueBackgroundPreparation(job, index);
+    return;
+  }
+
+  for (let queueIndex = preparationQueue.length - 1; queueIndex >= 0; queueIndex -= 1) {
+    if (preparationQueue[queueIndex].key === key) preparationQueue.splice(queueIndex, 1);
+  }
+  asset.preparation = { status: "queued", error: null, encoder: null, fallback: false };
+  asset.updatedAt = Date.now();
+  if (job.selectedIndex === index) syncSelectedAsset(job);
   job.updatedAt = Date.now();
-  if (!preparationQueue.includes(job)) preparationQueue.push(job);
+  selectedPreparationKeys.add(key);
+  void prepareQueuedTarget({ job, index, key, createdAt: Date.now() })
+    .catch((error) => {
+      agentLogger.error("selected_media_preparation_unhandled", {
+        jobId: job.id,
+        fileIndex: index,
+        error,
+      });
+      asset.preparation = {
+        status: "error",
+        error: error instanceof Error ? error.message : "Browser preparation failed.",
+        encoder: null,
+        fallback: false,
+      };
+    })
+    .finally(() => {
+      selectedPreparationKeys.delete(key);
+      if (job.selectedIndex === index) syncSelectedAsset(job);
+      job.updatedAt = Date.now();
+    });
+}
+
+function queueBackgroundPreparation(job, index = job.selectedIndex) {
+  if (!Number.isInteger(index)) return;
+  const asset = mediaAsset(job, index);
+  if (!["waiting", "error"].includes(asset.preparation.status)) return;
+  asset.preparation = { status: "queued", error: null, encoder: null, fallback: false };
+  asset.updatedAt = Date.now();
+  if (job.selectedIndex === index) syncSelectedAsset(job);
+  job.updatedAt = Date.now();
+  const key = mediaTargetKey(job.id, index);
+  if (!preparationQueue.some((target) => target.key === key)) {
+    preparationQueue.push({ job, index, key, createdAt: Date.now() });
+  }
   prioritizePreparationQueue();
   refreshPreparationScheduling();
   startPreparationWorker();
@@ -2077,9 +2414,14 @@ async function runStorageCleanup({ force = false } = {}) {
     }
 
     for (const job of jobs.values()) {
-      if (!cacheExpired(job.lastAccessedAt, settings, now) || job.preparation.status === "preparing") continue;
+      const assets = Array.from(job.assets?.values?.() || []);
+      if (
+        !cacheExpired(job.lastAccessedAt, settings, now) ||
+        assets.some((asset) => ["queued", "preparing"].includes(asset.preparation.status))
+      ) continue;
       await removeGeneratedArtifacts(job.id);
-      job.preparation = { status: "waiting", error: null, encoder: null, fallback: false };
+      for (const asset of assets) asset.preparation = defaultPreparation();
+      syncSelectedAsset(job);
       result.removedEntries.push(`cache:${job.id}`);
     }
 
@@ -2133,15 +2475,17 @@ async function runStorageCleanup({ force = false } = {}) {
       .filter((jobId) => String(jobId || "").startsWith("content-"))
       .map((jobId) => jobId.slice("content-".length)));
     for (const job of jobs.values()) {
-      if (cacheExpired(job.lastAccessedAt, settings, now) || !job.identityFingerprint) continue;
-      let media;
-      try {
-        media = selectedJobFile(job);
-      } catch {
-        continue;
+      if (cacheExpired(job.lastAccessedAt, settings, now)) continue;
+      for (const [index, asset] of job.assets?.entries?.() || []) {
+        if (!asset.identityFingerprint) continue;
+        try {
+          const media = jobFile(job, index);
+          if (asset.identityFingerprintKey !== fileIdentityKey(index, media)) continue;
+          protectedContentNames.add(`${asset.identityFingerprint}-${media.size}`);
+        } catch {
+          // A stale file asset no longer protects generated content.
+        }
       }
-      if (job.identityFingerprintKey !== fileIdentityKey(job.selectedIndex, media)) continue;
-      protectedContentNames.add(`${job.identityFingerprint}-${media.size}`);
     }
     const expiredHlsContent = await pruneExpiredChildren(path.join(HLS_DIR, "content"), {
       now,
@@ -2240,8 +2584,11 @@ function agentResourceSnapshot() {
       peers: client.torrents.reduce((total, torrent) => total + torrent.numPeers, 0),
       downloadSpeed: client.downloadSpeed,
       uploadSpeed: client.uploadSpeed,
-      pendingVerifications: Array.from(jobs.values())
-        .filter((job) => Boolean(job.torrentVerificationPromise)).length,
+      pendingVerifications: Array.from(jobs.values()).reduce(
+        (total, job) => total + Array.from(job.assets?.values?.() || [])
+          .filter((asset) => Boolean(asset.torrentVerificationPromise)).length,
+        0
+      ),
       connectionBudget: torrentPressure.totalBudget,
       perTorrentLimit: torrentPressure.perTorrentLimit,
       trimmedPeers: torrentPressure.trimmedPeers,
@@ -2457,6 +2804,36 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    if (request.method === "POST" && url.pathname === "/media-priority") {
+      const body = await readJson(request);
+      let targets = normalizeMediaTargets(body.targets || []);
+      const selected = body.selected
+        ? normalizeMediaTargets([body.selected], 1)[0]
+        : null;
+      if (
+        selected &&
+        !targets.some((target) =>
+          target.jobId === selected.jobId && target.fileIndex === selected.fileIndex
+        )
+      ) {
+        targets = [selected, ...targets];
+      }
+      setMediaPriority(selected, targets);
+      const foreground = mediaResourceProfile("foreground");
+      const background = mediaResourceProfile("background");
+      sendJson(response, 200, {
+        ok: true,
+        selected,
+        targets: mediaPriorityTargets,
+        foregroundLoad: foreground.share,
+        backgroundLoad: background.share,
+        systemTier: foreground.systemTier,
+        foregroundThreads: foreground.threads,
+        backgroundThreads: background.threads,
+      }, headers);
+      return;
+    }
+
     if (request.method === "POST" && url.pathname === "/preparation-priority") {
       const body = await readJson(request);
       const validSourceId = (value) => /^[a-zA-Z0-9-]{8,80}$/.test(value);
@@ -2479,8 +2856,10 @@ const server = createServer(async (request, response) => {
       setPreparationPriority(sourceId, sourceIds);
       sendJson(response, 200, {
         ok: true,
-        sourceId: activePreparationJobId,
-        sourceIds: preparationOrderJobIds,
+        sourceId: mediaPriorityTargets.find((target) =>
+          mediaTargetKey(target.jobId, target.fileIndex) === activePreparationTargetKey
+        )?.jobId || null,
+        sourceIds: Array.from(new Set(mediaPriorityTargets.map((target) => target.jobId))),
         foregroundLoad: mediaResourceProfile("foreground").share,
         backgroundLoad: mediaResourceProfile("background").share,
       }, headers);
@@ -2614,37 +2993,52 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    const subtitleMatch = /^\/downloads\/([a-zA-Z0-9-]{8,80})\/subtitles\/(\d+)\.(vtt|ass)$/.exec(url.pathname);
+    const mediaSubtitleMatch =
+      /^\/downloads\/([a-zA-Z0-9-]{8,80})\/media\/(\d+)\/subtitles\/(\d+)\.(vtt|ass)$/.exec(url.pathname);
+    const legacySubtitleMatch =
+      /^\/downloads\/([a-zA-Z0-9-]{8,80})\/subtitles\/(\d+)\.(vtt|ass)$/.exec(url.pathname);
+    const subtitleMatch = mediaSubtitleMatch || legacySubtitleMatch;
     if (request.method === "GET" && subtitleMatch) {
       const job = jobs.get(subtitleMatch[1]);
-      if (!job || job.status !== "ready") throw new Error("Download is not ready for subtitle extraction.");
+      const fileIndex = mediaSubtitleMatch ? Number(subtitleMatch[2]) : job?.selectedIndex;
+      const trackId = mediaSubtitleMatch ? subtitleMatch[3] : subtitleMatch[2];
+      const format = mediaSubtitleMatch ? subtitleMatch[4] : subtitleMatch[3];
+      if (!job || !Number.isInteger(fileIndex) || !torrentFileIsFullyVerified(job, fileIndex)) {
+        throw new Error("Download is not ready for subtitle extraction.");
+      }
       touchJob(job);
-      const format = subtitleMatch[3];
-      const filePath = await subtitleFile(job, subtitleMatch[2], format);
+      const filePath = await subtitleFile(job, fileIndex, trackId, format);
       const info = await stat(filePath);
       response.writeHead(200, {
         ...headers,
         "content-type": format === "ass" ? "text/x-ssa; charset=utf-8" : "text/vtt; charset=utf-8",
         "content-length": info.size,
-        "cache-control": "private, max-age=3600",
+        "cache-control": "private, max-age=31536000, immutable",
       });
       createReadStream(filePath).pipe(response);
       return;
     }
 
-    const subtitleFontMatch =
+    const mediaSubtitleFontMatch =
+      /^\/downloads\/([a-zA-Z0-9-]{8,80})\/media\/(\d+)\/subtitle-fonts\/(\d+)$/.exec(url.pathname);
+    const legacySubtitleFontMatch =
       /^\/downloads\/([a-zA-Z0-9-]{8,80})\/subtitle-fonts\/(\d+)$/.exec(url.pathname);
+    const subtitleFontMatch = mediaSubtitleFontMatch || legacySubtitleFontMatch;
     if (request.method === "GET" && subtitleFontMatch) {
       const job = jobs.get(subtitleFontMatch[1]);
-      if (!job || job.status !== "ready") throw new Error("Download is not ready for font extraction.");
+      const fileIndex = mediaSubtitleFontMatch ? Number(subtitleFontMatch[2]) : job?.selectedIndex;
+      const fontId = mediaSubtitleFontMatch ? subtitleFontMatch[3] : subtitleFontMatch[2];
+      if (!job || !Number.isInteger(fileIndex) || !torrentFileIsFullyVerified(job, fileIndex)) {
+        throw new Error("Download is not ready for font extraction.");
+      }
       touchJob(job);
-      const font = await subtitleFontFile(job, subtitleFontMatch[2]);
+      const font = await subtitleFontFile(job, fileIndex, fontId);
       const info = await stat(font.path);
       response.writeHead(200, {
         ...headers,
         "content-type": font.mimeType,
         "content-length": info.size,
-        "cache-control": "private, max-age=3600",
+        "cache-control": "private, max-age=31536000, immutable",
       });
       createReadStream(font.path).pipe(response);
       return;

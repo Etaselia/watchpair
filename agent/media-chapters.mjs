@@ -4,6 +4,7 @@ export function chapterProbeArguments(mediaPath) {
     "-print_format", "json",
     "-show_streams",
     "-show_chapters",
+    "-show_format",
     mediaPath,
   ];
 }

@@ -1,3 +1,4 @@
+import { mediaItemId, mediaManifest, sameMediaManifest } from "../lib/media-queue.mjs";
 import {
   initialPlayerState,
   type LocalReadiness,
@@ -5,6 +6,7 @@ import {
   type PlayerState,
   type QueueReadiness,
   type SelectedMedia,
+  type SharedMediaItem,
   type SharedSource,
   type VoiceConfig,
   type VoicePresence,
@@ -152,8 +154,8 @@ function sanitizeVoicePresence(value: Partial<VoicePresence> | undefined): Voice
 function sanitizeReadiness(value: Partial<LocalReadiness> | undefined): LocalReadiness {
   const queue = Object.fromEntries(
     Object.entries(value?.queue || {})
-      .filter(([id]) => /^[a-zA-Z0-9-]{8,80}$/.test(id))
-      .slice(0, 30)
+      .filter(([id]) => /^[a-zA-Z0-9-]{8,100}$/.test(id))
+      .slice(0, 500)
       .map(([id, state]) => [id, sanitizeQueueReadiness(state)])
   );
   return {
@@ -163,12 +165,42 @@ function sanitizeReadiness(value: Partial<LocalReadiness> | undefined): LocalRea
   };
 }
 
+function sanitizeStoredMediaItems(source: SharedSource): SharedMediaItem[] | undefined {
+  if (!Array.isArray(source.mediaItems)) return undefined;
+  try {
+    const items = mediaManifest(
+      source.mediaItems.slice(0, 500).map((item) => ({
+        index: item.fileIndex,
+        path: item.path,
+        size: item.size,
+        included: item.included,
+        priority: item.priority,
+      })),
+      source.id
+    );
+    const controls = new Map(source.mediaItems.map((item) => [item.id, item]));
+    return items.map((item) => ({
+      ...item,
+      included: controls.get(item.id)?.included !== false,
+      priority: Boolean(controls.get(item.id)?.priority),
+    }));
+  } catch {
+    return undefined;
+  }
+}
+
 function normalizeSources(value: string | null): SharedSource[] {
   const stored = json<SharedSource | SharedSource[] | null>(value, null);
   if (!stored) return [];
-  return (Array.isArray(stored) ? stored : [stored]).filter(
-    (item) => item && typeof item.id === "string" && typeof item.value === "string"
-  );
+  return (Array.isArray(stored) ? stored : [stored])
+    .filter((item) => item && typeof item.id === "string" && typeof item.value === "string")
+    .map((source) => ({
+      ...source,
+      infoHash: /^[a-f0-9]{40}$/i.test(String(source.infoHash || ""))
+        ? String(source.infoHash).toLowerCase()
+        : undefined,
+      mediaItems: sanitizeStoredMediaItems(source),
+    }));
 }
 
 function voiceConfig(value: string | undefined): VoiceConfig {
@@ -656,6 +688,111 @@ async function handlePost(request: Request, store: SessionStore) {
       sourceIds.map((id) => byId.get(id)!),
       now
     );
+  } else if (action === "source-manifest") {
+    const sourceId = String(body.sourceId || "");
+    const source = currentSession.sources.find((item) => item.id === sourceId);
+    if (!source) {
+      return Response.json({ error: "That queued source was not found." }, { status: 400 });
+    }
+    const candidates = Array.isArray(body.mediaItems) ? body.mediaItems : [];
+    if (!candidates.length || candidates.length > 500) {
+      return Response.json({ error: "A torrent can publish between 1 and 500 video files." }, { status: 400 });
+    }
+    const indexes = candidates.map((value) => Number((value as Partial<SharedMediaItem>).fileIndex));
+    if (
+      indexes.some((index) => !Number.isInteger(index) || index < 0) ||
+      new Set(indexes).size !== indexes.length
+    ) {
+      return Response.json({ error: "Every torrent video needs a unique file index." }, { status: 400 });
+    }
+    const nextManifest = mediaManifest(
+      candidates.map((value, index) => {
+        const candidate = value as Partial<SharedMediaItem>;
+        return {
+          index: indexes[index],
+          path: String(candidate.path || candidate.name || "").slice(0, 500),
+          size: Number(candidate.size),
+          included: candidate.included !== false,
+          priority: Boolean(candidate.priority),
+        };
+      }),
+      sourceId
+    );
+    if (
+      nextManifest.length !== candidates.length ||
+      nextManifest.some((item) => !item.path || !Number.isSafeInteger(item.size) || item.size <= 0)
+    ) {
+      return Response.json({ error: "The torrent manifest contains an invalid video file." }, { status: 400 });
+    }
+    if (source.mediaItems?.length && !sameMediaManifest(source.mediaItems, nextManifest)) {
+      return Response.json({ error: "This torrent already has a different synchronized file manifest." }, { status: 409 });
+    }
+    const infoHash = String(body.infoHash || "").toLowerCase();
+    if (infoHash && !/^[a-f0-9]{40}$/.test(infoHash)) {
+      return Response.json({ error: "A valid torrent info hash is required." }, { status: 400 });
+    }
+    if (source.infoHash && infoHash && source.infoHash !== infoHash) {
+      return Response.json({ error: "The torrent info hash does not match the synchronized source." }, { status: 409 });
+    }
+    const controls = new Map((source.mediaItems || []).map((item) => [item.id, item]));
+    const incoming = new Map(nextManifest.map((item) => [item.id, item]));
+    const order = source.mediaItems?.length ? source.mediaItems : nextManifest;
+    const mediaItems = order.map((current) => {
+      const item = incoming.get(current.id)!;
+      return {
+        ...item,
+        included: controls.get(item.id)?.included ?? item.included,
+        priority: controls.get(item.id)?.priority ?? item.priority,
+      };
+    });
+    await store.setSources(
+      token,
+      currentSession.sources.map((item) => item.id === sourceId
+        ? { ...item, infoHash: infoHash || item.infoHash, mediaItems }
+        : item),
+      now
+    );
+  } else if (action === "prioritize-media" || action === "include-media") {
+    const itemId = String(body.itemId || "");
+    const source = currentSession.sources.find((candidate) =>
+      candidate.mediaItems?.some((item) => item.id === itemId)
+    );
+    if (!source) {
+      return Response.json({ error: "That synchronized video was not found." }, { status: 400 });
+    }
+    const property = action === "prioritize-media" ? "priority" : "included";
+    await store.setSources(
+      token,
+      currentSession.sources.map((candidate) => candidate.id === source.id
+        ? {
+            ...candidate,
+            mediaItems: candidate.mediaItems?.map((item) => item.id === itemId
+              ? { ...item, [property]: Boolean(body[property]) }
+              : item),
+          }
+        : candidate),
+      now
+    );
+  } else if (action === "reorder-media") {
+    const sourceId = String(body.sourceId || "");
+    const source = currentSession.sources.find((candidate) => candidate.id === sourceId);
+    const itemIds = Array.isArray(body.itemIds) ? body.itemIds.map(String) : [];
+    if (
+      !source?.mediaItems ||
+      itemIds.length !== source.mediaItems.length ||
+      new Set(itemIds).size !== itemIds.length ||
+      itemIds.some((id) => !source.mediaItems?.some((item) => item.id === id))
+    ) {
+      return Response.json({ error: "The complete episode order is required." }, { status: 400 });
+    }
+    const byId = new Map(source.mediaItems.map((item) => [item.id, item]));
+    await store.setSources(
+      token,
+      currentSession.sources.map((candidate) => candidate.id === sourceId
+        ? { ...candidate, mediaItems: itemIds.map((id) => byId.get(id)!) }
+        : candidate),
+      now
+    );
   } else if (action === "select-media") {
     const candidate = body.media as Partial<SelectedMedia> | null;
     if (!candidate?.name || !Number.isFinite(candidate.size)) {
@@ -665,16 +802,30 @@ async function handlePost(request: Request, store: SessionStore) {
     if (sourceId && !currentSession.sources.some((source) => source.id === sourceId)) {
       return Response.json({ error: "That queued source was not found." }, { status: 400 });
     }
+    const source = sourceId
+      ? currentSession.sources.find((item) => item.id === sourceId)
+      : undefined;
+    const itemId = candidate.itemId ? String(candidate.itemId).slice(0, 100) : undefined;
+    const manifestItem = itemId
+      ? source?.mediaItems?.find((item) => item.id === itemId)
+      : source?.mediaItems?.find((item) => item.fileIndex === Number(candidate.fileIndex));
+    if (source?.mediaItems?.length && !manifestItem) {
+      return Response.json({ error: "That synchronized video was not found in the torrent manifest." }, { status: 400 });
+    }
+    if (manifestItem && manifestItem.id !== mediaItemId(sourceId!, manifestItem.fileIndex)) {
+      return Response.json({ error: "The synchronized video identity is invalid." }, { status: 400 });
+    }
     if (candidate.fileIndex !== undefined && (!Number.isInteger(candidate.fileIndex) || Number(candidate.fileIndex) < 0)) {
       return Response.json({ error: "A valid media file index is required." }, { status: 400 });
     }
     await store.setSelectedMedia(
       token,
       {
+        itemId: manifestItem?.id || itemId,
         sourceId,
-        fileIndex: Number.isInteger(candidate.fileIndex) ? Number(candidate.fileIndex) : undefined,
-        name: String(candidate.name).slice(0, 260),
-        size: Number(candidate.size),
+        fileIndex: manifestItem?.fileIndex ?? (Number.isInteger(candidate.fileIndex) ? Number(candidate.fileIndex) : undefined),
+        name: manifestItem?.name || String(candidate.name).slice(0, 260),
+        size: manifestItem?.size || Number(candidate.size),
         fingerprint: candidate.fingerprint ? String(candidate.fingerprint).slice(0, 128) : undefined,
       },
       now
