@@ -14,6 +14,7 @@ const inputs = [
   ["hardware-acceleration.mjs", resolve(root, "agent", "hardware-acceleration.mjs")],
   ["media-governor.mjs", resolve(root, "agent", "media-governor.mjs")],
   ["media-priority.mjs", resolve(root, "agent", "media-priority.mjs")],
+  ["torrent-bandwidth-governor.mjs", resolve(root, "agent", "torrent-bandwidth-governor.mjs")],
   ["process-registry.mjs", resolve(root, "agent", "process-registry.mjs")],
   ["persistent-log.mjs", resolve(root, "agent", "persistent-log.mjs")],
   ["recovery-telemetry.mjs", resolve(root, "agent", "recovery-telemetry.mjs")],

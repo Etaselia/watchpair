@@ -840,6 +840,14 @@ svg {
   font-size: 8px;
 }
 
+.queue-preparation.subtitle-preparation {
+  margin-top: 0;
+}
+
+.queue-preparation.subtitle-preparation.error {
+  color: var(--danger);
+}
+
 .download-controls {
   display: flex;
   align-items: center;
@@ -1827,6 +1835,36 @@ svg {
   padding: 38px 22px 18px;
   background: rgba(5, 5, 5, 0.9);
   transition: opacity 180ms ease, transform 180ms ease;
+}
+
+.subtitle-readiness {
+  display: flex;
+  min-height: 28px;
+  max-width: min(680px, 100%);
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 10px;
+  border-left: 2px solid var(--acid);
+  color: #d7dbd0;
+  padding: 3px 9px;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.subtitle-readiness svg {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  color: var(--acid);
+}
+
+.subtitle-readiness.error {
+  border-left-color: var(--coral);
+  color: #ffd8d3;
+}
+
+.subtitle-readiness.error svg {
+  color: var(--coral);
 }
 
 .player-shell.controls-hidden {

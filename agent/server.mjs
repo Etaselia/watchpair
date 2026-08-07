@@ -40,6 +40,7 @@ import {
   normalizeMediaTargets,
   replaceTorrentSelections,
 } from "./media-priority.mjs";
+import { createTorrentBandwidthGovernor } from "./torrent-bandwidth-governor.mjs";
 import { createJsonStore } from "./job-store.mjs";
 import { cacheExpired, cleanupSettingsFromEnvironment, jobCanBeCleaned, jobCleanupReason } from "./cleanup-policy.mjs";
 import { createSubtitleAssetPipeline } from "./subtitle-pipeline.mjs";
@@ -58,7 +59,11 @@ import {
 } from "./subtitle-assets.mjs";
 import { isSupportedMagnet } from "./torrent-input.mjs";
 import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, verifiedTorrentFileProgress, verifyTorrentFilePieces } from "./webtorrent-safety.mjs";
-import { applyTorrentConnectionPlan, torrentConnectionPlan } from "./torrent-pressure.mjs";
+import {
+  applyTorrentConnectionPlan,
+  torrentConnectionPlan,
+  torrentRoleConnectionLimits,
+} from "./torrent-pressure.mjs";
 import { createPersistentLogger, installProcessDiagnostics } from "./persistent-log.mjs";
 import { createTorrentRecoveryTelemetry } from "./recovery-telemetry.mjs";
 
@@ -203,6 +208,9 @@ const subtitleAssetPipeline = createSubtitleAssetPipeline({
   cacheRoot: SUBTITLE_DIR,
   runScheduledFfmpeg,
 });
+const torrentBandwidthGovernor = createTorrentBandwidthGovernor();
+let torrentBandwidth = torrentBandwidthGovernor.snapshot();
+let torrentDownloadRoles = new Map();
 installWebTorrentSafetyGuards();
 const client = new WebTorrent({
   maxConns: INITIAL_TORRENT_PRESSURE.perTorrentLimit,
@@ -211,20 +219,49 @@ const client = new WebTorrent({
   dhtPort: DHT_PORT,
   seedOutgoingConnections: true,
 });
-let torrentPressure = { ...INITIAL_TORRENT_PRESSURE, trimmedPeers: 0 };
+let torrentPressure = { ...INITIAL_TORRENT_PRESSURE, trimmedPeers: 0, pausedTorrents: 0 };
+let lastTorrentPressurePlanKey = "";
+let lastTorrentPressureLogAt = 0;
 function refreshTorrentPressure(reason) {
-  const previousLimit = torrentPressure.perTorrentLimit;
-  torrentPressure = applyTorrentConnectionPlan(client, {
-    mode: RESOURCE_MODE,
+  const basePlan = torrentConnectionPlan(RESOURCE_MODE, client.torrents.length, {
     totalBudget: TORRENT_CONNECTION_BUDGET,
   });
-  if (previousLimit !== torrentPressure.perTorrentLimit || torrentPressure.trimmedPeers > 0) {
+  const jobsByTorrent = new Map(Array.from(jobs.values())
+    .filter((job) => job.torrent)
+    .map((job) => [job.torrent, job]));
+  const roles = client.torrents.map((torrent) => {
+    const job = jobsByTorrent.get(torrent);
+    if (job?.seed) return "seed";
+    if (!torrent.files?.length) return "metadata";
+    return torrentDownloadRoles.get(job?.id) || "idle";
+  });
+  const limits = torrentRoleConnectionLimits(roles, {
+    totalBudget: basePlan.totalBudget,
+    foregroundShare: torrentBandwidth.targetShare,
+  });
+  torrentPressure = applyTorrentConnectionPlan(client, {
+    mode: RESOURCE_MODE,
+    totalBudget: basePlan.totalBudget,
+    limitForTorrent: (_torrent, index) => limits[index],
+  });
+  const planKey = JSON.stringify({ roles, limits });
+  const now = Date.now();
+  if (
+    planKey !== lastTorrentPressurePlanKey ||
+    (torrentPressure.trimmedPeers > 0 && now - lastTorrentPressureLogAt >= 10_000)
+  ) {
+    lastTorrentPressurePlanKey = planKey;
+    lastTorrentPressureLogAt = now;
     agentLogger.info("torrent_pressure_adjusted", {
       reason,
       torrentCount: torrentPressure.torrentCount,
       totalBudget: torrentPressure.totalBudget,
       perTorrentLimit: torrentPressure.perTorrentLimit,
+      maxPerTorrentLimit: torrentPressure.maxPerTorrentLimit,
+      roles,
+      limits,
       trimmedPeers: torrentPressure.trimmedPeers,
+      pausedTorrents: torrentPressure.pausedTorrents,
     });
   }
 }
@@ -1257,52 +1294,121 @@ function orderedTorrentVideoIndexes(torrent) {
     .map((item) => item.index);
 }
 
-function firstUnfinishedPriorityTarget() {
-  for (const target of mediaPriorityTargets) {
-    const job = jobs.get(target.jobId);
-    const file = job?.torrent?.files?.[target.fileIndex];
-    if (!job) continue;
-    if (job.kind !== "magnet" || job.seed) continue;
-    if (!job.torrent?.files?.length) return target;
-    if (!file) continue;
-    if (!file.done) return target;
+const MAX_BANDWIDTH_TARGETS = 16;
+let lastTorrentBandwidthPlanKey = "";
+
+function pendingTorrentTargets() {
+  const targets = [];
+  if (mediaPriorityTargets.length) {
+    for (const target of mediaPriorityTargets) {
+      const job = jobs.get(target.jobId);
+      const file = job?.torrent?.files?.[target.fileIndex];
+      if (job?.kind !== "magnet" || job.seed || !file || file.done) continue;
+      targets.push({ jobId: job.id, fileIndex: target.fileIndex });
+      if (targets.length >= MAX_BANDWIDTH_TARGETS) break;
+    }
+    return targets;
   }
-  return null;
+
+  for (const job of jobs.values()) {
+    if (job.kind !== "magnet" || job.seed || !job.torrent?.files?.length) continue;
+    for (const fileIndex of orderedTorrentVideoIndexes(job.torrent)) {
+      if (job.torrent.files[fileIndex].done) continue;
+      targets.push({ jobId: job.id, fileIndex });
+      if (targets.length >= MAX_BANDWIDTH_TARGETS) return targets;
+    }
+  }
+  return targets;
 }
 
-function firstUnfinishedFallbackTarget() {
-  for (const job of jobs.values()) {
-    if (job.kind !== "magnet" || job.seed) continue;
-    if (!job.torrent?.files?.length) return null;
-    const fileIndex = orderedTorrentVideoIndexes(job.torrent)
-      .find((index) => !job.torrent.files[index].done);
-    if (fileIndex !== undefined) return { jobId: job.id, fileIndex };
-  }
-  return null;
+function productiveTorrentPeers(torrent) {
+  return (torrent?.wires || []).filter((wire) =>
+    !wire.destroyed && wire.peerChoking === false
+  ).length;
+}
+
+function bandwidthTargetSnapshot(target) {
+  const job = jobs.get(target.jobId);
+  const file = job?.torrent?.files?.[target.fileIndex];
+  if (!job || !file) return null;
+  return {
+    ...target,
+    key: mediaTargetKey(target.jobId, target.fileIndex),
+    downloaded: Math.round(file.length * verifiedTorrentFileProgress(file)),
+    done: file.done,
+    peers: job.torrent.numPeers,
+    productivePeers: productiveTorrentPeers(job.torrent),
+  };
 }
 
 function refreshTorrentSelections(reason = "priority-plan") {
-  const target = mediaPriorityTargets.length
-    ? firstUnfinishedPriorityTarget()
-    : firstUnfinishedFallbackTarget();
-  for (const job of jobs.values()) {
-    if (job.kind !== "magnet" || job.seed || !job.torrent?.files?.length) continue;
-    let selections = [];
-    if (target?.jobId === job.id && job.torrent.files[target.fileIndex]) {
-      selections = [{ fileIndex: target.fileIndex, priority: 100 }];
-    }
-    replaceTorrentSelections(job.torrent, selections);
-    const selectionKey = selections.length ? mediaTargetKey(job.id, selections[0].fileIndex) : "";
-    if (job.lastTorrentSelectionKey !== selectionKey) {
-      job.lastTorrentSelectionKey = selectionKey;
-      agentLogger.info("torrent_download_priority_changed", {
-        reason,
-        jobId: job.id,
-        fileIndex: selections[0]?.fileIndex ?? null,
-        targetKey: selectionKey || null,
-      });
+  const targets = pendingTorrentTargets()
+    .map(bandwidthTargetSnapshot)
+    .filter(Boolean);
+  torrentBandwidth = torrentBandwidthGovernor.update({
+    targets,
+    totalDownloadSpeed: client.downloadSpeed,
+    resourceMode: RESOURCE_MODE,
+    sampledAt: Date.now(),
+  });
+
+  const targetsByKey = new Map(targets.map((target) => [target.key, target]));
+  const activeTargets = [];
+  const foreground = targetsByKey.get(torrentBandwidth.foregroundKey);
+  if (foreground) activeTargets.push({ ...foreground, priority: 100 });
+  torrentBandwidth.backgroundKeys.forEach((key, index) => {
+    const target = targetsByKey.get(key);
+    if (target) activeTargets.push({
+      ...target,
+      priority: Math.max(1, 20 - index),
+    });
+  });
+
+  const selectionsByJob = new Map();
+  torrentDownloadRoles = new Map();
+  for (const target of activeTargets) {
+    let selections = selectionsByJob.get(target.jobId);
+    if (!selections) selectionsByJob.set(target.jobId, selections = []);
+    selections.push({ fileIndex: target.fileIndex, priority: target.priority });
+    if (target.key === torrentBandwidth.foregroundKey) {
+      torrentDownloadRoles.set(target.jobId, "foreground");
+    } else if (!torrentDownloadRoles.has(target.jobId)) {
+      torrentDownloadRoles.set(target.jobId, "background");
     }
   }
+
+  const force = reason === "verification-retry";
+  for (const job of jobs.values()) {
+    if (job.kind !== "magnet" || job.seed || !job.torrent?.files?.length) continue;
+    const selections = selectionsByJob.get(job.id) || [];
+    const selectionKey = selections
+      .map((selection) => selection.fileIndex + ":" + selection.priority)
+      .join(",");
+    if (!force && job.lastTorrentSelectionKey === selectionKey) continue;
+    replaceTorrentSelections(job.torrent, selections);
+    job.lastTorrentSelectionKey = selectionKey;
+    agentLogger.info("torrent_download_priority_changed", {
+      reason,
+      jobId: job.id,
+      fileIndexes: selections.map((selection) => selection.fileIndex),
+      priorities: selections.map((selection) => selection.priority),
+    });
+  }
+
+  const planKey = JSON.stringify({
+    mode: torrentBandwidth.mode,
+    foregroundKey: torrentBandwidth.foregroundKey,
+    backgroundKeys: torrentBandwidth.backgroundKeys,
+  });
+  if (planKey !== lastTorrentBandwidthPlanKey) {
+    lastTorrentBandwidthPlanKey = planKey;
+    agentLogger.info("torrent_bandwidth_plan_changed", {
+      reason,
+      ...torrentBandwidth,
+    });
+  }
+  refreshTorrentPressure(reason);
+  return torrentBandwidth;
 }
 
 function startTorrent(job) {
@@ -1322,6 +1428,7 @@ function startTorrent(job) {
     return;
   }
   job.torrent = torrent;
+  torrent.on("wire", () => refreshTorrentPressure("wire-connected"));
   installTorrentPieceRecovery(
     torrent,
     () => {
@@ -1707,6 +1814,7 @@ async function seedLocalFile({ id, filePath, label, managed = false, ...metadata
       job.updatedAt = Date.now();
     });
     torrent.on("wire", () => {
+      refreshTorrentPressure("wire-connected");
       job.updatedAt = Date.now();
     });
     torrent.on("warning", (error) => {
@@ -2636,7 +2744,10 @@ function agentResourceSnapshot() {
       ),
       connectionBudget: torrentPressure.totalBudget,
       perTorrentLimit: torrentPressure.perTorrentLimit,
+      maxPerTorrentLimit: torrentPressure.maxPerTorrentLimit,
       trimmedPeers: torrentPressure.trimmedPeers,
+      pausedTorrents: torrentPressure.pausedTorrents,
+      bandwidth: torrentBandwidth,
     },
     jobs: jobStatuses,
     activeResources,
@@ -2657,6 +2768,15 @@ function writeResourceSnapshot() {
 }
 
 await restoreJobs();
+const torrentBandwidthTimer = setInterval(() => {
+  try {
+    refreshTorrentSelections("bandwidth-sample");
+  } catch (error) {
+    agentLogger.warn("torrent_bandwidth_sample_failed", { error });
+  }
+}, 1_000);
+torrentBandwidthTimer.unref?.();
+refreshTorrentSelections("startup");
 const persistenceTimer = setInterval(persistJobs, 2_000);
 persistenceTimer.unref?.();
 const resourceDiagnosticTimer = setInterval(writeResourceSnapshot, 5_000);
@@ -2799,7 +2919,10 @@ const server = createServer(async (request, response) => {
           trackers: TRACKERS,
           connectionBudget: torrentPressure.totalBudget,
           perTorrentLimit: torrentPressure.perTorrentLimit,
+          maxPerTorrentLimit: torrentPressure.maxPerTorrentLimit,
           trimmedPeers: torrentPressure.trimmedPeers,
+          pausedTorrents: torrentPressure.pausedTorrents,
+          bandwidth: torrentBandwidth,
         },
         jobs: jobs.size,
         requests: {
@@ -2912,6 +3035,7 @@ const server = createServer(async (request, response) => {
         systemTier: foreground.systemTier,
         foregroundThreads: foreground.threads,
         backgroundThreads: background.threads,
+        download: torrentBandwidth,
       }, headers);
       return;
     }
@@ -3210,6 +3334,7 @@ const shutdown = async () => {
   shuttingDown = true;
   agentLogger.info("agent_shutdown_started", agentResourceSnapshot());
   torrentRecoveryTelemetry.close();
+  clearInterval(torrentBandwidthTimer);
   clearInterval(persistenceTimer);
   clearInterval(resourceDiagnosticTimer);
   clearInterval(cleanupTimer);

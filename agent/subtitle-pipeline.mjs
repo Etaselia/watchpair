@@ -49,7 +49,7 @@ export function createSubtitleAssetPipeline({ cacheRoot, runScheduledFfmpeg }) {
         decoder: "header-only",
         hardware: false,
         inputPath: descriptor.mediaPath,
-        priority: 30,
+        priority: 90,
         captureProgress: false,
         arguments: fontPlan.args,
       });
@@ -75,7 +75,7 @@ export function createSubtitleAssetPipeline({ cacheRoot, runScheduledFfmpeg }) {
         decoder: "subtitle packets only",
         hardware: false,
         inputPath: descriptor.mediaPath,
-        priority: 20,
+        priority: 80,
         arguments: subtitlePlan.args,
       });
     }

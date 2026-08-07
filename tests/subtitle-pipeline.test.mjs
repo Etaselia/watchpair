@@ -42,12 +42,13 @@ test("subtitle pipeline batches fonts and text once per content identity", async
   assert.equal(first.fonts.size, 2);
   assert.equal(first.subtitles.size, 3);
   assert.equal(calls.length, 2);
-  assert.deepEqual(calls.map((call) => call.priority), [30, 20]);
+  assert.deepEqual(calls.map((call) => call.priority), [90, 80]);
   assert.equal(calls[0].captureProgress, false);
   assert.ok(calls[0].arguments.includes("-dump_attachment:t:0"));
   assert.ok(calls[0].arguments.includes("-dump_attachment:t:2"));
   assert.equal(calls[1].arguments.filter((argument) => argument === "-i").length, 1);
   assert.equal(calls[1].arguments.some((argument) => /0:[va]/.test(argument)), false);
+  assert.equal(calls[1].arguments[calls[1].arguments.indexOf("-threads") + 1], "1");
 
   await rm(first.subtitles.values().next().value);
   const repaired = await pipeline.prepare(descriptor);
