@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/Etaselia/watchpair/compare/v0.10.0...v0.10.1) (2026-08-07)
+
+
+### Bug Fixes
+
+* keep companion responsive during subtitle preparation ([#59](https://github.com/Etaselia/watchpair/issues/59)) ([bfc24ff](https://github.com/Etaselia/watchpair/commit/bfc24ff47a43d95ad82f98f1f94d6d3586a13c14))
+
 ## [0.10.0](https://github.com/Etaselia/watchpair/compare/v0.9.5...v0.10.0) (2026-08-07)
 
 
