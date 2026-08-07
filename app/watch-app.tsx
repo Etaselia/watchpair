@@ -285,6 +285,54 @@ function preparationSummary(job?: AgentJob, file?: AgentFile | null) {
   };
 }
 
+function subtitleAvailabilitySummary(job?: AgentJob, file?: AgentFile | null) {
+  if (!job || !file?.downloadReady) {
+    return { label: "Subtitles inspected after download", title: "", error: false };
+  }
+  const status = file.subtitleStatus || job.subtitleStatus;
+  const assetStatus = file.subtitleAssetStatus || job.subtitleAssetStatus || "waiting";
+  const tracks = file.subtitles || job.subtitles || EMPTY_SUBTITLE_TRACKS;
+  const supported = tracks.filter((track) => track.supported);
+  if (status === "waiting" || status === "probing") {
+    return { label: "Detecting subtitle tracks", title: "", error: false };
+  }
+  if (status === "error") {
+    return {
+      label: "Subtitle detection failed",
+      title: file.subtitleError || job.subtitleError || "",
+      error: true,
+    };
+  }
+  if (!tracks.length) {
+    return { label: "No embedded subtitles", title: "", error: false };
+  }
+  if (!supported.length) {
+    return {
+      label: "Image subtitles unavailable in browser",
+      title: "The embedded tracks are image-based rather than browser-renderable text.",
+      error: true,
+    };
+  }
+  if (assetStatus === "preparing") {
+    return { label: "Preparing embedded subtitles", title: "", error: false };
+  }
+  if (assetStatus === "error") {
+    return {
+      label: "Subtitle preparation failed",
+      title: file.subtitleAssetError || job.subtitleAssetError || "",
+      error: true,
+    };
+  }
+  if (assetStatus === "ready") {
+    return { label: "Embedded subtitles ready", title: "", error: false };
+  }
+  return {
+    label: supported.length + " embedded subtitle track" + (supported.length === 1 ? "" : "s"),
+    title: "",
+    error: false,
+  };
+}
+
 type SubtitleFont =
   | "proportional-sans"
   | "proportional-serif"
@@ -511,6 +559,12 @@ export default function WatchApp() {
   const embeddedAudioTracks = selectedAgentFile?.audioTracks || agentJob?.audioTracks || EMPTY_AUDIO_TRACKS;
   const embeddedChapters = selectedAgentFile?.chapters || agentJob?.chapters || EMPTY_CHAPTERS;
   const embeddedSubtitles = selectedAgentFile?.subtitles || agentJob?.subtitles || EMPTY_SUBTITLE_TRACKS;
+  const embeddedSubtitleStatus = selectedAgentFile?.subtitleStatus || agentJob?.subtitleStatus || "waiting";
+  const embeddedSubtitleAssetStatus =
+    selectedAgentFile?.subtitleAssetStatus || agentJob?.subtitleAssetStatus || "waiting";
+  const embeddedSubtitleError = selectedAgentFile?.subtitleError || agentJob?.subtitleError || null;
+  const embeddedSubtitleAssetError =
+    selectedAgentFile?.subtitleAssetError || agentJob?.subtitleAssetError || null;
   const sourcesKey = sources.map((source) => source.id).join(":");
 
   useEffect(() => {
@@ -1859,6 +1913,10 @@ export default function WatchApp() {
         audioTracks={embeddedAudioTracks}
         chapters={embeddedChapters}
         subtitleTracks={embeddedSubtitles}
+        subtitleStatus={embeddedSubtitleStatus}
+        subtitleAssetStatus={embeddedSubtitleAssetStatus}
+        subtitleError={embeddedSubtitleError}
+        subtitleAssetError={embeddedSubtitleAssetError}
         queue={playbackQueue}
         onSelectVideo={selectPlaylistMedia}
         onBack={() => setView("lobby")}
@@ -2097,6 +2155,7 @@ export default function WatchApp() {
                   (participant) => participant.queue?.[activeReadinessKey]?.ready
                 ).length || 0;
                 const preparation = preparationSummary(job, target);
+                const subtitleAvailability = subtitleAvailabilitySummary(job, target);
 
                 return (
                   <article className={`queue-item ${selected ? "selected" : ""}`} key={source.id}>
@@ -2134,6 +2193,13 @@ export default function WatchApp() {
                       <Cpu />
                       <span>{preparation.label}</span>
                       {preparation.hardware && <strong>GPU</strong>}
+                    </div>
+                    <div
+                      className={"queue-preparation subtitle-preparation" + (subtitleAvailability.error ? " error" : "")}
+                      title={subtitleAvailability.title || undefined}
+                    >
+                      <Subtitles />
+                      <span>{subtitleAvailability.label}</span>
                     </div>
 
                     <div className="queue-actions">
@@ -2276,6 +2342,7 @@ export default function WatchApp() {
                           );
                           const itemState = readiness.queue[item.id];
                           const itemPreparation = preparationSummary(job, file);
+                          const itemSubtitles = subtitleAvailabilitySummary(job, file);
                           return (
                             <div
                               className={`agent-file-row ${fileSelected ? "selected" : ""} ${item.included ? "" : "excluded"}`}
@@ -2312,6 +2379,7 @@ export default function WatchApp() {
                                     {item.path !== item.name ? `${item.path} / ` : ""}
                                     {formatBytes(item.size)} / {Math.round(file?.progress || itemState?.progress || 0)}%
                                     {" / "}{itemPreparation.label}
+                                    {" / "}{itemSubtitles.label}
                                   </small>
                                 </span>
                                 {fileSelected && <Check />}
@@ -2546,6 +2614,10 @@ interface SyncedPlayerProps {
   queue: PlayerQueueItem[];
   onSelectVideo: (itemId: string) => Promise<void>;
   subtitleTracks: AgentSubtitleTrack[];
+  subtitleStatus: AgentFile["subtitleStatus"];
+  subtitleAssetStatus: NonNullable<AgentFile["subtitleAssetStatus"]>;
+  subtitleError: string | null;
+  subtitleAssetError: string | null;
   onBack: () => void;
   onEnded?: () => void;
   onSend: (player: PlayerState) => Promise<void>;
@@ -2606,6 +2678,10 @@ function SyncedPlayer({
   audioTracks,
   chapters,
   subtitleTracks,
+  subtitleStatus,
+  subtitleAssetStatus,
+  subtitleError,
+  subtitleAssetError,
   queue,
   onSelectVideo,
   onBack,
@@ -2679,6 +2755,47 @@ function SyncedPlayer({
       : hasRequestedSubtitle
         ? session.player.subtitleLanguage
         : "off";
+  const supportedSubtitleTracks = subtitleTracks.filter((track) => track.supported);
+  const subtitleNotice = (() => {
+    if (subtitleStatus === "waiting" || subtitleStatus === "probing") {
+      return { message: "Detecting embedded subtitle tracks", loading: true, error: false };
+    }
+    if (subtitleStatus === "error") {
+      return {
+        message: subtitleError || "Embedded subtitle tracks could not be inspected",
+        loading: false,
+        error: true,
+      };
+    }
+    if (!subtitleTracks.length) {
+      return { message: "No embedded subtitles in this video", loading: false, error: false };
+    }
+    if (!supportedSubtitleTracks.length) {
+      return {
+        message: "Embedded subtitles are image-based and unavailable in the browser",
+        loading: false,
+        error: true,
+      };
+    }
+    if (hasRequestedSubtitle && subtitleAssetStatus === "error") {
+      return {
+        message: subtitleAssetError || "Selected subtitles could not be prepared",
+        loading: false,
+        error: true,
+      };
+    }
+    if (
+      hasRequestedSubtitle &&
+      (subtitleAssetStatus === "waiting" || subtitleAssetStatus === "preparing")
+    ) {
+      return {
+        message: "Preparing " + (requestedSubtitleTrack?.label || "selected") + " subtitles on this device",
+        loading: true,
+        error: false,
+      };
+    }
+    return null;
+  })();
   const playbackAudioTrack = requestedAudioTrack || defaultAudioTrack;
   const desiredAudioTrackIndex = playbackAudioTrack
     ? audioTracks.findIndex((track) => track.id === playbackAudioTrack.id)
@@ -3637,6 +3754,17 @@ function SyncedPlayer({
       )}
 
       <div className="player-controls">
+        {subtitleNotice && (
+          <div
+            className={"subtitle-readiness" + (subtitleNotice.error ? " error" : "")}
+            role={subtitleNotice.error ? "alert" : "status"}
+          >
+            {subtitleNotice.loading
+              ? <LoaderCircle className="spin" />
+              : subtitleNotice.error ? <X /> : <Subtitles />}
+            <span>{subtitleNotice.message}</span>
+          </div>
+        )}
         {captionSettingsOpen && (
           <section className="caption-settings" role="dialog" aria-label="Caption options">
             <header className="caption-settings-header">
@@ -3884,6 +4012,15 @@ function SyncedPlayer({
                 aria-label="Subtitles"
               >
                 <option value="off">Off</option>
+                {(subtitleStatus === "waiting" || subtitleStatus === "probing") && (
+                  <option value="subtitle-status" disabled>Detecting embedded subtitles...</option>
+                )}
+                {subtitleStatus === "ready" && !subtitleTracks.length && (
+                  <option value="subtitle-empty" disabled>No embedded subtitles</option>
+                )}
+                {subtitleStatus === "error" && (
+                  <option value="subtitle-error" disabled>Embedded subtitles unavailable</option>
+                )}
                 <option value="local" disabled={!localSubtitleName}>
                   {localSubtitleName || "Local subtitle file"}
                 </option>

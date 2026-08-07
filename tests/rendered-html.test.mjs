@@ -433,6 +433,10 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /Caption options/);
   assert.match(app, /Background opacity/);
   assert.match(app, /Character edge/);
+  assert.match(app, /Detecting embedded subtitle tracks/);
+  assert.match(app, /Preparing .* subtitles on this device/);
+  assert.match(app, /Image subtitles unavailable in browser/);
+  assert.match(app, /Subtitle preparation failed/);
   assert.match(app, /aria-label="Select video"/);
   assert.match(app, /aria-label="Next video"/);
   assert.match(app, /isTrustedPlaybackUrl/);
@@ -530,6 +534,7 @@ test("packages the pairable magnet and subtitle companion", async () => {
     "WatchPair Companion/job-store.mjs",
     "WatchPair Companion/media-priority.mjs",
     "WatchPair Companion/torrent-input.mjs",
+    "WatchPair Companion/torrent-bandwidth-governor.mjs",
     "WatchPair Companion/torrent-pressure.mjs",
     "WatchPair Companion/webtorrent-safety.mjs",
     "WatchPair Companion/package.json",

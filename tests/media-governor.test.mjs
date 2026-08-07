@@ -250,6 +250,57 @@ test("selected playback preempts lower-priority subtitle work for the same conte
 });
 
 
+test("selected subtitle extraction preempts HLS and the queued HLS resume follows it", async () => {
+  const events = [];
+  let releaseHls;
+  const monitor = {
+    snapshot: () => ({ eventLoopDelayP95Ms: 0, systemCpuPercent: 0 }),
+    shouldDeferBackground: () => false,
+    stop() {},
+  };
+  const scheduler = createMediaTaskScheduler({ monitor });
+  scheduler.prioritize("content-one");
+  const active = scheduler.enqueue({
+    taskId: "hls-active",
+    jobId: "content-one",
+    stage: "browser-playback",
+    priority: 50,
+    run: async () => ({
+      value: "hls-active",
+      completion: new Promise((resolve) => { releaseHls = () => { events.push("hls:stopped"); resolve(); }; }),
+      interrupt: () => { events.push("hls:interrupt"); releaseHls(); },
+    }),
+  });
+  assert.equal(await active, "hls-active");
+
+  const resumed = scheduler.enqueue({
+    taskId: "hls-resume",
+    jobId: "content-one",
+    stage: "browser-playback",
+    priority: 50,
+    run: async () => ({
+      value: "hls-resumed",
+      completion: Promise.resolve().then(() => events.push("hls:resumed")),
+    }),
+  });
+  const subtitles = scheduler.enqueue({
+    taskId: "subtitles-urgent",
+    jobId: "content-one",
+    stage: "subtitles",
+    priority: 80,
+    run: async () => ({
+      value: "subtitles",
+      completion: Promise.resolve().then(() => events.push("subtitles:ready")),
+    }),
+  });
+
+  assert.equal(await subtitles, "subtitles");
+  assert.equal(await resumed, "hls-resumed");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, ["hls:interrupt", "hls:stopped", "subtitles:ready", "hls:resumed"]);
+  scheduler.shutdown();
+});
+
 test("media scheduler emits queue lifecycle diagnostics", async () => {
   const events = [];
   const monitor = {

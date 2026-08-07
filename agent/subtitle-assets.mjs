@@ -157,7 +157,7 @@ export function subtitleExtractionPlan(mediaPath, streams, outputDirectory, opti
     });
   });
 
-  const args = ["-v", "error", "-y", "-i", mediaPath];
+  const args = ["-v", "error", "-y", "-threads", "1", "-i", mediaPath];
   for (const asset of assets) {
     args.push("-map", `0:${asset.streamIndex}`, "-c:s", asset.format, "-f", asset.format, asset.outputPath);
   }

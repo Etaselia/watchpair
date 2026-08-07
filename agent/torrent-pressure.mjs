@@ -16,6 +16,40 @@ function normalizedBudget(value, fallback) {
     : fallback;
 }
 
+export function torrentRoleConnectionLimits(
+  roles,
+  { totalBudget = 20, foregroundShare = 0.75 } = {},
+) {
+  const normalizedRoles = Array.isArray(roles) ? roles : [];
+  if (!normalizedRoles.length) return [];
+  const budget = Math.max(normalizedRoles.length, normalizedBudget(totalBudget, 20));
+  const targetShare = Math.max(0.55, Math.min(0.9, Number(foregroundShare) || 0.75));
+  const limits = normalizedRoles.map(() => 1);
+  const foregroundIndex = normalizedRoles.indexOf("foreground");
+  const secondaryIndexes = normalizedRoles
+    .map((role, index) => (role === "background" || role === "seed") ? index : -1)
+    .filter((index) => index >= 0);
+  let remaining = budget - limits.length;
+
+  if (foregroundIndex >= 0 && remaining > 0) {
+    const foregroundTarget = Math.max(1, Math.floor(budget * targetShare));
+    const foregroundExtra = Math.min(remaining, foregroundTarget - limits[foregroundIndex]);
+    limits[foregroundIndex] += Math.max(0, foregroundExtra);
+    remaining -= Math.max(0, foregroundExtra);
+  }
+
+  const activeIndexes = secondaryIndexes.length
+    ? secondaryIndexes
+    : foregroundIndex >= 0 ? [foregroundIndex] : normalizedRoles.map((_, index) => index);
+  let cursor = 0;
+  while (remaining > 0 && activeIndexes.length) {
+    limits[activeIndexes[cursor % activeIndexes.length]] += 1;
+    cursor += 1;
+    remaining -= 1;
+  }
+  return limits;
+}
+
 export function torrentConnectionPlan(
   mode,
   torrentCount,
@@ -42,28 +76,56 @@ function wireScore(wire) {
 
 export function applyTorrentConnectionPlan(
   client,
-  { mode, totalBudget, trim = true } = {},
+  { mode, totalBudget, trim = true, limitForTorrent } = {},
 ) {
   const torrents = Array.isArray(client?.torrents) ? client.torrents : [];
   const plan = torrentConnectionPlan(mode, torrents.length, { totalBudget });
-  client.maxConns = plan.perTorrentLimit;
+  const torrentLimits = torrents.map((torrent, index) => {
+    const requested = limitForTorrent?.(torrent, index, plan);
+    return Number.isFinite(Number(requested))
+      ? Math.max(1, Math.min(plan.totalBudget, Math.floor(Number(requested))))
+      : plan.perTorrentLimit;
+  });
+  client.maxConns = torrentLimits.length
+    ? Math.max(...torrentLimits)
+    : plan.perTorrentLimit;
 
   let trimmedPeers = 0;
+  let pausedTorrents = 0;
   if (trim) {
-    for (const torrent of torrents) {
-      const wires = Array.isArray(torrent?.wires) ? [...torrent.wires] : [];
-      if (wires.length <= plan.perTorrentLimit) continue;
-      wires.sort((left, right) => wireScore(right) - wireScore(left));
-      for (const wire of wires.slice(plan.perTorrentLimit)) {
-        try {
-          wire.destroy();
-          trimmedPeers += 1;
-        } catch {
-          // A wire can close between the snapshot and pressure adjustment.
+    for (const [torrentIndex, torrent] of torrents.entries()) {
+      const wires = Array.isArray(torrent?.wires) ? torrent.wires.filter((wire) => !wire.destroyed) : [];
+      const limit = torrentLimits[torrentIndex] ?? plan.perTorrentLimit;
+      if (wires.length > limit) {
+        wires.sort((left, right) => wireScore(right) - wireScore(left));
+        for (const wire of wires.slice(limit)) {
+          try {
+            wire.destroy();
+            trimmedPeers += 1;
+          } catch {
+            // A wire can close between the snapshot and pressure adjustment.
+          }
+        }
+      }
+
+      if (typeof limitForTorrent === "function") {
+        const liveConnections = wires.filter((wire) => !wire.destroyed).length;
+        // pause() only stops new peer dialing; selected pieces keep flowing on live wires.
+        if (liveConnections >= limit && typeof torrent?.pause === "function") {
+          torrent.pause();
+          pausedTorrents += 1;
+        } else if (torrent?.paused && typeof torrent.resume === "function") {
+          torrent.resume();
         }
       }
     }
   }
 
-  return { ...plan, trimmedPeers };
+  return {
+    ...plan,
+    maxPerTorrentLimit: client.maxConns,
+    torrentLimits,
+    trimmedPeers,
+    pausedTorrents,
+  };
 }
