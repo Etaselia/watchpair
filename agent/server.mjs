@@ -60,6 +60,7 @@ import { isSupportedMagnet } from "./torrent-input.mjs";
 import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, verifiedTorrentFileProgress, verifyTorrentFilePieces } from "./webtorrent-safety.mjs";
 import { applyTorrentConnectionPlan, torrentConnectionPlan } from "./torrent-pressure.mjs";
 import { createPersistentLogger, installProcessDiagnostics } from "./persistent-log.mjs";
+import { createTorrentRecoveryTelemetry } from "./recovery-telemetry.mjs";
 
 const HOST = "127.0.0.1";
 const APP_VERSION = process.env.WATCHPAIR_APP_VERSION || "0.10.0"; // x-release-please-version
@@ -109,6 +110,13 @@ agentLogger.info("agent_process_started", {
   packaged: Boolean(process.versions.electron),
   log: agentLogger.details(),
 });
+const torrentRecoveryTelemetry = createTorrentRecoveryTelemetry({
+  onFlush: (summary) => {
+    const level = summary.peerFailures ? "warn" : "info";
+    agentLogger[level]("torrent_piece_recovery_summary", summary);
+  },
+});
+
 const JOBS_PATH = path.join(DOWNLOAD_DIR, ".watchpair-jobs.json");
 const IMPORT_DIR = path.join(DOWNLOAD_DIR, ".watchpair-imports");
 const HLS_DIR = path.join(DOWNLOAD_DIR, ".watchpair-hls");
@@ -525,6 +533,8 @@ function createMediaAsset(index) {
     mediaStreams: [],
     subtitleAssetStatus: "waiting",
     subtitleAssetError: null,
+    subtitleAssetResult: null,
+    subtitleAssetResultKey: null,
     subtitleAssetPromise: null,
     subtitleAssetPromiseKey: null,
     videoCodec: null,
@@ -784,6 +794,8 @@ async function probeSubtitleTracks(job, index = job.selectedIndex) {
   asset.mediaStreams = [];
   asset.subtitleAssetStatus = "waiting";
   asset.subtitleAssetError = null;
+  asset.subtitleAssetResult = null;
+  asset.subtitleAssetResultKey = null;
   asset.subtitleAssetPromise = null;
   asset.subtitleAssetPromiseKey = null;
   asset.chapters = [];
@@ -937,6 +949,8 @@ async function prepareSubtitleAssetsForSelection(job, index, selectionKey) {
   const schedulerJobId = `content-${mediaKey}-${media.size}`;
   asset.subtitleAssetStatus = "preparing";
   asset.subtitleAssetError = null;
+  asset.subtitleAssetResult = null;
+  asset.subtitleAssetResultKey = null;
   if (job.selectedIndex === index) syncSelectedAsset(job);
   const subtitleStartedAt = Date.now();
   agentLogger.info("subtitle_assets_started", {
@@ -964,6 +978,8 @@ async function prepareSubtitleAssetsForSelection(job, index, selectionKey) {
     if (asset.subtitleProbeKey === selectionKey) {
       asset.subtitleAssetStatus = "ready";
       asset.subtitleAssetError = null;
+      asset.subtitleAssetResult = result;
+      asset.subtitleAssetResultKey = selectionKey;
       if (job.selectedIndex === index) syncSelectedAsset(job);
     }
     return result;
@@ -977,6 +993,8 @@ async function prepareSubtitleAssetsForSelection(job, index, selectionKey) {
     if (asset.subtitleProbeKey === selectionKey) {
       asset.subtitleAssetStatus = "error";
       asset.subtitleAssetError = error instanceof Error ? error.message : "Subtitle preparation failed.";
+      asset.subtitleAssetResult = null;
+      asset.subtitleAssetResultKey = null;
       if (job.selectedIndex === index) syncSelectedAsset(job);
     }
     throw error;
@@ -986,6 +1004,11 @@ async function prepareSubtitleAssetsForSelection(job, index, selectionKey) {
 function preparedSubtitleAssets(job, index = job.selectedIndex) {
   const asset = mediaAsset(job, index);
   const selectionKey = fileIdentityKey(index, jobFile(job, index));
+  if (
+    asset.subtitleAssetStatus === "ready" &&
+    asset.subtitleAssetResultKey === selectionKey &&
+    asset.subtitleAssetResult
+  ) return Promise.resolve(asset.subtitleAssetResult);
   if (asset.subtitleAssetPromise && asset.subtitleAssetPromiseKey === selectionKey) {
     return asset.subtitleAssetPromise;
   }
@@ -1000,6 +1023,31 @@ function preparedSubtitleAssets(job, index = job.selectedIndex) {
   asset.subtitleAssetPromise = promise;
   asset.subtitleAssetPromiseKey = selectionKey;
   return promise;
+}
+
+function requestSubtitleAssetPreparation(job, index = job.selectedIndex) {
+  const asset = mediaAsset(job, index);
+  const selectionKey = fileIdentityKey(index, jobFile(job, index));
+  if (
+    asset.subtitleAssetStatus === "ready" &&
+    asset.subtitleAssetResultKey === selectionKey &&
+    asset.subtitleAssetResult
+  ) {
+    return { status: "ready", assets: asset.subtitleAssetResult };
+  }
+
+  if (asset.subtitleAssetStatus === "error" && asset.subtitleProbeKey === selectionKey) {
+    const error = asset.subtitleAssetError || "Subtitle preparation failed.";
+    asset.subtitleAssetStatus = "waiting";
+    asset.subtitleAssetError = null;
+    if (job.selectedIndex === index) syncSelectedAsset(job);
+    return { status: "error", error };
+  }
+
+  void preparedSubtitleAssets(job, index).catch(() => {
+    // The polling request observes the stored failure on its next short response.
+  });
+  return { status: "preparing", retryAfterMs: 750 };
 }
 
 function queueMediaPreparation(job, index = job.selectedIndex) {
@@ -1021,9 +1069,8 @@ function queueMediaPreparation(job, index = job.selectedIndex) {
     });
 }
 
-async function subtitleFile(job, index, trackId, format = "vtt") {
+function subtitleFile(job, index, trackId, format, prepared) {
   const asset = mediaAsset(job, index);
-  await queueSubtitleProbe(job, index);
   const track = asset.subtitleTracks.find((item) => item.id === trackId);
   if (!track) throw new Error("Embedded subtitle track not found.");
   if (!track.supported) {
@@ -1033,21 +1080,18 @@ async function subtitleFile(job, index, trackId, format = "vtt") {
     throw new Error("This subtitle track does not contain ASS/SSA styling.");
   }
 
-  const prepared = await preparedSubtitleAssets(job, index);
   const output = prepared.subtitles.get(`${track.id}:${format === "ass" ? "ass" : "webvtt"}`);
   if (!output) throw new Error("The requested subtitle asset was not prepared.");
   return output;
 }
 
-async function subtitleFontFile(job, index, fontId) {
+function subtitleFontFile(job, index, fontId, prepared) {
   const asset = mediaAsset(job, index);
-  await queueSubtitleProbe(job, index);
   const font = asset.subtitleTracks
     .flatMap((track) => track.fonts || [])
     .find((item) => item.id === fontId);
   if (!font) throw new Error("Embedded subtitle font not found.");
 
-  const prepared = await preparedSubtitleAssets(job, index);
   const output = prepared.fonts.get(font.id);
   if (!output) throw new Error("The requested embedded font was not prepared.");
   return { path: output, mimeType: font.mimeType };
@@ -1286,8 +1330,9 @@ function startTorrent(job) {
       );
       return torrent.files?.[planned?.fileIndex] || torrent.files?.[job.selectedIndex];
     },
-    ({ reason, disconnected }) => {
-      agentLogger.warn("torrent_piece_recovery", { jobId: job.id, reason, disconnected });
+    (event) => {
+      const { reason, disconnected } = event;
+      torrentRecoveryTelemetry.record(job.id, event);
       job.status = "downloading";
       if (reason === "disk-verification") job.diskInvalidations += 1;
       if (reason === "peer-verification") {
@@ -2625,16 +2670,46 @@ setTimeout(() => void runStorageCleanup().catch((error) => {
   console.warn(`Startup cleanup failed: ${error.message}`);
 }), 10_000).unref?.();
 
+let activeAgentRequests = 0;
+let peakAgentRequests = 0;
+
+function diagnosticRequestPath(pathname) {
+  return pathname
+    .replace(/^\/downloads\/[^/]+/, "/downloads/:job")
+    .replace(/^\/imports\/[^/]+/, "/imports/:import")
+    .replace(/^\/library\/[^/]+/, "/library/:entry");
+}
+
 const server = createServer(async (request, response) => {
   const url = new URL(request.url || "/", "http://" + HOST + ":" + PORT);
   const requestStartedAt = Date.now();
+  const requestPath = diagnosticRequestPath(url.pathname);
+  let requestSettled = false;
+  activeAgentRequests += 1;
+  peakAgentRequests = Math.max(peakAgentRequests, activeAgentRequests);
+  const settleRequest = () => {
+    if (requestSettled) return;
+    requestSettled = true;
+    activeAgentRequests = Math.max(0, activeAgentRequests - 1);
+  };
   response.once("finish", () => {
+    settleRequest();
     const durationMs = Date.now() - requestStartedAt;
     if (durationMs < 2_000 || url.pathname.startsWith("/stream/") || url.pathname.startsWith("/hls/")) return;
     agentLogger.warn("slow_agent_request", {
       method: request.method,
-      path: url.pathname,
+      path: requestPath,
       statusCode: response.statusCode,
+      durationMs,
+    });
+  });
+  response.once("close", () => {
+    settleRequest();
+    const durationMs = Date.now() - requestStartedAt;
+    if (response.writableFinished || durationMs < 500 || url.pathname.startsWith("/stream/") || url.pathname.startsWith("/hls/")) return;
+    agentLogger.warn("aborted_agent_request", {
+      method: request.method,
+      path: requestPath,
       durationMs,
     });
   });
@@ -2727,6 +2802,10 @@ const server = createServer(async (request, response) => {
           trimmedPeers: torrentPressure.trimmedPeers,
         },
         jobs: jobs.size,
+        requests: {
+          active: activeAgentRequests,
+          peak: peakAgentRequests,
+        },
         cleanup: CLEANUP_SETTINGS,
         transcoder: TRANSCODER,
         media: {
@@ -2783,6 +2862,9 @@ const server = createServer(async (request, response) => {
         hlsType: String(body.hlsType || "").slice(0, 100),
         hlsDetails: String(body.hlsDetails || "").slice(0, 200),
         fatal: Boolean(body.fatal),
+        consecutiveFailures: Number.isFinite(body.consecutiveFailures) ? body.consecutiveFailures : null,
+        healthCheckDurationMs: Number.isFinite(body.healthCheckDurationMs) ? body.healthCheckDurationMs : null,
+        recentActivityAgeMs: Number.isFinite(body.recentActivityAgeMs) ? body.recentActivityAgeMs : null,
         userAgent: String(body.userAgent || "").slice(0, 300),
       });
       sendJson(response, 202, { ok: true }, headers);
@@ -3007,7 +3089,16 @@ const server = createServer(async (request, response) => {
         throw new Error("Download is not ready for subtitle extraction.");
       }
       touchJob(job);
-      const filePath = await subtitleFile(job, fileIndex, trackId, format);
+      const preparation = requestSubtitleAssetPreparation(job, fileIndex);
+      if (preparation.status === "preparing") {
+        sendJson(response, 202, preparation, { ...headers, "retry-after": "1" });
+        return;
+      }
+      if (preparation.status === "error") {
+        sendJson(response, 422, { error: preparation.error }, headers);
+        return;
+      }
+      const filePath = subtitleFile(job, fileIndex, trackId, format, preparation.assets);
       const info = await stat(filePath);
       response.writeHead(200, {
         ...headers,
@@ -3032,7 +3123,16 @@ const server = createServer(async (request, response) => {
         throw new Error("Download is not ready for font extraction.");
       }
       touchJob(job);
-      const font = await subtitleFontFile(job, fileIndex, fontId);
+      const preparation = requestSubtitleAssetPreparation(job, fileIndex);
+      if (preparation.status === "preparing") {
+        sendJson(response, 202, preparation, { ...headers, "retry-after": "1" });
+        return;
+      }
+      if (preparation.status === "error") {
+        sendJson(response, 422, { error: preparation.error }, headers);
+        return;
+      }
+      const font = subtitleFontFile(job, fileIndex, fontId, preparation.assets);
       const info = await stat(font.path);
       response.writeHead(200, {
         ...headers,
@@ -3068,7 +3168,7 @@ const server = createServer(async (request, response) => {
   } catch (error) {
     agentLogger.warn("agent_request_failed", {
       method: request.method,
-      path: url.pathname,
+      path: requestPath,
       durationMs: Date.now() - requestStartedAt,
       error,
     });
@@ -3109,6 +3209,7 @@ const shutdown = async () => {
   if (shuttingDown) return;
   shuttingDown = true;
   agentLogger.info("agent_shutdown_started", agentResourceSnapshot());
+  torrentRecoveryTelemetry.close();
   clearInterval(persistenceTimer);
   clearInterval(resourceDiagnosticTimer);
   clearInterval(cleanupTimer);
@@ -3124,6 +3225,7 @@ const shutdown = async () => {
     }),
   ]);
   agentLogger.info("agent_shutdown_finished", { uptimeSeconds: Math.round(process.uptime()) });
+  agentLogger.flush();
 };
 process.on("SIGINT", () => void shutdown());
 process.on("SIGTERM", () => void shutdown());

@@ -16,6 +16,7 @@ const inputs = [
   ["media-priority.mjs", resolve(root, "agent", "media-priority.mjs")],
   ["process-registry.mjs", resolve(root, "agent", "process-registry.mjs")],
   ["persistent-log.mjs", resolve(root, "agent", "persistent-log.mjs")],
+  ["recovery-telemetry.mjs", resolve(root, "agent", "recovery-telemetry.mjs")],
   ["render-queue.mjs", resolve(root, "agent", "render-queue.mjs")],
   ["scheduled-ffmpeg.mjs", resolve(root, "agent", "scheduled-ffmpeg.mjs")],
   ["job-store.mjs", resolve(root, "agent", "job-store.mjs")],

@@ -22,6 +22,7 @@ test("persistent logger redacts secrets and magnet links", async (t) => {
     nested: { authorization: "Bearer top-secret-authorization" },
   });
 
+  logger.flush();
   const contents = await readFile(path.join(directory, "watchpair-agent.log"), "utf8");
   assert.doesNotMatch(contents, /top-secret/);
   assert.doesNotMatch(contents, /btih:/);
@@ -45,6 +46,7 @@ test("persistent logger rotates within its configured file count", async (t) => 
     logger.info("rotation_sample", { index, message: "x".repeat(80) });
   }
 
+  logger.flush();
   await access(path.join(directory, "watchpair-agent.log"));
   await access(path.join(directory, "watchpair-agent.log.1"));
   await access(path.join(directory, "watchpair-agent.log.2"));
