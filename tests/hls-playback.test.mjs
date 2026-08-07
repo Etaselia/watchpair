@@ -424,6 +424,15 @@ test("preempts background HLS work and resumes its existing generation", { timeo
       if (attempt === 199) assert.fail("Preempted HLS generation did not resume and finish");
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if (manager.diagnostics().generations.some((generation) =>
+        generation.jobId === background.jobId && generation.complete
+      )) break;
+      if (attempt === 199) {
+        assert.fail("Resumed HLS generation was not validated as complete");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
     const backgroundStarts = events.filter(({ event, data }) =>
       event === "hls_generation_started" && data.jobId === background.jobId
     );
@@ -434,9 +443,6 @@ test("preempts background HLS work and resumes its existing generation", { timeo
     const firstReady = states.findIndex(({ preparation }) => preparation.status === "ready");
     assert.ok(firstReady >= 0, JSON.stringify(states));
     assert.ok(states.slice(firstReady).every(({ preparation }) => preparation.status === "ready"), JSON.stringify(states));
-    assert.ok(manager.diagnostics().generations.some((generation) =>
-      generation.jobId === background.jobId && generation.complete
-    ));
   } finally {
     await manager?.shutdown();
     await rm(directory, { recursive: true, force: true });
