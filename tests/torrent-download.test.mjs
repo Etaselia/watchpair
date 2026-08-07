@@ -73,6 +73,8 @@ test("piece recovery rewinds the selected file", () => {
   const torrent = new EventEmitter();
   const invalidated = [];
   torrent._markUnverified = (index) => invalidated.push(index);
+  torrent.bitfield = { get: (index) => index === 4 };
+  torrent.pieces = [];
   const calls = [];
   const file = {
     done: false,
@@ -82,10 +84,11 @@ test("piece recovery rewinds the selected file", () => {
   const recoveries = [];
 
   installTorrentPieceRecovery(torrent, () => file, (event) => recoveries.push(event));
+  torrent._markUnverified(3);
   torrent._markUnverified(4);
   torrent.emit("warning", new Error("Piece 8 failed verification"));
 
-  assert.deepEqual(invalidated, [4]);
+  assert.deepEqual(invalidated, [3, 4]);
   assert.deepEqual(calls, ["deselect", "select:10", "deselect", "select:10"]);
   assert.deepEqual(recoveries.map((event) => [event.index, event.reason]), [
     [4, "disk-verification"],

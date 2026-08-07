@@ -122,18 +122,36 @@ test("companion serves original ASS, WebVTT fallback, and attached MKV fonts", {
       { title: "Second half", start: 1, end: 2 },
     ]);
 
-    const assResponse = await fetch(track.assUrl);
+    const preparationUrls = [
+      track.assUrl,
+      track.url,
+      ...Array.from({ length: 4 }, (_, index) => track.fonts[0].url + `&probe=${index}`),
+    ];
+    const preparationStartedAt = Date.now();
+    const preparationResponses = await Promise.all(preparationUrls.map((url) => fetch(url)));
+    assert.ok(Date.now() - preparationStartedAt < 2_000);
+    assert.ok(preparationResponses.some((response) => response.status === 202));
+    assert.ok(preparationResponses.every((response) => [200, 202].includes(response.status)));
+    await Promise.all(preparationResponses.map((response) => response.arrayBuffer()));
+
+    const healthResponse = await fetch(`${base}/health`, {
+      signal: AbortSignal.timeout(1_000),
+    });
+    assert.equal(healthResponse.status, 200);
+    assert.equal((await healthResponse.json()).ok, true);
+
+    const assResponse = await waitForAsset(track.assUrl, 15_000);
     assert.equal(assResponse.status, 200);
     assert.match(assResponse.headers.get("content-type") || "", /^text\/x-ssa/);
     const ass = await assResponse.text();
     assert.match(ass, /pos\(120,80\)/);
     assert.equal((ass.match(/^Dialogue:/gm) || []).length, 2);
 
-    const fallbackResponse = await fetch(track.url);
+    const fallbackResponse = await waitForAsset(track.url, 15_000);
     assert.equal(fallbackResponse.status, 200);
     assert.match(await fallbackResponse.text(), /^WEBVTT/m);
 
-    const fontResponse = await fetch(track.fonts[0].url);
+    const fontResponse = await waitForAsset(track.fonts[0].url, 15_000);
     assert.equal(fontResponse.status, 200);
     assert.equal(fontResponse.headers.get("content-type"), "font/woff2");
     assert.deepEqual(Buffer.from(await fontResponse.arrayBuffer()), await readFile(fontPath));
@@ -156,6 +174,17 @@ async function freePort() {
   const port = await listen(server);
   await new Promise((resolve) => server.close(resolve));
   return port;
+}
+
+async function waitForAsset(url, timeout) {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    const response = await fetch(url);
+    if (response.status !== 202) return response;
+    await response.arrayBuffer();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`Timed out waiting for prepared asset ${url}`);
 }
 
 async function waitForJson(url, timeout, ready) {

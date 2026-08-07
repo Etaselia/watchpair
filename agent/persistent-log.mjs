@@ -77,16 +77,76 @@ export function createPersistentLogger({
   maxBytes = DEFAULT_MAX_BYTES,
   maxFiles = DEFAULT_MAX_FILES,
   now = () => new Date(),
+  flushIntervalMs = 50,
+  maxBufferedBytes = 256 * 1024,
 } = {}) {
   const resolvedDirectory = path.resolve(directory || ".");
   const filePath = path.join(resolvedDirectory, path.basename(fileName));
   let enabled = true;
   let writeFailureReported = false;
+  let fileSize = 0;
+  let pendingLines = [];
+  let pendingBytes = 0;
+  let flushTimer = null;
 
   try {
     mkdirSync(resolvedDirectory, { recursive: true, mode: 0o700 });
+    fileSize = existsSync(filePath) ? statSync(filePath).size : 0;
   } catch {
     enabled = false;
+  }
+
+  function reportWriteFailure(error) {
+    enabled = false;
+    pendingLines = [];
+    pendingBytes = 0;
+    if (!writeFailureReported) {
+      writeFailureReported = true;
+      process.stderr.write(`WatchPair could not write its persistent log: ${error.message}\n`);
+    }
+  }
+
+  function flush() {
+    if (flushTimer) clearTimeout(flushTimer);
+    flushTimer = null;
+    if (!enabled || !pendingLines.length) return enabled;
+
+    const lines = pendingLines;
+    pendingLines = [];
+    pendingBytes = 0;
+    try {
+      let chunk = "";
+      let chunkBytes = 0;
+      const appendChunk = () => {
+        if (!chunkBytes) return;
+        appendFileSync(filePath, chunk, { encoding: "utf8", mode: 0o600 });
+        fileSize += chunkBytes;
+        chunk = "";
+        chunkBytes = 0;
+      };
+
+      for (const entry of lines) {
+        if (fileSize + chunkBytes > 0 && fileSize + chunkBytes + entry.bytes > maxBytes) {
+          appendChunk();
+          rotateFiles(filePath, maxFiles);
+          fileSize = 0;
+        }
+        chunk += entry.line;
+        chunkBytes += entry.bytes;
+        if (chunkBytes >= maxBufferedBytes) appendChunk();
+      }
+      appendChunk();
+      return true;
+    } catch (error) {
+      reportWriteFailure(error);
+      return false;
+    }
+  }
+
+  function scheduleFlush() {
+    if (flushTimer || !enabled) return;
+    flushTimer = setTimeout(flush, Math.max(0, flushIntervalMs));
+    flushTimer.unref?.();
   }
 
   function write(level, event, data = {}) {
@@ -101,16 +161,14 @@ export function createPersistentLogger({
         event,
       };
       const line = JSON.stringify(record) + "\n";
-      const size = existsSync(filePath) ? statSync(filePath).size : 0;
-      if (size + Buffer.byteLength(line) > maxBytes) rotateFiles(filePath, maxFiles);
-      appendFileSync(filePath, line, { encoding: "utf8", mode: 0o600 });
-      return true;
+      const bytes = Buffer.byteLength(line);
+      pendingLines.push({ line, bytes });
+      pendingBytes += bytes;
+      if (level === "error" || pendingBytes >= maxBufferedBytes) flush();
+      else scheduleFlush();
+      return enabled;
     } catch (error) {
-      enabled = false;
-      if (!writeFailureReported) {
-        writeFailureReported = true;
-        process.stderr.write(`WatchPair could not write its persistent log: ${error.message}\n`);
-      }
+      reportWriteFailure(error);
       return false;
     }
   }
@@ -121,6 +179,7 @@ export function createPersistentLogger({
     warn: (event, data) => write("warn", event, data),
     error: (event, data) => write("error", event, data),
     write,
+    flush,
     details: () => ({
       enabled,
       directory: resolvedDirectory,
@@ -128,6 +187,9 @@ export function createPersistentLogger({
       fileName: path.basename(filePath),
       maxBytes,
       maxFiles,
+      flushIntervalMs,
+      maxBufferedBytes,
+      pendingBytes,
     }),
     captureConsole(target = console) {
       if (target[CONSOLE_CAPTURE]) return () => {};
@@ -159,8 +221,14 @@ export function installProcessDiagnostics(logger, target = process) {
   const handlers = {
     warning: (warning) => logger.warn("process_warning", { warning }),
     uncaughtExceptionMonitor: (error, origin) => logger.error("uncaught_exception", { origin, error }),
-    beforeExit: (code) => logger.info("process_before_exit", { code }),
-    exit: (code) => logger.info("process_exit", { code }),
+    beforeExit: (code) => {
+      logger.info("process_before_exit", { code });
+      logger.flush?.();
+    },
+    exit: (code) => {
+      logger.info("process_exit", { code });
+      logger.flush?.();
+    },
   };
   for (const [event, handler] of Object.entries(handlers)) target.on(event, handler);
   return () => {

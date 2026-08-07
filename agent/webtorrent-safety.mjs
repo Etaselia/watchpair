@@ -96,7 +96,9 @@ export function installTorrentPieceRecovery(torrent, getSelectedFile, onRecovery
 
   const markUnverified = torrent._markUnverified.bind(torrent);
   torrent._markUnverified = function markUnverifiedAndRewind(index) {
+    const wasVerified = Boolean(torrent.bitfield?.get?.(index)) || torrent.pieces?.[index] === null;
     markUnverified(index);
+    if (!wasVerified) return;
     rewindSelectedFile(getSelectedFile);
     onRecovery?.({ index, reason: "disk-verification", sources: 0, disconnected: 0 });
   };

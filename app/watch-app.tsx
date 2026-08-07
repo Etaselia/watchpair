@@ -55,6 +55,7 @@ import {
   AGENT_URL,
   addAgentDownload,
   detectAgent,
+  getAgentActivityAge,
   getAgentDownloads,
   getAgentPermissionState,
   getAgentConnectUrl,
@@ -79,6 +80,7 @@ import {
   type AgentJob,
   type AgentSubtitleTrack,
 } from "../lib/agent-client";
+import { mapWithConcurrency } from "../lib/agent-subtitle-fetch.mjs";
 import { VoiceDock, useRoomVoice } from "./room-voice";
 import {
   downloadDirectFile,
@@ -585,16 +587,44 @@ export default function WatchApp() {
     if (agentPermission !== "granted" && agentPermission !== "unsupported") return;
     let active = true;
     let failures = 0;
+    let missedChecks = 0;
     const keepAlive = async () => {
+      const startedAt = Date.now();
       try {
         const available = await detectAgent();
         if (!active) return;
+        const recoveredChecks = missedChecks;
         failures = 0;
+        missedChecks = 0;
         setAgentAvailable(available);
-      } catch {
+        if (available && recoveredChecks) {
+          void reportAgentPlaybackEvent({
+            event: "companion_health_recovered",
+            level: "warn",
+            consecutiveFailures: recoveredChecks,
+            healthCheckDurationMs: Date.now() - startedAt,
+            recentActivityAgeMs: getAgentActivityAge(),
+            userAgent: navigator.userAgent,
+          });
+        }
+      } catch (caught) {
         if (!active) return;
+        missedChecks += 1;
+        const recentActivityAgeMs = getAgentActivityAge();
+        if (recentActivityAgeMs <= 20_000) {
+          failures = 0;
+          setAgentAvailable(true);
+          return;
+        }
         failures += 1;
-        if (failures >= 4) setAgentAvailable(false);
+        if (failures >= 4) {
+          setAgentAvailable(false);
+          console.warn("WatchPair companion health checks failed", {
+            failures,
+            recentActivityAgeMs,
+            error: caught instanceof Error ? caught.message : String(caught),
+          });
+        }
       }
     };
 
@@ -1481,10 +1511,11 @@ export default function WatchApp() {
     loadedSubtitleRef.current = loadKey;
 
     let active = true;
+    const controller = new AbortController();
     const clearTimer = window.setTimeout(() => {
       if (active) setSubtitleCues([]);
     }, 0);
-    void getAgentSubtitle(requestedSubtitleTrackUrl)
+    void getAgentSubtitle(requestedSubtitleTrackUrl, controller.signal)
       .then((contents) => {
         if (!active) return;
         const cues = parseSubtitles(contents);
@@ -1492,13 +1523,17 @@ export default function WatchApp() {
         setSubtitleCues(cues);
       })
       .catch((caught) => {
-        if (!active) return;
+        if (!active || controller.signal.aborted) return;
         loadedSubtitleRef.current = "";
         setError(caught instanceof Error ? caught.message : "Could not load embedded subtitles.");
       });
 
     return () => {
       active = false;
+      controller.abort();
+      if (loadedSubtitleRef.current === loadKey) {
+        loadedSubtitleRef.current = "";
+      }
       window.clearTimeout(clearTimer);
     };
   }, [
@@ -2733,13 +2768,14 @@ function SyncedPlayer({
     if (!video || !wantsOriginalAss || !assTrackKey) return;
 
     let active = true;
+    const controller = new AbortController();
     let renderer: import("jassub").default | null = null;
     let workerFailed: (() => void) | null = null;
     setReadyAssTrack("");
     void Promise.all([
       import("jassub"),
-      getAgentSubtitle(assTrackKey),
-      Promise.all(assFontUrls.map((url) => getAgentSubtitleBytes(url))),
+      getAgentSubtitle(assTrackKey, controller.signal),
+      mapWithConcurrency(assFontUrls, 2, (url) => getAgentSubtitleBytes(url, controller.signal)),
     ])
       .then(([{ default: JASSUB }, subContent, fonts]) => {
         if (!active) return null;
@@ -2769,7 +2805,7 @@ function SyncedPlayer({
         return renderer.resize(true);
       })
       .catch((caught) => {
-        if (!active) return;
+        if (!active || controller.signal.aborted) return;
         console.error("Could not render ASS subtitles", caught);
         setReadyAssTrack("");
         setFailedAssTrack(assTrackKey);
@@ -2777,6 +2813,7 @@ function SyncedPlayer({
 
     return () => {
       active = false;
+      controller.abort();
       setReadyAssTrack((current) => current === assTrackKey ? "" : current);
       if (assRendererRef.current === renderer) assRendererRef.current = null;
       if (renderer && workerFailed) {

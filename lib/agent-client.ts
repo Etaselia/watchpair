@@ -1,4 +1,5 @@
 import type { SharedSource } from "./session-types";
+import { fetchPreparedAgentAsset } from "./agent-subtitle-fetch.mjs";
 
 export const AGENT_URL = "http://127.0.0.1:41735";
 export const AGENT_PROTOCOL_VERSION = 1;
@@ -232,10 +233,21 @@ export interface AgentCleanupResult {
   bytes: number;
 }
 
+let lastAgentResponseAt = 0;
+
+function noteAgentResponse() {
+  lastAgentResponseAt = Date.now();
+}
+
+export function getAgentActivityAge() {
+  return lastAgentResponseAt ? Date.now() - lastAgentResponseAt : Number.POSITIVE_INFINITY;
+}
+
 async function agentFetch<T>(path: string, init?: RequestInit) {
   const headers = new Headers(init?.headers);
   if (init?.body && !headers.has("content-type")) headers.set("content-type", "application/json");
   const response = await fetch(AGENT_URL + path, { ...init, headers });
+  noteAgentResponse();
   const data = (await response.json()) as T & { error?: string };
   if (!response.ok) throw new Error(data.error || "The local agent rejected the request.");
   return data;
@@ -268,11 +280,11 @@ export async function resolveAgentSource(value: string) {
   return result.source;
 }
 
-async function getAgentSubtitleResponse(url: string) {
+async function getAgentSubtitleResponse(url: string, signal?: AbortSignal) {
   if (!url.startsWith(AGENT_URL + "/downloads/")) {
     throw new Error("The companion returned an invalid subtitle URL.");
   }
-  const response = await fetch(url, { cache: "force-cache" });
+  const response = await fetchPreparedAgentAsset(url, { signal, onResponse: noteAgentResponse });
   if (!response.ok) {
     const data = (await response.json().catch(() => null)) as { error?: string } | null;
     throw new Error(data?.error || "Could not extract embedded subtitles.");
@@ -280,12 +292,12 @@ async function getAgentSubtitleResponse(url: string) {
   return response;
 }
 
-export async function getAgentSubtitle(url: string) {
-  return (await getAgentSubtitleResponse(url)).text();
+export async function getAgentSubtitle(url: string, signal?: AbortSignal) {
+  return (await getAgentSubtitleResponse(url, signal)).text();
 }
 
-export async function getAgentSubtitleBytes(url: string) {
-  return new Uint8Array(await (await getAgentSubtitleResponse(url)).arrayBuffer());
+export async function getAgentSubtitleBytes(url: string, signal?: AbortSignal) {
+  return new Uint8Array(await (await getAgentSubtitleResponse(url, signal)).arrayBuffer());
 }
 
 export async function addAgentDownload(source: SharedSource) {
@@ -342,6 +354,9 @@ export interface AgentPlaybackDiagnostic {
   hlsType?: string;
   hlsDetails?: string;
   fatal?: boolean;
+  consecutiveFailures?: number;
+  healthCheckDurationMs?: number;
+  recentActivityAgeMs?: number;
   userAgent?: string;
 }
 
