@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   clampSeekTarget,
+  clampToPreparedRanges,
   isPlaybackAcknowledgement,
   isSeekAcknowledgement,
   PLAYBACK_TRANSACTION_TIMEOUT_MS,
@@ -135,4 +136,16 @@ test("releases unacknowledged playback intent after its timeout", () => {
     ),
     false
   );
+});
+
+test("clamps synchronization to committed media ranges", () => {
+  const ranges = [
+    { start: 0, end: 120 },
+    { start: 125, end: 180 },
+  ];
+  assert.equal(clampToPreparedRanges(60, ranges), 60);
+  assert.equal(clampToPreparedRanges(123, ranges), 125);
+  assert.equal(clampToPreparedRanges(250, ranges), 179.95);
+  assert.equal(clampToPreparedRanges(-5, ranges), 0);
+  assert.equal(clampToPreparedRanges(42, []), 42);
 });

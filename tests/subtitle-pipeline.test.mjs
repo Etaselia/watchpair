@@ -43,6 +43,7 @@ test("subtitle pipeline batches fonts and text once per content identity", async
   assert.equal(first.subtitles.size, 3);
   assert.equal(calls.length, 2);
   assert.deepEqual(calls.map((call) => call.priority), [90, 80]);
+  assert.deepEqual(calls.map((call) => call.preemptible), [false, false]);
   assert.equal(calls[0].captureProgress, false);
   assert.ok(calls[0].arguments.includes("-dump_attachment:t:0"));
   assert.ok(calls[0].arguments.includes("-dump_attachment:t:2"));

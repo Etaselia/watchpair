@@ -451,7 +451,7 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /HTMLMediaElement\.HAVE_METADATA/);
   assert.match(app, /HTMLMediaElement\.HAVE_FUTURE_DATA/);
   assert.doesNotMatch(app, /HLS_STARTUP_FLOOR_SECONDS/);
-  assert.match(app, /return Math\.max\(target, seekableStart\)/);
+  assert.match(app, /clampToPreparedRanges\(target, ranges\)/);
   assert.match(app, /seekableStart: finiteMediaValue/);
   assert.match(agent, /clientEvent: String\(body\.event/);
   assert.match(agent, /seekTarget: Number\.isFinite/);
@@ -524,6 +524,7 @@ test("packages the pairable magnet and subtitle companion", async () => {
   const expected = [
     "WatchPair Companion/server.mjs",
     "WatchPair Companion/hls-playback.mjs",
+    "WatchPair Companion/hls-epoch-playback.mjs",
     "WatchPair Companion/hardware-acceleration.mjs",
     "WatchPair Companion/media-governor.mjs",
     "WatchPair Companion/process-registry.mjs",
@@ -558,6 +559,7 @@ test("packages the pairable magnet and subtitle companion", async () => {
 
   const bundledAgent = strFromU8(archive["WatchPair Companion/server.mjs"]);
   const bundledHls = strFromU8(archive["WatchPair Companion/hls-playback.mjs"]);
+  const bundledHlsEngine = strFromU8(archive["WatchPair Companion/hls-epoch-playback.mjs"]);
   const bundledHardware = strFromU8(archive["WatchPair Companion/hardware-acceleration.mjs"]);
   const bundledSafetyGuard = strFromU8(archive["WatchPair Companion/webtorrent-safety.mjs"]);
   const companionPackage = strFromU8(archive["WatchPair Companion/package.json"]);
@@ -570,11 +572,12 @@ test("packages the pairable magnet and subtitle companion", async () => {
   assert.match(bundledAgent, /subtitleFile/);
   assert.match(bundledAgent, /createHlsPlaybackManager/);
   assert.match(bundledAgent, /window\.close/);
-  assert.match(bundledHls, /hls_playlist_type/);
-  assert.match(bundledHls, /watchpair-audio/);
-  assert.match(bundledHls, /videoPipeline/);
-  assert.match(bundledHls, /pipelineDiagnostics/);
-  assert.match(bundledHls, /DEFAULT_PLAYABLE_SECONDS = 120/);
+  assert.match(bundledHls, /export \* from "\.\/hls-epoch-playback\.mjs"/);
+  assert.match(bundledHlsEngine, /hls_playlist_type/);
+  assert.match(bundledHlsEngine, /watchpair-audio/);
+  assert.match(bundledHlsEngine, /videoPipeline/);
+  assert.match(bundledHlsEngine, /pipelineDiagnostics/);
+  assert.match(bundledHlsEngine, /DEFAULT_PLAYABLE_SECONDS = 120/);
   assert.match(bundledHardware, /h264_nvenc/);
   assert.match(bundledHardware, /h264_qsv/);
   assert.match(bundledHardware, /h264_vaapi/);

@@ -33,3 +33,17 @@ export function normalizeMediaChapters(chapters) {
     .sort((left, right) => left.start - right.start)
     .map((chapter, index) => ({ ...chapter, index }));
 }
+
+export function mediaDurationFromProbe(metadata) {
+  const videoStream = (metadata?.streams || []).find(
+    (stream) => stream.codec_type === "video"
+  );
+  const streamDuration = Number(videoStream?.duration);
+  if (Number.isFinite(streamDuration) && streamDuration > 0) return streamDuration;
+
+  const formatDuration = Number(metadata?.format?.duration);
+  const rawStart = Number(videoStream?.start_time ?? metadata?.format?.start_time ?? 0);
+  const start = Number.isFinite(rawStart) ? Math.max(0, rawStart) : 0;
+  const duration = formatDuration - start;
+  return Number.isFinite(duration) && duration > 0 ? duration : null;
+}

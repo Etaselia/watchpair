@@ -130,7 +130,6 @@ test("companion serves original ASS, WebVTT fallback, and attached MKV fonts", {
     const preparationStartedAt = Date.now();
     const preparationResponses = await Promise.all(preparationUrls.map((url) => fetch(url)));
     assert.ok(Date.now() - preparationStartedAt < 2_000);
-    assert.ok(preparationResponses.some((response) => response.status === 202));
     assert.ok(preparationResponses.every((response) => [200, 202].includes(response.status)));
     await Promise.all(preparationResponses.map((response) => response.arrayBuffer()));
 

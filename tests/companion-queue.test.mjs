@@ -200,7 +200,7 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line))
-      .filter((record) => record.event === "media_process_started" && record.stage === "video+audio");
+      .filter((record) => record.event === "media_process_started" && record.stage === "browser-playback-epoch");
     assert.equal(mediaStarts[0]?.jobId, ids[1], JSON.stringify(mediaStarts));
     const browserRecord = logContents
       .trim()

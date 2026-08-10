@@ -90,14 +90,18 @@ export function createMediaTaskScheduler({
   onEvent = () => {},
 } = {}) {
   const pending = [];
+  const idleWaiters = new Set();
   let activeTask = null;
   let foregroundJobId = null;
   let orderedJobIds = [];
   let jobOrder = new Map();
   let sequence = 0;
   let draining = false;
+  let accepting = true;
+  let stopping = false;
   let lastDeferredLogAt = 0;
   let deferredPreemptionKey = "";
+
   const emit = (event, data) => {
     try {
       onEvent(event, data);
@@ -105,12 +109,50 @@ export function createMediaTaskScheduler({
       // Diagnostic reporting must never affect media scheduling.
     }
   };
+  const stoppedError = () => {
+    const error = new Error("Media scheduler stopped.");
+    error.code = "WATCHPAIR_MEDIA_SCHEDULER_STOPPED";
+    return error;
+  };
   const rank = (jobId) => jobOrder.get(jobId) ?? Number.MAX_SAFE_INTEGER;
   const sort = () => pending.sort((left, right) =>
     Number(right.jobId === foregroundJobId) - Number(left.jobId === foregroundJobId) ||
     rank(left.jobId) - rank(right.jobId) ||
     Number(right.priority || 0) - Number(left.priority || 0) || left.sequence - right.sequence
   );
+  const notifyIdle = () => {
+    if (activeTask || pending.length || draining) return;
+    for (const resolve of idleWaiters) resolve();
+    idleWaiters.clear();
+  };
+  const waitForIdle = () => {
+    if (!activeTask && !pending.length && !draining) return Promise.resolve();
+    return new Promise((resolve) => idleWaiters.add(resolve));
+  };
+  const createActiveTask = (task, profile) => {
+    const controller = new AbortController();
+    let interruptHandler = null;
+    let handlerInvoked = false;
+    const invokeHandler = () => {
+      if (!interruptHandler || handlerInvoked) return;
+      handlerInvoked = true;
+      void Promise.resolve().then(() => interruptHandler()).catch(() => {});
+    };
+    return {
+      ...task,
+      profile,
+      controller,
+      interrupted: false,
+      interrupt(reason = stoppedError()) {
+        if (!controller.signal.aborted) controller.abort(reason);
+        invokeHandler();
+      },
+      registerInterrupt(handler) {
+        interruptHandler = typeof handler === "function" ? handler : null;
+        if (controller.signal.aborted) invokeHandler();
+      },
+    };
+  };
   const interruptForForeground = () => {
     const promoted = pending.find((task) => task.jobId === foregroundJobId);
     const restartPromotedActive = Boolean(
@@ -147,7 +189,7 @@ export function createMediaTaskScheduler({
       promotedJobId: foregroundJobId,
       reason: restartPromotedActive ? "foreground-profile" : "selected-work",
     });
-    void activeTask.interrupt();
+    activeTask.interrupt();
   };
   const drain = async () => {
     if (draining) return;
@@ -173,7 +215,8 @@ export function createMediaTaskScheduler({
         pending.shift();
         const profile = mediaResourceProfile(foreground ? "foreground" : "background");
         const startedAt = Date.now();
-        activeTask = { ...task, profile, interrupt: null, interrupted: false };
+        const runningTask = createActiveTask(task, profile);
+        activeTask = runningTask;
         emit("media_task_started", {
           taskId: task.taskId,
           jobId: task.jobId,
@@ -182,8 +225,12 @@ export function createMediaTaskScheduler({
           queuedMs: startedAt - task.queuedAt,
         });
         try {
-          const result = await task.run(profile);
-          activeTask.interrupt = result?.interrupt || null;
+          const taskContext = {
+            signal: runningTask.controller.signal,
+            registerInterrupt: (handler) => runningTask.registerInterrupt(handler),
+          };
+          const result = await task.run(profile, taskContext);
+          runningTask.registerInterrupt(result?.interrupt);
           task.resolve(result?.value);
           interruptForForeground();
           await result?.completion;
@@ -203,17 +250,42 @@ export function createMediaTaskScheduler({
           });
           task.reject(error);
         } finally {
-          activeTask = null;
+          if (activeTask === runningTask) activeTask = null;
         }
       }
     } finally {
       draining = false;
       if (pending.length) void drain();
+      else notifyIdle();
     }
   };
+  const beginShutdown = () => {
+    if (stopping) return false;
+    stopping = true;
+    accepting = false;
+    emit("media_scheduler_stopping", {
+      queuedTasks: pending.length,
+      activeTask: activeTask?.taskId || null,
+    });
+    const error = stoppedError();
+    for (const task of pending.splice(0)) task.reject(error);
+    if (activeTask && !activeTask.interrupted) {
+      activeTask.interrupted = true;
+      activeTask.interrupt(error);
+    }
+    monitor.stop();
+    notifyIdle();
+    return true;
+  };
+
   return {
     enqueue({ taskId, jobId, stage, priority = 0, preemptible = true, restartOnPromotion = false, run }) {
       const queuedAt = Date.now();
+      if (!accepting) {
+        const rejected = Promise.reject(stoppedError());
+        void rejected.catch(() => {});
+        return rejected;
+      }
       const promise = new Promise((resolve, reject) => {
         pending.push({
           taskId,
@@ -237,7 +309,9 @@ export function createMediaTaskScheduler({
           restartOnPromotion,
           queueDepth: pending.length,
         });
-        sort(); interruptForForeground(); void drain();
+        sort();
+        interruptForForeground();
+        void drain();
       });
       void promise.catch(() => {});
       return promise;
@@ -266,10 +340,13 @@ export function createMediaTaskScheduler({
     },
     cancelJob(jobId, error = new Error("Media work was cancelled.")) {
       const cancelled = pending.filter((task) => task.jobId === jobId);
-      for (let index = pending.length - 1; index >= 0; index -= 1) if (pending[index].jobId === jobId) pending.splice(index, 1);
+      for (let index = pending.length - 1; index >= 0; index -= 1) {
+        if (pending[index].jobId === jobId) pending.splice(index, 1);
+      }
       for (const task of cancelled) task.reject(error);
-      if (activeTask?.jobId === jobId && activeTask.interrupt && !activeTask.interrupted) {
-        activeTask.interrupted = true; void activeTask.interrupt();
+      if (activeTask?.jobId === jobId && !activeTask.interrupted) {
+        activeTask.interrupted = true;
+        activeTask.interrupt(error);
       }
       if (cancelled.length || activeTask?.jobId === jobId) {
         emit("media_job_cancelled", {
@@ -281,8 +358,16 @@ export function createMediaTaskScheduler({
     },
     snapshot() {
       return {
+        accepting,
+        stopping,
         foregroundJobId,
-        active: activeTask ? { taskId: activeTask.taskId, jobId: activeTask.jobId, stage: activeTask.stage, profile: activeTask.profile.kind, mode: activeTask.profile.mode } : null,
+        active: activeTask ? {
+          taskId: activeTask.taskId,
+          jobId: activeTask.jobId,
+          stage: activeTask.stage,
+          profile: activeTask.profile.kind,
+          mode: activeTask.profile.mode,
+        } : null,
         orderedJobIds,
         queued: pending.map((task) => ({
           taskId: task.taskId,
@@ -294,11 +379,10 @@ export function createMediaTaskScheduler({
         responsiveness: monitor.snapshot(),
       };
     },
-    shutdown() {
-      emit("media_scheduler_stopping", { queuedTasks: pending.length, activeTask: activeTask?.taskId || null });
-      for (const task of pending.splice(0)) task.reject(new Error("Media scheduler stopped."));
-      if (activeTask?.interrupt && !activeTask.interrupted) void activeTask.interrupt();
-      monitor.stop();
+    beginShutdown,
+    async shutdown() {
+      beginShutdown();
+      await waitForIdle();
     },
   };
 }

@@ -331,3 +331,67 @@ test("media scheduler emits queue lifecycle diagnostics", async () => {
   assert.ok(events[1].data.queuedMs >= 0);
   assert.ok(events[2].data.durationMs >= 0);
 });
+
+
+test("shutdown rejects new work and interrupts a task still starting", async () => {
+  const events = [];
+  let markStarted;
+  let finishStartup;
+  let finishWork;
+  let interrupted = false;
+  let lateTaskStarted = false;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const startupGate = new Promise((resolve) => { finishStartup = resolve; });
+  const completion = new Promise((resolve) => { finishWork = resolve; });
+  const monitor = {
+    snapshot: () => ({ eventLoopDelayP95Ms: 0, systemCpuPercent: 0 }),
+    shouldDeferBackground: () => false,
+    stop() {},
+  };
+  const scheduler = createMediaTaskScheduler({
+    monitor,
+    onEvent: (event, data) => events.push({ event, data }),
+  });
+
+  const active = scheduler.enqueue({
+    taskId: "starting",
+    jobId: "episode",
+    stage: "browser-playback",
+    run: async (_profile, { registerInterrupt }) => {
+      markStarted();
+      await startupGate;
+      registerInterrupt(() => {
+        interrupted = true;
+        finishWork();
+      });
+      return { value: "started", completion };
+    },
+  });
+
+  await started;
+  scheduler.beginShutdown();
+  const rejected = scheduler.enqueue({
+    taskId: "too-late",
+    jobId: "episode-two",
+    stage: "browser-playback",
+    run: async () => {
+      lateTaskStarted = true;
+      return { value: "late", completion: Promise.resolve() };
+    },
+  });
+  finishStartup();
+
+  assert.equal(await active, "started");
+  await assert.rejects(rejected, { code: "WATCHPAIR_MEDIA_SCHEDULER_STOPPED" });
+  await scheduler.shutdown();
+
+  assert.equal(interrupted, true);
+  assert.equal(lateTaskStarted, false);
+  assert.equal(scheduler.snapshot().active, null);
+  const stoppingIndex = events.findIndex(({ event }) => event === "media_scheduler_stopping");
+  assert.ok(stoppingIndex >= 0);
+  assert.equal(
+    events.slice(stoppingIndex + 1).some(({ event }) => event === "media_task_started"),
+    false
+  );
+});
