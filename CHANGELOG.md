@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.3](https://github.com/Etaselia/watchpair/compare/v0.10.2...v0.10.3) (2026-08-10)
+
+
+### Bug Fixes
+
+* make progressive playback resilient ([#66](https://github.com/Etaselia/watchpair/issues/66)) ([8b7007d](https://github.com/Etaselia/watchpair/commit/8b7007d17518d543bba026675475501c342fbd68))
+
 ## [0.10.2](https://github.com/Etaselia/watchpair/compare/v0.10.1...v0.10.2) (2026-08-07)
 
 
