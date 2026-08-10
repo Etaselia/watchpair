@@ -42,6 +42,7 @@ export interface AgentFile {
   path: string;
   name: string;
   size: number;
+  duration?: number | null;
   downloaded: number;
   progress: number;
   downloadReady: boolean;
@@ -150,6 +151,10 @@ export interface AgentPreparation {
   hardwareDecode?: boolean;
   fallback: boolean;
   bufferedSeconds?: number;
+  contiguousReadySeconds?: number;
+  sourceDuration?: number;
+  committedEpochs?: number;
+  epochSeconds?: number;
   complete?: boolean;
   generationId?: string | null;
   resumed?: boolean;

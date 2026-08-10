@@ -19,6 +19,11 @@ export const SEEK_TRANSACTION_TIMEOUT_MS: number;
 
 export const PLAYBACK_TRANSACTION_TIMEOUT_MS: number;
 export function clampSeekTarget(value: number, duration: number): number;
+export function clampToPreparedRanges(
+  value: number,
+  ranges: Array<{ start: number; end: number }>,
+  edgeMargin?: number
+): number;
 export function isSeekAcknowledgement(
   transaction: LocalSeekTransaction | null,
   state: PlayerState,

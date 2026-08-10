@@ -32,3 +32,48 @@ test("process registry reports active work without exposing media paths", () => 
   assert.equal(events[0].data.arguments.at(-2), "<media>");
   assert.ok(events[1].data.durationMs >= 0);
 });
+
+
+test("process registry terminates children and force-kills stragglers before shutdown completes", async () => {
+  const events = [];
+  const registry = createProcessRegistry({
+    onEvent: (event, data) => events.push({ event, data }),
+  });
+
+  const graceful = new EventEmitter();
+  graceful.pid = 101;
+  graceful.kill = (signal) => {
+    queueMicrotask(() => graceful.emit("close", null, signal));
+    return true;
+  };
+  registry.track(graceful, { stage: "video", command: "ffmpeg" });
+
+  const stubborn = new EventEmitter();
+  stubborn.pid = 102;
+  const stubbornSignals = [];
+  stubborn.kill = (signal) => {
+    stubbornSignals.push(signal);
+    if (signal === "SIGKILL") queueMicrotask(() => stubborn.emit("close", null, signal));
+    return true;
+  };
+  registry.track(stubborn, { stage: "audio", command: "ffmpeg" });
+
+  const result = await registry.terminateAll({ graceMs: 5, forceMs: 100 });
+  assert.equal(result.started, 2);
+  assert.equal(result.remaining, 0);
+  assert.equal(result.empty, true);
+  assert.deepEqual(stubbornSignals, ["SIGTERM", "SIGKILL"]);
+  assert.equal(registry.snapshot().closing, true);
+  assert.equal(registry.snapshot().active.length, 0);
+  assert.ok(events.some(({ event }) => event === "media_process_shutdown_started"));
+  assert.ok(events.some(({ event }) => event === "media_process_shutdown_finished"));
+
+  const late = new EventEmitter();
+  late.pid = 103;
+  late.kill = (signal) => {
+    queueMicrotask(() => late.emit("close", null, signal));
+    return true;
+  };
+  registry.track(late, { stage: "late", command: "ffmpeg" });
+  assert.equal(await registry.waitForEmpty(100), true);
+});

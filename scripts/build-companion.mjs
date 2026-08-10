@@ -11,6 +11,7 @@ const archiveModifiedAt = new Date("2000-01-01T12:00:00Z");
 const inputs = [
   ["server.mjs", resolve(root, "agent", "server.mjs")],
   ["hls-playback.mjs", resolve(root, "agent", "hls-playback.mjs")],
+  ["hls-epoch-playback.mjs", resolve(root, "agent", "hls-epoch-playback.mjs")],
   ["hardware-acceleration.mjs", resolve(root, "agent", "hardware-acceleration.mjs")],
   ["media-governor.mjs", resolve(root, "agent", "media-governor.mjs")],
   ["media-priority.mjs", resolve(root, "agent", "media-priority.mjs")],

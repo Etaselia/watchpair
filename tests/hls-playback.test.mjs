@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { rmSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -20,11 +21,106 @@ async function readPlaylist(filePath) {
     try {
       return await readFile(filePath, "utf8");
     } catch (error) {
-      if (!["EAGAIN", "ENODATA", "ENOENT"].includes(error?.code) || attempt === 49) throw error;
+      if (!["EAGAIN", "ENODATA", "ENOENT"].includes(error?.code) || attempt === 49) {
+        throw error;
+      }
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
   }
   throw new Error("Playlist could not be read.");
+}
+
+async function waitFor(check, message, timeoutMs = 20_000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const value = await check();
+    if (value) return value;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.fail(message);
+}
+
+function playlistAssetNames(playlist) {
+  return Array.from(
+    String(playlist).matchAll(/(?:URI="([^"]+)"|^(epoch-\d{6}-segment-\d{6}\.m4s)$)/gm),
+    (match) => match[1] || match[2]
+  );
+}
+
+function playlistDuration(playlist) {
+  return Array.from(String(playlist).matchAll(/^#EXTINF:([\d.]+)/gm))
+    .reduce((total, match) => total + Number(match[1]), 0);
+}
+
+async function createInput(filePath, {
+  duration = 6,
+  audioTracks = 1,
+  timestampOffset = 0,
+} = {}) {
+  const argumentsList = [
+    "-hide_banner", "-loglevel", "error", "-y",
+    "-f", "lavfi", "-i",
+    "testsrc2=size=320x180:rate=24:duration=" + duration,
+  ];
+  for (let index = 0; index < audioTracks; index += 1) {
+    argumentsList.push(
+      "-f", "lavfi", "-i",
+      "sine=frequency=" + (440 + index * 220) +
+        ":sample_rate=48000:duration=" + duration
+    );
+  }
+  argumentsList.push("-map", "0:v:0");
+  for (let index = 0; index < audioTracks; index += 1) {
+    argumentsList.push("-map", String(index + 1) + ":a:0");
+  }
+  argumentsList.push(
+    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+    "-g", "24", "-keyint_min", "24", "-sc_threshold", "0",
+    "-c:a", "aac", "-shortest"
+  );
+  if (timestampOffset) {
+    argumentsList.push("-output_ts_offset", String(timestampOffset));
+  }
+  argumentsList.push(filePath);
+  await runFile(ffmpegPath, argumentsList);
+}
+
+async function firstVideoPacket(manager, descriptor, playlist, directory, epochIndex) {
+  const prefix = "epoch-" + String(epochIndex).padStart(6, "0");
+  const initName = prefix + "-init.mp4";
+  const segmentName = prefix + "-segment-000000.m4s";
+  assert.match(playlist, new RegExp(initName.replaceAll(".", "\\.")));
+  assert.match(playlist, new RegExp(segmentName.replaceAll(".", "\\.")));
+  const [init, segment] = await Promise.all([
+    manager.getAsset(descriptor, "video/" + initName),
+    manager.getAsset(descriptor, "video/" + segmentName),
+  ]);
+  const fragment = path.join(directory, prefix + "-first.mp4");
+  await writeFile(fragment, Buffer.concat([
+    await readFile(init.filePath),
+    await readFile(segment.filePath),
+  ]));
+  const result = JSON.parse((await runFile(ffprobeStatic.path, [
+    "-v", "error",
+    "-select_streams", "v:0",
+    "-show_entries", "packet=pts_time,dts_time,flags",
+    "-read_intervals", "%+#1",
+    "-of", "json",
+    fragment,
+  ])).stdout);
+  return result.packets?.[0];
+}
+
+function audioTrack(id, streamIndex, language, label, isDefault) {
+  return {
+    id: String(id),
+    streamIndex,
+    language,
+    label,
+    codec: "aac",
+    channels: 1,
+    default: isDefault,
+  };
 }
 
 test("copies only browser-compatible eight-bit H.264 video", () => {
@@ -59,59 +155,31 @@ test("copies only browser-compatible eight-bit H.264 video", () => {
   }), false);
 });
 
-test("progressively prepares one HLS video rendition with separate audio tracks", { timeout: 30_000 }, async () => {
-  const directory = await mkdtemp(path.join(tmpdir(), "watchpair-hls-"));
+test("publishes contiguous immutable epochs with every audio track", { timeout: 40_000 }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchpair-hls-epochs-"));
   const input = path.join(directory, "input.mkv");
   const cacheRoot = path.join(directory, "cache");
-  const descriptor = {
-    jobId: "hls-test-job",
-    fileIndex: 0,
-    fileSize: 0,
-    contentFingerprint: "0123456789abcdef0123456789abcdef",
-    inputPath: input,
-    videoCodec: "h264",
-    videoPixelFormat: "yuv420p",
-    videoProfile: "High",
-    videoStartTime: 5,
-    inputArguments: ["-readrate", "1"],
-    audioTracks: [
-      {
-        id: "1",
-        streamIndex: 1,
-        language: "jpn",
-        label: "Japanese",
-        codec: "aac",
-        channels: 1,
-        default: true,
-      },
-      {
-        id: "2",
-        streamIndex: 2,
-        language: "eng",
-        label: "English",
-        codec: "aac",
-        channels: 1,
-        default: false,
-      },
-    ],
-  };
-
+  const events = [];
   let manager;
-  try {
-    await runFile(ffmpegPath, [
-      "-hide_banner", "-loglevel", "error", "-y",
-      "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=6",
-      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6",
-      "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000:duration=6",
-      "-map", "0:v:0", "-map", "1:a:0", "-map", "2:a:0",
-      "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-      "-g", "24", "-keyint_min", "24", "-sc_threshold", "0",
-      "-c:a", "aac", "-shortest",
-      "-output_ts_offset", "5",
-      input,
-    ]);
 
-    descriptor.fileSize = (await stat(input)).size;
+  try {
+    await createInput(input, { duration: 6, audioTracks: 2, timestampOffset: 5 });
+    const descriptor = {
+      jobId: "hls-epoch-test",
+      fileIndex: 0,
+      fileSize: (await stat(input)).size,
+      contentFingerprint: "0123456789abcdef0123456789abcdef",
+      inputPath: input,
+      videoCodec: "h264",
+      videoPixelFormat: "yuv420p",
+      videoProfile: "High",
+      videoStartTime: 5,
+      inputArguments: ["-readrate", "1"],
+      audioTracks: [
+        audioTrack(1, 1, "jpn", "Japanese", true),
+        audioTrack(2, 2, "eng", "English", false),
+      ],
+    };
 
     manager = createHlsPlaybackManager({
       ffmpegPath,
@@ -125,9 +193,20 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
         arguments: ["-c:v", "watchpair_missing_encoder"],
       },
       segmentSeconds: 1,
+      epochSeconds: 2,
       playableSeconds: 2,
       playlistWaitMs: 15_000,
+      onEvent: (event, data) => events.push({ event, data }),
     });
+
+    const initial = await manager.prepare(descriptor);
+    assert.equal(initial.status, "ready");
+    assert.equal(initial.encoder.id, "cpu");
+    assert.equal(initial.fallback, true);
+    assert.ok(initial.contiguousReadySeconds >= 2);
+    assert.ok(initial.sourceDuration >= 5.9 && initial.sourceDuration < 6.2);
+    assert.equal(initial.committedEpochs, 1);
+    assert.equal(initial.complete, false);
 
     const masterAsset = await manager.getAsset(descriptor, "master.m3u8");
     const master = await readPlaylist(masterAsset.filePath);
@@ -137,180 +216,245 @@ test("progressively prepares one HLS video rendition with separate audio tracks"
     assert.match(master, /URI="audio\/2\/index\.m3u8"/);
     assert.equal((master.match(/EXT-X-STREAM-INF/g) || []).length, 1);
 
-    const initialPreparation = await manager.prepare(descriptor);
-    assert.equal(initialPreparation.status, "ready");
-    assert.equal(initialPreparation.encoder.id, "cpu");
-    assert.equal(initialPreparation.hardwareDecode, false);
-    assert.equal(initialPreparation.fallback, true);
-    const initialDiagnostics = manager.diagnostics();
-    assert.ok(initialDiagnostics.processes.active.length <= 1);
-    assert.equal(initialDiagnostics.processes.active[0]?.stage, "video+audio", JSON.stringify(initialDiagnostics));
-
     const videoAsset = await manager.getAsset(descriptor, "video/index.m3u8");
-    const earlyVideo = await readPlaylist(videoAsset.filePath);
-    assert.doesNotMatch(earlyVideo, /#EXT-X-ENDLIST/, "playback should unlock before conversion finishes");
     const japaneseAsset = await manager.getAsset(descriptor, "audio/1/index.m3u8");
-    const earlyJapanese = await readPlaylist(japaneseAsset.filePath);
-    assert.match(earlyJapanese, /segment-000001\.m4s/);
     const englishAsset = await manager.getAsset(descriptor, "audio/2/index.m3u8");
+    const earlyPlaylists = await Promise.all([
+      readPlaylist(videoAsset.filePath),
+      readPlaylist(japaneseAsset.filePath),
+      readPlaylist(englishAsset.filePath),
+    ]);
+    for (const playlist of earlyPlaylists) {
+      assert.match(playlist, /epoch-000000-init\.mp4/);
+      assert.match(playlist, /epoch-000000-segment-000000\.m4s/);
+    }
+    assert.doesNotMatch(earlyPlaylists[0], /#EXT-X-ENDLIST/);
+
+    await waitFor(async () => {
+      const playlist = await readPlaylist(videoAsset.filePath);
+      return playlist.includes("#EXT-X-ENDLIST") ? playlist : null;
+    }, "Epoch HLS preparation did not finish");
 
     const [video, japanese, english] = await Promise.all([
       readPlaylist(videoAsset.filePath),
       readPlaylist(japaneseAsset.filePath),
       readPlaylist(englishAsset.filePath),
     ]);
-    assert.match(video, /#EXT-X-PLAYLIST-TYPE:EVENT/);
-    assert.match(video, /segment-000000\.m4s/);
-    assert.match(video, /segment-000001\.m4s/);
-    assert.match(japanese, /segment-000000\.m4s/);
-    assert.match(english, /segment-000000\.m4s/);
-
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      const playlists = await Promise.all([
-        readPlaylist(videoAsset.filePath),
-        readPlaylist(japaneseAsset.filePath),
-        readPlaylist(englishAsset.filePath),
-      ]);
-      assert.ok(manager.diagnostics().processes.active.length <= 1);
-      if (playlists.every((playlist) => playlist.includes("#EXT-X-ENDLIST"))) break;
-      if (attempt === 199) assert.fail("HLS preparation did not finish");
-      await new Promise((resolve) => setTimeout(resolve, 50));
+    for (const playlist of [video, japanese, english]) {
+      assert.match(playlist, /#EXT-X-ENDLIST/);
+      assert.equal((playlist.match(/#EXT-X-MAP/g) || []).length, 3);
+      assert.equal((playlist.match(/#EXT-X-DISCONTINUITY/g) || []).length, 2);
+      const names = playlistAssetNames(playlist);
+      assert.equal(new Set(names).size, names.length);
     }
-    const completedProcesses = manager.diagnostics().processes.recent
-      .filter((record) => record.jobId === descriptor.jobId)
-      .sort((left, right) => left.startedAt - right.startedAt);
-    for (let index = 1; index < completedProcesses.length; index += 1) {
-      assert.ok(completedProcesses[index - 1].finishedAt <= completedProcesses[index].startedAt);
+    assert.ok(Math.abs(playlistDuration(video) - initial.sourceDuration) < 1.1);
+    assert.ok(Math.abs(playlistDuration(japanese) - initial.sourceDuration) < 1.1);
+    assert.ok(Math.abs(playlistDuration(english) - initial.sourceDuration) < 1.1);
+
+    for (const name of playlistAssetNames(video)) {
+      assert.ok(
+        (await stat(path.join(path.dirname(videoAsset.filePath), name))).size > 0,
+        "Published playlist references a missing asset: " + name
+      );
+    }
+    for (let epochIndex = 0; epochIndex < 3; epochIndex += 1) {
+      const packet = await firstVideoPacket(
+        manager,
+        descriptor,
+        video,
+        directory,
+        epochIndex
+      );
+      assert.ok(packet, "Epoch " + epochIndex + " has no first video packet");
+      assert.match(packet.flags, /K/);
+      assert.ok(
+        Math.abs(Number(packet.pts_time)) <= 0.001,
+        "Epoch " + epochIndex + " starts at PTS " + packet.pts_time
+      );
+      assert.ok(Math.abs(Number(packet.dts_time)) <= 0.001);
     }
 
-    const preparation = await manager.prepare(descriptor);
-    assert.equal(preparation.status, "ready");
-    assert.equal(preparation.encoder.id, "cpu");
-    assert.equal(preparation.fallback, true);
+    const diagnostics = manager.diagnostics();
+    assert.equal(diagnostics.generations[0].complete, true);
+    assert.equal(diagnostics.generations[0].committedEpochs, 3);
+    assert.ok(diagnostics.processes.active.length <= 1);
+    const epochProcesses = diagnostics.processes.recent.filter(
+      (record) => record.stage === "browser-playback-epoch"
+    );
+    assert.ok(epochProcesses.length >= 3);
+    assert.ok(epochProcesses.every(
+      (record) => !record.arguments.includes("append_list")
+    ));
+    assert.ok(events.some(({ event }) => event === "hls_epoch_committed"));
 
-    assert.ok((await stat(masterAsset.filePath)).size > 0);
-    const probeAsset = async (filePath) => JSON.parse(
-      (
-        await runFile(ffprobeStatic.path, [
-          "-v", "error",
-          "-print_format", "json",
-          "-show_streams",
-          filePath,
-        ])
-      ).stdout
-    );
-    const [videoInit, audioInit] = await Promise.all([
-      manager.getAsset(descriptor, "video/init.mp4"),
-      manager.getAsset(descriptor, "audio/1/init.mp4"),
-    ]);
-    const [videoProbe, audioProbe] = await Promise.all([
-      probeAsset(videoInit.filePath),
-      probeAsset(audioInit.filePath),
-    ]);
-    assert.ok(videoProbe.streams.some((stream) => stream.codec_name === "h264"));
-    assert.ok(audioProbe.streams.some((stream) => stream.codec_name === "aac"));
-    const firstVideoSegment = await manager.getAsset(descriptor, "video/segment-000000.m4s");
-    const firstVideoFragment = path.join(directory, "first-video-fragment.mp4");
-    await writeFile(firstVideoFragment, Buffer.concat([
-      await readFile(videoInit.filePath),
-      await readFile(firstVideoSegment.filePath),
-    ]));
-    const firstPacketProbe = JSON.parse(
-      (
-        await runFile(ffprobeStatic.path, [
-          "-v", "error",
-          "-select_streams", "v:0",
-          "-show_entries", "packet=pts_time,dts_time,flags",
-          "-of", "json",
-          firstVideoFragment,
-        ])
-      ).stdout
-    );
-    const firstPacket = firstPacketProbe.packets?.[0];
-    assert.ok(firstPacket, JSON.stringify(firstPacketProbe));
-    assert.match(firstPacket.flags, /K/);
-    assert.ok(
-      Math.abs(Number(firstPacket.pts_time)) <= 0.001,
-      `First HLS video packet starts at ${firstPacket.pts_time}s instead of zero.`
-    );
-    assert.ok(Math.abs(Number(firstPacket.dts_time)) <= 0.001);
-    const vp9Descriptor = { ...descriptor, rendition: "vp9", inputArguments: ["-readrate", "4"] };
-    const vp9Preparation = await manager.prepare(vp9Descriptor);
-    assert.equal(vp9Preparation.encoder.id, "vp9");
-    const vp9Init = await manager.getAsset(vp9Descriptor, "video/init.mp4");
-    const vp9Probe = await probeAsset(vp9Init.filePath);
-    assert.ok(vp9Probe.streams.some((stream) => stream.codec_name === "vp9"));
-
+    const completed = await manager.prepare(descriptor);
     await manager.shutdown();
+    manager = null;
 
     const cachedManager = createHlsPlaybackManager({
       ffmpegPath: path.join(directory, "missing-ffmpeg"),
       cacheRoot,
+      segmentSeconds: 1,
+      epochSeconds: 2,
+      playableSeconds: 2,
       playlistWaitMs: 1_000,
     });
-    const equivalentDescriptor = { ...descriptor, jobId: "equivalent-job" };
-    const cachedVideo = await cachedManager.getAsset(equivalentDescriptor, "video/index.m3u8");
-    assert.match(await readPlaylist(cachedVideo.filePath), /#EXT-X-ENDLIST/);
-    await cachedManager.removeJob(equivalentDescriptor.jobId);
-    assert.match(await readPlaylist(cachedVideo.filePath), /#EXT-X-ENDLIST/);
-    await assert.rejects(stat(path.join(cacheRoot, "jobs", equivalentDescriptor.jobId)), { code: "ENOENT" });
-    await cachedManager.shutdown();
+    try {
+      const equivalent = {
+        ...descriptor,
+        jobId: "equivalent-job",
+        sourceDuration: completed.sourceDuration,
+      };
+      const cachedVideo = await cachedManager.getAsset(
+        equivalent,
+        "video/index.m3u8"
+      );
+      assert.equal(cachedVideo.filePath, videoAsset.filePath);
+      assert.match(await readPlaylist(cachedVideo.filePath), /#EXT-X-ENDLIST/);
+      await cachedManager.removeJob(equivalent.jobId);
+      assert.match(await readPlaylist(cachedVideo.filePath), /#EXT-X-ENDLIST/);
+    } finally {
+      await cachedManager.shutdown();
+    }
   } finally {
     await manager?.shutdown();
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-test("does not promote a cached HLS window whose first segment is missing", { timeout: 5_000 }, async () => {
-  const directory = await mkdtemp(path.join(tmpdir(), "watchpair-hls-invalid-start-"));
+test("reports a later epoch failure while preserving the committed playable prefix", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchpair-hls-late-failure-"));
+  const input = path.join(directory, "input.mkv");
+  let manager;
+  let removedInput = false;
+
+  try {
+    await createInput(input, { duration: 4, audioTracks: 1 });
+    const descriptor = {
+      jobId: "hls-late-failure-test",
+      fileIndex: 0,
+      fileSize: (await stat(input)).size,
+      contentFingerprint: "dddddddddddddddddddddddddddddddd",
+      inputPath: input,
+      sourceDuration: 4,
+      videoCodec: "mpeg4",
+      videoPixelFormat: "yuv420p",
+      videoProfile: "Simple Profile",
+      videoStartTime: 0,
+      audioTracks: [audioTrack(1, 1, "eng", "English", true)],
+    };
+    manager = createHlsPlaybackManager({
+      ffmpegPath,
+      ffprobePath: ffprobeStatic.path,
+      cacheRoot: path.join(directory, "cache"),
+      segmentSeconds: 1,
+      epochSeconds: 2,
+      playableSeconds: 2,
+      playlistWaitMs: 5_000,
+      onEvent: (event, details) => {
+        if (event === "hls_epoch_committed" && details.epochIndex === 0 && !removedInput) {
+          removedInput = true;
+          rmSync(input, { force: true });
+        }
+      },
+    });
+
+    const initial = await manager.prepare(descriptor);
+    assert.equal(initial.status, "ready");
+    assert.equal(initial.complete, false);
+    const failed = await waitFor(
+      async () => {
+        const preparation = await manager.getPreparation(descriptor);
+        return preparation.error ? preparation : null;
+      },
+      "A failure after the first committed epoch was not reported"
+    );
+    assert.equal(failed.status, "ready");
+    assert.equal(failed.complete, false);
+    assert.equal(failed.committedEpochs, 1);
+    assert.match(failed.error, /HLS epoch 2/i);
+
+    const videoAsset = await manager.getAsset(descriptor, "video/index.m3u8");
+    const playlist = await readPlaylist(videoAsset.filePath);
+    assert.equal((playlist.match(/#EXT-X-MAP/g) || []).length, 1);
+    assert.doesNotMatch(playlist, /#EXT-X-ENDLIST/);
+  } finally {
+    await manager?.shutdown();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("rejects an invalid v11 generation instead of promoting its missing first segment", { timeout: 8_000 }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchpair-hls-invalid-"));
   const cacheRoot = path.join(directory, "cache");
   const fingerprint = "cccccccccccccccccccccccccccccccc";
   const fileSize = 12345;
-  const generationId = "11111111-1111-1111-1111-111111111111";
+  const invalidGenerationId = "11111111-1111-1111-1111-111111111111";
   const baseDirectory = path.join(
     cacheRoot,
     "content",
-    `${fingerprint}-${fileSize}`,
-    "h264-hls-v10"
+    fingerprint + "-" + fileSize,
+    "h264-hls-v11"
   );
-  const generationDirectory = path.join(baseDirectory, "generations", generationId);
-  const videoDirectory = path.join(generationDirectory, "video");
-  const audioDirectory = path.join(generationDirectory, "audio", "1");
-  const playlist = [
-    "#EXTM3U",
-    "#EXT-X-VERSION:7",
-    "#EXT-X-MEDIA-SEQUENCE:0",
-    "#EXT-X-MAP:URI=\"init.mp4\"",
-    "#EXTINF:2.0,",
-    "segment-000000.m4s",
-    "#EXTINF:2.0,",
-    "segment-000001.m4s",
-    "",
-  ].join("\n");
+  const invalidDirectory = path.join(
+    baseDirectory,
+    "generations",
+    invalidGenerationId
+  );
   const events = [];
   let manager;
 
   try {
+    await mkdir(path.join(invalidDirectory, "video"), { recursive: true });
+    await writeFile(
+      path.join(invalidDirectory, "video", "epoch-000000-init.mp4"),
+      "fake-init"
+    );
+    await writeFile(path.join(invalidDirectory, "manifest.json"), JSON.stringify({
+      cacheVersion: "hls-v11",
+      generationId: invalidGenerationId,
+      fileSize,
+      contentFingerprint: fingerprint,
+      rendition: "h264",
+      sourceDuration: 4,
+      epochSeconds: 2,
+      segmentSeconds: 1,
+      audioTrackIds: [],
+      epochs: [{
+        index: 0,
+        sourceStart: 0,
+        sourceDuration: 2,
+        validatedStart: true,
+        streams: {
+          video: {
+            init: "epoch-000000-init.mp4",
+            segments: [{
+              uri: "epoch-000000-segment-000000.m4s",
+              duration: 1,
+            }],
+          },
+          audio: {},
+        },
+      }],
+      complete: false,
+    }));
     await Promise.all([
-      mkdir(videoDirectory, { recursive: true }),
-      mkdir(audioDirectory, { recursive: true }),
-    ]);
-    await Promise.all([
-      writeFile(path.join(generationDirectory, "master.m3u8"), "#EXTM3U\nvideo/index.m3u8\n"),
-      writeFile(path.join(videoDirectory, "init.mp4"), "video-init"),
-      writeFile(path.join(audioDirectory, "init.mp4"), "audio-init"),
-      writeFile(path.join(videoDirectory, "index.m3u8"), playlist),
-      writeFile(path.join(audioDirectory, "index.m3u8"), playlist),
-      writeFile(path.join(videoDirectory, "segment-000001.m4s"), "late-video"),
-      writeFile(path.join(audioDirectory, "segment-000001.m4s"), "late-audio"),
-      writeFile(path.join(baseDirectory, "current.json"), JSON.stringify({ generationId })),
+      writeFile(
+        path.join(baseDirectory, "current.json"),
+        JSON.stringify({ generationId: invalidGenerationId })
+      ),
+      writeFile(
+        path.join(baseDirectory, "working.json"),
+        JSON.stringify({ generationId: invalidGenerationId })
+      ),
     ]);
 
     manager = createHlsPlaybackManager({
       ffmpegPath,
-      ffprobePath: ffprobeStatic.path,
       cacheRoot,
-      playableSeconds: 2,
+      segmentSeconds: 1,
+      epochSeconds: 2,
+      playableSeconds: 1,
       playlistWaitMs: 1_000,
       onEvent: (event, data) => events.push({ event, data }),
     });
@@ -320,72 +464,57 @@ test("does not promote a cached HLS window whose first segment is missing", { ti
       fileSize,
       contentFingerprint: fingerprint,
       inputPath: path.join(directory, "missing-input.mkv"),
+      sourceDuration: 4,
       videoCodec: "hevc",
       videoPixelFormat: "yuv420p10le",
       videoProfile: "Main 10",
-      audioTracks: [{
-        id: "1",
-        streamIndex: 1,
-        language: "eng",
-        label: "English",
-        codec: "aac",
-        channels: 2,
-        default: true,
-      }],
+      videoStartTime: 0,
+      audioTracks: [],
     }));
-    assert.ok(events.some(({ event }) => event === "hls_generation_started"));
-    assert.equal(events.some(({ event }) => event === "hls_generation_promoted"), false);
+
+    const started = events.find(({ event }) => event === "hls_generation_started");
+    assert.ok(started, JSON.stringify(events));
+    assert.notEqual(started.data.generationId, invalidGenerationId);
+    assert.equal(
+      events.some(({ event }) => event === "hls_generation_promoted"),
+      false
+    );
   } finally {
     await manager?.shutdown();
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-test("preempts background HLS work and resumes its existing generation", { timeout: 30_000 }, async () => {
-  const directory = await mkdtemp(path.join(tmpdir(), "watchpair-hls-preempt-"));
+test("hands selected work over at an epoch boundary without mutating the background playlist", { timeout: 45_000 }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchpair-hls-priority-"));
   const input = path.join(directory, "input.mkv");
   const cacheRoot = path.join(directory, "cache");
   const events = [];
-  const states = [];
   let manager;
 
   try {
-    await runFile(ffmpegPath, [
-      "-hide_banner", "-loglevel", "error", "-y",
-      "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=8",
-      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=8",
-      "-map", "0:v:0", "-map", "1:a:0",
-      "-c:v", "mpeg4", "-q:v", "6", "-c:a", "aac", "-shortest",
-      input,
-    ]);
+    await createInput(input, { duration: 8, audioTracks: 1 });
     const fileSize = (await stat(input)).size;
     const common = {
       fileIndex: 0,
       fileSize,
       inputPath: input,
+      sourceDuration: 8,
       videoCodec: "mpeg4",
       videoPixelFormat: "yuv420p",
       videoProfile: "Simple Profile",
-      audioTracks: [{
-        id: "1",
-        streamIndex: 1,
-        language: "eng",
-        label: "English",
-        codec: "aac",
-        channels: 1,
-        default: true,
-      }],
+      videoStartTime: 0,
+      audioTracks: [audioTrack(1, 1, "eng", "English", true)],
     };
     const background = {
       ...common,
-      jobId: "background-preempt-test",
+      jobId: "background-epoch-test",
       contentFingerprint: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       inputArguments: ["-readrate", "1"],
-      onState: (preparation, transition) => states.push({ preparation, transition }),
     };
     const foreground = {
       ...common,
-      jobId: "foreground-preempt-test",
+      jobId: "foreground-epoch-test",
       contentFingerprint: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       inputArguments: ["-readrate", "8"],
     };
@@ -395,56 +524,178 @@ test("preempts background HLS work and resumes its existing generation", { timeo
       ffprobePath: ffprobeStatic.path,
       cacheRoot,
       segmentSeconds: 1,
-      playableSeconds: 1,
+      epochSeconds: 2,
+      playableSeconds: 2,
       playlistWaitMs: 10_000,
       onEvent: (event, data) => events.push({ event, data }),
     });
 
-    const initialPreparation = await manager.prepare(background);
-    assert.equal(initialPreparation.status, "ready");
-    assert.ok(initialPreparation.generationId);
-    const initialAsset = await manager.getAsset(background, "video/index.m3u8");
-    assert.doesNotMatch(await readPlaylist(initialAsset.filePath), /#EXT-X-ENDLIST/);
+    const firstBackgroundWindow = await manager.prepare(background);
+    assert.equal(firstBackgroundWindow.committedEpochs, 1);
+    const backgroundAsset = await manager.getAsset(
+      background,
+      "video/index.m3u8"
+    );
+    const stablePath = backgroundAsset.filePath;
 
     const foregroundPreparation = manager.prepare(foreground);
     manager.setPriorityJob(foreground.jobId);
-    assert.equal((await foregroundPreparation).status, "ready");
+    const firstForegroundWindow = await foregroundPreparation;
+    assert.equal(firstForegroundWindow.status, "ready");
+    assert.equal(firstForegroundWindow.committedEpochs, 1);
 
-    const retainedAsset = await manager.getAsset(background, "video/index.m3u8");
-    assert.equal(retainedAsset.filePath, initialAsset.filePath);
+    const commits = events.filter(({ event }) => event === "hls_epoch_committed");
+    const firstForegroundCommit = commits.findIndex(
+      ({ data }) => data.jobId === foreground.jobId
+    );
+    const thirdBackgroundCommit = commits.findIndex(
+      ({ data }) => data.jobId === background.jobId && data.epochIndex === 2
+    );
+    assert.ok(firstForegroundCommit >= 0, JSON.stringify(commits));
     assert.ok(
-      events.some(({ event, data }) =>
-        event === "hls_generation_preempted" && data.jobId === background.jobId
-      ),
+      thirdBackgroundCommit < 0 || firstForegroundCommit < thirdBackgroundCommit,
+      JSON.stringify(commits)
+    );
+    assert.ok(
+      events.some(({ event }) => event === "media_task_preemption_deferred"),
       JSON.stringify(events)
     );
-
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      if ((await readPlaylist(retainedAsset.filePath)).includes("#EXT-X-ENDLIST")) break;
-      if (attempt === 199) assert.fail("Preempted HLS generation did not resume and finish");
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      if (manager.diagnostics().generations.some((generation) =>
-        generation.jobId === background.jobId && generation.complete
-      )) break;
-      if (attempt === 199) {
-        assert.fail("Resumed HLS generation was not validated as complete");
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    const backgroundStarts = events.filter(({ event, data }) =>
-      event === "hls_generation_started" && data.jobId === background.jobId
+    assert.equal(
+      events.some(({ event }) => event === "media_task_preempted"),
+      false
     );
-    assert.ok(backgroundStarts.length >= 2, JSON.stringify(events));
-    assert.equal(backgroundStarts[0].data.resumed, false);
-    assert.equal(backgroundStarts.at(-1).data.resumed, true);
-    assert.ok(backgroundStarts.at(-1).data.resumeSeconds >= 1, JSON.stringify(backgroundStarts));
-    const firstReady = states.findIndex(({ preparation }) => preparation.status === "ready");
-    assert.ok(firstReady >= 0, JSON.stringify(states));
-    assert.ok(states.slice(firstReady).every(({ preparation }) => preparation.status === "ready"), JSON.stringify(states));
+
+    await waitFor(
+      () => manager.diagnostics().generations.every(
+        (generation) => generation.complete
+      ),
+      "Both epoch render queues did not finish",
+      30_000
+    );
+    const retained = await manager.getAsset(background, "video/index.m3u8");
+    assert.equal(retained.filePath, stablePath);
+    const playlist = await readPlaylist(retained.filePath);
+    assert.match(playlist, /#EXT-X-ENDLIST/);
+    assert.ok((playlist.match(/#EXT-X-DISCONTINUITY/g) || []).length >= 3);
+
+    const processes = manager.diagnostics().processes.recent.filter(
+      (record) => record.stage === "browser-playback-epoch"
+    );
+    assert.ok(processes.length >= 8, JSON.stringify(processes));
+    assert.ok(processes.every(
+      (record) => !record.arguments.includes("append_list")
+    ));
   } finally {
     await manager?.shutdown();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("resumes only committed epochs after restart and discards a stale writer workspace", { timeout: 35_000 }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchpair-hls-restart-"));
+  const input = path.join(directory, "input.mkv");
+  const cacheRoot = path.join(directory, "cache");
+  const fingerprint = "dddddddddddddddddddddddddddddddd";
+  const events = [];
+  let firstManager;
+  let secondManager;
+
+  try {
+    await createInput(input, { duration: 6, audioTracks: 1 });
+    const descriptor = {
+      jobId: "restart-epoch-test",
+      fileIndex: 0,
+      fileSize: (await stat(input)).size,
+      contentFingerprint: fingerprint,
+      inputPath: input,
+      sourceDuration: 6,
+      videoCodec: "mpeg4",
+      videoPixelFormat: "yuv420p",
+      videoProfile: "Simple Profile",
+      videoStartTime: 0,
+      inputArguments: ["-readrate", "1"],
+      audioTracks: [audioTrack(1, 1, "eng", "English", true)],
+    };
+    const options = {
+      ffmpegPath,
+      ffprobePath: ffprobeStatic.path,
+      cacheRoot,
+      segmentSeconds: 1,
+      epochSeconds: 2,
+      playableSeconds: 2,
+      playlistWaitMs: 10_000,
+    };
+
+    firstManager = createHlsPlaybackManager(options);
+    const firstWindow = await firstManager.prepare(descriptor);
+    assert.equal(firstWindow.committedEpochs, 1);
+    const generationId = firstWindow.generationId;
+    await firstManager.shutdown();
+    firstManager = null;
+
+    const generationPath = path.join(
+      cacheRoot,
+      "content",
+      fingerprint + "-" + descriptor.fileSize,
+      "h264-hls-v11",
+      "generations",
+      generationId
+    );
+    const manifestBefore = JSON.parse(
+      await readFile(path.join(generationPath, "manifest.json"), "utf8")
+    );
+    assert.ok(manifestBefore.epochs.length >= 1);
+    assert.equal(manifestBefore.complete, false);
+    const staleDirectory = path.join(generationPath, ".working", "stale-attempt");
+    await mkdir(staleDirectory, { recursive: true });
+    await writeFile(path.join(staleDirectory, "partial.m4s"), "partial");
+    await writeFile(path.join(generationPath, "writer.json"), JSON.stringify({
+      cacheVersion: "hls-v11",
+      generationId,
+      token: "stale-token",
+      epochIndex: manifestBefore.epochs.length,
+      pid: 999999,
+      startedAt: Date.now() - 60_000,
+    }));
+
+    secondManager = createHlsPlaybackManager({
+      ...options,
+      onEvent: (event, data) => events.push({ event, data }),
+    });
+    const resumedDescriptor = {
+      ...descriptor,
+      inputArguments: ["-readrate", "8"],
+    };
+    const resumedWindow = await secondManager.prepare(resumedDescriptor);
+    assert.equal(resumedWindow.generationId, generationId);
+    assert.equal(resumedWindow.resumed, true);
+    assert.ok(resumedWindow.resumeSeconds >= 2);
+    assert.ok(events.some(
+      ({ event, data }) =>
+        event === "hls_stale_writer_recovered" &&
+        data.generationId === generationId
+    ));
+
+    await waitFor(
+      () => secondManager.diagnostics().generations[0]?.complete,
+      "Restarted epoch generation did not complete"
+    );
+    const video = await secondManager.getAsset(
+      resumedDescriptor,
+      "video/index.m3u8"
+    );
+    const playlist = await readPlaylist(video.filePath);
+    assert.match(playlist, /#EXT-X-ENDLIST/);
+    assert.equal((playlist.match(/#EXT-X-MAP/g) || []).length, 3);
+    assert.equal((playlist.match(/#EXT-X-DISCONTINUITY/g) || []).length, 2);
+    assert.equal(
+      await stat(path.join(generationPath, "writer.json"))
+        .then(() => "present", (error) => error.code),
+      "ENOENT"
+    );
+  } finally {
+    await firstManager?.shutdown();
+    await secondManager?.shutdown();
     await rm(directory, { recursive: true, force: true });
   }
 });

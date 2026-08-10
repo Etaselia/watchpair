@@ -77,6 +77,7 @@ import {
   type AgentLibraryFile,
   type AgentMediaTarget,
   type AgentPermissionState,
+  type AgentPreparation,
   type AgentJob,
   type AgentSubtitleTrack,
 } from "../lib/agent-client";
@@ -105,6 +106,7 @@ import {
 } from "../lib/media-queue.mjs";
 import {
   clampSeekTarget,
+  clampToPreparedRanges,
   isPlaybackAcknowledgement,
   isSeekAcknowledgement,
   shouldHoldLocalPlayback,
@@ -1516,8 +1518,25 @@ export default function WatchApp() {
     if (!player || !sourceId || !selectedMediaTrackKey || agentJob?.subtitleStatus !== "ready") return;
     const initializationKey = sourceId + ":" + selectedMediaTrackKey;
     if (initializedMediaTracksRef.current === initializationKey) return;
-    const defaultSubtitle = embeddedSubtitles.find((track) => track.default && track.supported);
-    if (!defaultSubtitle || requestedSubtitleSelection !== "off") {
+
+    const supportedTracks = embeddedSubtitles.filter((track) => track.supported);
+    const defaultSubtitle =
+      supportedTracks.find((track) => track.forced) ||
+      supportedTracks.find((track) => track.default) ||
+      supportedTracks[0];
+    const requestedTrackIsReady = Boolean(
+      requestedSubtitleTrack && requestedSubtitleTrack.supported
+    );
+    const shouldRecoverEmbeddedSelection =
+      requestedSubtitleSelection.startsWith("embedded:") &&
+      !requestedTrackIsReady;
+    const shouldSelectDefault =
+      requestedSubtitleSelection === "off" &&
+      Boolean(defaultSubtitle?.default || defaultSubtitle?.forced);
+    if (
+      !defaultSubtitle ||
+      (!shouldRecoverEmbeddedSelection && !shouldSelectDefault)
+    ) {
       initializedMediaTracksRef.current = initializationKey;
       return;
     }
@@ -1543,6 +1562,7 @@ export default function WatchApp() {
     selectedMediaTrackKey,
     sendAction,
     requestedSubtitleSelection,
+    requestedSubtitleTrack,
     playbackSourceId,
   ]);
 
@@ -1908,6 +1928,7 @@ export default function WatchApp() {
         session={session}
         deviceId={deviceId}
         mediaUrl={mediaUrl}
+        mediaPreparation={selectedAgentFile?.preparation || agentJob?.preparation || null}
         subtitleCues={subtitleCues}
         localSubtitleName={localSubtitleName}
         audioTracks={embeddedAudioTracks}
@@ -2607,6 +2628,7 @@ interface SyncedPlayerProps {
   session: WatchSession;
   deviceId: string;
   mediaUrl: string;
+  mediaPreparation: AgentPreparation | null;
   subtitleCues: SubtitleCue[];
   localSubtitleName: string;
   audioTracks: AgentAudioTrack[];
@@ -2665,14 +2687,18 @@ function finiteMediaValue(value: number | undefined) {
 function playbackTarget(video: HTMLVideoElement, expected: number, isHlsPlayback: boolean) {
   const target = Math.max(0, expected);
   if (!isHlsPlayback) return target;
-  const seekableStart = video.seekable.length ? video.seekable.start(0) : 0;
-  return Math.max(target, seekableStart);
+  const ranges = Array.from({ length: video.seekable.length }, (_, index) => ({
+    start: video.seekable.start(index),
+    end: video.seekable.end(index),
+  }));
+  return clampToPreparedRanges(target, ranges);
 }
 
 function SyncedPlayer({
   session,
   deviceId,
   mediaUrl,
+  mediaPreparation,
   subtitleCues,
   localSubtitleName,
   audioTracks,
@@ -2749,6 +2775,8 @@ function SyncedPlayer({
     : "";
   const requestedSubtitleTrack = subtitleTracks.find((track) => track.id === requestedPlayerSubtitleId);
   const hasRequestedSubtitle = Boolean(requestedSubtitleTrack);
+  const expectsEmbeddedSubtitle =
+    session.player.subtitleLanguage.startsWith("embedded:");
   const subtitleSelection =
     session.player.subtitleLanguage === "local" && localSubtitleName
       ? "local"
@@ -2777,7 +2805,7 @@ function SyncedPlayer({
         error: true,
       };
     }
-    if (hasRequestedSubtitle && subtitleAssetStatus === "error") {
+    if (expectsEmbeddedSubtitle && subtitleAssetStatus === "error") {
       return {
         message: subtitleAssetError || "Selected subtitles could not be prepared",
         loading: false,
@@ -2785,11 +2813,11 @@ function SyncedPlayer({
       };
     }
     if (
-      hasRequestedSubtitle &&
+      expectsEmbeddedSubtitle &&
       (subtitleAssetStatus === "waiting" || subtitleAssetStatus === "preparing")
     ) {
       return {
-        message: "Preparing " + (requestedSubtitleTrack?.label || "selected") + " subtitles on this device",
+        message: "Preparing " + (requestedSubtitleTrack?.label || "embedded") + " subtitles on this device",
         loading: true,
         error: false,
       };
@@ -2822,6 +2850,26 @@ function SyncedPlayer({
     return url.toString();
   }, [hlsVideoRendition, mediaUrl, requestedAudioTrack]);
   const isHlsPlayback = playbackUrl.includes("/hls/") && playbackUrl.includes(".m3u8");
+  const preparedThrough =
+    mediaPreparation?.contiguousReadySeconds ??
+    mediaPreparation?.bufferedSeconds ??
+    0;
+  const roomPlaybackPosition = Math.max(session.player.position, currentTime);
+  const preparationError = mediaPreparation?.error || "";
+  const visibleMediaError = mediaError || (mediaLoading ? preparationError : "");
+  const mediaWaitingMessage = !mediaUrl
+    ? "Preparing selected video"
+    : !isHlsPlayback
+      ? "Preparing video for this browser"
+      : mediaPreparation?.complete
+        ? "Buffering prepared video"
+        : preparedThrough > 0 && roomPlaybackPosition >= preparedThrough - 1
+          ? "Preparing " + formatTime(roomPlaybackPosition) +
+            ", ready through " + formatTime(preparedThrough)
+          : preparedThrough > 0
+            ? "Buffering video, ready through " + formatTime(preparedThrough)
+            : "Preparing the first video window";
+
   const reportPlaybackEvent = useCallback(
     (event: string, details: PlaybackDiagnosticDetails = {}) => {
       if (!playbackUrl.startsWith(AGENT_URL)) return;
@@ -3388,7 +3436,11 @@ function SyncedPlayer({
       const video = videoRef.current;
       if (!video) return;
       setCurrentTime(video.currentTime);
-      setDuration(mediaDuration(video));
+      const sourceDuration = Number(mediaPreparation?.sourceDuration);
+      setDuration(Math.max(
+        mediaDuration(video),
+        Number.isFinite(sourceDuration) ? sourceDuration : 0
+      ));
 
       if (session.player.subtitleLanguage === "off" || !subtitleCues.length) {
         setSubtitleText("");
@@ -3400,7 +3452,12 @@ function SyncedPlayer({
     }, 120);
 
     return () => window.clearInterval(timer);
-  }, [session.player.subtitleLanguage, session.player.subtitleOffset, subtitleCues]);
+  }, [
+    mediaPreparation?.sourceDuration,
+    session.player.subtitleLanguage,
+    session.player.subtitleOffset,
+    subtitleCues,
+  ]);
 
   async function togglePlayback() {
     const video = videoRef.current;
@@ -3672,7 +3729,18 @@ function SyncedPlayer({
           );
           pinControls();
         }}
-        onEnded={() => { if (onEnded) void send({ paused: true, position: duration }).then(onEnded); }}
+        onEnded={() => {
+          if (isHlsPlayback && mediaPreparation?.complete === false) {
+            setMediaLoading(true);
+            reportPlaybackEvent("hls_window_exhausted", {
+              level: "info",
+              seekTarget: roomPlaybackPosition,
+              message: "Playback reached the current committed HLS window.",
+            });
+            return;
+          }
+          if (onEnded) void send({ paused: true, position: duration }).then(onEnded);
+        }}
         onPlay={revealControls}
         onPause={pinControls}
         onDoubleClick={fullscreen}
@@ -3733,11 +3801,14 @@ function SyncedPlayer({
         </div>
       )}
 
-      {(mediaLoading || mediaError) && !needsGesture && (
-        <div className={"media-state-overlay" + (mediaError ? " error" : "")} role={mediaError ? "alert" : "status"}>
-          {mediaError ? <X /> : <LoaderCircle className="spin" />}
-          <strong>{mediaError || (!mediaUrl ? "Preparing selected video" : isHlsPlayback ? "Preparing first video segments" : "Preparing video for this browser")}</strong>
-          {mediaError && (
+      {(mediaLoading || visibleMediaError) && !needsGesture && (
+        <div
+          className={"media-state-overlay" + (visibleMediaError ? " error" : "")}
+          role={visibleMediaError ? "alert" : "status"}
+        >
+          {visibleMediaError ? <X /> : <LoaderCircle className="spin" />}
+          <strong>{visibleMediaError || mediaWaitingMessage}</strong>
+          {visibleMediaError && (
             <button type="button" onClick={onBack}>
               <ArrowLeft />
               Back to lobby

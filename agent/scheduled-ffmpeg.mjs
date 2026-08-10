@@ -24,6 +24,7 @@ export function createScheduledFfmpegRunner({ ffmpegPath, scheduler, processRegi
     hardware = false,
     inputPath = null,
     priority = 0,
+    preemptible = true,
     captureProgress = true,
     arguments: fixedArguments,
     argumentsForProfile,
@@ -33,7 +34,9 @@ export function createScheduledFfmpegRunner({ ffmpegPath, scheduler, processRegi
       taskId,
       stage,
       priority,
-      run: async (profile) => {
+      preemptible,
+      run: async (profile, taskContext = {}) => {
+        if (taskContext.signal?.aborted) throw taskContext.signal.reason;
         const mediaArguments = argumentsForProfile
           ? argumentsForProfile(profile)
           : fixedArguments;
@@ -44,6 +47,14 @@ export function createScheduledFfmpegRunner({ ffmpegPath, scheduler, processRegi
           windowsHide: true,
           stdio: ["ignore", "pipe", "pipe"],
         });
+        const interrupt = () => {
+          try {
+            return child.kill("SIGTERM");
+          } catch {
+            return false;
+          }
+        };
+        taskContext.registerInterrupt?.(interrupt);
         applyMediaProcessPriority(child, profile);
         const tracker = child.pid ? processRegistry.track(child, {
           jobId,
@@ -74,7 +85,7 @@ export function createScheduledFfmpegRunner({ ffmpegPath, scheduler, processRegi
         return {
           value: completion,
           completion,
-          interrupt: () => child.kill("SIGTERM"),
+          interrupt,
         };
       },
     });

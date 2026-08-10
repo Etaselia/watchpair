@@ -25,7 +25,11 @@ import {
   startsAtBrowserZero,
   streamHlsAsset,
 } from "./hls-playback.mjs";
-import { createMediaTaskScheduler, mediaResourceProfile } from "./media-governor.mjs";
+import {
+  createMediaTaskScheduler,
+  createResponsivenessMonitor,
+  mediaResourceProfile,
+} from "./media-governor.mjs";
 import { createProcessRegistry } from "./process-registry.mjs";
 import {
   CPU_ENCODER,
@@ -44,7 +48,11 @@ import { createTorrentBandwidthGovernor } from "./torrent-bandwidth-governor.mjs
 import { createJsonStore } from "./job-store.mjs";
 import { cacheExpired, cleanupSettingsFromEnvironment, jobCanBeCleaned, jobCleanupReason } from "./cleanup-policy.mjs";
 import { createSubtitleAssetPipeline } from "./subtitle-pipeline.mjs";
-import { chapterProbeArguments, normalizeMediaChapters } from "./media-chapters.mjs";
+import {
+  chapterProbeArguments,
+  mediaDurationFromProbe,
+  normalizeMediaChapters,
+} from "./media-chapters.mjs";
 import { fingerprintPath } from "./media-fingerprint.mjs";
 import {
   createSingleFlightCache,
@@ -198,15 +206,33 @@ function mediaDiagnosticEvent(event, data) {
   }
 }
 const mediaScheduler = createMediaTaskScheduler({ onEvent: mediaDiagnosticEvent });
+const subtitleResponsiveness = createResponsivenessMonitor();
+const subtitleScheduler = createMediaTaskScheduler({
+  monitor: {
+    snapshot: () => subtitleResponsiveness.snapshot(),
+    shouldDeferBackground: () =>
+      subtitleResponsiveness.snapshot().eventLoopDelayP95Ms > 100,
+    stop: () => subtitleResponsiveness.stop(),
+  },
+  onEvent: (event, data) => mediaDiagnosticEvent(event, {
+    ...data,
+    lane: "subtitles",
+  }),
+});
 const mediaProcessRegistry = createProcessRegistry({ onEvent: mediaDiagnosticEvent });
 const runScheduledFfmpeg = createScheduledFfmpegRunner({
   ffmpegPath: FFMPEG_PATH,
   scheduler: mediaScheduler,
   processRegistry: mediaProcessRegistry,
 });
+const runSubtitleFfmpeg = createScheduledFfmpegRunner({
+  ffmpegPath: FFMPEG_PATH,
+  scheduler: subtitleScheduler,
+  processRegistry: mediaProcessRegistry,
+});
 const subtitleAssetPipeline = createSubtitleAssetPipeline({
   cacheRoot: SUBTITLE_DIR,
-  runScheduledFfmpeg,
+  runScheduledFfmpeg: runSubtitleFfmpeg,
 });
 const torrentBandwidthGovernor = createTorrentBandwidthGovernor();
 let torrentBandwidth = torrentBandwidthGovernor.snapshot();
@@ -576,6 +602,7 @@ function createMediaAsset(index) {
     subtitleAssetPromiseKey: null,
     videoCodec: null,
     videoPixelFormat: null,
+    duration: null,
     videoStartTime: null,
     videoProfile: null,
     subtitleStatus: "waiting",
@@ -604,7 +631,7 @@ const MEDIA_ASSET_FIELDS = [
   "identityFingerprint", "identityFingerprintKey", "torrentVerifiedKey",
   "audioTracks", "chapters", "subtitleTracks", "mediaStreams",
   "subtitleAssetStatus", "subtitleAssetError", "videoCodec", "videoPixelFormat",
-  "videoStartTime",
+  "duration", "videoStartTime",
   "videoProfile", "subtitleStatus", "subtitleError", "preparation",
 ];
 
@@ -868,6 +895,7 @@ async function probeSubtitleTracks(job, index = job.selectedIndex) {
     asset.videoCodec = String(videoStream?.codec_name || "unknown");
     asset.videoPixelFormat = String(videoStream?.pix_fmt || "unknown");
     asset.videoProfile = String(videoStream?.profile || "unknown");
+    asset.duration = mediaDurationFromProbe(metadata);
     const rawVideoStart = Number(videoStream?.start_time ?? metadata.format?.start_time);
     asset.videoStartTime = Number.isFinite(rawVideoStart) ? rawVideoStart : null;
     asset.chapters = normalizeMediaChapters(metadata.chapters);
@@ -926,6 +954,7 @@ async function probeSubtitleTracks(job, index = job.selectedIndex) {
         codec: asset.videoCodec,
         pixelFormat: asset.videoPixelFormat,
         profile: asset.videoProfile,
+        duration: asset.duration,
       },
       audioTracks: asset.audioTracks.length,
       subtitleTracks: asset.subtitleTracks.length,
@@ -988,6 +1017,8 @@ async function prepareSubtitleAssetsForSelection(job, index, selectionKey) {
   asset.subtitleAssetError = null;
   asset.subtitleAssetResult = null;
   asset.subtitleAssetResultKey = null;
+  asset.updatedAt = Date.now();
+  job.updatedAt = Date.now();
   if (job.selectedIndex === index) syncSelectedAsset(job);
   const subtitleStartedAt = Date.now();
   agentLogger.info("subtitle_assets_started", {
@@ -1017,6 +1048,8 @@ async function prepareSubtitleAssetsForSelection(job, index, selectionKey) {
       asset.subtitleAssetError = null;
       asset.subtitleAssetResult = result;
       asset.subtitleAssetResultKey = selectionKey;
+      asset.updatedAt = Date.now();
+      job.updatedAt = Date.now();
       if (job.selectedIndex === index) syncSelectedAsset(job);
     }
     return result;
@@ -1032,6 +1065,8 @@ async function prepareSubtitleAssetsForSelection(job, index, selectionKey) {
       asset.subtitleAssetError = error instanceof Error ? error.message : "Subtitle preparation failed.";
       asset.subtitleAssetResult = null;
       asset.subtitleAssetResultKey = null;
+      asset.updatedAt = Date.now();
+      job.updatedAt = Date.now();
       if (job.selectedIndex === index) syncSelectedAsset(job);
     }
     throw error;
@@ -1091,6 +1126,12 @@ function queueMediaPreparation(job, index = job.selectedIndex) {
   void queueSubtitleProbe(job, index)
     .then(() => {
       if (jobs.get(job.id) !== job) return;
+      const asset = mediaAsset(job, index);
+      if (asset.subtitleTracks.some((track) => track.supported)) {
+        void preparedSubtitleAssets(job, index).catch(() => {
+          // The stored subtitle asset state is surfaced by the regular job poll.
+        });
+      }
       const key = mediaTargetKey(job.id, index);
       if (key === activePreparationTargetKey) queueSelectedPreparation(job, index);
       else queueBackgroundPreparation(job, index);
@@ -1170,6 +1211,7 @@ function agentFileSnapshot(job, index, file, downloaded, progress, downloadReady
     path: relativePath,
     name,
     size: file.size,
+    duration: asset.duration,
     downloaded,
     progress,
     downloadReady,
@@ -2154,6 +2196,7 @@ async function hlsDescriptor(job, fileIndex, rendition = "h264") {
     rendition,
     audioTracks: asset.audioTracks,
     videoStartTime: asset.videoStartTime,
+    sourceDuration: asset.duration,
   };
 }
 
@@ -2192,7 +2235,8 @@ async function prepareQueuedTarget(target) {
       const diagnostic = state.diagnostics?.at(-1);
       asset.preparation = {
         ...state,
-        error: state.status === "error" ? diagnostic?.message || "Browser preparation failed." : null,
+        error: state.error ||
+          (state.status === "error" ? diagnostic?.message || "Browser preparation failed." : null),
       };
       asset.updatedAt = Date.now();
       if (job.selectedIndex === index) syncSelectedAsset(job);
@@ -2249,17 +2293,21 @@ function contentSchedulerIdForTarget(target) {
 
 function refreshPreparationScheduling() {
   prioritizePreparationQueue();
-  mediaScheduler.setJobOrder(mediaPriorityTargets.map((target) =>
+  const schedulerOrder = mediaPriorityTargets.map((target) =>
     contentSchedulerIdForTarget(target) || mediaTargetKey(target.jobId, target.fileIndex)
-  ));
+  );
+  mediaScheduler.setJobOrder(schedulerOrder);
+  subtitleScheduler.setJobOrder(schedulerOrder);
   const activeTarget = mediaPriorityTargets.find(
     (target) => mediaTargetKey(target.jobId, target.fileIndex) === activePreparationTargetKey
   ) || null;
+  const activeSchedulerId = contentSchedulerIdForTarget(activeTarget);
   hlsPlayback.setPriorityTarget(
     activeTarget?.jobId || null,
     activeTarget?.fileIndex ?? null,
-    contentSchedulerIdForTarget(activeTarget)
+    activeSchedulerId
   );
+  subtitleScheduler.prioritize(activeSchedulerId);
 }
 
 function setMediaPriority(selected, targets) {
@@ -2622,8 +2670,12 @@ async function runStorageCleanup({ force = false } = {}) {
       maxAgeMs: settings.partialRetentionHours * 60 * 60 * 1000,
       include: (entry) => entry.isFile() && /^[a-zA-Z0-9-]{8,80}\.part$/.test(entry.name),
     });
-    const mediaWork = mediaScheduler.snapshot();
-    const protectedContentNames = new Set([mediaWork.active, ...mediaWork.queued]
+    const mediaWork = [
+      mediaScheduler.snapshot(),
+      subtitleScheduler.snapshot(),
+    ];
+    const protectedContentNames = new Set(mediaWork
+      .flatMap((work) => [work.active, ...work.queued])
       .map((task) => task?.jobId)
       .filter((jobId) => String(jobId || "").startsWith("content-"))
       .map((jobId) => jobId.slice("content-".length)));
@@ -2694,6 +2746,7 @@ function sampleProcessCpu() {
 
 function agentResourceSnapshot() {
   const scheduler = mediaScheduler.snapshot();
+  const subtitleWork = subtitleScheduler.snapshot();
   const processes = mediaProcessRegistry.snapshot();
   const memory = process.memoryUsage();
   const jobStatuses = {};
@@ -2719,6 +2772,10 @@ function agentResourceSnapshot() {
       foregroundJobId: scheduler.foregroundJobId,
       active: scheduler.active,
       queuedTasks: scheduler.queued.length,
+      subtitles: {
+        active: subtitleWork.active,
+        queuedTasks: subtitleWork.queued.length,
+      },
     },
     processes: processes.active.map((entry) => ({
       pid: entry.pid,
@@ -2897,6 +2954,7 @@ const server = createServer(async (request, response) => {
 
     if (request.method === "GET" && url.pathname === "/health") {
       const scheduler = mediaScheduler.snapshot();
+      const subtitleWork = subtitleScheduler.snapshot();
       const processes = mediaProcessRegistry.snapshot();
       const activeProcess = processes.active[0] || null;
       const logDetails = agentLogger.details();
@@ -2934,6 +2992,7 @@ const server = createServer(async (request, response) => {
         media: {
           mode: mediaResourceProfile("foreground").mode,
           scheduler,
+          subtitleScheduler: subtitleWork,
           activeProcesses: processes.active.length,
           activeProcess: activeProcess
             ? {
@@ -2954,6 +3013,8 @@ const server = createServer(async (request, response) => {
       sendJson(response, 200, {
         transcoder: TRANSCODER,
         scheduler: mediaScheduler.snapshot(),
+        subtitleScheduler: subtitleScheduler.snapshot(),
+        subtitleAssets: subtitleAssetPipeline.snapshot(),
         processes: mediaProcessRegistry.snapshot(),
         hls: hlsPlayback.diagnostics(),
         resources: agentResourceSnapshot(),
@@ -3338,12 +3399,21 @@ const shutdown = async () => {
   clearInterval(persistenceTimer);
   clearInterval(resourceDiagnosticTimer);
   clearInterval(cleanupTimer);
-  await hlsPlayback.shutdown();
-  mediaScheduler.shutdown();
+  const serverClosed = new Promise((resolve) => server.close(resolve));
+  mediaScheduler.beginShutdown();
+  subtitleScheduler.beginShutdown();
+  await Promise.allSettled([
+    hlsPlayback.shutdown(),
+    mediaProcessRegistry.terminateAll(),
+  ]);
+  await Promise.all([
+    mediaScheduler.shutdown(),
+    subtitleScheduler.shutdown(),
+  ]);
   persistJobs();
   await Promise.all([
     jobStore.flush(),
-    new Promise((resolve) => server.close(resolve)),
+    serverClosed,
     new Promise((resolve) => {
       if (client.destroyed) resolve();
       else client.destroy(resolve);

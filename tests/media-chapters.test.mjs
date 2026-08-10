@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   chapterProbeArguments,
+  mediaDurationFromProbe,
   normalizeMediaChapters,
 } from "../agent/media-chapters.mjs";
 
@@ -56,4 +57,20 @@ test("normalizes, sorts, and labels media chapters", () => {
       },
     ]
   );
+});
+
+test("uses stream duration and removes positive timestamp offsets from format fallback", () => {
+  assert.equal(mediaDurationFromProbe({
+    streams: [{ codec_type: "video", duration: "600.25", start_time: "5" }],
+    format: { duration: "605.25", start_time: "5" },
+  }), 600.25);
+  assert.equal(mediaDurationFromProbe({
+    streams: [{ codec_type: "video", start_time: "5" }],
+    format: { duration: "605.25", start_time: "5" },
+  }), 600.25);
+  assert.equal(mediaDurationFromProbe({
+    streams: [{ codec_type: "video", start_time: "-0.25" }],
+    format: { duration: "600" },
+  }), 600);
+  assert.equal(mediaDurationFromProbe({ streams: [], format: {} }), null);
 });
