@@ -30,6 +30,7 @@ import {
 import {
   createPendingVoiceCaptureRegistry,
   createVoiceCaptureGenerationGuard,
+  createVoicePeerRecoveryScheduler,
   updateVoicePeersUntilQuiescent,
 } from "../lib/voice-capture-generation.mjs";
 
@@ -101,6 +102,8 @@ const SILENT_PRESENCE: VoicePresence = {
   muted: true,
   deafened: false,
 };
+const VOICE_PEER_CONNECTION_ERROR =
+  "A voice peer could not connect. A TURN server may be required on this network.";
 
 function voiceConstraints(
   inputDeviceId: string,
@@ -196,7 +199,9 @@ export function useRoomVoice({
   const [notice, setNotice] = useState("");
   const [captureGuard] = useState(() => createVoiceCaptureGenerationGuard());
   const [pendingCaptureRegistry] = useState(() => createPendingVoiceCaptureRegistry());
+  const [peerRecoveryScheduler] = useState(() => createVoicePeerRecoveryScheduler());
   const peersRef = useRef(new Map<string, PeerState>());
+  const reconcilePeersRef = useRef<() => void>(() => {});
   const seenSignalsRef = useRef(new Set<string>());
   const signalQueueRef = useRef(Promise.resolve());
   const rawStreamRef = useRef<MediaStream | null>(null);
@@ -255,10 +260,11 @@ export function useRoomVoice({
     );
   }, []);
 
-  const closePeer = useCallback((remoteId: string) => {
+  const closePeer = useCallback((remoteId: string, expectedPeer?: PeerState) => {
     const peer = peersRef.current.get(remoteId);
-    if (!peer) return;
+    if (!peer || (expectedPeer && peer !== expectedPeer)) return;
     peersRef.current.delete(remoteId);
+    peerRecoveryScheduler.cancel(peer);
     speakingUntilRef.current.delete(remoteId);
     peer.audio?.pause();
     peer.audio?.remove();
@@ -270,7 +276,7 @@ export function useRoomVoice({
       next.delete(remoteId);
       return next;
     });
-  }, [updatePeerCount]);
+  }, [peerRecoveryScheduler, updatePeerCount]);
 
   const applyOutputDevice = useCallback(async (audio: HTMLAudioElement, id: string) => {
     const sinkAudio = audio as HTMLAudioElement & {
@@ -335,14 +341,28 @@ export function useRoomVoice({
       }
     };
     pc.onconnectionstatechange = () => {
+      if (peersRef.current.get(remoteId) !== peer) return;
       updatePeerCount();
-      if (pc.connectionState === "failed") {
-        setError("A voice peer could not connect. A TURN server may be required on this network.");
-        closePeer(remoteId);
+      if (pc.connectionState === "connected") {
+        setError((current) => current === VOICE_PEER_CONNECTION_ERROR ? "" : current);
+      } else if (pc.connectionState === "failed") {
+        setError(VOICE_PEER_CONNECTION_ERROR);
       }
+      peerRecoveryScheduler.observe(peer, pc.connectionState, (stalePeer: PeerState) => {
+        if (
+          peersRef.current.get(remoteId) !== stalePeer ||
+          !enabledRef.current ||
+          !activeRemoteVoiceParticipants(sessionRef.current, deviceId)
+            .some((participant) => participant.deviceId === remoteId) ||
+          !["disconnected", "failed"].includes(stalePeer.pc.connectionState)
+        ) return;
+
+        closePeer(remoteId, stalePeer);
+        reconcilePeersRef.current();
+      });
     };
     return peer;
-  }, [applyOutputDevice, closePeer, updatePeerCount]);
+  }, [applyOutputDevice, closePeer, deviceId, peerRecoveryScheduler, updatePeerCount]);
 
   const sendOffer = useCallback(async (remoteId: string, peer: PeerState) => {
     if (peer.offerStarted || peer.pc.signalingState !== "stable") return;
@@ -375,6 +395,10 @@ export function useRoomVoice({
       if (deviceId.localeCompare(remoteId) < 0) void sendOffer(remoteId, peer);
     }
   }, [closePeer, deviceId, ensurePeer, sendOffer]);
+
+  useLayoutEffect(() => {
+    reconcilePeersRef.current = reconcilePeers;
+  }, [reconcilePeers]);
 
   const replaceCapture = useCallback(async (
     nextInputDeviceId: string,
@@ -923,6 +947,7 @@ export function useRoomVoice({
     return () => {
       captureGuard.unmount();
       pendingCaptureRegistry.disposeCurrent();
+      peerRecoveryScheduler.dispose();
       enabledRef.current = false;
       startingRef.current = false;
       for (const peer of peers.values()) {
@@ -940,7 +965,7 @@ export function useRoomVoice({
       localAnalyserRef.current = null;
       localLevelDataRef.current = null;
     };
-  }, [captureGuard, pendingCaptureRegistry]);
+  }, [captureGuard, peerRecoveryScheduler, pendingCaptureRegistry]);
 
   useEffect(() => {
     seenSignalsRef.current.clear();
