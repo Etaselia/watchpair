@@ -8,7 +8,23 @@ updates:
     groups:
       npm-minor-and-patch:
         update-types: [minor, patch]
+    ignore:
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: eslint
+        update-types: ["version-update:semver-major"]
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
     open-pull-requests-limit: 10
+  - package-ecosystem: npm
+    directory: /companion
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      companion-minor-and-patch:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 5
   - package-ecosystem: github-actions
     directory: /
     schedule:

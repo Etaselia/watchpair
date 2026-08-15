@@ -56,11 +56,13 @@ async function createInput(filePath, {
   duration = 6,
   audioTracks = 1,
   timestampOffset = 0,
+  frameRate = "24",
+  videoSize = "320x180",
 } = {}) {
   const argumentsList = [
     "-hide_banner", "-loglevel", "error", "-y",
     "-f", "lavfi", "-i",
-    "testsrc2=size=320x180:rate=24:duration=" + duration,
+    "testsrc2=size=" + videoSize + ":rate=" + frameRate + ":duration=" + duration,
   ];
   for (let index = 0; index < audioTracks; index += 1) {
     argumentsList.push(
@@ -232,6 +234,10 @@ test("publishes contiguous immutable epochs with every audio track", { timeout: 
 
     await waitFor(async () => {
       const playlist = await readPlaylist(videoAsset.filePath);
+      const preparation = await manager.getPreparation(descriptor);
+      if (preparation.error) {
+        assert.fail(preparation.error + "\n" + JSON.stringify(events));
+      }
       return playlist.includes("#EXT-X-ENDLIST") ? playlist : null;
     }, "Epoch HLS preparation did not finish");
 
@@ -247,9 +253,30 @@ test("publishes contiguous immutable epochs with every audio track", { timeout: 
       const names = playlistAssetNames(playlist);
       assert.equal(new Set(names).size, names.length);
     }
-    assert.ok(Math.abs(playlistDuration(video) - initial.sourceDuration) < 1.1);
-    assert.ok(Math.abs(playlistDuration(japanese) - initial.sourceDuration) < 1.1);
-    assert.ok(Math.abs(playlistDuration(english) - initial.sourceDuration) < 1.1);
+    assert.ok(Math.abs(playlistDuration(video) - initial.sourceDuration) < 0.05);
+    assert.ok(Math.abs(playlistDuration(japanese) - initial.sourceDuration) < 0.1);
+    assert.ok(Math.abs(playlistDuration(english) - initial.sourceDuration) < 0.1);
+
+    const manifest = JSON.parse(await readFile(
+      path.join(path.dirname(videoAsset.filePath), "..", "manifest.json"),
+      "utf8"
+    ));
+    let expectedSourceStart = 0;
+    for (const epoch of manifest.epochs) {
+      assert.ok(Math.abs(epoch.sourceStart - expectedSourceStart) <= 0.001);
+      for (const stream of [
+        epoch.streams.video,
+        epoch.streams.audio["1"],
+        epoch.streams.audio["2"],
+      ]) {
+        const segmentDuration = stream.segments.reduce(
+          (total, segment) => total + segment.duration,
+          0
+        );
+        assert.ok(Math.abs(stream.presentationDuration - segmentDuration) <= 0.001);
+      }
+      expectedSourceStart += epoch.streams.video.presentationDuration;
+    }
 
     for (const name of playlistAssetNames(video)) {
       assert.ok(
@@ -322,6 +349,128 @@ test("publishes contiguous immutable epochs with every audio track", { timeout: 
   }
 });
 
+test("keeps fractional-rate AV timelines aligned across 30-second epochs", { timeout: 90_000 }, async (t) => {
+  const cases = [
+    { label: "23.976 fps", rate: "24000/1001", fps: 24000 / 1001 },
+    { label: "29.97 fps", rate: "30000/1001", fps: 30000 / 1001 },
+    { label: "25 fps", rate: "25", fps: 25 },
+  ];
+
+  for (const [caseIndex, frameRate] of cases.entries()) {
+    await t.test(frameRate.label, { timeout: 30_000 }, async () => {
+      const directory = await mkdtemp(path.join(tmpdir(), "watchpair-hls-rate-"));
+      const input = path.join(directory, "input.mkv");
+      const requestedInputDuration = 96;
+      const sourceFrames = Math.ceil(requestedInputDuration * frameRate.fps - 1e-9);
+      const sourceDuration = sourceFrames / frameRate.fps;
+      let manager;
+
+      try {
+        await createInput(input, {
+          duration: requestedInputDuration,
+          audioTracks: 1,
+          frameRate: frameRate.rate,
+          videoSize: "160x90",
+        });
+        const descriptor = {
+          jobId: "fractional-rate-" + caseIndex,
+          fileIndex: 0,
+          fileSize: (await stat(input)).size,
+          contentFingerprint: String(caseIndex + 1).repeat(32),
+          inputPath: input,
+          sourceDuration,
+          videoCodec: "mpeg4",
+          videoPixelFormat: "yuv420p",
+          videoProfile: "Simple Profile",
+          videoStartTime: 0,
+          audioTracks: [audioTrack(1, 1, "eng", "English", true)],
+        };
+        manager = createHlsPlaybackManager({
+          ffmpegPath,
+          ffprobePath: ffprobeStatic.path,
+          cacheRoot: path.join(directory, "cache"),
+          segmentSeconds: 4,
+          epochSeconds: 30,
+          playableSeconds: 30,
+          playlistWaitMs: 10_000,
+        });
+
+        await manager.prepare(descriptor);
+        await waitFor(
+          () => manager.diagnostics().generations[0]?.complete,
+          frameRate.label + " generation did not complete"
+        );
+        const videoAsset = await manager.getAsset(descriptor, "video/index.m3u8");
+        const audioAsset = await manager.getAsset(descriptor, "audio/1/index.m3u8");
+        const playlist = await readPlaylist(videoAsset.filePath);
+        const audioPlaylist = await readPlaylist(audioAsset.filePath);
+        const manifest = JSON.parse(await readFile(
+          path.join(path.dirname(videoAsset.filePath), "..", "manifest.json"),
+          "utf8"
+        ));
+
+        assert.ok(manifest.epochs.length >= 4, JSON.stringify(manifest));
+        let presentationStart = 0;
+        let audioPresentationDuration = 0;
+        for (const epoch of manifest.epochs) {
+          assert.ok(
+            Math.abs(epoch.sourceStart - presentationStart) <= 0.001,
+            frameRate.label + " epoch " + epoch.index +
+              " starts at source " + epoch.sourceStart +
+              " but begins at presentation time " + presentationStart
+          );
+          const segmentDuration = epoch.streams.video.segments.reduce(
+            (total, segment) => total + segment.duration,
+            0
+          );
+          assert.ok(
+            Math.abs(epoch.streams.video.presentationDuration - segmentDuration) <= 0.001
+          );
+          const audio = epoch.streams.audio["1"];
+          const audioSegmentDuration = audio.segments.reduce(
+            (total, segment) => total + segment.duration,
+            0
+          );
+          assert.ok(Math.abs(audio.presentationDuration - audioSegmentDuration) <= 0.001);
+          audioPresentationDuration += audio.presentationDuration;
+          assert.ok(epoch.sourceDuration <= 30.001);
+          presentationStart += epoch.streams.video.presentationDuration;
+        }
+
+        const frameDuration = 1 / frameRate.fps;
+        assert.ok(
+          Math.abs(playlistDuration(playlist) - presentationStart) <= 0.001
+        );
+        assert.ok(
+          Math.abs(playlistDuration(audioPlaylist) - audioPresentationDuration) <= 0.001
+        );
+        assert.ok(
+          Math.abs(presentationStart - sourceDuration) <= frameDuration + 0.002,
+          frameRate.label + " presentation differs from source by " +
+            Math.abs(presentationStart - sourceDuration) + " seconds"
+        );
+        const maximumAvQuantization =
+          manifest.epochs.length * (1024 / 48_000) + frameDuration + 0.002;
+        assert.ok(
+          Math.abs(audioPresentationDuration - presentationStart) <= maximumAvQuantization,
+          frameRate.label + " audio and video timelines differ by " +
+            Math.abs(audioPresentationDuration - presentationStart) + " seconds"
+        );
+        if (frameRate.rate.includes("/")) {
+          const lastEpoch = manifest.epochs.at(-1);
+          assert.ok(
+            Math.abs(lastEpoch.sourceStart - lastEpoch.index * 30) > frameDuration,
+            frameRate.label + " did not exercise accumulated frame-boundary compensation"
+          );
+        }
+      } finally {
+        await manager?.shutdown();
+        await rm(directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 test("reports a later epoch failure while preserving the committed playable prefix", { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "watchpair-hls-late-failure-"));
   const input = path.join(directory, "input.mkv");
@@ -384,7 +533,7 @@ test("reports a later epoch failure while preserving the committed playable pref
   }
 });
 
-test("rejects an invalid v11 generation instead of promoting its missing first segment", { timeout: 8_000 }, async () => {
+test("rejects a complete v12 generation with an invalid terminal duration", { timeout: 8_000 }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "watchpair-hls-invalid-"));
   const cacheRoot = path.join(directory, "cache");
   const fingerprint = "cccccccccccccccccccccccccccccccc";
@@ -394,7 +543,7 @@ test("rejects an invalid v11 generation instead of promoting its missing first s
     cacheRoot,
     "content",
     fingerprint + "-" + fileSize,
-    "h264-hls-v11"
+    "h264-hls-v12"
   );
   const invalidDirectory = path.join(
     baseDirectory,
@@ -410,8 +559,12 @@ test("rejects an invalid v11 generation instead of promoting its missing first s
       path.join(invalidDirectory, "video", "epoch-000000-init.mp4"),
       "fake-init"
     );
+    await writeFile(
+      path.join(invalidDirectory, "video", "epoch-000000-segment-000000.m4s"),
+      "fake-segment"
+    );
     await writeFile(path.join(invalidDirectory, "manifest.json"), JSON.stringify({
-      cacheVersion: "hls-v11",
+      cacheVersion: "hls-v12",
       generationId: invalidGenerationId,
       fileSize,
       contentFingerprint: fingerprint,
@@ -428,15 +581,16 @@ test("rejects an invalid v11 generation instead of promoting its missing first s
         streams: {
           video: {
             init: "epoch-000000-init.mp4",
+            presentationDuration: 5.5,
             segments: [{
               uri: "epoch-000000-segment-000000.m4s",
-              duration: 1,
+              duration: 5.5,
             }],
           },
           audio: {},
         },
       }],
-      complete: false,
+      complete: true,
     }));
     await Promise.all([
       writeFile(
@@ -637,7 +791,7 @@ test("resumes only committed epochs after restart and discards a stale writer wo
       cacheRoot,
       "content",
       fingerprint + "-" + descriptor.fileSize,
-      "h264-hls-v11",
+      "h264-hls-v12",
       "generations",
       generationId
     );
@@ -650,7 +804,7 @@ test("resumes only committed epochs after restart and discards a stale writer wo
     await mkdir(staleDirectory, { recursive: true });
     await writeFile(path.join(staleDirectory, "partial.m4s"), "partial");
     await writeFile(path.join(generationPath, "writer.json"), JSON.stringify({
-      cacheVersion: "hls-v11",
+      cacheVersion: "hls-v12",
       generationId,
       token: "stale-token",
       epochIndex: manifestBefore.epochs.length,

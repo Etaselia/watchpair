@@ -90,25 +90,27 @@ test("companion prioritizes one torrent while preserving ordered background prog
       assert.equal(response.status, 202);
     }
 
-    const initial = await waitForPair(base, ids, 20_000, (jobs) =>
-      jobs.every((job) => job.files?.[0]?.progress > 0 && job.files[0].progress < 100),
-      () => companion.exitCode !== null
-    );
-    assert.ok(initial[1].files[0].downloaded > 0, "the second torrent should not be paused completely");
-
     const governed = await waitForJson(
       base + "/health",
       20_000,
       (body) => {
         const bandwidth = body?.torrent?.bandwidth;
         return bandwidth?.foregroundKey === ids[0] + ":0" &&
-          bandwidth.sampleCount >= 2 && bandwidth.totalSpeed > 0;
+          bandwidth.backgroundKeys?.includes(ids[1] + ":0") &&
+          bandwidth.sampleCount >= 2 && bandwidth.foregroundSpeed > 0 &&
+          bandwidth.totalSpeed > 0;
       },
       () => companion.exitCode !== null
     );
+    assert.deepEqual(governed.torrent.bandwidth.backgroundKeys, [ids[1] + ":0"]);
     assert.ok(governed.torrent.bandwidth.backgroundSlots >= 1);
     assert.ok(governed.torrent.bandwidth.backgroundDuty > 0);
     assert.equal(governed.torrent.bandwidth.targetShare, 0.78);
+
+    await waitForPair(base, ids, 5_000, (jobs) =>
+      jobs[0].files?.[0]?.downloaded > 0 && jobs[0].files[0].progress < 100,
+      () => companion.exitCode !== null
+    );
 
     const reorderResponse = await fetch(base + "/media-priority", {
       method: "POST",

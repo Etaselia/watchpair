@@ -14,12 +14,24 @@ import {
   Volume2,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type {
   VoicePresence,
   VoiceSignalType,
   WatchSession,
 } from "../lib/session-types";
+import {
+  createVoiceAutoJoinState,
+  reconcileVoiceAutoJoin,
+  suppressVoiceAutoJoin,
+  voiceAutoJoinFailureMessage,
+  voiceMicrophoneFailureMessage,
+} from "../lib/voice-auto-join.mjs";
+import {
+  createPendingVoiceCaptureRegistry,
+  createVoiceCaptureGenerationGuard,
+  updateVoicePeersUntilQuiescent,
+} from "../lib/voice-capture-generation.mjs";
 
 interface PeerState {
   pc: RTCPeerConnection;
@@ -33,6 +45,13 @@ interface PeerState {
 interface AudioDevice {
   id: string;
   label: string;
+}
+
+class VoiceCaptureCancelledError extends Error {
+  constructor() {
+    super("Voice capture was cancelled.");
+    this.name = "VoiceCaptureCancelledError";
+  }
 }
 
 export interface RoomVoiceController {
@@ -54,6 +73,7 @@ export interface RoomVoiceController {
   speakingIds: Set<string>;
   selfSpeaking: boolean;
   error: string;
+  notice: string;
   participants: WatchSession["participants"];
   start: () => Promise<void>;
   stop: () => void;
@@ -144,6 +164,13 @@ function sameIds(left: Set<string>, right: Set<string>) {
   return true;
 }
 
+function activeRemoteVoiceParticipants(session: WatchSession | null, deviceId: string) {
+  if (!deviceId) return [];
+  return (session?.participants || []).filter(
+    (participant) => participant.deviceId !== deviceId && participant.voice.enabled
+  );
+}
+
 export function useRoomVoice({
   session,
   deviceId,
@@ -166,6 +193,9 @@ export function useRoomVoice({
   const [connectedPeers, setConnectedPeers] = useState(0);
   const [speakingIds, setSpeakingIds] = useState<Set<string>>(new Set());
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [captureGuard] = useState(() => createVoiceCaptureGenerationGuard());
+  const [pendingCaptureRegistry] = useState(() => createPendingVoiceCaptureRegistry());
   const peersRef = useRef(new Map<string, PeerState>());
   const seenSignalsRef = useRef(new Set<string>());
   const signalQueueRef = useRef(Promise.resolve());
@@ -178,12 +208,16 @@ export function useRoomVoice({
   const monitorFrameRef = useRef(0);
   const speakingUntilRef = useRef(new Map<string, number>());
   const masterVolumeRef = useRef(1);
+  const inputGainRef = useRef(1);
   const participantVolumesRef = useRef<Record<string, number>>({});
   const enabledRef = useRef(false);
+  const startingRef = useRef(false);
+  const autoJoinStateRef = useRef(createVoiceAutoJoinState());
   const mutedRef = useRef(false);
   const deafenedRef = useRef(false);
   const outputDeviceRef = useRef("");
   const sessionRef = useRef(session);
+  const captureSessionTokenRef = useRef(session?.token ?? null);
   const signalRef = useRef(onSignal);
   const presenceRef = useRef(onPresence);
 
@@ -344,66 +378,197 @@ export function useRoomVoice({
 
   const replaceCapture = useCallback(async (
     nextInputDeviceId: string,
-    nextNoiseSuppression: boolean
+    nextNoiseSuppression: boolean,
+    isCurrent: () => boolean
   ) => {
-    const raw = await navigator.mediaDevices.getUserMedia({
-      audio: voiceConstraints(nextInputDeviceId, nextNoiseSuppression),
-      video: false,
-    });
-    const rawTrack = raw.getAudioTracks()[0];
-    if (!rawTrack) throw new Error("The selected microphone did not provide audio.");
-    rawTrack.contentHint = "speech";
+    const pendingCapture = pendingCaptureRegistry.begin();
+    let outboundTrack: MediaStreamTrack | null = null;
+    const senderChanges: Array<{
+      remoteId: string;
+      peer: PeerState;
+      sender: RTCRtpSender;
+      previousTrack: MediaStreamTrack | null;
+      added: boolean;
+    }> = [];
+    const requireCurrent = () => {
+      if (!isCurrent()) throw new VoiceCaptureCancelledError();
+    };
+    const isPeerCurrent = (remoteId: string, peer: PeerState) => Boolean(
+      peersRef.current.get(remoteId) === peer &&
+      peer.pc.signalingState !== "closed" &&
+      peer.pc.connectionState !== "closed"
+    );
+    const disposePreparedCapture = () => {
+      pendingCaptureRegistry.dispose(pendingCapture);
+    };
 
-    const context = new AudioContext({ latencyHint: "interactive", sampleRate: 48_000 });
-    await context.resume();
-    const source = context.createMediaStreamSource(raw);
-    const gain = context.createGain();
-    gain.gain.value = inputGain;
-    const analyser = context.createAnalyser();
-    analyser.fftSize = 256;
-    analyser.smoothingTimeConstant = 0.85;
-    const destination = context.createMediaStreamDestination();
-    source.connect(gain);
-    gain.connect(analyser);
-    analyser.connect(destination);
-    const outboundTrack = destination.stream.getAudioTracks()[0];
-    outboundTrack.enabled = !mutedRef.current;
-    outboundTrack.contentHint = "speech";
+    try {
+      const nextRaw = await navigator.mediaDevices.getUserMedia({
+        audio: voiceConstraints(nextInputDeviceId, nextNoiseSuppression),
+        video: false,
+      });
+      if (!pendingCaptureRegistry.attachRawStream(pendingCapture, nextRaw)) {
+        throw new VoiceCaptureCancelledError();
+      }
+      requireCurrent();
+      const rawTrack = nextRaw.getAudioTracks()[0];
+      if (!rawTrack) throw new Error("The selected microphone did not provide audio.");
+      rawTrack.contentHint = "speech";
 
-    for (const peer of peersRef.current.values()) {
-      const sender = peer.pc.getSenders().find((candidate) => candidate.track?.kind === "audio");
-      if (sender) await sender.replaceTrack(outboundTrack);
-      else peer.pc.addTrack(outboundTrack, new MediaStream([outboundTrack]));
+      const nextContext = new AudioContext({ latencyHint: "interactive", sampleRate: 48_000 });
+      if (!pendingCaptureRegistry.attachContext(pendingCapture, nextContext)) {
+        throw new VoiceCaptureCancelledError();
+      }
+      await nextContext.resume();
+      requireCurrent();
+      const source = nextContext.createMediaStreamSource(nextRaw);
+      const gain = nextContext.createGain();
+      if (!pendingCaptureRegistry.attachGainNode(
+        pendingCapture,
+        gain,
+        inputGainRef.current
+      )) {
+        throw new VoiceCaptureCancelledError();
+      }
+      const analyser = nextContext.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.85;
+      const destination = nextContext.createMediaStreamDestination();
+      source.connect(gain);
+      gain.connect(analyser);
+      analyser.connect(destination);
+      const nextOutboundTrack = destination.stream.getAudioTracks()[0];
+      if (!nextOutboundTrack) throw new Error("The microphone processor did not provide audio.");
+      outboundTrack = nextOutboundTrack;
+      nextOutboundTrack.contentHint = "speech";
+      if (!pendingCaptureRegistry.attachOutboundTrack(
+        pendingCapture,
+        nextOutboundTrack,
+        mutedRef.current
+      )) {
+        throw new VoiceCaptureCancelledError();
+      }
+
+      await updateVoicePeersUntilQuiescent({
+        snapshotPeers: () => Array.from(peersRef.current.entries()),
+        isPeerCurrent,
+        requireCurrent,
+        updatePeer: async (remoteId: string, peer: PeerState) => {
+          const sender = peer.pc.getSenders().find(
+            (candidate) => candidate.track?.kind === "audio"
+          );
+          if (sender) {
+            const previousTrack = sender.track;
+            await sender.replaceTrack(nextOutboundTrack);
+            senderChanges.push({
+              remoteId,
+              peer,
+              sender,
+              previousTrack,
+              added: false,
+            });
+          } else {
+            const addedSender = peer.pc.addTrack(
+              nextOutboundTrack,
+              new MediaStream([nextOutboundTrack])
+            );
+            senderChanges.push({
+              remoteId,
+              peer,
+              sender: addedSender,
+              previousTrack: null,
+              added: true,
+            });
+          }
+        },
+        commit: () => {
+          const peerSnapshots = Array.from(peersRef.current.entries())
+            .filter(([remoteId, peer]) => isPeerCurrent(remoteId, peer));
+          const remoteLevels = new Map<string, {
+            peer: PeerState;
+            analyser: AnalyserNode;
+            levelData: Uint8Array<ArrayBuffer>;
+          }>();
+          for (const [remoteId, peer] of peerSnapshots) {
+            const remoteStream = peer.audio?.srcObject;
+            if (!(remoteStream instanceof MediaStream)) continue;
+            const remoteAnalyser = nextContext.createAnalyser();
+            remoteAnalyser.fftSize = 256;
+            remoteAnalyser.smoothingTimeConstant = 0.85;
+            nextContext.createMediaStreamSource(remoteStream).connect(remoteAnalyser);
+            remoteLevels.set(remoteId, {
+              peer,
+              analyser: remoteAnalyser,
+              levelData: new Uint8Array(remoteAnalyser.fftSize),
+            });
+          }
+
+          // Quiescence, the ownership check, and the ref swap are synchronous.
+          // Any peer added before this point received the new track in a prior pass.
+          requireCurrent();
+          const previousRaw = rawStreamRef.current;
+          const previousOutboundTrack = outboundTrackRef.current;
+          const previousContext = audioContextRef.current;
+          if (!pendingCaptureRegistry.commit(pendingCapture, () => {
+            nextOutboundTrack.enabled = !mutedRef.current;
+            gain.gain.value = inputGainRef.current;
+            rawStreamRef.current = nextRaw;
+            outboundTrackRef.current = nextOutboundTrack;
+            audioContextRef.current = nextContext;
+            gainNodeRef.current = gain;
+            localAnalyserRef.current = analyser;
+            localLevelDataRef.current = new Uint8Array(analyser.fftSize);
+          })) {
+            throw new VoiceCaptureCancelledError();
+          }
+          previousRaw?.getTracks().forEach((track) => track.stop());
+          previousOutboundTrack?.stop();
+          void previousContext?.close().catch(() => {});
+
+          for (const [remoteId, peer] of peerSnapshots) {
+            const remoteLevel = remoteLevels.get(remoteId);
+            peer.analyser = remoteLevel?.peer === peer ? remoteLevel.analyser : null;
+            peer.levelData = remoteLevel?.peer === peer ? remoteLevel.levelData : null;
+          }
+        },
+      });
+    } catch (caught) {
+      for (const change of senderChanges.reverse()) {
+        if (!isPeerCurrent(change.remoteId, change.peer)) continue;
+        if (change.sender.track !== outboundTrack) continue;
+        try {
+          if (change.added) change.peer.pc.removeTrack(change.sender);
+          else await change.sender.replaceTrack(change.previousTrack);
+        } catch {
+          // The peer may already be closed by the cancellation that brought us here.
+        }
+      }
+      disposePreparedCapture();
+      throw caught;
     }
+  }, [pendingCaptureRegistry]);
 
-    rawStreamRef.current?.getTracks().forEach((track) => track.stop());
-    outboundTrackRef.current?.stop();
-    await audioContextRef.current?.close().catch(() => {});
-    rawStreamRef.current = raw;
-    outboundTrackRef.current = outboundTrack;
-    audioContextRef.current = context;
-    gainNodeRef.current = gain;
-    localAnalyserRef.current = analyser;
-    localLevelDataRef.current = new Uint8Array(analyser.fftSize);
-
-    for (const peer of peersRef.current.values()) {
-      peer.analyser = null;
-      peer.levelData = null;
-      const remoteStream = peer.audio?.srcObject;
-      if (!(remoteStream instanceof MediaStream)) continue;
-      const remoteAnalyser = context.createAnalyser();
-      remoteAnalyser.fftSize = 256;
-      remoteAnalyser.smoothingTimeConstant = 0.85;
-      context.createMediaStreamSource(remoteStream).connect(remoteAnalyser);
-      peer.analyser = remoteAnalyser;
-      peer.levelData = new Uint8Array(remoteAnalyser.fftSize);
+  const stopVoice = useCallback((
+    suppressAutoJoin: boolean,
+    publishPresence = true
+  ) => {
+    captureGuard.cancel();
+    pendingCaptureRegistry.disposeCurrent();
+    if (suppressAutoJoin) {
+      autoJoinStateRef.current = suppressVoiceAutoJoin(
+        activeRemoteVoiceParticipants(sessionRef.current, deviceId).length
+      );
     }
-  }, [inputGain]);
-
-  const stop = useCallback(() => {
     const wasEnabled = enabledRef.current;
     enabledRef.current = false;
-    if (wasEnabled) playVoiceCue("disconnect");
+    startingRef.current = false;
+    if (wasEnabled) {
+      try {
+        playVoiceCue("disconnect");
+      } catch {
+        // Audio cues are optional; capture teardown must always continue.
+      }
+    }
     for (const remoteId of Array.from(peersRef.current.keys())) closePeer(remoteId);
     rawStreamRef.current?.getTracks().forEach((track) => track.stop());
     outboundTrackRef.current?.stop();
@@ -423,51 +588,104 @@ export function useRoomVoice({
     setConnectedPeers(0);
     setSpeakingIds(new Set());
     setSettingsOpen(false);
-    presenceRef.current(SILENT_PRESENCE);
-  }, [closePeer]);
+    setNotice("");
+    if (publishPresence) presenceRef.current(SILENT_PRESENCE);
+  }, [captureGuard, closePeer, deviceId, pendingCaptureRegistry]);
 
-  const start = useCallback(async () => {
-    if (enabledRef.current || busy) return;
+  const stop = useCallback(() => stopVoice(true), [stopVoice]);
+
+  useLayoutEffect(() => {
+    const nextToken = session?.token ?? null;
+    if (captureSessionTokenRef.current === nextToken) return;
+    captureSessionTokenRef.current = nextToken;
+    if (enabledRef.current || startingRef.current) stopVoice(false, false);
+    else {
+      captureGuard.cancel();
+      pendingCaptureRegistry.disposeCurrent();
+    }
+  }, [captureGuard, pendingCaptureRegistry, session?.token, stopVoice]);
+
+  const startVoice = useCallback(async (autoJoinerName: string | null) => {
+    if (enabledRef.current || startingRef.current) return;
+    const captureLease = captureGuard.begin(captureSessionTokenRef.current);
+    const captureIsCurrent = () => Boolean(
+      startingRef.current &&
+      captureGuard.isCurrent(captureLease, captureSessionTokenRef.current)
+    );
+    startingRef.current = true;
     setBusy(true);
     setError("");
+    setNotice(
+      autoJoinerName
+        ? `${autoJoinerName} joined voice. Joining automatically…`
+        : ""
+    );
     try {
-      await replaceCapture(inputDeviceId, noiseSuppression);
+      await replaceCapture(inputDeviceId, noiseSuppression, captureIsCurrent);
+      if (!captureIsCurrent()) throw new VoiceCaptureCancelledError();
       for (const signal of sessionRef.current?.voiceSignals || []) {
         seenSignalsRef.current.add(signal.id);
       }
       enabledRef.current = true;
+      startingRef.current = false;
       setEnabled(true);
       setBusy(false);
-      playVoiceCue("connect");
-      presenceRef.current({ enabled: true, muted: false, deafened: false });
-      await refreshDevices();
+      setNotice("");
+      try {
+        playVoiceCue("connect");
+      } catch {
+        // Audio cues are optional and must not affect an established capture.
+      }
+      presenceRef.current({
+        enabled: true,
+        muted: mutedRef.current,
+        deafened: deafenedRef.current,
+      });
+      void refreshDevices().catch(() => {});
       reconcilePeers();
     } catch (caught) {
-      setBusy(false);
-      setError(caught instanceof Error ? caught.message : "Microphone access failed.");
-      stop();
+      if (
+        caught instanceof VoiceCaptureCancelledError ||
+        !captureGuard.isCurrent(captureLease, captureSessionTokenRef.current)
+      ) {
+        if (captureGuard.owns(captureLease)) stopVoice(false, false);
+        return;
+      }
+      autoJoinStateRef.current = suppressVoiceAutoJoin(
+        activeRemoteVoiceParticipants(sessionRef.current, deviceId).length
+      );
+      stopVoice(false, false);
+      setError(
+        autoJoinerName
+          ? voiceAutoJoinFailureMessage(autoJoinerName, caught)
+          : voiceMicrophoneFailureMessage(caught)
+      );
     }
   }, [
-    busy,
+    captureGuard,
+    deviceId,
     inputDeviceId,
     noiseSuppression,
     reconcilePeers,
     refreshDevices,
     replaceCapture,
-    stop,
+    stopVoice,
   ]);
+
+  const start = useCallback(() => startVoice(null), [startVoice]);
 
   const toggleMute = useCallback(() => {
     const next = !mutedRef.current;
     mutedRef.current = next;
     if (outboundTrackRef.current) outboundTrackRef.current.enabled = !next;
+    pendingCaptureRegistry.setMuted(next);
     setMuted(next);
     presenceRef.current({
       enabled: enabledRef.current,
       muted: next,
       deafened: deafenedRef.current,
     });
-  }, []);
+  }, [pendingCaptureRegistry]);
 
   const toggleDeafen = useCallback(() => {
     const next = !deafenedRef.current;
@@ -487,16 +705,29 @@ export function useRoomVoice({
     setInputDeviceIdState(id);
     localStorage.setItem("watchpair-voice-input", id);
     if (!enabledRef.current) return;
+    const captureLease = captureGuard.begin(captureSessionTokenRef.current);
+    const captureIsCurrent = () => Boolean(
+      enabledRef.current &&
+      captureGuard.isCurrent(captureLease, captureSessionTokenRef.current)
+    );
     setBusy(true);
     try {
-      await replaceCapture(id, noiseSuppression);
+      await replaceCapture(id, noiseSuppression, captureIsCurrent);
+      if (!captureIsCurrent()) throw new VoiceCaptureCancelledError();
       setError("");
     } catch (caught) {
+      if (
+        caught instanceof VoiceCaptureCancelledError ||
+        !captureGuard.isCurrent(captureLease, captureSessionTokenRef.current)
+      ) {
+        if (captureGuard.owns(captureLease)) stopVoice(false, false);
+        return;
+      }
       setError(caught instanceof Error ? caught.message : "Could not switch microphones.");
     } finally {
-      setBusy(false);
+      if (captureGuard.owns(captureLease)) setBusy(false);
     }
-  }, [noiseSuppression, replaceCapture]);
+  }, [captureGuard, noiseSuppression, replaceCapture, stopVoice]);
 
   const setOutputDevice = useCallback(async (id: string) => {
     outputDeviceRef.current = id;
@@ -513,23 +744,38 @@ export function useRoomVoice({
     setNoiseSuppressionState(next);
     localStorage.setItem("watchpair-voice-noise-suppression", next ? "1" : "0");
     if (!enabledRef.current) return;
+    const captureLease = captureGuard.begin(captureSessionTokenRef.current);
+    const captureIsCurrent = () => Boolean(
+      enabledRef.current &&
+      captureGuard.isCurrent(captureLease, captureSessionTokenRef.current)
+    );
     setBusy(true);
     try {
-      await replaceCapture(inputDeviceId, next);
+      await replaceCapture(inputDeviceId, next, captureIsCurrent);
+      if (!captureIsCurrent()) throw new VoiceCaptureCancelledError();
       setError("");
     } catch (caught) {
+      if (
+        caught instanceof VoiceCaptureCancelledError ||
+        !captureGuard.isCurrent(captureLease, captureSessionTokenRef.current)
+      ) {
+        if (captureGuard.owns(captureLease)) stopVoice(false, false);
+        return;
+      }
       setError(caught instanceof Error ? caught.message : "Could not update microphone processing.");
     } finally {
-      setBusy(false);
+      if (captureGuard.owns(captureLease)) setBusy(false);
     }
-  }, [inputDeviceId, replaceCapture]);
+  }, [captureGuard, inputDeviceId, replaceCapture, stopVoice]);
 
   const setInputGain = useCallback((next: number) => {
     const gain = Math.max(0, Math.min(2, next));
+    inputGainRef.current = gain;
     setInputGainState(gain);
     if (gainNodeRef.current) gainNodeRef.current.gain.value = gain;
+    pendingCaptureRegistry.setGain(gain);
     localStorage.setItem("watchpair-voice-gain", String(gain));
-  }, []);
+  }, [pendingCaptureRegistry]);
 
   const applyVolumes = useCallback(() => {
     for (const [remoteId, peer] of peersRef.current) {
@@ -589,7 +835,12 @@ export function useRoomVoice({
           .map(([id, volume]) => [id, Math.max(0, Math.min(1, volume))])
       );
       setParticipantVolumes(participantVolumesRef.current);
-      if (Number.isFinite(savedGain) && savedGain >= 0 && savedGain <= 2) setInputGainState(savedGain);
+      if (Number.isFinite(savedGain) && savedGain >= 0 && savedGain <= 2) {
+        inputGainRef.current = savedGain;
+        setInputGainState(savedGain);
+        if (gainNodeRef.current) gainNodeRef.current.gain.value = savedGain;
+        pendingCaptureRegistry.setGain(savedGain);
+      }
       if (savedSuppression === "0") setNoiseSuppressionState(false);
       void refreshDevices();
     }, 0);
@@ -598,7 +849,7 @@ export function useRoomVoice({
       window.clearTimeout(timer);
       navigator.mediaDevices.removeEventListener?.("devicechange", refreshDevices);
     };
-  }, [refreshDevices]);
+  }, [pendingCaptureRegistry, refreshDevices]);
 
   useEffect(() => {
     if (!enabled) return;
@@ -666,10 +917,14 @@ export function useRoomVoice({
     return () => cancelAnimationFrame(monitorFrameRef.current);
   }, [deviceId, enabled]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    captureGuard.mount();
     const peers = peersRef.current;
     return () => {
+      captureGuard.unmount();
+      pendingCaptureRegistry.disposeCurrent();
       enabledRef.current = false;
+      startingRef.current = false;
       for (const peer of peers.values()) {
         peer.audio?.pause();
         peer.pc.close();
@@ -677,16 +932,36 @@ export function useRoomVoice({
       peers.clear();
       rawStreamRef.current?.getTracks().forEach((track) => track.stop());
       outboundTrackRef.current?.stop();
+      rawStreamRef.current = null;
+      outboundTrackRef.current = null;
       void audioContextRef.current?.close().catch(() => {});
+      audioContextRef.current = null;
+      gainNodeRef.current = null;
+      localAnalyserRef.current = null;
+      localLevelDataRef.current = null;
     };
-  }, []);
+  }, [captureGuard, pendingCaptureRegistry]);
 
   useEffect(() => {
     seenSignalsRef.current.clear();
     signalQueueRef.current = Promise.resolve();
-    if (!enabledRef.current) return;
-    stop();
-  }, [session?.token, stop]);
+    autoJoinStateRef.current = createVoiceAutoJoinState();
+    if (!enabledRef.current && !startingRef.current) return;
+    stopVoice(false, false);
+  }, [session?.token, stopVoice]);
+
+  useEffect(() => {
+    if (!deviceId) return;
+    const remoteParticipants = activeRemoteVoiceParticipants(session, deviceId);
+    const update = reconcileVoiceAutoJoin(autoJoinStateRef.current, {
+      remoteCount: remoteParticipants.length,
+      localEnabled: enabledRef.current,
+      localStarting: startingRef.current,
+    });
+    autoJoinStateRef.current = update.state;
+    if (!update.shouldStart) return;
+    void startVoice(remoteParticipants[0]?.name || "Someone");
+  }, [deviceId, session, startVoice]);
 
   return {
     enabled,
@@ -707,6 +982,7 @@ export function useRoomVoice({
     speakingIds,
     selfSpeaking: speakingIds.has(deviceId),
     error,
+    notice,
     participants: session?.participants || [],
     start,
     stop,
@@ -735,6 +1011,7 @@ export function VoiceDock({ voice }: { voice: RoomVoiceController }) {
           {voice.busy ? <LoaderCircle className="spin" /> : <Mic />}
           {voice.busy ? "Opening microphone" : "Join voice"}
         </button>
+        {voice.notice && <span className="voice-processing" role="status">{voice.notice}</span>}
         {voice.error && <span className="voice-error" role="alert">{voice.error}</span>}
       </aside>
     );

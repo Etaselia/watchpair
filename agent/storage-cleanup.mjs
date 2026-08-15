@@ -4,6 +4,102 @@ import path from "node:path";
 export const MANAGED_JOB_DIRECTORY = /^[a-zA-Z0-9-]{8,80}$/;
 const DEFAULT_SIZE_CONCURRENCY = 8;
 
+export function createSingleFlightOperation({
+  run,
+  createId,
+  now = Date.now,
+  historyLimit = 20,
+}) {
+  if (typeof run !== "function") throw new TypeError("A background operation requires a run function.");
+  let sequence = 0;
+  let active = null;
+  let latest = null;
+  const records = new Map();
+
+  const operationId = typeof createId === "function"
+    ? createId
+    : () => `${now()}-${++sequence}`;
+  const snapshot = (record) => record
+    ? {
+        id: record.id,
+        status: record.status,
+        startedAt: record.startedAt,
+        finishedAt: record.finishedAt,
+        result: record.result,
+        error: record.error,
+      }
+    : {
+        id: null,
+        status: "idle",
+        startedAt: null,
+        finishedAt: null,
+        result: null,
+        error: null,
+      };
+  const trimHistory = () => {
+    const limit = Math.max(1, Math.floor(Number(historyLimit) || 20));
+    for (const [id, record] of records) {
+      if (records.size <= limit) break;
+      if (record === active) continue;
+      records.delete(id);
+    }
+  };
+
+  const start = (input) => {
+    if (active) {
+      return {
+        started: false,
+        operation: snapshot(active),
+        completion: active.completion,
+      };
+    }
+
+    const record = {
+      id: String(operationId()),
+      status: "running",
+      startedAt: now(),
+      finishedAt: null,
+      result: null,
+      error: null,
+      completion: null,
+    };
+    active = record;
+    latest = record;
+    records.set(record.id, record);
+    trimHistory();
+    record.completion = Promise.resolve()
+      .then(() => run(input))
+      .then(
+        (result) => {
+          record.status = "complete";
+          record.result = result;
+          record.finishedAt = now();
+          return snapshot(record);
+        },
+        (error) => {
+          record.status = "error";
+          record.error = error instanceof Error ? error.message : String(error || "Operation failed.");
+          record.finishedAt = now();
+          return snapshot(record);
+        }
+      )
+      .finally(() => {
+        if (active === record) active = null;
+      });
+    return { started: true, operation: snapshot(record), completion: record.completion };
+  };
+
+  return {
+    start,
+    get(id = null) {
+      if (id !== null && id !== undefined && id !== "") {
+        return records.has(String(id)) ? snapshot(records.get(String(id))) : null;
+      }
+      return snapshot(latest);
+    },
+  };
+}
+
 export function createSingleFlightCache({
   load,
   ttlMs = 60_000,

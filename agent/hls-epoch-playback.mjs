@@ -23,11 +23,12 @@ import {
 } from "./process-registry.mjs";
 import { mediaDurationFromProbe } from "./media-chapters.mjs";
 
-const CACHE_VERSION = "hls-v11";
+const CACHE_VERSION = "hls-v12";
 const DEFAULT_SEGMENT_SECONDS = 4;
 const DEFAULT_PLAYABLE_SECONDS = 120;
 const DEFAULT_EPOCH_SECONDS = 30;
 const FRAGMENT_VALIDATION_TIMEOUT_MS = 15_000;
+const VIDEO_END_TOLERANCE_SECONDS = 0.025;
 const GENERATION_POINTER = "current.json";
 const WORKING_POINTER = "working.json";
 const MANIFEST_FILE = "manifest.json";
@@ -42,6 +43,10 @@ const COPYABLE_H264_PROFILES = new Set([
 
 function rounded(value) {
   return Math.round(Number(value || 0) * 1000) / 1000;
+}
+
+function timelineRounded(value) {
+  return Math.round(Number(value || 0) * 1_000_000) / 1_000_000;
 }
 
 function createDeferred() {
@@ -345,9 +350,21 @@ function publicMediaPlaylist(manifest, kind, trackId = null) {
   return lines.join("\n");
 }
 
+function streamPresentationDuration(stream) {
+  const recorded = Number(stream?.presentationDuration);
+  if (Number.isFinite(recorded) && recorded > 0) return recorded;
+  return Array.isArray(stream?.segments)
+    ? stream.segments.reduce((total, segment) => total + Number(segment.duration || 0), 0)
+    : 0;
+}
+
 function manifestPreparedSeconds(manifest) {
   const last = manifest.epochs.at(-1);
-  return last ? rounded(Number(last.sourceStart) + Number(last.sourceDuration)) : 0;
+  return last
+    ? timelineRounded(
+        Number(last.sourceStart) + streamPresentationDuration(streamForEpoch(last, "video"))
+      )
+    : 0;
 }
 
 function expectedAudioIds(audioTracks) {
@@ -424,12 +441,15 @@ async function validateManifestAssets(
     : [];
   if (!sameStringArray(descriptorIds, manifestIds)) return false;
 
+  let expectedSourceStart = 0;
   for (const [index, epoch] of manifest.epochs.entries()) {
     if (
       Number(epoch.index) !== index ||
-      Math.abs(Number(epoch.sourceStart) - index * epochSeconds) > 0.05 ||
+      !Number.isFinite(Number(epoch.sourceStart)) ||
+      Math.abs(Number(epoch.sourceStart) - expectedSourceStart) > 0.001 ||
       !Number.isFinite(Number(epoch.sourceDuration)) ||
       Number(epoch.sourceDuration) <= 0 ||
+      Number(epoch.sourceDuration) > epochSeconds + 0.001 ||
       epoch.validatedStart !== true
     ) return false;
     const requiredStreams = [
@@ -447,23 +467,35 @@ async function validateManifestAssets(
         !stream ||
         !(await referencedAssetExists(directory, stream.init)) ||
         !Array.isArray(stream.segments) ||
-        !stream.segments.length
+        !stream.segments.length ||
+        !Number.isFinite(Number(stream.presentationDuration)) ||
+        Number(stream.presentationDuration) <= 0
       ) return false;
+      let segmentDuration = 0;
       for (const segment of stream.segments) {
         if (
           !Number.isFinite(Number(segment.duration)) ||
           Number(segment.duration) <= 0 ||
           !(await referencedAssetExists(directory, segment.uri))
         ) return false;
+        segmentDuration += Number(segment.duration);
+      }
+      if (Math.abs(Number(stream.presentationDuration) - segmentDuration) > 0.001) {
+        return false;
       }
     }
+    expectedSourceStart = timelineRounded(
+      Number(epoch.sourceStart) +
+      streamPresentationDuration(streamForEpoch(epoch, "video"))
+    );
   }
 
   const prepared = manifestPreparedSeconds(manifest);
-  if (prepared > Number(manifest.sourceDuration) + Math.max(2, epochSeconds)) return false;
+  const terminalDurationTolerance = Math.max(0.25, segmentSeconds * 0.1);
+  if (prepared > Number(manifest.sourceDuration) + terminalDurationTolerance) return false;
   if (
     manifest.complete &&
-    Math.abs(prepared - Number(manifest.sourceDuration)) > Math.max(2, epochSeconds * 0.2)
+    Math.abs(prepared - Number(manifest.sourceDuration)) > terminalDurationTolerance
   ) return false;
   return true;
 }
@@ -1036,14 +1068,14 @@ export function createHlsPlaybackManager({
       ...(state.pipeline?.arguments.decode || []),
       ...renderInputArguments(profile),
       ...(descriptor.inputArguments || []),
-      "-ss", epochStart.toFixed(3),
+      "-ss", epochStart.toFixed(6),
       "-fflags", "+genpts+discardcorrupt",
       "-i", state.inputPath,
     ];
     const videoArguments = [
       "-map", "0:v:0",
       "-an", "-sn", "-dn",
-      "-t", requestedDuration.toFixed(3),
+      "-t", requestedDuration.toFixed(6),
       ...(state.pipeline
         ? [
             ...normalizedVideoFilterArguments(state.pipeline.arguments.filter),
@@ -1063,7 +1095,7 @@ export function createHlsPlaybackManager({
       return [
         "-map", "0:" + track.streamIndex,
         "-vn", "-sn", "-dn",
-        "-t", requestedDuration.toFixed(3),
+        "-t", requestedDuration.toFixed(6),
         "-c:a", "aac",
         "-threads", "1",
         "-b:a", "192k",
@@ -1156,9 +1188,13 @@ export function createHlsPlaybackManager({
       const destination = path.join(destinationDirectory, name);
       await rm(destination, { force: true });
       await rename(source, destination);
-      segments.push({ uri: name, duration: rounded(segment.duration) });
+      segments.push({ uri: name, duration: timelineRounded(segment.duration) });
     }
-    return { init: initName, segments };
+    return {
+      init: initName,
+      segments,
+      presentationDuration: timelineRounded(playlist.duration),
+    };
   }
 
   async function commitEpoch(
@@ -1189,12 +1225,19 @@ export function createHlsPlaybackManager({
       );
     }
 
+    const presentedEnd = epochStart + video.presentationDuration;
+    const requestedEnd = epochStart + requestedDuration;
+    const endTolerance = Math.max(0.25, segmentSeconds * 0.1);
     const reachesEnd =
-      epochStart + requestedDuration >= state.sourceDuration - Math.max(0.25, segmentSeconds * 0.1);
+      presentedEnd >= state.sourceDuration - VIDEO_END_TOLERANCE_SECONDS ||
+      (
+        requestedEnd >= state.sourceDuration - 0.001 &&
+        presentedEnd >= state.sourceDuration - endTolerance
+      );
     const epoch = {
       index: epochIndex,
-      sourceStart: rounded(epochStart),
-      sourceDuration: rounded(requestedDuration),
+      sourceStart: timelineRounded(epochStart),
+      sourceDuration: timelineRounded(requestedDuration),
       validatedStart: true,
       streams: { video, audio },
       committedAt: Date.now(),
@@ -1247,6 +1290,7 @@ export function createHlsPlaybackManager({
       epochIndex,
       sourceStart: epoch.sourceStart,
       sourceDuration: epoch.sourceDuration,
+      presentationDuration: video.presentationDuration,
       contiguousReadySeconds: state.contiguousReadySeconds,
       complete: state.complete,
     });
@@ -1263,7 +1307,7 @@ export function createHlsPlaybackManager({
     state.currentEpoch = epochIndex;
     state.rendering = true;
     await ensurePipeline(state, profile);
-    const epochStart = epochIndex * epochLength;
+    const epochStart = manifestPreparedSeconds(state.manifest);
     const requestedDuration = Math.min(epochLength, state.sourceDuration - epochStart);
     if (!(requestedDuration > 0)) {
       throw new Error("The HLS epoch begins beyond the source duration.");

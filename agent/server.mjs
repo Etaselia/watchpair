@@ -55,6 +55,7 @@ import {
 } from "./media-chapters.mjs";
 import { fingerprintPath } from "./media-fingerprint.mjs";
 import {
+  createSingleFlightOperation,
   createSingleFlightCache,
   MANAGED_JOB_DIRECTORY,
   pathSize,
@@ -2721,6 +2722,40 @@ async function runStorageCleanup({ force = false } = {}) {
   return cleanupPromise;
 }
 
+const storageCleanupOperation = createSingleFlightOperation({
+  createId: randomUUID,
+  run: ({ force }) => runStorageCleanup({ force }),
+});
+
+function startStorageCleanup({ force = false, source = "automatic" } = {}) {
+  const started = storageCleanupOperation.start({ force });
+  if (started.started) {
+    agentLogger.info("storage_cleanup_started", {
+      operationId: started.operation.id,
+      force,
+      source,
+    });
+    void started.completion.then((operation) => {
+      if (operation.status === "complete") {
+        agentLogger.info("storage_cleanup_finished", {
+          operationId: operation.id,
+          durationMs: operation.finishedAt - operation.startedAt,
+          removedJobs: operation.result?.removedJobs?.length || 0,
+          removedEntries: operation.result?.removedEntries?.length || 0,
+          bytes: operation.result?.bytes || 0,
+        });
+      } else {
+        agentLogger.error("storage_cleanup_failed", {
+          operationId: operation.id,
+          durationMs: operation.finishedAt - operation.startedAt,
+          error: operation.error,
+        });
+      }
+    });
+  }
+  return started.operation;
+}
+
 let previousProcessCpu = process.cpuUsage();
 let previousProcessCpuAt = process.hrtime.bigint();
 let idleDiagnosticTicks = 0;
@@ -2839,13 +2874,13 @@ persistenceTimer.unref?.();
 const resourceDiagnosticTimer = setInterval(writeResourceSnapshot, 5_000);
 resourceDiagnosticTimer.unref?.();
 writeResourceSnapshot();
-const cleanupTimer = setInterval(() => void runStorageCleanup().catch((error) => {
-  console.warn(`Automatic cleanup failed: ${error.message}`);
-}), CLEANUP_INTERVAL_MS);
+const cleanupTimer = setInterval(() => {
+  startStorageCleanup({ source: "automatic" });
+}, CLEANUP_INTERVAL_MS);
 cleanupTimer.unref?.();
-setTimeout(() => void runStorageCleanup().catch((error) => {
-  console.warn(`Startup cleanup failed: ${error.message}`);
-}), 10_000).unref?.();
+setTimeout(() => {
+  startStorageCleanup({ source: "startup" });
+}, 10_000).unref?.();
 
 let activeAgentRequests = 0;
 let peakAgentRequests = 0;
@@ -3065,8 +3100,20 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    if (request.method === "GET" && url.pathname === "/cleanup") {
+      const operationId = url.searchParams.get("id");
+      const operation = storageCleanupOperation.get(operationId);
+      if (!operation) {
+        sendJson(response, 404, { error: "Cleanup operation not found." }, headers);
+        return;
+      }
+      sendJson(response, 200, operation, headers);
+      return;
+    }
+
     if (request.method === "POST" && url.pathname === "/cleanup") {
-      sendJson(response, 200, await runStorageCleanup({ force: true }), headers);
+      const operation = startStorageCleanup({ force: true, source: "manual" });
+      sendJson(response, 202, operation, headers);
       return;
     }
 
