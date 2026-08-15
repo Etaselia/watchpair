@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.4](https://github.com/Etaselia/watchpair/compare/v0.10.3...v0.10.4) (2026-08-15)
+
+
+### Bug Fixes
+
+* improve playback sync and companion reliability ([#68](https://github.com/Etaselia/watchpair/issues/68)) ([d2bb35b](https://github.com/Etaselia/watchpair/commit/d2bb35bb316cabe6d84e379ad425bd845144127f))
+
 ## [0.10.3](https://github.com/Etaselia/watchpair/compare/v0.10.2...v0.10.3) (2026-08-10)
 
 
