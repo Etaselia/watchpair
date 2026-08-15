@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.5](https://github.com/Etaselia/watchpair/compare/v0.10.4...v0.10.5) (2026-08-15)
+
+
+### Bug Fixes
+
+* recover voice peers after disconnect ([#71](https://github.com/Etaselia/watchpair/issues/71)) ([552e3b6](https://github.com/Etaselia/watchpair/commit/552e3b6f1e8a4e9f5e8cf69411a4e70da8df2225))
+
 ## [0.10.4](https://github.com/Etaselia/watchpair/compare/v0.10.3...v0.10.4) (2026-08-15)
 
 
