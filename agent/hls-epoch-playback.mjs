@@ -28,6 +28,7 @@ const DEFAULT_SEGMENT_SECONDS = 4;
 const DEFAULT_PLAYABLE_SECONDS = 120;
 const DEFAULT_EPOCH_SECONDS = 30;
 const FRAGMENT_VALIDATION_TIMEOUT_MS = 15_000;
+const PLAYABLE_WINDOW_TOLERANCE_SECONDS = 0.25;
 const VIDEO_END_TOLERANCE_SECONDS = 0.025;
 const GENERATION_POINTER = "current.json";
 const WORKING_POINTER = "working.json";
@@ -220,13 +221,85 @@ function normalizedAudioFilter() {
   return "aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS";
 }
 
-function pipelineError(label, code, stderr) {
-  const detail = String(stderr || "").trim().split("\n").slice(-4).join(" ").slice(0, 700);
-  return new Error(
+export function isPrivatePathCandidate(value) {
+  if (typeof value !== "string") return false;
+  const candidate = value.trim();
+  if (!candidate || /^[a-zA-Z]:$/.test(candidate)) return false;
+  const segments = candidate.replaceAll("\\", "/").split("/").filter(Boolean);
+  if (!segments.length || segments.every((segment) => [".", ".."].includes(segment))) {
+    return false;
+  }
+  return ![path.posix, path.win32].some((implementation) => {
+    const normalized = implementation.normalize(candidate);
+    const root = implementation.parse(normalized).root;
+    return root &&
+      normalized.toLowerCase() === implementation.normalize(root).toLowerCase();
+  });
+}
+
+function redactPrivatePaths(value, privatePaths = []) {
+  let redacted = String(value || "");
+  const variants = new Set();
+  for (const privatePath of privatePaths) {
+    const exact = String(privatePath || "").trim();
+    if (!isPrivatePathCandidate(exact)) continue;
+    variants.add(exact);
+    variants.add(exact.replaceAll("\\", "/"));
+    variants.add(exact.replaceAll("/", "\\"));
+  }
+  for (const privatePath of [...variants].sort((left, right) => right.length - left.length)) {
+    const escaped = privatePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    redacted = redacted.replace(new RegExp(escaped, "gi"), () => "[private path]");
+  }
+  return redacted;
+}
+
+function sanitizePublicValue(value, privatePaths, seen = new WeakMap()) {
+  if (typeof value === "string") return redactPrivatePaths(value, privatePaths);
+  if (!value || typeof value !== "object") return value;
+  if (seen.has(value)) return seen.get(value);
+  if (value instanceof Error) return sanitizePublicError(value, privatePaths, seen);
+
+  const sanitized = Array.isArray(value) ? [] : {};
+  seen.set(value, sanitized);
+  for (const [key, nested] of Object.entries(value)) {
+    sanitized[key] = sanitizePublicValue(nested, privatePaths, seen);
+  }
+  return sanitized;
+}
+
+function sanitizePublicError(error, privatePaths, seen = new WeakMap()) {
+  const source = error instanceof Error ? error : new Error(String(error));
+  if (seen.has(source)) return seen.get(source);
+  const sanitized = new Error(redactPrivatePaths(source.message, privatePaths));
+  sanitized.name = redactPrivatePaths(source.name || "Error", privatePaths);
+  sanitized.stack = redactPrivatePaths(
+    source.stack || sanitized.name + ": " + sanitized.message,
+    privatePaths
+  );
+  seen.set(source, sanitized);
+  for (const [key, value] of Object.entries(source)) {
+    if (["message", "name", "stack"].includes(key)) continue;
+    sanitized[key] = sanitizePublicValue(value, privatePaths, seen);
+  }
+  return sanitized;
+}
+
+function pipelineError(label, code, stderr, privatePaths = []) {
+  const detail = redactPrivatePaths(stderr, privatePaths)
+    .trim()
+    .split("\n")
+    .slice(-4)
+    .join(" ")
+    .slice(0, 700);
+  const error = new Error(
     label + " preparation failed" +
     (code === null ? "" : " with code " + code) +
     (detail ? ": " + detail : ".")
   );
+  error.code = "WATCHPAIR_HLS_PIPELINE_FAILED";
+  if (code !== null) error.exitCode = code;
+  return error;
 }
 
 function stoppedError(message = "Browser playback preparation stopped.") {
@@ -358,13 +431,32 @@ function streamPresentationDuration(stream) {
     : 0;
 }
 
-function manifestPreparedSeconds(manifest) {
+export function manifestPreparedSeconds(manifest) {
   const last = manifest.epochs.at(-1);
   return last
     ? timelineRounded(
         Number(last.sourceStart) + streamPresentationDuration(streamForEpoch(last, "video"))
       )
     : 0;
+}
+
+export function hlsTerminalDurationTolerance(segmentSeconds = DEFAULT_SEGMENT_SECONDS) {
+  const supplied = Number(segmentSeconds);
+  const duration = Number.isFinite(supplied) && supplied > 0
+    ? supplied
+    : DEFAULT_SEGMENT_SECONDS;
+  return Math.max(0.25, duration * 0.1);
+}
+
+export function isWithinHlsTerminalDuration(
+  sourceDuration,
+  presentationDuration,
+  segmentSeconds = DEFAULT_SEGMENT_SECONDS
+) {
+  const source = Number(sourceDuration);
+  const presentation = Number(presentationDuration);
+  return Number.isFinite(source) && source > 0 && Number.isFinite(presentation) &&
+    Math.abs(presentation - source) <= hlsTerminalDurationTolerance(segmentSeconds);
 }
 
 function expectedAudioIds(audioTracks) {
@@ -491,11 +583,11 @@ async function validateManifestAssets(
   }
 
   const prepared = manifestPreparedSeconds(manifest);
-  const terminalDurationTolerance = Math.max(0.25, segmentSeconds * 0.1);
+  const terminalDurationTolerance = hlsTerminalDurationTolerance(segmentSeconds);
   if (prepared > Number(manifest.sourceDuration) + terminalDurationTolerance) return false;
   if (
     manifest.complete &&
-    Math.abs(prepared - Number(manifest.sourceDuration)) > terminalDurationTolerance
+    !isWithinHlsTerminalDuration(manifest.sourceDuration, prepared, segmentSeconds)
   ) return false;
   return true;
 }
@@ -553,6 +645,12 @@ export function createHlsPlaybackManager({
   const ownsScheduler = !scheduler;
   const mediaScheduler = scheduler || createMediaTaskScheduler({ onEvent });
   const registry = processRegistry || createProcessRegistry({ onEvent });
+  const privateToolPaths = [ffmpegPath, ffprobePath].filter(
+    (candidate) =>
+      typeof candidate === "string" &&
+      path.isAbsolute(candidate) &&
+      isPrivatePathCandidate(candidate)
+  );
   let shuttingDown = false;
   let priorityOwnerJobId = null;
   let priorityTargetKey = null;
@@ -560,6 +658,10 @@ export function createHlsPlaybackManager({
 
   const epochLength = Math.max(segmentSeconds, Number(epochSeconds) || DEFAULT_EPOCH_SECONDS);
   const playableWindow = Math.max(segmentSeconds, Number(playableSeconds) || DEFAULT_PLAYABLE_SECONDS);
+  const playableThreshold = Math.max(
+    segmentSeconds,
+    playableWindow - PLAYABLE_WINDOW_TOLERANCE_SECONDS
+  );
 
   const emit = (event, data) => {
     try {
@@ -569,11 +671,34 @@ export function createHlsPlaybackManager({
     }
   };
 
+  function statePrivatePaths(state, extraPaths = []) {
+    return [
+      state?.inputPath,
+      state?.baseDirectory,
+      state?.generationPath,
+      state?.servingDirectory,
+      state?.currentWorkingDirectory,
+      cacheRoot,
+      process.cwd(),
+      ...privateToolPaths,
+      ...extraPaths,
+    ];
+  }
+
+  function publicStateValue(state, value, extraPaths = []) {
+    return sanitizePublicValue(value, statePrivatePaths(state, extraPaths));
+  }
+
+  function publicStateError(state, error, extraPaths = []) {
+    return sanitizePublicError(error, statePrivatePaths(state, extraPaths));
+  }
+
   function capture(executable, argumentsList, {
     state = null,
     taskContext = null,
     label = "media validation",
     timeoutMs = FRAGMENT_VALIDATION_TIMEOUT_MS,
+    privatePaths = [],
   } = {}) {
     const child = spawn(executable, argumentsList, {
       windowsHide: true,
@@ -587,7 +712,7 @@ export function createHlsPlaybackManager({
       stage: label,
       command: executable,
       arguments: argumentsList,
-      privatePaths: state?.inputPath ? [state.inputPath] : [],
+      privatePaths: [state?.inputPath, ...privateToolPaths].filter(Boolean),
     });
     taskContext?.registerInterrupt?.(() => child.kill("SIGTERM"));
     if (taskContext?.signal?.aborted || shuttingDown) child.kill("SIGTERM");
@@ -621,7 +746,12 @@ export function createHlsPlaybackManager({
         } else if (code === 0) {
           resolve(stdout);
         } else {
-          reject(pipelineError(label, code, stderr));
+          reject(pipelineError(label, code, stderr, [
+            state?.inputPath,
+            state?.generationPath,
+            ...privateToolPaths,
+            ...privatePaths,
+          ]));
         }
       }));
       tracker.setDetail?.({ validation: true });
@@ -640,7 +770,10 @@ export function createHlsPlaybackManager({
       "-show_entries", "stream=codec_type,duration,start_time:format=duration,start_time",
       "-of", "json",
       descriptor.inputPath,
-    ], { label: "source-duration probe" });
+    ], {
+      label: "source-duration probe",
+      privatePaths: [descriptor.inputPath],
+    });
     const duration = mediaDurationFromProbe(JSON.parse(output));
     if (!Number.isFinite(duration) || duration <= 0) {
       throw new Error("Could not determine the source video duration.");
@@ -667,7 +800,12 @@ export function createHlsPlaybackManager({
         "-read_intervals", "%+#1",
         "-of", "json",
         temporaryPath,
-      ], { state, taskContext, label: "epoch-start validation" }));
+      ], {
+        state,
+        taskContext,
+        label: "epoch-start validation",
+        privatePaths: [temporaryPath, videoDirectory],
+      }));
       const packet = result.packets?.[0];
       const pts = Number(packet?.pts_time);
       const dts = Number(packet?.dts_time);
@@ -694,11 +832,10 @@ export function createHlsPlaybackManager({
   }
 
   function preparationState(state) {
+    const publicError = state.error ? publicStateError(state, state.error) : null;
     return {
       status: state.status,
-      error: state.error
-        ? String(state.error.message || state.error)
-        : null,
+      error: publicError?.message || null,
       encoder: {
         id: state.encoder.id,
         label: state.encoder.label,
@@ -722,7 +859,7 @@ export function createHlsPlaybackManager({
       rendering: Boolean(state.rendering && !state.complete && !state.stopping),
       resourceProfile: state.resourceProfile?.kind || "background",
       pipeline: state.pipeline,
-      diagnostics: state.pipelineDiagnostics,
+      diagnostics: publicStateValue(state, state.pipelineDiagnostics),
     };
   }
 
@@ -872,7 +1009,7 @@ export function createHlsPlaybackManager({
       ? null
       : videoPipeline(selectedEncoder, { disableFrameReordering: true });
     const contiguousReadySeconds = manifestPreparedSeconds(selected.manifest);
-    const playable = selected.manifest.complete || contiguousReadySeconds >= playableWindow;
+    const playable = selected.manifest.complete || contiguousReadySeconds >= playableThreshold;
     const playableDeferred = createDeferred();
     if (playable) playableDeferred.resolve();
 
@@ -907,6 +1044,7 @@ export function createHlsPlaybackManager({
       children: new Set(),
       currentTask: null,
       currentEpoch: null,
+      currentWorkingDirectory: null,
       resourceProfile: null,
       rendering: false,
       stopping: false,
@@ -1006,7 +1144,9 @@ export function createHlsPlaybackManager({
       disableFrameReordering: true,
     });
     state.hardwareDecode = Boolean(state.pipeline.hardwareDecode);
-    if (!validation.ok) state.pipelineDiagnostics.push(validation.reason);
+    if (!validation.ok) {
+      state.pipelineDiagnostics.push(publicStateValue(state, validation.reason));
+    }
   }
 
   function launchEpochProcess(state, argumentsList, workingDirectory, taskContext, epochIndex) {
@@ -1028,7 +1168,12 @@ export function createHlsPlaybackManager({
       profile: state.resourceProfile.mode + ":" + state.resourceProfile.kind,
       command: ffmpegPath,
       arguments: processArguments,
-      privatePaths: [state.inputPath, state.generationPath, workingDirectory],
+      privatePaths: [
+        state.inputPath,
+        state.generationPath,
+        workingDirectory,
+        ...privateToolPaths,
+      ],
     });
     attachFfmpegProgress(child.stdout, tracker);
     taskContext.registerInterrupt?.(() => child.kill("SIGTERM"));
@@ -1053,7 +1198,12 @@ export function createHlsPlaybackManager({
         } else if (code === 0) {
           resolve();
         } else {
-          reject(pipelineError("HLS epoch " + (epochIndex + 1), code, stderr));
+          reject(pipelineError("HLS epoch " + (epochIndex + 1), code, stderr, [
+            state.inputPath,
+            state.generationPath,
+            workingDirectory,
+            ...privateToolPaths,
+          ]));
         }
       }));
     });
@@ -1227,12 +1377,11 @@ export function createHlsPlaybackManager({
 
     const presentedEnd = epochStart + video.presentationDuration;
     const requestedEnd = epochStart + requestedDuration;
-    const endTolerance = Math.max(0.25, segmentSeconds * 0.1);
     const reachesEnd =
       presentedEnd >= state.sourceDuration - VIDEO_END_TOLERANCE_SECONDS ||
       (
         requestedEnd >= state.sourceDuration - 0.001 &&
-        presentedEnd >= state.sourceDuration - endTolerance
+        isWithinHlsTerminalDuration(state.sourceDuration, presentedEnd, segmentSeconds)
       );
     const epoch = {
       index: epochIndex,
@@ -1278,7 +1427,7 @@ export function createHlsPlaybackManager({
       state.playableDeferred.resolve();
     } else {
       await persistPointer(state.baseDirectory, WORKING_POINTER, state.generationId);
-      if (state.contiguousReadySeconds >= playableWindow) {
+      if (state.contiguousReadySeconds >= playableThreshold) {
         await promoteGeneration(state, "contiguous-window");
       }
     }
@@ -1318,6 +1467,7 @@ export function createHlsPlaybackManager({
       ".working",
       String(epochIndex).padStart(6, "0") + "-" + token
     );
+    state.currentWorkingDirectory = workingDirectory;
     await writeWriterLease(state, token, epochIndex);
 
     try {
@@ -1426,8 +1576,12 @@ export function createHlsPlaybackManager({
       preemptible: false,
       restartOnPromotion: false,
       run: async (resourceProfile, taskContext = {}) => {
-        await renderEpoch(state, epochIndex, resourceProfile, taskContext);
-        return { value: true };
+        try {
+          await renderEpoch(state, epochIndex, resourceProfile, taskContext);
+          return { value: true };
+        } catch (error) {
+          throw publicStateError(state, error);
+        }
       },
     });
     state.currentTask = task;
@@ -1435,6 +1589,7 @@ export function createHlsPlaybackManager({
     void task
       .then(async () => {
         if (state.currentTask === task) state.currentTask = null;
+        state.currentWorkingDirectory = null;
         if (state.complete) {
           state.status = "ready";
           await cleanupInactiveGenerations(
@@ -1443,7 +1598,7 @@ export function createHlsPlaybackManager({
           ).catch((error) => emit("hls_generation_cleanup_failed", {
             jobId: state.jobId,
             generationId: state.generationId,
-            error,
+            error: publicStateError(state, error),
           }));
           emit("hls_generation_completed", {
             jobId: state.jobId,
@@ -1460,6 +1615,8 @@ export function createHlsPlaybackManager({
       .catch((error) => {
         if (state.currentTask === task) state.currentTask = null;
         state.rendering = false;
+        const publicError = publicStateError(state, error);
+        state.currentWorkingDirectory = null;
         if (state.cancelled || state.stopping || shuttingDown) {
           emit("hls_epoch_stopped", {
             jobId: state.jobId,
@@ -1469,8 +1626,8 @@ export function createHlsPlaybackManager({
           });
           return;
         }
-        const message = error instanceof Error ? error.message : String(error);
-        state.error = error;
+        const message = publicError.message;
+        state.error = publicError;
         state.pipelineDiagnostics.push({
           code: "hls_epoch_failed",
           stage: "browser-playback",
@@ -1478,7 +1635,7 @@ export function createHlsPlaybackManager({
           message,
         });
         state.status = state.servingDirectory ? "ready" : "error";
-        if (!state.servingDirectory) state.playableDeferred.reject(error);
+        if (!state.servingDirectory) state.playableDeferred.reject(publicError);
         emit("hls_generation_failed", {
           jobId: state.jobId,
           schedulerJobId: state.schedulerJobId,
@@ -1486,6 +1643,7 @@ export function createHlsPlaybackManager({
           epochIndex,
           servingGenerationId: state.servingGenerationId,
           error: message,
+          errorCode: publicError.code || null,
         });
         notifyState(state, "generation-failed", { epochIndex });
       });
@@ -1525,7 +1683,12 @@ export function createHlsPlaybackManager({
         .catch((error) => {
           sessions.delete(key);
           activeStates.delete(key);
-          throw error;
+          throw sanitizePublicError(error, [
+            descriptor.inputPath,
+            cacheRoot,
+            process.cwd(),
+            ...privateToolPaths,
+          ]);
         });
       sessions.set(key, pending);
     }
