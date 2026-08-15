@@ -164,7 +164,10 @@ elements["save-settings"].addEventListener("click", () => action(
   "Settings saved"
 ));
 elements["cleanup-now"].addEventListener("click", () => action(
-  () => window.watchpair.cleanup(),
+  () => {
+    setMessage("Cleaning…");
+    return window.watchpair.cleanup();
+  },
   "Cleanup complete"
 ));
 elements["check-update"].addEventListener("click", () => action(

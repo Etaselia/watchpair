@@ -107,6 +107,22 @@ test("imports, seeds, restores, and stops a local companion file", { timeout: 30
     assert.equal(pinnedResponse.status, 200);
     assert.equal((await pinnedResponse.json()).job.pinned, true);
 
+    const cleanupStartedAt = Date.now();
+    const cleanupResponse = await localFetch(base + "/cleanup", { method: "POST" });
+    assert.equal(cleanupResponse.status, 202);
+    assert.ok(Date.now() - cleanupStartedAt < 2_000, "cleanup request should return before scanning storage");
+    const cleanupStarted = await cleanupResponse.json();
+    assert.equal(cleanupStarted.status, "running");
+    assert.ok(cleanupStarted.id);
+    const cleanupFinished = await waitForJson(
+      `${base}/cleanup?id=${encodeURIComponent(cleanupStarted.id)}`,
+      10_000,
+      (body) => body?.status === "complete" || body?.status === "error",
+      () => companion.exitCode !== null,
+    );
+    assert.equal(cleanupFinished.status, "complete", cleanupFinished.error);
+    assert.deepEqual(cleanupFinished.result.removedJobs, []);
+
     const bulk = await (await localFetch(base + "/downloads")).json();
     assert.equal(bulk.jobs.length, 1);
     assert.equal(bulk.jobs[0].id, sourceId);

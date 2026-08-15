@@ -1,8 +1,37 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import test from "node:test";
 import { parse } from "yaml";
+
+function deploymentBash() {
+  if (process.env.WATCHPAIR_TEST_BASH) return process.env.WATCHPAIR_TEST_BASH;
+  if (process.platform !== "win32") return "bash";
+
+  const candidates = [];
+  const gitExecPath = spawnSync("git", ["--exec-path"], { encoding: "utf8" });
+  if (gitExecPath.status === 0 && gitExecPath.stdout.trim()) {
+    candidates.push(path.resolve(gitExecPath.stdout.trim(), "../../..", "bin", "bash.exe"));
+  }
+  for (const root of [
+    process.env.ProgramW6432,
+    process.env.ProgramFiles,
+    process.env["ProgramFiles(x86)"],
+  ]) {
+    if (root) candidates.push(path.join(root, "Git", "bin", "bash.exe"));
+  }
+  if (process.env.LOCALAPPDATA) {
+    candidates.push(path.join(process.env.LOCALAPPDATA, "Programs", "Git", "bin", "bash.exe"));
+  }
+  return candidates.find((candidate) => existsSync(candidate)) || "bash";
+}
+
+const bash = deploymentBash();
+const bashArguments = (arguments_) => process.platform === "win32"
+  ? ["-l", ...arguments_]
+  : arguments_;
 
 test("deployment scripts reject unvalidated SSH commands before sudo", () => {
   for (const command of [
@@ -11,7 +40,7 @@ test("deployment scripts reject unvalidated SSH commands before sudo", () => {
     "status 1.2 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "shell 1.2.0 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   ]) {
-    const result = spawnSync("bash", ["ops/watchpair-ci-gate"], {
+    const result = spawnSync(bash, bashArguments(["ops/watchpair-ci-gate"]), {
       env: { ...process.env, SSH_ORIGINAL_COMMAND: command },
       encoding: "utf8",
     });
@@ -72,7 +101,7 @@ test("desktop release artifacts use stable names and publish only after packaged
 
 test("deployment shell scripts pass syntax validation", () => {
   for (const script of ["ops/watchpair-ci-gate", "ops/watchpair-ci-deploy"]) {
-    const result = spawnSync("bash", ["-n", script], { encoding: "utf8" });
+    const result = spawnSync(bash, bashArguments(["-n", script]), { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
   }
 });

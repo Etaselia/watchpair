@@ -238,6 +238,15 @@ export interface AgentCleanupResult {
   bytes: number;
 }
 
+export interface AgentCleanupOperation {
+  id: string | null;
+  status: "idle" | "running" | "complete" | "error";
+  startedAt: number | null;
+  finishedAt: number | null;
+  result: AgentCleanupResult | null;
+  error: string | null;
+}
+
 let lastAgentResponseAt = 0;
 
 function noteAgentResponse() {
@@ -433,8 +442,36 @@ export async function getAgentStorage() {
   return agentFetch<AgentStorageStatus>("/storage", { cache: "no-store" });
 }
 
+function isAgentCleanupResult(value: unknown): value is AgentCleanupResult {
+  const result = value as Partial<AgentCleanupResult> | null;
+  return Boolean(result && Array.isArray(result.removedJobs) &&
+    Array.isArray(result.removedEntries) && Number.isFinite(result.bytes));
+}
+
+export async function startAgentCleanup() {
+  return agentFetch<AgentCleanupOperation | AgentCleanupResult>("/cleanup", { method: "POST" });
+}
+
+export async function getAgentCleanup(operationId?: string) {
+  const query = operationId ? `?id=${encodeURIComponent(operationId)}` : "";
+  return agentFetch<AgentCleanupOperation>(`/cleanup${query}`, { cache: "no-store" });
+}
+
 export async function runAgentCleanup() {
-  return agentFetch<AgentCleanupResult>("/cleanup", { method: "POST" });
+  const started = await startAgentCleanup();
+  if (isAgentCleanupResult(started)) return started;
+
+  let operation = started;
+  while (operation.status === "running") {
+    if (!operation.id) throw new Error("The local agent returned an invalid cleanup operation.");
+    await new Promise((resolve) => window.setTimeout(resolve, 500));
+    operation = await getAgentCleanup(operation.id);
+  }
+  if (operation.status === "complete" && isAgentCleanupResult(operation.result)) {
+    return operation.result;
+  }
+  if (operation.status === "error") throw new Error(operation.error || "Cleanup failed.");
+  throw new Error("The local agent returned an invalid cleanup operation.");
 }
 
 export async function retryAgentDownload(sourceId: string) {

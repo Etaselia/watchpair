@@ -16,6 +16,7 @@ import {
 import electronLog from "electron-log";
 import electronUpdater from "electron-updater";
 import { createSerialTaskQueue, ownsAgentProcess } from "./agent-lifecycle.mjs";
+import { estimateStorageAfterCleanup, waitForCleanupOperation } from "./cleanup-operation.mjs";
 import {
   deepLinkOrigin,
   normalizeDesktopSettings,
@@ -58,6 +59,7 @@ let settings;
 let agentState = { status: "starting", error: null, health: null, storage: null };
 let updateState = { status: "idle", version: null, percent: 0, error: null };
 let lastStorageRefreshAt = 0;
+let storageRevision = 0;
 let lastAgentDiagnosticStatus = null;
 let agentRefreshPromise = null;
 
@@ -137,7 +139,6 @@ async function refreshAgentStateNow({ forceStorage = false } = {}) {
   try {
     const shouldRefreshStorage = forceStorage || !agentState.storage ||
       Date.now() - lastStorageRefreshAt >= 60_000;
-    if (shouldRefreshStorage) lastStorageRefreshAt = Date.now();
     const storageRequest = shouldRefreshStorage
       ? agentFetch("/storage")
         .then((value) => ({ value, error: null }))
@@ -148,6 +149,10 @@ async function refreshAgentStateNow({ forceStorage = false } = {}) {
       storageRequest,
     ]);
     if (storageResult.error) electronLog.warn("Storage diagnostics refresh failed", storageResult.error);
+    else if (shouldRefreshStorage) {
+      lastStorageRefreshAt = Date.now();
+      storageRevision += 1;
+    }
     agentState = { status: "ready", error: null, health, storage: storageResult.value };
   } catch (error) {
     agentState = {
@@ -170,6 +175,19 @@ async function refreshAgentStateNow({ forceStorage = false } = {}) {
   }
   sendState();
   return agentState;
+}
+
+function applyCleanupResult(result, startedRevision) {
+  const storage = estimateStorageAfterCleanup(agentState.storage, result, {
+    currentRevision: storageRevision,
+    startedRevision,
+  });
+  if (storage === agentState.storage) return;
+  agentState = {
+    ...agentState,
+    storage,
+  };
+  storageRevision += 1;
 }
 
 function refreshAgentState(options = {}) {
@@ -273,6 +291,7 @@ async function startAgentNow() {
   await stopAgentNow();
   agentState = { status: "starting", error: null, health: null, storage: null };
   lastStorageRefreshAt = 0;
+  storageRevision += 1;
   sendState();
   const serverPath = path.join(applicationRoot, "agent", "server.mjs");
   electronLog.info("Starting companion agent", { port: AGENT_PORT, logFile: AGENT_LOG_FILE });
@@ -611,9 +630,18 @@ function registerIpc() {
     return publicState();
   });
   ipcMain.handle("companion:cleanup", async () => {
-    await agentFetch("/cleanup", { method: "POST" });
-    await refreshAgentState({ forceStorage: true });
-    return publicState();
+    const startedStorageRevision = storageRevision;
+    const started = await agentFetch("/cleanup", { method: "POST" });
+    const result = await waitForCleanupOperation(started, {
+      read: (operationId) => agentFetch(`/cleanup?id=${encodeURIComponent(operationId)}`),
+    });
+    applyCleanupResult(result, startedStorageRevision);
+    const state = publicState();
+    sendState();
+    // Refresh exact usage immediately, but keep the potentially long filesystem
+    // scan outside the user-facing IPC request that previously timed out.
+    void refreshAgentState({ forceStorage: true });
+    return state;
   });
   ipcMain.handle("companion:open-downloads", () => shell.openPath(settings.downloadDirectory));
   ipcMain.handle("companion:open-logs", async () => {
