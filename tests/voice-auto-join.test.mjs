@@ -10,6 +10,7 @@ import {
 import {
   createPendingVoiceCaptureRegistry,
   createVoiceCaptureGenerationGuard,
+  createVoicePeerRecoveryScheduler,
   updateVoicePeersUntilQuiescent,
 } from "../lib/voice-capture-generation.mjs";
 
@@ -149,6 +150,91 @@ test("late capture resources are stopped after synchronous cancellation", () => 
   assert.equal(lateTrack.stops, 1);
   assert.equal(lateContext.closes, 1);
   assert.equal(lateOutbound.stops, 1);
+});
+
+test("a stale disconnected initiator is replaced and re-offers while both users remain joined", () => {
+  const timers = [];
+  const cleared = new Set();
+  const scheduler = createVoicePeerRecoveryScheduler({
+    disconnectGraceMs: 2_500,
+    setTimer(callback, delay) {
+      const timer = { callback, delay };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimer(timer) {
+      cleared.add(timer);
+    },
+  });
+  const localId = "device-a";
+  const remoteId = "device-b";
+  const participants = [
+    { deviceId: localId, voice: { enabled: true } },
+    { deviceId: remoteId, voice: { enabled: true } },
+  ];
+  const stalePeer = { connectionState: "disconnected", label: "stale" };
+  const peers = new Map([[remoteId, stalePeer]]);
+  let offers = 0;
+
+  const reconcilePeers = () => {
+    const remoteActive = participants.some(
+      (participant) => participant.deviceId === remoteId && participant.voice.enabled
+    );
+    if (!remoteActive || peers.has(remoteId)) return;
+    peers.set(remoteId, { connectionState: "new", label: "replacement" });
+    if (localId.localeCompare(remoteId) < 0) offers += 1;
+  };
+  const recover = (capturedPeer) => {
+    if (
+      peers.get(remoteId) !== capturedPeer ||
+      capturedPeer.connectionState !== "disconnected"
+    ) return;
+    peers.delete(remoteId);
+    reconcilePeers();
+  };
+
+  assert.equal(participants.filter((participant) => participant.voice.enabled).length, 2);
+  assert.equal(
+    Array.from(peers.values()).filter((peer) => peer.connectionState === "connected").length,
+    0
+  );
+  assert.equal(scheduler.observe(stalePeer, stalePeer.connectionState, recover), true);
+  assert.equal(scheduler.observe(stalePeer, stalePeer.connectionState, recover), false);
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].delay, 2_500);
+
+  timers[0].callback();
+  assert.equal(peers.get(remoteId)?.label, "replacement");
+  assert.equal(offers, 1);
+
+  // A late callback tied to the old connection cannot remove its replacement.
+  recover(stalePeer);
+  assert.equal(peers.get(remoteId)?.label, "replacement");
+  assert.equal(offers, 1);
+  scheduler.dispose();
+  assert.equal(cleared.size, 0);
+});
+
+test("peer recovery is cancelled when a transient disconnect reconnects", () => {
+  const timers = [];
+  const cleared = new Set();
+  const scheduler = createVoicePeerRecoveryScheduler({
+    setTimer(callback, delay) {
+      const timer = { callback, delay };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimer(timer) {
+      cleared.add(timer);
+    },
+  });
+  const peer = {};
+  let recoveries = 0;
+
+  scheduler.observe(peer, "disconnected", () => { recoveries += 1; });
+  scheduler.observe(peer, "connected", () => { recoveries += 1; });
+  assert.equal(cleared.has(timers[0]), true);
+  assert.equal(recoveries, 0);
 });
 
 test("voice capture replacement reaches joining peers and ignores departed snapshots", async () => {
