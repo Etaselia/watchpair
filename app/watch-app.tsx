@@ -115,6 +115,11 @@ import {
   type LocalSeekTransaction,
 } from "../lib/player-seek.mjs";
 import {
+  activeRecoverySession,
+  isRecentStaticAssetRecovery,
+  STATIC_ASSET_REJOIN_KEY,
+} from "../lib/static-asset-recovery.mjs";
+import {
   type LocalReadiness,
   type QueueReadiness,
   type PlayerState,
@@ -508,6 +513,7 @@ export default function WatchApp() {
   const loadedSubtitleRef = useRef("");
   const initializedMediaTracksRef = useRef("");
   const autoOpenedMediaRef = useRef("");
+  const recoveryJoinAttemptedRef = useRef(false);
   const pairingTimerRef = useRef<number | null>(null);
   const roomSourcesRef = useRef<{ token: string; ids: string[] }>({ token: "", ids: [] });
   const localFileBindingRef = useRef<{
@@ -819,6 +825,49 @@ export default function WatchApp() {
       setBusy(null);
     }
   };
+
+  useEffect(() => {
+    if (!deviceId || joined || recoveryJoinAttemptedRef.current) return;
+
+    let shouldRejoin = false;
+    try {
+      shouldRejoin = isRecentStaticAssetRecovery(
+        sessionStorage.getItem(STATIC_ASSET_REJOIN_KEY),
+      );
+    } catch {
+      return;
+    }
+    if (!shouldRejoin) return;
+
+    const token = normalizeToken(new URLSearchParams(window.location.search).get("room") || "");
+    if (token.length !== 9) {
+      sessionStorage.removeItem(STATIC_ASSET_REJOIN_KEY);
+      return;
+    }
+
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled || recoveryJoinAttemptedRef.current) return;
+      recoveryJoinAttemptedRef.current = true;
+      sessionStorage.removeItem(STATIC_ASSET_REJOIN_KEY);
+      void fetch(
+        `/api/sessions?token=${encodeURIComponent(token)}&deviceId=${encodeURIComponent(deviceId)}`,
+        { cache: "no-store" },
+      ).then(async (response) => {
+        if (!response.ok) return null;
+        const data = (await response.json()) as { session?: WatchSession };
+        return activeRecoverySession(data.session, deviceId) as WatchSession | null;
+      }).then((recoveredSession) => {
+        if (!cancelled && recoveredSession) enterSession(recoveredSession);
+      }).catch(() => {
+        // Recovery is best-effort; leave an inactive or unreachable invite in the lobby.
+      });
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [deviceId, enterSession, joined]);
 
   const sendAction = useCallback(
     async (action: string, values: Record<string, unknown> = {}) => {

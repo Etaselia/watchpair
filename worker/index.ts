@@ -1,6 +1,11 @@
 /** Cloudflare Worker entry point for WatchPair. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
+import {
+  isMissingStaticAssetStatus,
+  isStaticChunkModule,
+  staticChunkRecoveryModule,
+} from "../lib/static-asset-recovery.mjs";
 import { handleSessionApi } from "./session-api";
 
 interface Env {
@@ -37,6 +42,25 @@ const worker = {
 
     if (url.pathname === "/api/sessions") {
       return handleSessionApi(request, env);
+    }
+
+    if (
+      (request.method === "GET" || request.method === "HEAD") &&
+      isStaticChunkModule(url.pathname)
+    ) {
+      const asset = await env.ASSETS.fetch(request);
+      if (!isMissingStaticAssetStatus(asset.status)) return asset;
+      const source = staticChunkRecoveryModule();
+      return new Response(request.method === "HEAD" ? null : source, {
+        status: 200,
+        headers: {
+          "cache-control": "no-store",
+          "content-length": String(new TextEncoder().encode(source).byteLength),
+          "content-type": "text/javascript; charset=utf-8",
+          "x-content-type-options": "nosniff",
+          "x-watchpair-recovery": "stale-static-module",
+        },
+      });
     }
 
     if (url.pathname.startsWith("/_next/static/") && url.pathname.endsWith(".wasm")) {

@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { headers } from "next/headers";
+import { staticAssetRecoveryBootstrap } from "../lib/static-asset-recovery.mjs";
 import "./globals.css";
 
 const title = "WatchPair | Watch in sync";
@@ -47,6 +48,9 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: staticAssetRecoveryBootstrap() }} />
+      </head>
       <body>{children}</body>
     </html>
   );
