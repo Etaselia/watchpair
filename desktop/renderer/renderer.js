@@ -142,7 +142,7 @@ async function action(work, success) {
   try {
     const next = await work();
     if (next?.settings) render(next, { populateForm: true });
-    setMessage(success || "Done");
+    setMessage((typeof success === "function" ? success(next) : success) || "Done");
   } catch (error) {
     setMessage(error instanceof Error ? error.message : "The action failed.", true);
   } finally {
@@ -168,7 +168,7 @@ elements["cleanup-now"].addEventListener("click", () => action(
     setMessage("Cleaning…");
     return window.watchpair.cleanup();
   },
-  "Cleanup complete"
+  (next) => next?.cleanup?.message || "Cleanup complete"
 ));
 elements["check-update"].addEventListener("click", () => action(
   () => window.watchpair.checkForUpdates(),

@@ -105,6 +105,7 @@ assert.equal(report.saved.agent.health.transcoder.preference, "cpu");
 assert.equal(report.saved.agent.health.media.mode, "eco");
 assert.equal(report.cleaned.agent.storage.directory, downloads);
 assert.equal(typeof report.cleaned.agent.storage.usage.bytes, "number");
+assert.equal(report.cleanupMessage, "Cleanup complete — nothing eligible");
 assert.deepEqual(report.dom, {
   title: "WatchPair Companion",
   status: "Running",
