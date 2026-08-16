@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.8](https://github.com/Etaselia/watchpair/compare/v0.10.7...v0.10.8) (2026-08-16)
+
+
+### Bug Fixes
+
+* recover stale static chunks after deploys ([#78](https://github.com/Etaselia/watchpair/issues/78)) ([ebad061](https://github.com/Etaselia/watchpair/commit/ebad061b5fb97970d7aa7ecbb7919c57158959e4))
+
 ## [0.10.7](https://github.com/Etaselia/watchpair/compare/v0.10.6...v0.10.7) (2026-08-16)
 
 
