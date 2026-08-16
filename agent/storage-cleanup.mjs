@@ -1,4 +1,4 @@
-import { readdir, rm, stat } from "node:fs/promises";
+import { lstat, readdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
 
 export const MANAGED_JOB_DIRECTORY = /^[a-zA-Z0-9-]{8,80}$/;
@@ -164,12 +164,13 @@ export function createSingleFlightCache({
   };
 }
 
-export async function pathSize(target, { concurrency = DEFAULT_SIZE_CONCURRENCY } = {}) {
+export async function pathStats(target, { concurrency = DEFAULT_SIZE_CONCURRENCY } = {}) {
   const limit = Math.max(1, Math.min(32, Math.floor(Number(concurrency) || DEFAULT_SIZE_CONCURRENCY)));
   const queue = [target];
   let cursor = 0;
   let active = 0;
   let total = 0;
+  let latestMtimeMs = null;
 
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -186,13 +187,18 @@ export async function pathSize(target, { concurrency = DEFAULT_SIZE_CONCURRENCY 
         const current = queue[cursor];
         cursor += 1;
         active += 1;
-        stat(current)
+        lstat(current)
           .catch((error) => {
             if (error?.code === "ENOENT") return null;
             throw error;
           })
           .then(async (info) => {
             if (!info) return;
+            if (Number.isFinite(info.mtimeMs)) {
+              latestMtimeMs = latestMtimeMs === null
+                ? info.mtimeMs
+                : Math.max(latestMtimeMs, info.mtimeMs);
+            }
             if (!info.isDirectory()) {
               total += info.size;
               return;
@@ -204,7 +210,7 @@ export async function pathSize(target, { concurrency = DEFAULT_SIZE_CONCURRENCY 
             active -= 1;
             if (active === 0 && cursor >= queue.length) {
               settled = true;
-              resolve(total);
+              resolve({ bytes: total, latestMtimeMs });
               return;
             }
             schedule();
@@ -215,6 +221,14 @@ export async function pathSize(target, { concurrency = DEFAULT_SIZE_CONCURRENCY 
 
     schedule();
   });
+}
+
+export async function pathSize(target, options) {
+  return (await pathStats(target, options)).bytes;
+}
+
+export async function pathLatestMtime(target, options) {
+  return (await pathStats(target, options)).latestMtimeMs;
 }
 
 export async function removePathAndMeasure(target) {
@@ -230,6 +244,7 @@ export async function pruneExpiredChildren(
     maxAgeMs,
     include = () => true,
     protectedNames = new Set(),
+    inspect = stat,
   }
 ) {
   const entries = await readdir(root, { withFileTypes: true }).catch((error) => {
@@ -241,7 +256,10 @@ export async function pruneExpiredChildren(
   for (const entry of entries) {
     if (protectedNames.has(entry.name) || !include(entry)) continue;
     const target = path.join(root, entry.name);
-    const info = await stat(target).catch(() => null);
+    const info = await inspect(target).catch((error) => {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    });
     if (!info || now - info.mtimeMs < maxAgeMs) continue;
     const bytes = await removePathAndMeasure(target);
     removed.push({ name: entry.name, bytes });

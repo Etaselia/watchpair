@@ -16,7 +16,13 @@ import {
 import electronLog from "electron-log";
 import electronUpdater from "electron-updater";
 import { createSerialTaskQueue, ownsAgentProcess } from "./agent-lifecycle.mjs";
-import { estimateStorageAfterCleanup, waitForCleanupOperation } from "./cleanup-operation.mjs";
+import {
+  estimateStorageAfterCleanup,
+  legacyCleanupConfirmationOptions,
+  runCleanupWithLegacyConfirmation,
+  shouldRefreshStorage,
+  summarizeCleanupResult,
+} from "./cleanup-operation.mjs";
 import {
   deepLinkOrigin,
   normalizeDesktopSettings,
@@ -59,6 +65,7 @@ let settings;
 let agentState = { status: "starting", error: null, health: null, storage: null };
 let updateState = { status: "idle", version: null, percent: 0, error: null };
 let lastStorageRefreshAt = 0;
+let lastStorageRefreshAttemptAt = 0;
 let storageRevision = 0;
 let lastAgentDiagnosticStatus = null;
 let agentRefreshPromise = null;
@@ -137,9 +144,15 @@ async function agentFetch(route, init = {}) {
 async function refreshAgentStateNow({ forceStorage = false } = {}) {
   const startedAt = Date.now();
   try {
-    const shouldRefreshStorage = forceStorage || !agentState.storage ||
-      Date.now() - lastStorageRefreshAt >= 60_000;
-    const storageRequest = shouldRefreshStorage
+    const refreshStorage = shouldRefreshStorage({
+      force: forceStorage,
+      hasStorage: Boolean(agentState.storage),
+      lastSuccessfulAt: lastStorageRefreshAt,
+      lastAttemptAt: lastStorageRefreshAttemptAt,
+      now: startedAt,
+    });
+    if (refreshStorage) lastStorageRefreshAttemptAt = startedAt;
+    const storageRequest = refreshStorage
       ? agentFetch("/storage")
         .then((value) => ({ value, error: null }))
         .catch((error) => ({ value: agentState.storage, error }))
@@ -149,7 +162,7 @@ async function refreshAgentStateNow({ forceStorage = false } = {}) {
       storageRequest,
     ]);
     if (storageResult.error) electronLog.warn("Storage diagnostics refresh failed", storageResult.error);
-    else if (shouldRefreshStorage) {
+    else if (refreshStorage) {
       lastStorageRefreshAt = Date.now();
       storageRevision += 1;
     }
@@ -291,6 +304,7 @@ async function startAgentNow() {
   await stopAgentNow();
   agentState = { status: "starting", error: null, health: null, storage: null };
   lastStorageRefreshAt = 0;
+  lastStorageRefreshAttemptAt = 0;
   storageRevision += 1;
   sendState();
   const serverPath = path.join(applicationRoot, "agent", "server.mjs");
@@ -572,7 +586,10 @@ async function runSelfTest() {
   const saved = await mainWindow.webContents.executeJavaScript("window.watchpair.getState()");
 
   await mainWindow.webContents.executeJavaScript("document.querySelector('#cleanup-now').click()");
-  await waitForRenderer("document.querySelector('#message')?.textContent === 'Cleanup complete'");
+  await waitForRenderer("document.querySelector('#message')?.textContent === 'Cleanup complete — nothing eligible'");
+  const cleanupMessage = await mainWindow.webContents.executeJavaScript(
+    "document.querySelector('#message')?.textContent"
+  );
   const cleaned = await mainWindow.webContents.executeJavaScript("window.watchpair.getState()");
 
   await mainWindow.webContents.executeJavaScript("document.querySelector('#check-update').click()");
@@ -599,6 +616,7 @@ async function runSelfTest() {
     initial,
     saved,
     cleaned,
+    cleanupMessage,
     dom,
     screenshotPath,
     screenshotSize: image.getSize(),
@@ -631,17 +649,37 @@ function registerIpc() {
   });
   ipcMain.handle("companion:cleanup", async () => {
     const startedStorageRevision = storageRevision;
-    const started = await agentFetch("/cleanup", { method: "POST" });
-    const result = await waitForCleanupOperation(started, {
+    const result = await runCleanupWithLegacyConfirmation({
+      start: ({ includeLegacy, legacyJobs }) => agentFetch(
+        includeLegacy ? "/cleanup?includeLegacy=1" : "/cleanup",
+        {
+          method: "POST",
+          ...(includeLegacy ? {
+            headers: {
+              "content-type": "application/json",
+              "x-watchpair-control": CONTROL_TOKEN,
+            },
+            body: JSON.stringify({ legacyJobs }),
+          } : {}),
+        }
+      ),
       read: (operationId) => agentFetch(`/cleanup?id=${encodeURIComponent(operationId)}`),
+      confirmLegacy: async (_legacyJobs, initialResult) => {
+        const options = legacyCleanupConfirmationOptions(initialResult, {
+          retentionDays: settings.cleanup.downloadRetentionDays,
+        });
+        if (!options) return false;
+        const answer = await dialog.showMessageBox(mainWindow, options);
+        return answer.response === 1;
+      },
     });
     applyCleanupResult(result, startedStorageRevision);
     const state = publicState();
     sendState();
-    // Refresh exact usage immediately, but keep the potentially long filesystem
-    // scan outside the user-facing IPC request that previously timed out.
-    void refreshAgentState({ forceStorage: true });
-    return state;
+    return {
+      ...state,
+      cleanup: summarizeCleanupResult(result),
+    };
   });
   ipcMain.handle("companion:open-downloads", () => shell.openPath(settings.downloadDirectory));
   ipcMain.handle("companion:open-logs", async () => {

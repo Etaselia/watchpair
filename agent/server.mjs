@@ -46,7 +46,14 @@ import {
 } from "./media-priority.mjs";
 import { createTorrentBandwidthGovernor } from "./torrent-bandwidth-governor.mjs";
 import { createJsonStore } from "./job-store.mjs";
-import { cacheExpired, cleanupSettingsFromEnvironment, jobCanBeCleaned, jobCleanupReason } from "./cleanup-policy.mjs";
+import {
+  RETENTION_METADATA_VERSION,
+  cacheExpired,
+  cleanupSettingsFromEnvironment,
+  jobCanBeCleaned,
+  jobCleanupReason,
+  retentionMetadataReliable,
+} from "./cleanup-policy.mjs";
 import { createSubtitleAssetPipeline } from "./subtitle-pipeline.mjs";
 import {
   chapterProbeArguments,
@@ -58,6 +65,7 @@ import {
   createSingleFlightOperation,
   createSingleFlightCache,
   MANAGED_JOB_DIRECTORY,
+  pathLatestMtime,
   pathSize,
   pruneExpiredChildren,
 } from "./storage-cleanup.mjs";
@@ -806,7 +814,7 @@ async function completeSelectedFile(job, index = job.selectedIndex) {
   }
 }
 
-function selectTorrentFile(job, index) {
+function selectTorrentFile(job, index, { recordAccess = true } = {}) {
   const localFile = index === 0 ? job.file : null;
   const file = job.torrent?.files[index] || localFile;
   if (!file) throw new Error("Torrent file not found.");
@@ -814,7 +822,7 @@ function selectTorrentFile(job, index) {
   const asset = syncSelectedAsset(job);
   job.status = asset.status === "ready" ? "ready" : "downloading";
   job.error = asset.preparation.error || null;
-  touchJob(job);
+  if (recordAccess) touchJob(job);
   if (localFile) {
     if (asset.status === "ready") queueMediaPreparation(job, index);
   } else if (file.done) {
@@ -1454,7 +1462,7 @@ function refreshTorrentSelections(reason = "priority-plan") {
   return torrentBandwidth;
 }
 
-function startTorrent(job) {
+function startTorrent(job, { restoreMetadata = false } = {}) {
   job.status = "metadata";
   agentLogger.info("torrent_start_requested", { jobId: job.id, managed: Boolean(job.managed) });
   let torrent;
@@ -1510,7 +1518,9 @@ function startTorrent(job) {
       const asset = mediaAsset(job, index);
       asset.status = torrent.files[index].done ? "verifying" : "downloading";
     }
-    if (videos[0] !== undefined) selectTorrentFile(job, videos[0]);
+    if (videos[0] !== undefined) {
+      selectTorrentFile(job, videos[0], { recordAccess: !restoreMetadata });
+    }
     torrent.files.forEach((file, index) => {
       file.on("done", () => {
         agentLogger.info("torrent_file_downloaded", { jobId: job.id, fileIndex: index, size: file.length });
@@ -1610,6 +1620,11 @@ function createJob(source) {
     createdAt: Number(source.createdAt) || now,
     completedAt: Number(source.completedAt) || null,
     lastAccessedAt: Number(source.lastAccessedAt) || now,
+    retentionMetadataVersion: source.retentionMetadataVersion === undefined
+      ? RETENTION_METADATA_VERSION
+      : Number(source.retentionMetadataVersion) === RETENTION_METADATA_VERSION
+        ? RETENTION_METADATA_VERSION
+        : 0,
     seed: Boolean(source.seed),
     seedPath: source.seedPath || null,
     identityFingerprint: source.identityFingerprint || null,
@@ -1661,6 +1676,7 @@ function persistedJobs() {
     createdAt: job.createdAt,
     completedAt: job.completedAt,
     lastAccessedAt: job.lastAccessedAt,
+    retentionMetadataVersion: job.retentionMetadataVersion,
     updatedAt: job.updatedAt,
     seed: Boolean(job.seed),
     seedPath: job.seedPath,
@@ -1680,7 +1696,9 @@ function persistJobs() {
 function touchJob(job) {
   const now = Date.now();
   job.lastAccessedAt = now;
+  job.retentionMetadataVersion = RETENTION_METADATA_VERSION;
   job.updatedAt = now;
+  persistJobs();
 }
 
 function requiredTorrentMediaIndexes(job) {
@@ -1708,7 +1726,7 @@ function markJobCompleted(job) {
   return true;
 }
 
-async function addDownload(source) {
+async function addDownload(source, { restoreMetadata = false } = {}) {
   const id = String(source?.id || "");
   if (!/^[a-zA-Z0-9-]{8,80}$/.test(id)) throw new Error("Invalid source id.");
   if (jobs.has(id)) return jobs.get(id);
@@ -1724,8 +1742,24 @@ async function addDownload(source) {
     }
   }
 
-  const job = createJob({ id, kind, value, label: source.label });
-  if (kind === "magnet") startTorrent(job);
+  const restoredMetadata = restoreMetadata
+    ? {
+        managed: source.managed,
+        pinned: source.pinned,
+        createdAt: source.createdAt,
+        completedAt: source.completedAt,
+        lastAccessedAt: source.lastAccessedAt,
+        retentionMetadataVersion: kind === "magnet" && !source.seed &&
+          Number(source.retentionMetadataVersion) !== RETENTION_METADATA_VERSION
+          ? 0
+          : RETENTION_METADATA_VERSION,
+        updatedAt: source.updatedAt,
+        identityFingerprint: source.identityFingerprint,
+        identityFingerprintKey: source.identityFingerprintKey,
+      }
+    : {};
+  const job = createJob({ id, kind, value, label: source.label, ...restoredMetadata });
+  if (kind === "magnet") startTorrent(job, { restoreMetadata });
   else void startDirect(job);
   persistJobs();
   return job;
@@ -1735,6 +1769,18 @@ function validJobId(value) {
   const id = String(value || "");
   if (!/^[a-zA-Z0-9-]{8,80}$/.test(id)) throw new Error("Invalid source id.");
   return id;
+}
+
+function confirmedLegacyJobIds(body) {
+  if (!Array.isArray(body?.legacyJobs)) {
+    throw new Error("Confirmed legacy cleanup jobs must be an array of ids.");
+  }
+  const confirmed = new Set();
+  for (const value of body.legacyJobs) {
+    if (typeof value !== "string") throw new Error("Invalid confirmed legacy cleanup job id.");
+    confirmed.add(validJobId(value.trim()));
+  }
+  return Array.from(confirmed);
 }
 
 function importPartPath(id) {
@@ -1985,6 +2031,55 @@ async function removeGeneratedArtifacts(jobId) {
   ]);
 }
 
+function generatedArtifactPaths(jobId) {
+  const id = validJobId(jobId);
+  return [
+    path.join(HLS_DIR, "jobs", id),
+    path.join(HLS_DIR, id),
+    path.join(SUBTITLE_DIR, id),
+    path.join(MEDIA_DIR, id),
+    path.join(IMPORT_DIR, id + ".part"),
+  ];
+}
+
+async function generatedArtifactBytes(jobId) {
+  const sizes = await Promise.all(generatedArtifactPaths(jobId).map((target) => pathSize(target)));
+  return sizes.reduce((total, bytes) => total + bytes, 0);
+}
+
+async function jobRemovalBytes(job) {
+  const downloadBytes = job.managed
+    ? await pathSize(path.join(DOWNLOAD_DIR, job.id))
+    : 0;
+  return downloadBytes + await generatedArtifactBytes(job.id);
+}
+
+async function legacyJobFilesystemExpired(job, settings, now) {
+  if (
+    retentionMetadataReliable(job) ||
+    job.kind !== "magnet" ||
+    job.seed ||
+    !job.managed ||
+    job.pinned
+  ) return false;
+
+  const latestMtimeMs = await pathLatestMtime(path.join(DOWNLOAD_DIR, job.id));
+  return jobs.get(job.id) === job &&
+    !retentionMetadataReliable(job) &&
+    !job.pinned &&
+    Number.isFinite(latestMtimeMs) &&
+    now - latestMtimeMs >= settings.downloadRetentionDays * 24 * 60 * 60 * 1000;
+}
+
+function legacyDownloadSummary(job) {
+  const label = String(job.label || "video")
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/gu, "")
+    .split(/[\\/]/)
+    .filter(Boolean)
+    .at(-1);
+  return { id: job.id, label: safeName(label) };
+}
+
 async function stopJob(id, { deleteFiles = false } = {}) {
   const job = jobs.get(validJobId(id));
   if (!job) return false;
@@ -2029,13 +2124,17 @@ async function restoreJobs() {
           createdAt: record.createdAt,
           completedAt: record.completedAt,
           lastAccessedAt: record.lastAccessedAt,
+          retentionMetadataVersion: RETENTION_METADATA_VERSION,
           updatedAt: record.updatedAt,
         });
       } else if (record.kind === "magnet") {
-        await addDownload(record);
+        await addDownload(record, { restoreMetadata: true });
       } else if (record.file?.path) {
         const info = await stat(record.file.path);
-        const job = createJob(record);
+        const job = createJob({
+          ...record,
+          retentionMetadataVersion: RETENTION_METADATA_VERSION,
+        });
         job.file = { ...record.file, size: info.size };
         job.downloaded = info.size;
         job.selectedIndex = 0;
@@ -2047,7 +2146,7 @@ async function restoreJobs() {
         markJobCompleted(job);
         queueMediaPreparation(job, 0);
       } else {
-        await addDownload(record);
+        await addDownload(record, { restoreMetadata: true });
       }
     } catch (error) {
       console.warn(`Could not restore companion job ${record?.id || "unknown"}: ${error.message}`);
@@ -2600,29 +2699,66 @@ async function storageUsage({ fresh = false } = {}) {
 }
 
 let cleanupPromise = null;
-async function runStorageCleanup({ force = false } = {}) {
+async function runStorageCleanup({
+  force = false,
+  includeLegacy = false,
+  confirmedLegacyJobs = [],
+} = {}) {
   if (cleanupPromise) return cleanupPromise;
   cleanupPromise = (async () => {
     const settings = force ? { ...CLEANUP_SETTINGS, enabled: true } : CLEANUP_SETTINGS;
-    if (!settings.enabled) return { removedJobs: [], removedEntries: [], bytes: 0 };
+    if (!settings.enabled) {
+      return {
+        removedJobs: [], removedEntries: [], legacyJobs: [], legacyDownloads: [], bytes: 0,
+      };
+    }
 
     const now = Date.now();
-    const result = { removedJobs: [], removedEntries: [], bytes: 0 };
+    const confirmedLegacyJobSet = new Set(confirmedLegacyJobs);
+    const result = {
+      removedJobs: [], removedEntries: [], legacyJobs: [], legacyDownloads: [], bytes: 0,
+    };
     for (const job of Array.from(jobs.values())) {
+      if (!retentionMetadataReliable(job)) {
+        if (!(await legacyJobFilesystemExpired(job, settings, now))) continue;
+        if (!includeLegacy || !confirmedLegacyJobSet.has(job.id)) {
+          result.legacyJobs.push(job.id);
+          result.legacyDownloads.push(legacyDownloadSummary(job));
+          continue;
+        }
+        const removedBytes = await jobRemovalBytes(job);
+        if (!(await legacyJobFilesystemExpired(job, settings, now))) continue;
+        if (!(await stopJob(job.id, { deleteFiles: true }))) continue;
+        result.bytes += removedBytes;
+        result.removedJobs.push(job.id);
+        continue;
+      }
       if (!jobCleanupReason(job, settings, now)) continue;
-      if (job.managed) result.bytes += await pathSize(path.join(DOWNLOAD_DIR, job.id));
-      await stopJob(job.id, { deleteFiles: true });
+      const removedBytes = await jobRemovalBytes(job);
+      if (jobs.get(job.id) !== job || !jobCleanupReason(job, settings, Date.now())) continue;
+      if (!(await stopJob(job.id, { deleteFiles: true }))) continue;
+      result.bytes += removedBytes;
       result.removedJobs.push(job.id);
     }
 
     for (const job of jobs.values()) {
       const assets = Array.from(job.assets?.values?.() || []);
       if (
+        !retentionMetadataReliable(job) ||
         !cacheExpired(job.lastAccessedAt, settings, now) ||
         assets.some((asset) => ["queued", "preparing"].includes(asset.preparation.status))
       ) continue;
+      const removedBytes = await generatedArtifactBytes(job.id);
+      const currentAssets = Array.from(job.assets?.values?.() || []);
+      if (
+        jobs.get(job.id) !== job ||
+        !retentionMetadataReliable(job) ||
+        !cacheExpired(job.lastAccessedAt, settings, Date.now()) ||
+        currentAssets.some((asset) => ["queued", "preparing"].includes(asset.preparation.status))
+      ) continue;
       await removeGeneratedArtifacts(job.id);
-      for (const asset of assets) asset.preparation = defaultPreparation();
+      result.bytes += removedBytes;
+      for (const asset of currentAssets) asset.preparation = defaultPreparation();
       syncSelectedAsset(job);
       result.removedEntries.push(`cache:${job.id}`);
     }
@@ -2652,9 +2788,10 @@ async function runStorageCleanup({ force = false } = {}) {
       );
     for (const job of cleanupCandidates) {
       if (!overLimit()) break;
-      const removedBytes = await pathSize(path.join(DOWNLOAD_DIR, job.id));
+      const removedBytes = await jobRemovalBytes(job);
+      if (jobs.get(job.id) !== job || !jobCanBeCleaned(job, settings) || !overLimit()) continue;
+      if (!(await stopJob(job.id, { deleteFiles: true }))) continue;
       result.bytes += removedBytes;
-      await stopJob(job.id, { deleteFiles: true });
       result.removedJobs.push(job.id);
       accountForRemoval(removedBytes);
     }
@@ -2681,7 +2818,7 @@ async function runStorageCleanup({ force = false } = {}) {
       .filter((jobId) => String(jobId || "").startsWith("content-"))
       .map((jobId) => jobId.slice("content-".length)));
     for (const job of jobs.values()) {
-      if (cacheExpired(job.lastAccessedAt, settings, now)) continue;
+      if (retentionMetadataReliable(job) && cacheExpired(job.lastAccessedAt, settings, now)) continue;
       for (const [index, asset] of job.assets?.entries?.() || []) {
         if (!asset.identityFingerprint) continue;
         try {
@@ -2724,15 +2861,22 @@ async function runStorageCleanup({ force = false } = {}) {
 
 const storageCleanupOperation = createSingleFlightOperation({
   createId: randomUUID,
-  run: ({ force }) => runStorageCleanup({ force }),
+  run: ({ force, includeLegacy, confirmedLegacyJobs }) =>
+    runStorageCleanup({ force, includeLegacy, confirmedLegacyJobs }),
 });
 
-function startStorageCleanup({ force = false, source = "automatic" } = {}) {
-  const started = storageCleanupOperation.start({ force });
+function startStorageCleanup({
+  force = false,
+  includeLegacy = false,
+  confirmedLegacyJobs = [],
+  source = "automatic",
+} = {}) {
+  const started = storageCleanupOperation.start({ force, includeLegacy, confirmedLegacyJobs });
   if (started.started) {
     agentLogger.info("storage_cleanup_started", {
       operationId: started.operation.id,
       force,
+      includeLegacy,
       source,
     });
     void started.completion.then((operation) => {
@@ -2742,6 +2886,7 @@ function startStorageCleanup({ force = false, source = "automatic" } = {}) {
           durationMs: operation.finishedAt - operation.startedAt,
           removedJobs: operation.result?.removedJobs?.length || 0,
           removedEntries: operation.result?.removedEntries?.length || 0,
+          legacyJobs: operation.result?.legacyJobs?.length || 0,
           bytes: operation.result?.bytes || 0,
         });
       } else {
@@ -3112,7 +3257,23 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === "POST" && url.pathname === "/cleanup") {
-      const operation = startStorageCleanup({ force: true, source: "manual" });
+      const includeLegacy = url.searchParams.get("includeLegacy") === "1";
+      if (
+        includeLegacy &&
+        (!CONTROL_TOKEN || request.headers["x-watchpair-control"] !== CONTROL_TOKEN)
+      ) {
+        sendJson(response, 403, { error: "Invalid companion control token." }, headers);
+        return;
+      }
+      const confirmedLegacyJobs = includeLegacy
+        ? confirmedLegacyJobIds(await readJson(request))
+        : [];
+      const operation = startStorageCleanup({
+        force: true,
+        includeLegacy,
+        confirmedLegacyJobs,
+        source: "manual",
+      });
       sendJson(response, 202, operation, headers);
       return;
     }

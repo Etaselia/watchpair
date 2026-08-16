@@ -1,6 +1,8 @@
 const DAY_MS = 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
 
+export const RETENTION_METADATA_VERSION = 1;
+
 export const DEFAULT_CLEANUP_SETTINGS = Object.freeze({
   enabled: true,
   downloadRetentionDays: 30,
@@ -64,17 +66,42 @@ export function cleanupSettingsFromEnvironment(environment = process.env) {
 }
 
 export function jobCanBeCleaned(job, settings) {
-  if (!settings.enabled || !job?.managed || job.pinned) return false;
+  if (!settings.enabled || !job?.managed || job.pinned || !retentionMetadataReliable(job)) return false;
   if (!["ready", "error"].includes(job.status)) return false;
   if (job.preparation?.status === "preparing") return false;
   if (job.torrent && !job.torrent.destroyed && job.torrent.numPeers > 0) return false;
   return true;
 }
 
-export function jobCleanupReason(job, settings, now = Date.now()) {
-  if (!jobCanBeCleaned(job, settings)) return null;
+export function retentionMetadataReliable(job) {
+  return Number(job?.retentionMetadataVersion) === RETENTION_METADATA_VERSION;
+}
 
-  const lastUsed = Number(job.lastAccessedAt || job.completedAt || job.updatedAt || job.createdAt || now);
+export function jobRetentionTimestamp(job, now = Date.now()) {
+  const lastAccessedAt = Number(job?.lastAccessedAt);
+  const completedAt = Number(job?.completedAt);
+  const meaningful = [lastAccessedAt, completedAt]
+    .filter((timestamp) => Number.isFinite(timestamp) && timestamp > 0);
+  if (meaningful.length) return Math.max(...meaningful);
+
+  const updatedAt = Number(job?.updatedAt);
+  if (Number.isFinite(updatedAt) && updatedAt > 0) return updatedAt;
+  const createdAt = Number(job?.createdAt);
+  return Number.isFinite(createdAt) && createdAt > 0 ? createdAt : now;
+}
+
+export function jobCleanupReason(job, settings, now = Date.now()) {
+  if (!settings.enabled || !job?.managed || job.pinned || !retentionMetadataReliable(job)) return null;
+
+  // A restored torrent temporarily returns to metadata/downloading state and
+  // may reconnect to passive swarm peers before its on-disk files are
+  // verified. A persisted completion timestamp is the durable indication that
+  // retention applies; recent playback remains protected by lastAccessedAt.
+  const completedAt = Number(job.completedAt);
+  const completed = Number.isFinite(completedAt) && completedAt > 0;
+  if (!completed && job.status !== "error") return null;
+
+  const lastUsed = jobRetentionTimestamp(job, now);
   const retentionMs = settings.downloadRetentionDays * DAY_MS;
   return now - lastUsed >= retentionMs ? "retention" : null;
 }
