@@ -52,6 +52,11 @@ test("production-renders the WatchPair application", async () => {
 
   const html = await response.text();
   assert.match(html, /<title>WatchPair \| Watch in sync<\/title>/i);
+  assert.match(html, /vite:preloadError/);
+  assert.ok(
+    html.indexOf("vite:preloadError") < html.indexOf("<body"),
+    "the recovery listener should be installed before the application body",
+  );
   assert.match(html, /WatchPair/);
   assert.match(html, /Same frame/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|react-loading-skeleton/i);
@@ -70,6 +75,35 @@ test("production serves libass WebAssembly with the streaming MIME type", async 
   const response = await fetch(`http://127.0.0.1:${port}/_next/static/${wasm}`, { method: "HEAD" });
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("content-type"), "application/wasm");
+});
+
+test("production recovers stale JavaScript chunk requests without caching the miss", async () => {
+  const chunks = await readdir(new URL("../dist/client/_next/static/chunks/", import.meta.url));
+  const currentChunk = chunks.find((file) => file.startsWith("hls-") && file.endsWith(".js"));
+  assert.ok(currentChunk);
+  const current = await fetch(
+    `http://127.0.0.1:${port}/_next/static/chunks/${currentChunk}`,
+    { method: "HEAD" },
+  );
+  assert.equal(current.status, 200);
+  assert.equal(current.headers.get("x-watchpair-recovery"), null);
+
+  const response = await fetch(
+    `http://127.0.0.1:${port}/_next/static/chunks/hls-removed-by-deploy.js`,
+  );
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type") ?? "", /^text\/javascript\b/i);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.equal(response.headers.get("x-watchpair-recovery"), "stale-static-module");
+  const source = await response.text();
+  assert.match(source, /location\.reload\(\)/);
+  assert.match(source, /await new Promise/);
+
+  const missingStyle = await fetch(
+    `http://127.0.0.1:${port}/_next/static/chunks/removed-by-deploy.css`,
+  );
+  assert.ok(missingStyle.status >= 400);
+  assert.equal(missingStyle.headers.get("cache-control"), "no-store");
 });
 
 test("production session API supports join-in-progress state", async () => {

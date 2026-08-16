@@ -24,6 +24,7 @@ COPY --from=build --chown=node:node /app/node_modules/react-dom ./node_modules/r
 COPY --from=build --chown=node:node /app/node_modules/react-server-dom-webpack ./node_modules/react-server-dom-webpack
 COPY --from=build --chown=node:node /app/node_modules/scheduler ./node_modules/scheduler
 COPY --from=build --chown=node:node /app/dist ./dist
+COPY --chown=node:node lib/static-asset-recovery.mjs ./lib/static-asset-recovery.mjs
 COPY --chown=node:node scripts/start-container.mjs ./scripts/start-container.mjs
 USER node
 EXPOSE 3000
