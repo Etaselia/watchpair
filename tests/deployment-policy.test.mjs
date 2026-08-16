@@ -33,6 +33,49 @@ const bashArguments = (arguments_) => process.platform === "win32"
   ? ["-l", ...arguments_]
   : arguments_;
 
+function runAutomaticReleaseResolver(script, environment = {}) {
+  const workflowRunScript = script
+    .replaceAll("${{ github.event_name }}", "workflow_run")
+    .replaceAll("${{ inputs.approve }}", "false");
+  const harness = [
+    "gh() {",
+    "  case \"$*\" in",
+    "    *\"/actions/runs/\"*)",
+    "      printf '%s\\n' \"$MOCK_RELEASE_JOBS\"",
+    "      return \"${MOCK_RELEASE_JOBS_STATUS:-0}\"",
+    "      ;;",
+    "    *\"/releases?per_page=100\"*)",
+    "      printf '%s\\n' \"$MOCK_RELEASES\"",
+    "      return \"${MOCK_RELEASES_STATUS:-0}\"",
+    "      ;;",
+    "    *)",
+    "      echo \"Unexpected gh call: $*\" >&2",
+    "      return 70",
+    "      ;;",
+    "  esac",
+    "}",
+    workflowRunScript,
+  ].join("\n");
+
+  return spawnSync(bash, bashArguments(["-s"]), {
+    env: {
+      ...process.env,
+      GITHUB_OUTPUT: "/dev/null",
+      GITHUB_REPOSITORY: "Etaselia/watchpair",
+      RELEASE_SHA: "a".repeat(40),
+      RELEASE_RUN_ID: "1234",
+      RELEASE_RUN_ATTEMPT: "2",
+      REQUESTED_VERSION: "",
+      MOCK_RELEASE_JOBS: "{}",
+      MOCK_RELEASES: "[]",
+      ...environment,
+    },
+    input: harness,
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024,
+  });
+}
+
 test("deployment scripts reject unvalidated SSH commands before sudo", () => {
   for (const command of [
     "deploy 1.2.0 not-a-sha",
@@ -60,6 +103,215 @@ test("deployment workflow separates Vienna maintenance and approved manual envir
   assert.match(workflow, /production-vps-scheduled/);
   assert.match(workflow, /production-vps/);
   assert.match(workflow, /status \$VERSION \$REVISION/);
+  assert.equal(
+    parsed.jobs.deploy.environment.name,
+    "${{ github.event_name == 'workflow_dispatch' && 'production-vps' || 'production-vps-scheduled' }}",
+  );
+});
+
+test("trusted successful releases deploy only the stable tag for their exact commit", async () => {
+  const workflow = await readFile(".github/workflows/deploy-vps.yml", "utf8");
+  const parsed = parse(workflow);
+  const resolveJob = parsed.jobs.resolve;
+  const deployJob = parsed.jobs.deploy;
+  const releaseStep = resolveJob.steps.find(({ id }) => id === "release");
+  const sourceStep = parsed.jobs.deploy.steps.find(({ id }) => id === "source");
+
+  assert.deepEqual(parsed.on.workflow_run, {
+    workflows: ["Release"],
+    types: ["completed"],
+    branches: ["main"],
+  });
+  assert.match(parsed["run-name"], /github\.event\.workflow_run\.id/);
+  assert.match(parsed["run-name"], /github\.event\.workflow_run\.run_attempt/);
+  assert.match(parsed["run-name"], /github\.event\.workflow_run\.head_sha/);
+  assert.equal(parsed.permissions.contents, "read");
+  assert.equal(resolveJob.permissions.actions, "read");
+  assert.equal(resolveJob.permissions.contents, "read");
+  assert.equal(resolveJob.environment, undefined);
+  assert.doesNotMatch(JSON.stringify(resolveJob), /secrets\./);
+  assert.equal(resolveJob.outputs.eligible, "${{ steps.release.outputs.eligible }}");
+  assert.equal(resolveJob.outputs.tag, "${{ steps.release.outputs.tag }}");
+  assert.equal(resolveJob.outputs.version, "${{ steps.release.outputs.version }}");
+  assert.equal(deployJob.needs, "resolve");
+  assert.equal(deployJob.if, "needs.resolve.outputs.eligible == 'true'");
+  assert.equal(deployJob.permissions.contents, "read");
+  assert.equal(
+    deployJob.steps.find(({ uses }) => uses?.startsWith("actions/checkout@"))?.with.ref,
+    "${{ needs.resolve.outputs.tag }}",
+  );
+  assert.match(JSON.stringify(deployJob), /needs\.resolve\.outputs\.version/);
+  assert.doesNotMatch(JSON.stringify(deployJob), /steps\.release\.outputs/);
+  assert.match(resolveJob.if, /github\.event_name != 'workflow_run'/);
+  assert.match(
+    resolveJob.if,
+    /github\.event\.workflow_run\.conclusion == 'success'/,
+  );
+  assert.match(
+    resolveJob.if,
+    /github\.event\.workflow_run\.event == 'push'/,
+  );
+  assert.match(
+    resolveJob.if,
+    /github\.event\.workflow_run\.head_repository\.full_name == github\.repository/,
+  );
+  assert.match(
+    resolveJob.if,
+    /github\.event\.workflow_run\.head_branch == 'main'/,
+  );
+  assert.match(releaseStep.run, /github\.event_name \}\}" == "workflow_run"/);
+  assert.equal(
+    releaseStep.env.RELEASE_SHA,
+    "${{ github.event.workflow_run.head_sha }}",
+  );
+  assert.equal(
+    releaseStep.env.RELEASE_RUN_ID,
+    "${{ github.event.workflow_run.id }}",
+  );
+  assert.equal(
+    releaseStep.env.RELEASE_RUN_ATTEMPT,
+    "${{ github.event.workflow_run.run_attempt }}",
+  );
+
+  const automaticRelease = releaseStep.run.indexOf('== "workflow_run"');
+  const manualApproval = releaseStep.run.indexOf("inputs.approve");
+  assert.ok(automaticRelease >= 0);
+  assert.ok(manualApproval > automaticRelease);
+
+  const automaticScript = releaseStep.run.slice(automaticRelease, manualApproval);
+  const jobsLookup = automaticScript.indexOf(
+    "actions/runs/$RELEASE_RUN_ID/attempts/$RELEASE_RUN_ATTEMPT/jobs?per_page=100",
+  );
+  const releasesLookup = automaticScript.indexOf("releases?per_page=100");
+  assert.ok(jobsLookup >= 0);
+  assert.ok(releasesLookup > jobsLookup);
+  const attemptAttestation = automaticScript.slice(jobsLookup, releasesLookup);
+  assert.match(attemptAttestation, /if ! release_jobs_ready=\$\(/);
+  assert.match(attemptAttestation, /echo "eligible=false"/);
+  assert.match(attemptAttestation, /exit 0/);
+  for (const jobName of [
+    "Publish release artifacts",
+    "Publish Windows companion",
+    "Publish Linux companion",
+  ]) {
+    assert.match(automaticScript, new RegExp(`"${jobName}"`));
+  }
+  assert.match(automaticScript, /\.conclusion == "success"/);
+  assert.match(
+    automaticScript,
+    /--arg sha "\$RELEASE_SHA"/,
+  );
+  assert.match(
+    automaticScript,
+    /select\(\s*\.draft == false and\s*\.prerelease == false and\s*\.target_commitish == \$sha/,
+  );
+  assert.match(
+    automaticScript,
+    /test\("\^v\?\[0-9\]\+\\\\\.\[0-9\]\+\\\\\.\[0-9\]\+\$"\)/,
+  );
+  assert.match(automaticScript, /echo "eligible=false"/);
+  assert.match(automaticScript, /exit 0/);
+  assert.match(
+    automaticScript,
+    /Multiple stable semantic releases target the completed release workflow commit/,
+  );
+  assert.match(automaticScript, /if ! releases_json=\$\(gh api --paginate/);
+  assert.match(automaticScript, /if ! matching_tags=\$\(/);
+  assert.match(
+    automaticScript,
+    /if ! release_jobs_json=\$\(gh api --paginate/,
+  );
+  assert.doesNotMatch(automaticScript, /\|\| true/);
+  assert.doesNotMatch(automaticScript, /releases\/latest/);
+
+  const checkoutIndex = parsed.jobs.deploy.steps.findIndex(({ uses }) =>
+    uses?.startsWith("actions/checkout@"));
+  const sourceIndex = parsed.jobs.deploy.steps.indexOf(sourceStep);
+  const deployKeyIndex = parsed.jobs.deploy.steps.findIndex(
+    ({ name }) => name === "Configure deployment key",
+  );
+  assert.ok(checkoutIndex >= 0);
+  assert.ok(sourceIndex > checkoutIndex);
+  assert.ok(deployKeyIndex > sourceIndex);
+  assert.equal(
+    sourceStep.env.EXPECTED_RELEASE_SHA,
+    "${{ github.event.workflow_run.head_sha }}",
+  );
+  assert.match(sourceStep.run, /"\$sha" != "\$EXPECTED_RELEASE_SHA"/);
+  assert.match(sourceStep.run, /exit 64/);
+});
+
+test("automatic release resolution fails closed without turning a no-match into an error", async () => {
+  const parsed = parse(await readFile(".github/workflows/deploy-vps.yml", "utf8"));
+  const script = parsed.jobs.resolve.steps.find(({ id }) => id === "release").run;
+  const releaseSha = "a".repeat(40);
+  const successfulJobs = JSON.stringify({
+    jobs: [
+      "Publish release artifacts",
+      "Publish Windows companion",
+      "Publish Linux companion",
+    ].map((name) => ({ name, conclusion: "success" })),
+  });
+  const exactRelease = {
+    draft: false,
+    prerelease: false,
+    target_commitish: releaseSha,
+    tag_name: "v0.10.7",
+  };
+
+  const exact = runAutomaticReleaseResolver(script, {
+    MOCK_RELEASE_JOBS: successfulJobs,
+    MOCK_RELEASES: JSON.stringify([exactRelease]),
+  });
+  assert.equal(exact.status, 0, exact.stderr);
+  assert.match(exact.stdout, /Selected WatchPair 0\.10\.7\./);
+
+  const noMatch = runAutomaticReleaseResolver(script, {
+    MOCK_RELEASE_JOBS: successfulJobs,
+    MOCK_RELEASES: JSON.stringify([{
+      ...exactRelease,
+      target_commitish: "b".repeat(40),
+    }]),
+  });
+  assert.equal(noMatch.status, 0, noMatch.stderr);
+  assert.match(noMatch.stdout, /No stable semantic release targets/);
+  assert.doesNotMatch(noMatch.stdout, /Selected WatchPair/);
+
+  const unpublished = runAutomaticReleaseResolver(script, {
+    MOCK_RELEASE_JOBS: JSON.stringify({
+      jobs: [
+        { name: "Publish release artifacts", conclusion: "success" },
+        { name: "Publish Windows companion", conclusion: "skipped" },
+        { name: "Publish Linux companion", conclusion: "skipped" },
+      ],
+    }),
+    MOCK_RELEASES_STATUS: "9",
+  });
+  assert.equal(unpublished.status, 0, unpublished.stderr);
+  assert.match(unpublished.stdout, /did not publish every release artifact/);
+
+  const duplicate = runAutomaticReleaseResolver(script, {
+    MOCK_RELEASE_JOBS: successfulJobs,
+    MOCK_RELEASES: JSON.stringify([
+      exactRelease,
+      { ...exactRelease, tag_name: "v0.10.8" },
+    ]),
+  });
+  assert.equal(duplicate.status, 64, duplicate.stderr);
+  assert.match(duplicate.stderr, /Multiple stable semantic releases/);
+
+  const jobsApiFailure = runAutomaticReleaseResolver(script, {
+    MOCK_RELEASE_JOBS_STATUS: "9",
+  });
+  assert.equal(jobsApiFailure.status, 69, jobsApiFailure.stderr);
+  assert.match(jobsApiFailure.stderr, /Could not inspect the completed release workflow attempt/);
+
+  const releaseFilterFailure = runAutomaticReleaseResolver(script, {
+    MOCK_RELEASE_JOBS: successfulJobs,
+    MOCK_RELEASES: "not-json",
+  });
+  assert.equal(releaseFilterFailure.status, 65, releaseFilterFailure.stderr);
+  assert.match(releaseFilterFailure.stderr, /Could not validate repository releases/);
 });
 
 test("all GitHub workflow files contain valid YAML", async () => {

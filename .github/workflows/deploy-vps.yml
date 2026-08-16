@@ -1,6 +1,21 @@
 name: Deploy VPS
+run-name: >-
+  ${{
+    github.event_name == 'workflow_run' &&
+    format(
+      'Deploy VPS from Release run {0}, attempt {1}, SHA {2}',
+      github.event.workflow_run.id,
+      github.event.workflow_run.run_attempt,
+      github.event.workflow_run.head_sha
+    ) ||
+    format('Deploy VPS ({0})', github.event_name)
+  }}
 
 on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+    branches: [main]
   schedule:
     - cron: '7 4 * * *'
       timezone: Europe/Vienna
@@ -24,13 +39,27 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  deploy:
-    name: Deploy released image
+  resolve:
+    name: Resolve eligible release
+    if: >-
+      ${{
+        github.event_name != 'workflow_run' ||
+        (
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_repository.full_name == github.repository &&
+          github.event.workflow_run.head_branch == 'main'
+        )
+      }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    environment:
-      name: ${{ github.event_name == 'workflow_dispatch' && 'production-vps' || 'production-vps-scheduled' }}
-      url: https://38-180-216-137.sslip.io:8443
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      eligible: ${{ steps.release.outputs.eligible }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -39,6 +68,9 @@ jobs:
         shell: bash
         env:
           REQUESTED_VERSION: ${{ inputs.version }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+          RELEASE_RUN_ID: ${{ github.event.workflow_run.id }}
+          RELEASE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
         run: |
           set -euo pipefail
 
@@ -49,6 +81,89 @@ jobs:
                 grep -E '^v?[0-9]+\.[0-9]+\.0$' |
                 head -n 1 || true
             )
+          elif [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            if [[ ! "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "The completed release workflow did not provide a valid commit SHA." >&2
+              exit 64
+            fi
+            if [[ ! "$RELEASE_RUN_ID" =~ ^[1-9][0-9]*$ ]] || [[ ! "$RELEASE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+              echo "The completed release workflow did not provide a valid run attempt." >&2
+              exit 64
+            fi
+
+            if ! release_jobs_json=$(gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$RELEASE_RUN_ID/attempts/$RELEASE_RUN_ATTEMPT/jobs?per_page=100"); then
+              echo "Could not inspect the completed release workflow attempt." >&2
+              exit 69
+            fi
+            if ! release_jobs_ready=$(
+              jq -s -r '
+                [.[].jobs[]] as $jobs |
+                [
+                  "Publish release artifacts",
+                  "Publish Windows companion",
+                  "Publish Linux companion"
+                ] as $required |
+                [
+                  $required[] as $name |
+                  [$jobs[] | select(.name == $name)] |
+                  (length == 1 and .[0].conclusion == "success")
+                ] |
+                all
+              ' <<< "$release_jobs_json"
+            ); then
+              echo "Could not validate the completed release workflow jobs." >&2
+              exit 65
+            fi
+            if [[ "$release_jobs_ready" != "true" ]]; then
+              echo "eligible=false" >> "$GITHUB_OUTPUT"
+              echo "The completed workflow attempt did not publish every release artifact; skipping deployment."
+              exit 0
+            fi
+
+            if ! releases_json=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100"); then
+              echo "Could not inspect repository releases." >&2
+              exit 69
+            fi
+            if ! matching_tags=$(
+              jq -s -c --arg sha "$RELEASE_SHA" '
+                [
+                  .[][] |
+                  select(
+                    .draft == false and
+                    .prerelease == false and
+                    .target_commitish == $sha and
+                    (.tag_name | type == "string" and test("^v?[0-9]+\\.[0-9]+\\.[0-9]+$"))
+                  ) |
+                  .tag_name
+                ]
+              ' <<< "$releases_json"
+            ); then
+              echo "Could not validate repository releases." >&2
+              exit 65
+            fi
+            if ! match_count=$(jq -r 'length' <<< "$matching_tags"); then
+              echo "Could not count matching repository releases." >&2
+              exit 65
+            fi
+
+            case "$match_count" in
+              0)
+                echo "eligible=false" >> "$GITHUB_OUTPUT"
+                echo "No stable semantic release targets the completed release workflow commit; skipping deployment."
+                exit 0
+                ;;
+              1)
+                if ! tag=$(jq -r '.[0]' <<< "$matching_tags"); then
+                  echo "Could not resolve the matching repository release." >&2
+                  exit 65
+                fi
+                ;;
+              *)
+                echo "Multiple stable semantic releases target the completed release workflow commit." >&2
+                exit 64
+                ;;
+            esac
           elif [[ "${{ inputs.approve }}" != "true" ]]; then
             echo "Manual deployment was not approved." >&2
             exit 64
@@ -69,19 +184,36 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Selected WatchPair $version."
 
-      - if: steps.release.outputs.eligible == 'true'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+  deploy:
+    name: Deploy released image
+    needs: resolve
+    if: needs.resolve.outputs.eligible == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    environment:
+      name: ${{ github.event_name == 'workflow_dispatch' && 'production-vps' || 'production-vps-scheduled' }}
+      url: https://38-180-216-137.sslip.io:8443
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ steps.release.outputs.tag }}
+          ref: ${{ needs.resolve.outputs.tag }}
 
-      - if: steps.release.outputs.eligible == 'true'
-        id: source
-        name: Resolve released revision
+      - id: source
+        name: Resolve and verify released revision
         shell: bash
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        env:
+          EXPECTED_RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          if [[ "${{ github.event_name }}" == "workflow_run" ]] && [[ "$sha" != "$EXPECTED_RELEASE_SHA" ]]; then
+            echo "The selected release tag does not resolve to the completed release workflow commit." >&2
+            exit 64
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
-      - if: steps.release.outputs.eligible == 'true'
-        name: Configure deployment key
+      - name: Configure deployment key
         env:
           DEPLOY_KEY: ${{ secrets.WATCHPAIR_DEPLOY_SSH_KEY }}
         shell: bash
@@ -93,12 +225,11 @@ jobs:
           cp ops/watchpair-known-hosts "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
 
-      - if: steps.release.outputs.eligible == 'true'
-        id: status
+      - id: status
         name: Check deployed revision
         shell: bash
         env:
-          VERSION: ${{ steps.release.outputs.version }}
+          VERSION: ${{ needs.resolve.outputs.version }}
           REVISION: ${{ steps.source.outputs.sha }}
         run: |
           set +e
@@ -125,7 +256,7 @@ jobs:
           context: .
           platforms: linux/amd64
           outputs: type=docker,dest=${{ runner.temp }}/watchpair-image.tar
-          tags: watchpair:${{ steps.release.outputs.version }}
+          tags: watchpair:${{ needs.resolve.outputs.version }}
           build-args: VCS_REF=${{ steps.source.outputs.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -134,7 +265,7 @@ jobs:
         name: Deploy and verify release
         shell: bash
         env:
-          VERSION: ${{ steps.release.outputs.version }}
+          VERSION: ${{ needs.resolve.outputs.version }}
           REVISION: ${{ steps.source.outputs.sha }}
         run: |
           gzip -9 --stdout "${{ runner.temp }}/watchpair-image.tar" |
