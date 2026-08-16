@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.7](https://github.com/Etaselia/watchpair/compare/v0.10.6...v0.10.7) (2026-08-16)
+
+
+### Bug Fixes
+
+* **deploy:** automate successful release rollouts ([#76](https://github.com/Etaselia/watchpair/issues/76)) ([03fe98e](https://github.com/Etaselia/watchpair/commit/03fe98e4204b3327937a3420620c1daac1e4b942))
+
 ## [0.10.6](https://github.com/Etaselia/watchpair/compare/v0.10.5...v0.10.6) (2026-08-16)
 
 
