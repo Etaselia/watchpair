@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.6](https://github.com/Etaselia/watchpair/compare/v0.10.5...v0.10.6) (2026-08-16)
+
+
+### Bug Fixes
+
+* make storage cleanup reliable after restart ([#74](https://github.com/Etaselia/watchpair/issues/74)) ([b131444](https://github.com/Etaselia/watchpair/commit/b131444b1dff0e970c0ff8c52bd16e85a8841488))
+
 ## [0.10.5](https://github.com/Etaselia/watchpair/compare/v0.10.4...v0.10.5) (2026-08-15)
 
 
