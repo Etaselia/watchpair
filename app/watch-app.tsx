@@ -105,6 +105,13 @@ import {
   orderedMediaQueue,
 } from "../lib/media-queue.mjs";
 import {
+  hlsAudioPreference,
+  resolveHlsAudioChannelCount,
+  shouldRetryHlsWithStereo,
+  withStereoHlsAudio,
+  type HlsAudioMode,
+} from "../lib/hls-audio-fallback.mjs";
+import {
   clampSeekTarget,
   clampToPreparedRanges,
   isPlaybackAcknowledgement,
@@ -2769,6 +2776,7 @@ function SyncedPlayer({
   const assRendererRef = useRef<import("jassub").default | null>(null);
   const subtitleOffsetRef = useRef(session.player.subtitleOffset);
   const hlsRecoveryRef = useRef(false);
+  const hlsStereoFallbackPendingRef = useRef(false);
   const lastSeqRef = useRef(-1);
   const playerStateRef = useRef(session.player);
   const clockOffsetRef = useRef(0);
@@ -2785,6 +2793,10 @@ function SyncedPlayer({
   const [mediaLoading, setMediaLoading] = useState(true);
   const [mediaError, setMediaError] = useState("");
   const [hlsAudioRevision, setHlsAudioRevision] = useState(0);
+  const [hlsAudioModeState, setHlsAudioModeState] = useState<{
+    mediaKey: string;
+    mode: HlsAudioMode;
+  }>({ mediaKey: "", mode: "surround" });
   const [hlsVideoRendition] = useState<HlsVideoRendition>(preferredHlsVideoRendition);
   const [subtitleText, setSubtitleText] = useState("");
   const [failedAssTrack, setFailedAssTrack] = useState("");
@@ -2874,15 +2886,29 @@ function SyncedPlayer({
     return null;
   })();
   const playbackAudioTrack = requestedAudioTrack || defaultAudioTrack;
+  const playbackAudioTrackLabel = playbackAudioTrack?.label || "";
+  const playbackAudioTrackLanguage = playbackAudioTrack?.language || "";
+  const playbackAudioTrackChannels = playbackAudioTrack?.channels;
+  const initialHlsAudioPreference = useMemo(
+    () => hlsAudioPreference(playbackAudioTrackLabel
+      ? { label: playbackAudioTrackLabel, language: playbackAudioTrackLanguage }
+      : null),
+    [playbackAudioTrackLabel, playbackAudioTrackLanguage]
+  );
+  const hlsAudioMediaKey = `${mediaUrl}\n${playbackAudioTrack?.id || "original"}`;
+  const hlsAudioMode: HlsAudioMode = hlsAudioModeState.mediaKey === hlsAudioMediaKey
+    ? hlsAudioModeState.mode
+    : "surround";
   const desiredAudioTrackIndex = playbackAudioTrack
     ? audioTracks.findIndex((track) => track.id === playbackAudioTrack.id)
     : -1;
   const playbackUrl = useMemo(() => {
     if (mediaUrl.includes("/hls/") && mediaUrl.includes(".m3u8")) {
-      return mediaUrl.replace(
+      const hlsUrl = mediaUrl.replace(
         /\/(?:h264|vp9)\/master\.m3u8$/,
         `/${hlsVideoRendition}/master.m3u8`
       );
+      return hlsAudioMode === "stereo" ? withStereoHlsAudio(hlsUrl) : hlsUrl;
     }
     if (hlsVideoRendition === "vp9" && mediaUrl.startsWith(AGENT_URL)) {
       const url = new URL(mediaUrl);
@@ -2890,14 +2916,15 @@ function SyncedPlayer({
       if (stream) {
         url.pathname = `/hls/${stream[1]}/${stream[2]}/vp9/master.m3u8`;
         url.search = "";
-        return url.toString();
+        const hlsUrl = url.toString();
+        return hlsAudioMode === "stereo" ? withStereoHlsAudio(hlsUrl) : hlsUrl;
       }
     }
     if (!mediaUrl || !requestedAudioTrack) return mediaUrl;
     const url = new URL(mediaUrl);
     url.searchParams.set("audio", requestedAudioTrack.id);
     return url.toString();
-  }, [hlsVideoRendition, mediaUrl, requestedAudioTrack]);
+  }, [hlsAudioMode, hlsVideoRendition, mediaUrl, requestedAudioTrack]);
   const isHlsPlayback = playbackUrl.includes("/hls/") && playbackUrl.includes(".m3u8");
   const preparedThrough =
     mediaPreparation?.contiguousReadySeconds ??
@@ -2910,6 +2937,8 @@ function SyncedPlayer({
     ? "Preparing selected video"
     : !isHlsPlayback
       ? "Preparing video for this browser"
+      : hlsAudioMode === "stereo"
+        ? "Preparing stereo compatibility audio"
       : mediaPreparation?.complete
         ? "Buffering prepared video"
         : preparedThrough > 0 && roomPlaybackPosition >= preparedThrough - 1
@@ -3084,6 +3113,23 @@ function SyncedPlayer({
 
   useEffect(() => () => clearControlsTimer(), [clearControlsTimer]);
 
+  const activateHlsStereoFallback = useCallback((message: string, hlsDetails: string) => {
+    if (hlsStereoFallbackPendingRef.current) return;
+    hlsStereoFallbackPendingRef.current = true;
+    hlsRecoveryRef.current = true;
+    hlsRef.current?.stopLoad();
+    reportPlaybackEvent("hls_surround_audio_fallback", {
+      level: "warn",
+      message,
+      hlsDetails,
+    });
+    setHlsAudioModeState({ mediaKey: hlsAudioMediaKey, mode: "stereo" });
+    setMediaLoading(true);
+    setNeedsGesture(false);
+    setMediaError("");
+    pinControls();
+  }, [hlsAudioMediaKey, pinControls, reportPlaybackEvent]);
+
   const handlePlaybackFailure = useCallback(
     (caught: unknown) => {
       const video = videoRef.current;
@@ -3132,6 +3178,7 @@ function SyncedPlayer({
     pendingPlaybackRef.current = null;
     scrubbingRef.current = false;
     hlsRecoveryRef.current = false;
+    hlsStereoFallbackPendingRef.current = false;
 
     const fail = (message: string) => {
       setMediaLoading(false);
@@ -3177,6 +3224,7 @@ function SyncedPlayer({
             maxBufferLength: 60,
             manifestLoadingTimeOut: 65_000,
             levelLoadingTimeOut: 65_000,
+            audioPreference: initialHlsAudioPreference,
           });
           instance = hls;
           hlsRef.current = hls;
@@ -3187,6 +3235,13 @@ function SyncedPlayer({
             networkRecoveryAttempts = 0;
           });
           hls.on(Events.AUDIO_TRACKS_UPDATED, () => {
+            if (
+              desiredAudioTrackIndex >= 0 &&
+              hls.audioTracks.length > desiredAudioTrackIndex &&
+              hls.audioTrack !== desiredAudioTrackIndex
+            ) {
+              hls.audioTrack = desiredAudioTrackIndex;
+            }
             setHlsAudioRevision((revision) => revision + 1);
           });
           hls.on(Events.ERROR, (_event, data: ErrorData) => {
@@ -3220,6 +3275,29 @@ function SyncedPlayer({
                 hls.stopLoad();
                 hls.loadSource(playbackUrl);
               }, retryDelayMs);
+              return;
+            }
+            if (
+              data.type === ErrorTypes.MEDIA_ERROR &&
+              shouldRetryHlsWithStereo({
+                isHlsPlayback,
+                fatalHlsMediaError: data.fatal,
+                sourceChannels: resolveHlsAudioChannelCount(
+                  hls.audioTracks[hls.audioTrack]?.channels,
+                  playbackAudioTrackChannels
+                ),
+                audioMode: hlsAudioMode,
+              })
+            ) {
+              const message = data.error?.message || String(data.details);
+              const activeAudioChannels = resolveHlsAudioChannelCount(
+                hls.audioTracks[hls.audioTrack]?.channels,
+                playbackAudioTrackChannels
+              );
+              activateHlsStereoFallback(
+                message,
+                `${String(data.details)}; retrying ${activeAudioChannels}-channel audio as stereo`
+              );
               return;
             }
             if (data.type === ErrorTypes.MEDIA_ERROR && !hlsRecoveryRef.current) {
@@ -3284,7 +3362,17 @@ function SyncedPlayer({
       instance?.destroy();
       video.removeAttribute("src");
     };
-  }, [isHlsPlayback, pinControls, playbackUrl, reportPlaybackEvent]);
+  }, [
+    activateHlsStereoFallback,
+    hlsAudioMode,
+    desiredAudioTrackIndex,
+    initialHlsAudioPreference,
+    isHlsPlayback,
+    pinControls,
+    playbackAudioTrackChannels,
+    playbackUrl,
+    reportPlaybackEvent,
+  ]);
 
   useEffect(() => {
     const hls = hlsRef.current;
@@ -3767,12 +3855,31 @@ function SyncedPlayer({
           });
         }}
         onError={(event) => {
-          const message = event.currentTarget.error?.message || "HTML media element reported an error.";
+          const error = event.currentTarget.error;
+          const message = error?.message || "HTML media element reported an error.";
+          const activeAudioChannels = resolveHlsAudioChannelCount(
+            hlsRef.current?.audioTracks[hlsRef.current.audioTrack]?.channels,
+            playbackAudioTrackChannels
+          );
           reportPlaybackEvent("media_element_error", { level: "error", message });
-          if (hlsRef.current) return;
+          if (shouldRetryHlsWithStereo({
+            isHlsPlayback,
+            mediaErrorCode: error?.code,
+            sourceChannels: activeAudioChannels,
+            audioMode: hlsAudioMode,
+          })) {
+            activateHlsStereoFallback(
+              message,
+              `Native MediaError ${error?.code}; retrying ${activeAudioChannels}-channel audio as stereo`
+            );
+            return;
+          }
           setMediaLoading(false);
+          setNeedsGesture(false);
           setMediaError(
-            mediaUrl.startsWith(AGENT_URL)
+            isHlsPlayback && error?.code === 4
+              ? "This browser could not decode the prepared video or audio track."
+              : mediaUrl.startsWith(AGENT_URL)
               ? "The companion could not prepare this video for browser playback."
               : "This video format could not be opened by the browser."
           );

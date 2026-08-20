@@ -480,7 +480,20 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /Preparing video for this browser/);
   assert.match(app, /HlsRuntime\.isSupported/);
   assert.match(app, /AUDIO_TRACKS_UPDATED/);
+  assert.match(app, /audioPreference: initialHlsAudioPreference/);
+  assert.match(app, /hls\.audioTrack = desiredAudioTrackIndex/);
+  assert.match(app, /resolveHlsAudioChannelCount/);
   assert.match(app, /MANIFEST_PARSED/);
+  assert.match(app, /Preparing stereo compatibility audio/);
+  assert.match(app, /This browser could not decode the prepared video or audio track/);
+  assert.doesNotMatch(app, /if \(hlsRef\.current\) return/);
+  assert.match(app, /hlsRecoveryRef\.current = true;\s+hlsRef\.current\?\.stopLoad\(\)/);
+  const fatalAudioFallbackIndex = app.indexOf("fatalHlsMediaError: data.fatal");
+  const hlsMediaRecoveryIndex = app.indexOf("hls.recoverMediaError()");
+  assert.ok(
+    fatalAudioFallbackIndex >= 0 && fatalAudioFallbackIndex < hlsMediaRecoveryIndex,
+    "surround fallback must run before HLS media recovery",
+  );
   assert.match(app, /activeFile\?\.ready && activeItem\.ready/);
   assert.match(app, /HTMLMediaElement\.HAVE_METADATA/);
   assert.match(app, /HTMLMediaElement\.HAVE_FUTURE_DATA/);
