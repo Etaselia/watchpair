@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.9](https://github.com/Etaselia/watchpair/compare/v0.10.8...v0.10.9) (2026-08-20)
+
+
+### Bug Fixes
+
+* preserve surround audio in browser playback ([#80](https://github.com/Etaselia/watchpair/issues/80)) ([337b12a](https://github.com/Etaselia/watchpair/commit/337b12aa92a1b58e45bb3c2b92fe8cc79c3dda36))
+
 ## [0.10.8](https://github.com/Etaselia/watchpair/compare/v0.10.7...v0.10.8) (2026-08-16)
 
 
