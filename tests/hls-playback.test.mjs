@@ -91,6 +91,49 @@ async function createInput(filePath, {
   await runFile(ffmpegPath, argumentsList);
 }
 
+async function createSurroundInput(filePath, {
+  duration = 1.5,
+  channelLayout = "5.1(side)",
+  audioCodec = "ac3",
+} = {}) {
+  const argumentsList = [
+    "-hide_banner", "-loglevel", "error", "-y",
+    "-f", "lavfi", "-i",
+    "testsrc2=size=320x180:rate=24:duration=" + duration,
+    "-f", "lavfi", "-i",
+    "anullsrc=r=48000:cl=" + channelLayout,
+    "-map", "0:v:0", "-map", "1:a:0", "-t", String(duration),
+    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+    "-g", "24", "-keyint_min", "24", "-sc_threshold", "0",
+    "-c:a", audioCodec,
+  ];
+  if (audioCodec === "ac3") argumentsList.push("-b:a", "384k");
+  argumentsList.push(filePath);
+  await runFile(ffmpegPath, argumentsList);
+}
+
+async function probeAudioInit(manager, descriptor, trackId = "1") {
+  const asset = await manager.getAsset(
+    descriptor,
+    "audio/" + trackId + "/epoch-000000-init.mp4"
+  );
+  const result = JSON.parse((await runFile(ffprobeStatic.path, [
+    "-v", "error",
+    "-select_streams", "a:0",
+    "-show_entries", "stream=codec_name,sample_rate,channels,channel_layout,extradata",
+    "-show_data",
+    "-of", "json",
+    asset.filePath,
+  ])).stdout);
+  const stream = result.streams?.[0];
+  const firstWord = /00000000:\s*([0-9a-fA-F]{4})/.exec(stream?.extradata || "")?.[1];
+  assert.ok(firstWord, JSON.stringify(stream));
+  return {
+    ...stream,
+    channelConfiguration: (Number.parseInt(firstWord, 16) >> 3) & 0x0f,
+  };
+}
+
 async function firstVideoPacket(manager, descriptor, playlist, directory, epochIndex) {
   const prefix = "epoch-" + String(epochIndex).padStart(6, "0");
   const initName = prefix + "-init.mp4";
@@ -117,14 +160,22 @@ async function firstVideoPacket(manager, descriptor, playlist, directory, epochI
   return result.packets?.[0];
 }
 
-function audioTrack(id, streamIndex, language, label, isDefault) {
+function audioTrack(
+  id,
+  streamIndex,
+  language,
+  label,
+  isDefault,
+  { codec = "aac", channels = 1, channelLayout = "mono" } = {}
+) {
   return {
     id: String(id),
     streamIndex,
     language,
     label,
-    codec: "aac",
-    channels: 1,
+    codec,
+    channels,
+    channelLayout,
     default: isDefault,
   };
 }
@@ -457,6 +508,150 @@ test("publishes contiguous immutable epochs with every audio track", { timeout: 
     } finally {
       await cachedManager.shutdown();
     }
+  } finally {
+    await manager?.shutdown();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("canonicalizes 5.1(side) AAC and keeps an isolated stereo fallback", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchpair-hls-surround-"));
+  const input = path.join(directory, "input.mkv");
+  const cacheRoot = path.join(directory, "cache");
+  let manager;
+
+  try {
+    await createSurroundInput(input);
+    const common = {
+      jobId: "surround-audio-test",
+      fileIndex: 0,
+      fileSize: (await stat(input)).size,
+      contentFingerprint: "51515151515151515151515151515151",
+      inputPath: input,
+      sourceDuration: 1.5,
+      videoCodec: "h264",
+      videoPixelFormat: "yuv420p",
+      videoProfile: "Constrained Baseline",
+      videoStartTime: 0,
+      rendition: "vp9",
+      audioTracks: [audioTrack(1, 1, "eng", "English", true, {
+        codec: "ac3",
+        channels: 6,
+        channelLayout: "5.1(side)",
+      })],
+    };
+    const surround = { ...common, audioMode: "surround" };
+    const stereo = { ...common, audioMode: "stereo" };
+    manager = createHlsPlaybackManager({
+      ffmpegPath,
+      ffprobePath: ffprobeStatic.path,
+      cacheRoot,
+      segmentSeconds: 1,
+      epochSeconds: 2,
+      playableSeconds: 1,
+      playlistWaitMs: 10_000,
+    });
+
+    await manager.prepare(surround);
+    const surroundAudio = await probeAudioInit(manager, surround);
+    assert.equal(surroundAudio.codec_name, "aac");
+    assert.equal(surroundAudio.channels, 6);
+    assert.equal(surroundAudio.channel_layout, "5.1");
+    assert.equal(surroundAudio.channelConfiguration, 6);
+    const surroundProcess = manager.diagnostics().processes.recent.find(
+      (record) => record.stage === "browser-playback-epoch" &&
+        record.arguments.includes("pan=5.1|FL=FL|FR=FR|FC=FC|LFE=LFE|BL=SL|BR=SR,aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS")
+    );
+    assert.ok(surroundProcess, JSON.stringify(manager.diagnostics().processes.recent));
+    assert.ok(surroundProcess.arguments.includes("384k"));
+    const surroundMasterAsset = await manager.getAsset(surround, "master.m3u8");
+    const surroundMaster = await readPlaylist(surroundMasterAsset.filePath);
+    assert.match(surroundMaster, /CHANNELS="6"/);
+    assert.doesNotMatch(surroundMaster, /audio=stereo/);
+
+    await manager.prepare(stereo);
+    const stereoAudio = await probeAudioInit(manager, stereo);
+    assert.equal(stereoAudio.codec_name, "aac");
+    assert.equal(stereoAudio.channels, 2);
+    assert.equal(stereoAudio.channel_layout, "stereo");
+    assert.equal(stereoAudio.channelConfiguration, 2);
+    const stereoMasterAsset = await manager.getAsset(stereo, "master.m3u8");
+    const stereoMaster = await readPlaylist(stereoMasterAsset.filePath);
+    assert.match(stereoMaster, /CHANNELS="2"/);
+    assert.match(stereoMaster, /audio\/1\/index\.m3u8\?audio=stereo/);
+    assert.match(stereoMaster, /video\/index\.m3u8\?audio=stereo/);
+    assert.notEqual(stereoMasterAsset.filePath, surroundMasterAsset.filePath);
+
+    const stereoAudioPlaylist = await manager.getAsset(stereo, "audio/1/index.m3u8");
+    const stereoVideoPlaylist = await manager.getAsset(stereo, "video/index.m3u8");
+    for (const playlist of await Promise.all([
+      readPlaylist(stereoAudioPlaylist.filePath),
+      readPlaylist(stereoVideoPlaylist.filePath),
+    ])) {
+      assert.match(playlist, /epoch-000000-init\.mp4\?audio=stereo/);
+      assert.match(playlist, /epoch-000000-segment-000000\.m4s\?audio=stereo/);
+    }
+  } finally {
+    await manager?.shutdown();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("preserves canonical 7.1 AAC with a browser-safe ASC", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchpair-hls-seven-one-"));
+  const input = path.join(directory, "input.mkv");
+  let manager;
+
+  try {
+    await createSurroundInput(input, { channelLayout: "7.1", audioCodec: "flac" });
+    const common = {
+      jobId: "seven-one-audio-test",
+      fileIndex: 0,
+      fileSize: (await stat(input)).size,
+      contentFingerprint: "71717171717171717171717171717171",
+      inputPath: input,
+      sourceDuration: 1.5,
+      videoCodec: "h264",
+      videoPixelFormat: "yuv420p",
+      videoProfile: "Constrained Baseline",
+      videoStartTime: 0,
+      audioTracks: [audioTrack(1, 1, "eng", "English", true, {
+        codec: "flac",
+        channels: 8,
+        channelLayout: "7.1",
+      })],
+    };
+    manager = createHlsPlaybackManager({
+      ffmpegPath,
+      ffprobePath: ffprobeStatic.path,
+      cacheRoot: path.join(directory, "cache"),
+      segmentSeconds: 1,
+      epochSeconds: 2,
+      playableSeconds: 1,
+      playlistWaitMs: 10_000,
+    });
+
+    const surround = { ...common, audioMode: "surround" };
+    await manager.prepare(surround);
+    const surroundAudio = await probeAudioInit(manager, surround);
+    assert.equal(surroundAudio.channels, 8);
+    assert.equal(surroundAudio.channel_layout, "7.1");
+    assert.equal(surroundAudio.channelConfiguration, 7);
+    const surroundProcess = manager.diagnostics().processes.recent.find(
+      (record) => record.stage === "browser-playback-epoch" &&
+        record.arguments.includes("aformat=channel_layouts=7.1,aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS")
+    );
+    assert.ok(surroundProcess, JSON.stringify(manager.diagnostics().processes.recent));
+    assert.ok(surroundProcess.arguments.includes("512k"));
+    const surroundMaster = await manager.getAsset(surround, "master.m3u8");
+    assert.match(await readPlaylist(surroundMaster.filePath), /CHANNELS="8"/);
+
+    const stereo = { ...common, audioMode: "stereo" };
+    await manager.prepare(stereo);
+    const stereoAudio = await probeAudioInit(manager, stereo);
+    assert.equal(stereoAudio.channels, 2);
+    assert.equal(stereoAudio.channel_layout, "stereo");
+    assert.equal(stereoAudio.channelConfiguration, 2);
   } finally {
     await manager?.shutdown();
     await rm(directory, { recursive: true, force: true });
@@ -815,7 +1010,7 @@ test("sanitizes a task failure before shared scheduler telemetry", { timeout: 5_
             cacheRoot,
             "content",
             fingerprint + "-1",
-            "h264-hls-v12",
+            "h264-a-v13",
             "generations",
             data.generationId
           );
@@ -880,7 +1075,7 @@ test("sanitizes a task failure before shared scheduler telemetry", { timeout: 5_
   }
 });
 
-test("rejects a complete v12 generation with an invalid terminal duration", { timeout: 8_000 }, async () => {
+test("rejects a complete v13 generation with an invalid terminal duration", { timeout: 8_000 }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "watchpair-hls-invalid-"));
   const cacheRoot = path.join(directory, "cache");
   const fingerprint = "cccccccccccccccccccccccccccccccc";
@@ -890,7 +1085,7 @@ test("rejects a complete v12 generation with an invalid terminal duration", { ti
     cacheRoot,
     "content",
     fingerprint + "-" + fileSize,
-    "h264-hls-v12"
+    "h264-a-v13"
   );
   const invalidDirectory = path.join(
     baseDirectory,
@@ -911,11 +1106,12 @@ test("rejects a complete v12 generation with an invalid terminal duration", { ti
       "fake-segment"
     );
     await writeFile(path.join(invalidDirectory, "manifest.json"), JSON.stringify({
-      cacheVersion: "hls-v12",
+      cacheVersion: "hls-v13",
       generationId: invalidGenerationId,
       fileSize,
       contentFingerprint: fingerprint,
       rendition: "h264",
+      audioMode: "surround",
       sourceDuration: 4,
       epochSeconds: 2,
       segmentSeconds: 1,
@@ -1171,7 +1367,7 @@ test("resumes only committed epochs after restart and discards a stale writer wo
       cacheRoot,
       "content",
       fingerprint + "-" + descriptor.fileSize,
-      "h264-hls-v12",
+      "h264-a-v13",
       "generations",
       generationId
     );
@@ -1184,7 +1380,7 @@ test("resumes only committed epochs after restart and discards a stale writer wo
     await mkdir(staleDirectory, { recursive: true });
     await writeFile(path.join(staleDirectory, "partial.m4s"), "partial");
     await writeFile(path.join(generationPath, "writer.json"), JSON.stringify({
-      cacheVersion: "hls-v12",
+      cacheVersion: "hls-v13",
       generationId,
       token: "stale-token",
       epochIndex: manifestBefore.epochs.length,

@@ -23,7 +23,8 @@ import {
 } from "./process-registry.mjs";
 import { mediaDurationFromProbe } from "./media-chapters.mjs";
 
-const CACHE_VERSION = "hls-v12";
+const CACHE_VERSION = "hls-v13";
+const CACHE_DIRECTORY_VERSION = "v13";
 const DEFAULT_SEGMENT_SECONDS = 4;
 const DEFAULT_PLAYABLE_SECONDS = 120;
 const DEFAULT_EPOCH_SECONDS = 30;
@@ -109,6 +110,47 @@ function sourceAudioTracks(descriptor) {
   return Array.isArray(descriptor.audioTracks) ? descriptor.audioTracks : [];
 }
 
+function descriptorAudioMode(descriptor) {
+  return descriptor.audioMode === "stereo" ? "stereo" : "surround";
+}
+
+function audioOutputProfile(track, audioMode) {
+  const channels = Number(track.channels || 0);
+  const channelLayout = String(track.channelLayout || "").toLowerCase();
+  if (audioMode === "stereo") {
+    return { channels: 2, channelLayout: "stereo", bitrate: "192k" };
+  }
+  if (channels === 1) {
+    return { channels: 1, channelLayout: "mono", bitrate: "128k" };
+  }
+  if (channels === 2) {
+    return { channels: 2, channelLayout: "stereo", bitrate: "192k" };
+  }
+  if (channels === 6 && channelLayout === "5.1(side)") {
+    return {
+      channels: 6,
+      channelLayout: "5.1",
+      bitrate: "384k",
+      pan: "pan=5.1|FL=FL|FR=FR|FC=FC|LFE=LFE|BL=SL|BR=SR",
+    };
+  }
+  if (channels === 6 && channelLayout === "5.1") {
+    return { channels: 6, channelLayout: "5.1", bitrate: "384k" };
+  }
+  if (channels === 8 && channelLayout === "7.1") {
+    return { channels: 8, channelLayout: "7.1", bitrate: "512k" };
+  }
+  return { channels: 2, channelLayout: "stereo", bitrate: "192k" };
+}
+
+function audioModeQuery(audioMode) {
+  return audioMode === "stereo" ? "?audio=stereo" : "";
+}
+
+function publicAssetUri(uri, audioMode) {
+  return uri + audioModeQuery(audioMode);
+}
+
 function primaryAudioTrack(audioTracks) {
   return audioTracks.find((track) => track.default) || audioTracks[0] || null;
 }
@@ -158,24 +200,26 @@ async function readEpochPlaylist(directory, relativePath) {
   return playlist;
 }
 
-function masterPlaylist(audioTracks) {
+function masterPlaylist(audioTracks, audioMode) {
   const lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS"];
   const defaultTrack = primaryAudioTrack(audioTracks);
   for (const track of audioTracks) {
     const id = trackDirectory(track);
+    const output = audioOutputProfile(track, audioMode);
     const language = quoted(track.language === "und" ? "" : track.language);
     const languageAttribute = language ? ',LANGUAGE="' + language + '"' : "";
     lines.push(
       '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="watchpair-audio",NAME="' +
       quoted(track.label) + '",DEFAULT=' + (track === defaultTrack ? "YES" : "NO") +
-      ",AUTOSELECT=YES" + languageAttribute + ',URI="audio/' + id + '/index.m3u8"'
+      ",AUTOSELECT=YES" + languageAttribute + ',CHANNELS="' + output.channels +
+      '",URI="' + publicAssetUri("audio/" + id + "/index.m3u8", audioMode) + '"'
     );
   }
   lines.push(
     audioTracks.length
       ? '#EXT-X-STREAM-INF:BANDWIDTH=6500000,AUDIO="watchpair-audio"'
       : "#EXT-X-STREAM-INF:BANDWIDTH=6500000",
-    "video/index.m3u8",
+    publicAssetUri("video/index.m3u8", audioMode),
     ""
   );
   return lines.join("\n");
@@ -217,8 +261,10 @@ function normalizedVideoFilterArguments(argumentsList) {
   return result;
 }
 
-function normalizedAudioFilter() {
-  return "aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS";
+function normalizedAudioFilter(track, audioMode) {
+  const output = audioOutputProfile(track, audioMode);
+  const layoutFilter = output.pan || "aformat=channel_layouts=" + output.channelLayout;
+  return layoutFilter + ",aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS";
 }
 
 export function isPrivatePathCandidate(value) {
@@ -342,8 +388,15 @@ function descriptorCacheKey(descriptor) {
     descriptorSchedulerJobId(descriptor),
     descriptor.fileSize,
     descriptor.rendition || "h264",
+    descriptorAudioMode(descriptor),
     CACHE_VERSION,
   ].join(":");
+}
+
+function descriptorCacheVariant(descriptor) {
+  const audioToken = descriptorAudioMode(descriptor) === "stereo" ? "2" : "a";
+  return (descriptor.rendition || "h264") + "-" + audioToken + "-" +
+    CACHE_DIRECTORY_VERSION;
 }
 
 function descriptorCacheDirectory(cacheRoot, descriptor) {
@@ -353,7 +406,7 @@ function descriptorCacheDirectory(cacheRoot, descriptor) {
       cacheRoot,
       "content",
       fingerprint + "-" + descriptor.fileSize,
-      (descriptor.rendition || "h264") + "-" + CACHE_VERSION
+      descriptorCacheVariant(descriptor)
     );
   }
   return path.join(
@@ -361,7 +414,7 @@ function descriptorCacheDirectory(cacheRoot, descriptor) {
     "jobs",
     descriptor.jobId,
     descriptor.fileIndex + "-" + descriptor.fileSize + "-" +
-      (descriptor.rendition || "h264") + "-" + CACHE_VERSION
+      descriptorCacheVariant(descriptor)
   );
 }
 
@@ -396,6 +449,7 @@ function streamForEpoch(epoch, kind, trackId = null) {
 }
 
 function publicMediaPlaylist(manifest, kind, trackId = null) {
+  const audioMode = descriptorAudioMode(manifest);
   const streams = manifest.epochs
     .map((epoch) => ({ epoch, stream: streamForEpoch(epoch, kind, trackId) }))
     .filter(({ stream }) => stream?.segments?.length);
@@ -412,10 +466,10 @@ function publicMediaPlaylist(manifest, kind, trackId = null) {
   if (kind === "video") lines.push("#EXT-X-INDEPENDENT-SEGMENTS");
   streams.forEach(({ stream }, index) => {
     if (index > 0) lines.push("#EXT-X-DISCONTINUITY");
-    lines.push('#EXT-X-MAP:URI="' + stream.init + '"');
+    lines.push('#EXT-X-MAP:URI="' + publicAssetUri(stream.init, audioMode) + '"');
     for (const segment of stream.segments) {
       lines.push("#EXTINF:" + Number(segment.duration).toFixed(6) + ",");
-      lines.push(segment.uri);
+      lines.push(publicAssetUri(segment.uri, audioMode));
     }
   });
   if (manifest.complete) lines.push("#EXT-X-ENDLIST");
@@ -518,6 +572,7 @@ async function validateManifestAssets(
     Number(manifest.fileSize) !== Number(descriptor.fileSize) ||
     manifest.contentFingerprint !== validContentFingerprint(descriptor) ||
     String(manifest.rendition || "") !== String(descriptor.rendition || "h264") ||
+    descriptorAudioMode(manifest) !== descriptorAudioMode(descriptor) ||
     !Number.isFinite(Number(manifest.epochSeconds)) ||
     Math.abs(Number(manifest.epochSeconds) - epochSeconds) > 0.001 ||
     !Number.isFinite(Number(manifest.segmentSeconds)) ||
@@ -596,7 +651,7 @@ async function publishGeneration(generationPath, manifest, audioTracks) {
   await mkdir(path.join(generationPath, "video"), { recursive: true });
   await atomicWrite(
     path.join(generationPath, "master.m3u8"),
-    masterPlaylist(audioTracks)
+    masterPlaylist(audioTracks, descriptorAudioMode(manifest))
   );
   await atomicWrite(
     path.join(generationPath, "video", "index.m3u8"),
@@ -946,6 +1001,7 @@ export function createHlsPlaybackManager({
       fileSize: Number(descriptor.fileSize),
       contentFingerprint: validContentFingerprint(descriptor),
       rendition: descriptor.rendition || "h264",
+      audioMode: descriptorAudioMode(descriptor),
       sourceDuration: rounded(duration),
       epochSeconds: epochLength,
       segmentSeconds,
@@ -1018,7 +1074,8 @@ export function createHlsPlaybackManager({
       jobId: descriptor.jobId,
       schedulerJobId: schedulingId,
       ownerJobIds: new Set([descriptor.jobId]),
-      taskId: "hls:" + descriptor.fileIndex + ":" + (descriptor.rendition || "h264"),
+      taskId: "hls:" + descriptor.fileIndex + ":" + (descriptor.rendition || "h264") +
+        ":" + descriptorAudioMode(descriptor),
       descriptor,
       inputPath: descriptor.inputPath,
       baseDirectory,
@@ -1063,6 +1120,7 @@ export function createHlsPlaybackManager({
       jobId: state.jobId,
       schedulerJobId: schedulingId,
       generationId: state.generationId,
+      audioMode: descriptorAudioMode(state.descriptor),
       resumed: state.resumed,
       resumeSeconds: state.resumeSeconds,
       committedEpochs: state.manifest.epochs.length,
@@ -1151,35 +1209,21 @@ export function createHlsPlaybackManager({
 
   function launchEpochProcess(state, argumentsList, workingDirectory, taskContext, epochIndex) {
     const processArguments = ["-progress", "pipe:1", "-nostats", ...argumentsList];
+    let stderr = "";
     const child = spawn(ffmpegPath, processArguments, {
       cwd: workingDirectory,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    const recordPipeError = (error) => {
+      stderr = (stderr + "\nFFmpeg pipe error: " + error.message).slice(-16_384);
+    };
+    child.stdout.on("error", recordPipeError);
+    child.stderr.on("error", recordPipeError);
     state.children.add(child);
-    applyMediaProcessPriority(child, state.resourceProfile);
-    const tracker = registry.track(child, {
-      jobId: state.jobId,
-      taskId: state.taskId + ":epoch:" + epochIndex,
-      stage: "browser-playback-epoch",
-      encoder: state.encoder.label,
-      decoder: state.pipeline?.decode.name || "stream copy",
-      hardware: state.encoder.hardware,
-      profile: state.resourceProfile.mode + ":" + state.resourceProfile.kind,
-      command: ffmpegPath,
-      arguments: processArguments,
-      privatePaths: [
-        state.inputPath,
-        state.generationPath,
-        workingDirectory,
-        ...privateToolPaths,
-      ],
-    });
-    attachFfmpegProgress(child.stdout, tracker);
     taskContext.registerInterrupt?.(() => child.kill("SIGTERM"));
     if (taskContext.signal?.aborted || state.stopping || shuttingDown) child.kill("SIGTERM");
 
-    let stderr = "";
     child.stderr.on("data", (value) => {
       stderr = (stderr + value.toString()).slice(-16_384);
     });
@@ -1192,6 +1236,32 @@ export function createHlsPlaybackManager({
         callback();
       };
       child.once("error", (error) => finish(() => reject(error)));
+      child.once("spawn", () => {
+        try {
+          applyMediaProcessPriority(child, state.resourceProfile);
+          const tracker = registry.track(child, {
+            jobId: state.jobId,
+            taskId: state.taskId + ":epoch:" + epochIndex,
+            stage: "browser-playback-epoch",
+            encoder: state.encoder.label,
+            decoder: state.pipeline?.decode.name || "stream copy",
+            hardware: state.encoder.hardware,
+            profile: state.resourceProfile.mode + ":" + state.resourceProfile.kind,
+            command: ffmpegPath,
+            arguments: processArguments,
+            privatePaths: [
+              state.inputPath,
+              state.generationPath,
+              workingDirectory,
+              ...privateToolPaths,
+            ],
+          });
+          attachFfmpegProgress(child.stdout, tracker);
+        } catch (error) {
+          child.kill("SIGTERM");
+          finish(() => reject(error));
+        }
+      });
       child.once("close", (code) => finish(() => {
         if (taskContext.signal?.aborted || state.stopping || shuttingDown) {
           reject(taskContext.signal?.reason || stoppedError());
@@ -1242,14 +1312,16 @@ export function createHlsPlaybackManager({
     ];
     const audioArguments = state.audioTracks.flatMap((track) => {
       const id = trackDirectory(track);
+      const output = audioOutputProfile(track, descriptorAudioMode(descriptor));
       return [
         "-map", "0:" + track.streamIndex,
         "-vn", "-sn", "-dn",
         "-t", requestedDuration.toFixed(6),
         "-c:a", "aac",
         "-threads", "1",
-        "-b:a", "192k",
-        "-af", normalizedAudioFilter(),
+        "-b:a", output.bitrate,
+        "-ac", String(output.channels),
+        "-af", normalizedAudioFilter(track, descriptorAudioMode(descriptor)),
         ...playlistArguments(segmentSeconds, {
           playlist: "audio/" + id + "/index.m3u8",
           segment: "audio/" + id + "/segment-%06d.m4s",
@@ -1841,6 +1913,7 @@ export function createHlsPlaybackManager({
         status: state.status,
         generationId: state.generationId,
         servingGenerationId: state.servingGenerationId,
+        audioMode: descriptorAudioMode(state.descriptor),
         bufferedSeconds: state.contiguousReadySeconds,
         contiguousReadySeconds: state.contiguousReadySeconds,
         sourceDuration: state.sourceDuration,

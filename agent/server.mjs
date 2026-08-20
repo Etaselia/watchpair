@@ -917,6 +917,7 @@ async function probeSubtitleTracks(job, index = job.selectedIndex) {
         label: streamTrackLabel(stream, "Audio track"),
         codec: String(stream.codec_name || "unknown"),
         channels: Number(stream.channels || 0),
+        channelLayout: String(stream.channel_layout || ""),
         default: Boolean(stream.disposition?.default),
       }));
     const streams = metadata.streams || [];
@@ -2275,7 +2276,7 @@ async function preparedAudioFile(job, fileIndex, trackId) {
   }
 }
 
-async function hlsDescriptor(job, fileIndex, rendition = "h264") {
+async function hlsDescriptor(job, fileIndex, rendition = "h264", audioMode = "surround") {
   if (!["h264", "vp9"].includes(rendition)) throw new Error("Unsupported video rendition.");
   if (!torrentFileIsFullyVerified(job, fileIndex)) {
     throw new Error("The media file has not passed full verification.");
@@ -2294,6 +2295,7 @@ async function hlsDescriptor(job, fileIndex, rendition = "h264") {
     videoPixelFormat: asset.videoPixelFormat,
     videoProfile: asset.videoProfile,
     rendition,
+    audioMode: audioMode === "stereo" ? "stereo" : "surround",
     audioTracks: asset.audioTracks,
     videoStartTime: asset.videoStartTime,
     sourceDuration: asset.duration,
@@ -3542,7 +3544,12 @@ const server = createServer(async (request, response) => {
       const job = jobs.get(hlsMatch[1]);
       if (!job) throw new Error("Download not found.");
       touchJob(job);
-      const descriptor = await hlsDescriptor(job, Number(hlsMatch[2]), hlsMatch[3] || "h264");
+      const descriptor = await hlsDescriptor(
+        job,
+        Number(hlsMatch[2]),
+        hlsMatch[3] || "h264",
+        url.searchParams.get("audio") || "surround"
+      );
       const asset = await hlsPlayback.getAsset(descriptor, hlsMatch[4]);
       await streamHlsAsset(response, asset, headers);
       return;

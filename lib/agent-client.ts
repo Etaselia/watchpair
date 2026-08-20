@@ -69,6 +69,7 @@ export interface AgentAudioTrack {
   label: string;
   codec: string;
   channels: number;
+  channelLayout?: string;
   default: boolean;
 }
 
