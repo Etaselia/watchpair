@@ -135,7 +135,7 @@ import {
   type WatchSession,
 } from "../lib/session-types";
 
-const COMPANION_VERSION = "0.10.8"; // x-release-please-version
+const COMPANION_VERSION = "0.10.9"; // x-release-please-version
 const EMPTY_AUDIO_TRACKS: AgentAudioTrack[] = [];
 const EMPTY_CHAPTERS: AgentChapter[] = [];
 const EMPTY_SUBTITLE_TRACKS: AgentSubtitleTrack[] = [];
