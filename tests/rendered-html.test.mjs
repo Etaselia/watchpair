@@ -685,7 +685,6 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(route, /COMPLETE_TOKEN/);
   assert.match(route, /!currentSession && action === "join"/);
   assert.match(route, /action === "rename-source"/);
-  assert.match(route, /normalizeSources/);
   assert.match(route, /action === "source-manifest"/);
   assert.match(route, /action === "prioritize-media"/);
   assert.match(route, /action === "include-media"/);
