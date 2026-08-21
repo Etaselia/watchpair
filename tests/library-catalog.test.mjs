@@ -371,6 +371,56 @@ test("managed partial files are catalogued but never advertised as usable matche
   }
 });
 
+test("a managed file re-derives usable after verification on the next scan", async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "watchpair-library-verify-"));
+  const root = path.join(temporary, "downloads");
+  const jobRoot = path.join(root, "verify-source");
+  const filePath = path.join(jobRoot, "Episode.mkv");
+  const catalogPath = path.join(root, ".watchpair-library.json");
+  const infoHash = "fedcba9876543210fedcba9876543210fedcba98";
+  const fingerprint = "aaaa1111bbbb2222cccc3333dddd4444";
+  await mkdir(jobRoot, { recursive: true });
+  await writeFile(filePath, Buffer.alloc(100));
+  let usable = false;
+
+  try {
+    const catalog = createLibraryCatalog({
+      roots: [root],
+      catalogPath,
+      getManagedJobs: () => [{
+        id: "verify-source",
+        label: "Verifying show",
+        root: jobRoot,
+        identity: infoHash,
+        files: [{
+          path: filePath,
+          infoHash,
+          fileIndex: 0,
+          fingerprint: usable ? fingerprint : null,
+          usable,
+        }],
+      }],
+    });
+    await catalog.load();
+    await catalog.startScan().completion;
+    const partial = catalog.listFiles()[0];
+    assert.equal(partial.usable, false);
+    assert.equal(partial.fingerprint, null);
+
+    usable = true;
+    await catalog.startScan().completion;
+    const verified = catalog.listFiles()[0];
+    assert.equal(verified.usable, true);
+    assert.equal(verified.fingerprint, fingerprint);
+    assert.equal(
+      catalog.matchTorrent(infoHash, { fileIndex: 0, size: 100 })?.id,
+      verified.id
+    );
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test("unreadable nested directories and scan limits preserve the last-good catalog", async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), "watchpair-library-partial-scan-"));
   const root = path.join(temporary, "library");
