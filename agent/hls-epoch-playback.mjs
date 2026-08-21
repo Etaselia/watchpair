@@ -28,6 +28,13 @@ const CACHE_DIRECTORY_VERSION = "v13";
 const DEFAULT_SEGMENT_SECONDS = 4;
 const DEFAULT_PLAYABLE_SECONDS = 120;
 const DEFAULT_EPOCH_SECONDS = 30;
+// The largest per-epoch audio/video duration difference that is absorbed by
+// timeline alignment. Video and audio streams are cut on different sample
+// grids (video frames vs 48kHz AAC frames), so each 30s epoch's measured
+// durations differ by up to ~one video frame plus one AAC frame. Anything
+// beyond a quarter second means the audio stream is genuinely shorter and
+// must not be padded by playlist arithmetic.
+const MAX_AUDIO_TIMELINE_ADJUSTMENT_SECONDS = 0.25;
 const FRAGMENT_VALIDATION_TIMEOUT_MS = 15_000;
 const PLAYABLE_WINDOW_TOLERANCE_SECONDS = 0.25;
 const VIDEO_END_TOLERANCE_SECONDS = 0.025;
@@ -448,7 +455,7 @@ function streamForEpoch(epoch, kind, trackId = null) {
     : epoch.streams?.audio?.[String(trackId)];
 }
 
-function publicMediaPlaylist(manifest, kind, trackId = null) {
+export function publicMediaPlaylist(manifest, kind, trackId = null) {
   const audioMode = descriptorAudioMode(manifest);
   const streams = manifest.epochs
     .map((epoch) => ({ epoch, stream: streamForEpoch(epoch, kind, trackId) }))
@@ -1446,6 +1453,15 @@ export function createHlsPlaybackManager({
         outputs.audioPlaylists[id],
         epochIndex
       );
+      // The audio and video streams of an epoch are cut on different sample
+      // grids (video frames vs 48kHz AAC frames), so their measured playlist
+      // durations differ by up to one frame each. Publishing them as-is makes
+      // the audio playlist's cumulative duration drift from the video
+      // playlist's by that frame difference per epoch, which accumulates into
+      // an audible A/V desync over long videos. Lock the audio stream's
+      // declared duration to the video stream's so both playlists stay on the
+      // same cumulative timeline across arbitrary epoch counts.
+      alignAudioTimelineToVideo(audio[id], video.presentationDuration);
     }
 
     const presentedEnd = epochStart + video.presentationDuration;
@@ -1942,6 +1958,21 @@ export function createHlsPlaybackManager({
       })),
     }),
   };
+}
+
+export function alignAudioTimelineToVideo(stream, videoPresentationDuration) {
+  const target = Number(videoPresentationDuration);
+  if (!stream || !Number.isFinite(target) || target <= 0) return stream;
+  const current = Number(stream.presentationDuration);
+  if (!Number.isFinite(current) || current <= 0) return stream;
+  const delta = timelineRounded(target - current);
+  if (Math.abs(delta) < 0.000001) return stream;
+  if (Math.abs(delta) > MAX_AUDIO_TIMELINE_ADJUSTMENT_SECONDS) return stream;
+  const last = stream.segments[stream.segments.length - 1];
+  if (!last) return stream;
+  last.duration = timelineRounded(Number(last.duration || 0) + delta);
+  stream.presentationDuration = timelineRounded(target);
+  return stream;
 }
 
 async function readStableAsset(filePath) {

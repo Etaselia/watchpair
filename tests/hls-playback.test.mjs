@@ -9,12 +9,14 @@ import test from "node:test";
 import ffmpegPath from "ffmpeg-static";
 import ffprobeStatic from "ffprobe-static";
 import {
+  alignAudioTimelineToVideo,
   canCopyH264Video,
   createHlsPlaybackManager,
   hlsTerminalDurationTolerance,
   isPrivatePathCandidate,
   isWithinHlsTerminalDuration,
   manifestPreparedSeconds,
+  publicMediaPlaylist,
   startsAtBrowserZero,
 } from "../agent/hls-playback.mjs";
 
@@ -806,6 +808,102 @@ test("advances a 20-minute fractional-rate timeline by measured presentation tim
     "the fixture must reproduce the reported long-form drift if nominal starts are used"
   );
 });
+
+test("keeps audio playlist duration locked to video across 100+ epochs", () => {
+  // A 30-second epoch of 23.976fps video ends on the video frame grid
+  // (30.030000s) while the same epoch of 48kHz AAC ends on the AAC frame grid
+  // (30.016000s). Without alignment the per-epoch difference accumulates in
+  // the published audio playlist, which is the reported long-video desync.
+  const epochSeconds = 30;
+  const videoFrameDuration = 1001 / 24_000;
+  const audioFrameDuration = 1024 / 48_000;
+  const videoEpochDuration =
+    (Math.floor(epochSeconds / videoFrameDuration) + 1) * videoFrameDuration;
+  const audioEpochDuration =
+    (Math.floor(epochSeconds / audioFrameDuration) + 1) * audioFrameDuration;
+  const epochCount = 120;
+  const unalignedDrift = (videoEpochDuration - audioEpochDuration) * epochCount;
+  assert.ok(
+    unalignedDrift > 1.0,
+    "the fixture must reproduce the reported long-form audio drift if timelines are not aligned"
+  );
+
+  const split = (duration) => {
+    const segments = [];
+    let remaining = duration;
+    while (remaining > 0.000001) {
+      const next = Math.min(4, remaining);
+      segments.push({ duration: timelineRounded(next) });
+      remaining -= next;
+    }
+    const total = segments.reduce((sum, segment) => sum + segment.duration, 0);
+    segments[segments.length - 1].duration = timelineRounded(
+      segments[segments.length - 1].duration + (duration - total)
+    );
+    return segments;
+  };
+
+  const manifest = {
+    audioMode: "surround",
+    complete: true,
+    epochs: [],
+  };
+  let expectedStart = 0;
+  for (let index = 0; index < epochCount; index += 1) {
+    const prefix = "epoch-" + String(index).padStart(6, "0");
+    const videoSegments = split(videoEpochDuration).map((segment, segmentIndex) => ({
+      uri: prefix + "-segment-" + String(segmentIndex).padStart(6, "0") + ".m4s",
+      duration: segment.duration,
+    }));
+    const audioSegments = split(audioEpochDuration).map((segment, segmentIndex) => ({
+      uri: prefix + "-segment-" + String(segmentIndex).padStart(6, "0") + ".m4s",
+      duration: segment.duration,
+    }));
+    const videoStream = {
+      init: prefix + "-init.mp4",
+      presentationDuration: videoEpochDuration,
+      segments: videoSegments,
+    };
+    const audioStream = {
+      init: prefix + "-init.mp4",
+      presentationDuration: audioEpochDuration,
+      segments: audioSegments,
+    };
+    alignAudioTimelineToVideo(audioStream, videoEpochDuration);
+    assert.ok(
+      Math.abs(audioStream.presentationDuration - videoEpochDuration) <= 0.001,
+      "commitEpoch must lock the audio stream duration to the video stream"
+    );
+    manifest.epochs.push({
+      index,
+      sourceStart: expectedStart,
+      sourceDuration: epochSeconds,
+      validatedStart: true,
+      streams: { video: videoStream, audio: { "1": audioStream } },
+    });
+    expectedStart = Math.round((expectedStart + videoEpochDuration) * 1_000_000) /
+      1_000_000;
+  }
+
+  const videoPlaylist = publicMediaPlaylist(manifest, "video");
+  const audioPlaylist = publicMediaPlaylist(manifest, "audio", "1");
+  const videoDuration = playlistDuration(videoPlaylist);
+  const audioDuration = playlistDuration(audioPlaylist);
+  assert.ok(
+    Math.abs(audioDuration - videoDuration) <= 0.05,
+    "audio playlist duration " + audioDuration +
+      " must stay within a tight tolerance of video playlist duration " +
+      videoDuration + " across " + epochCount + " epochs"
+  );
+  assert.ok(
+    Math.abs(videoDuration - expectedStart) <= 0.001,
+    "the video playlist must remain consistent with the manifest timeline"
+  );
+});
+
+function timelineRounded(value) {
+  return Math.round(Number(value || 0) * 1_000_000) / 1_000_000;
+}
 
 test("reports a later epoch failure while preserving the committed playable prefix", { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "watchpair-hls-late-failure-"));
