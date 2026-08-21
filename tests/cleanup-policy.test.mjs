@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   DEFAULT_CLEANUP_SETTINGS,
+  RECENT_PLAYBACK_PROTECTION_MS,
   RETENTION_METADATA_VERSION,
   cacheExpired,
   cleanupSettingsFromEnvironment,
@@ -10,6 +11,7 @@ import {
   jobRetentionTimestamp,
   normalizeCleanupSettings,
   partialExpired,
+  prepareAutomaticJobDeletion,
   retentionMetadataReliable,
 } from "../agent/cleanup-policy.mjs";
 
@@ -53,6 +55,12 @@ test("cleanup separates retention expiry from storage-pressure safety", () => {
 
   assert.equal(jobCleanupReason(old, settings, now), "retention");
   assert.equal(jobCanBeCleaned(old, settings), true);
+  assert.equal(jobCanBeCleaned(old, settings, { active: true, now }), false);
+  assert.equal(jobCanBeCleaned({ ...old, lastAccessedAt: now - 1 }, settings, { now }), false);
+  assert.equal(jobCanBeCleaned({
+    ...old,
+    lastAccessedAt: now - RECENT_PLAYBACK_PROTECTION_MS - 1,
+  }, settings, { now }), true);
   assert.equal(jobCleanupReason({ ...old, managed: false }, settings, now), null);
   assert.equal(jobCleanupReason({ ...old, pinned: true }, settings, now), null);
   assert.equal(jobCanBeCleaned({ ...old, pinned: true }, settings), false);
@@ -135,4 +143,31 @@ test("cache and partial retention use separate clocks", () => {
   assert.equal(cacheExpired(34 * DAY, settings, now), false);
   assert.equal(partialExpired(now - 25 * 60 * 60 * 1000, settings, now), true);
   assert.equal(partialExpired(now - 23 * 60 * 60 * 1000, settings, now), false);
+});
+
+test("automatic deletion restores a transfer pinned while destruction is in flight", async () => {
+  const job = { pinned: false };
+  let current = true;
+  let releaseDestroy;
+  let restored = 0;
+  const destroying = new Promise((resolve) => { releaseDestroy = resolve; });
+  const deletion = prepareAutomaticJobDeletion(job, {
+    isCurrent: () => current,
+    destroy: () => destroying,
+    restore: async () => { restored += 1; },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  job.pinned = true;
+  releaseDestroy();
+  assert.equal(await deletion, false);
+  assert.equal(restored, 1);
+
+  job.pinned = false;
+  current = true;
+  assert.equal(await prepareAutomaticJobDeletion(job, {
+    isCurrent: () => current,
+    destroy: async () => {},
+    restore: async () => { restored += 1; },
+  }), true);
+  assert.equal(restored, 1);
 });

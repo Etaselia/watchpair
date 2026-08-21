@@ -1482,9 +1482,8 @@ export function createHlsPlaybackManager({
     await publishGeneration(state.generationPath, manifest, state.audioTracks);
     state.manifest = manifest;
     state.contiguousReadySeconds = manifestPreparedSeconds(manifest);
-    state.complete = manifest.complete;
 
-    if (state.complete) {
+    if (manifest.complete) {
       await atomicWriteJson(path.join(state.generationPath, COMPLETE_MARKER), {
         completedAt: Date.now(),
         cacheVersion: CACHE_VERSION,
@@ -1513,9 +1512,9 @@ export function createHlsPlaybackManager({
       sourceDuration: epoch.sourceDuration,
       presentationDuration: video.presentationDuration,
       contiguousReadySeconds: state.contiguousReadySeconds,
-      complete: state.complete,
+      complete: manifest.complete,
     });
-    notifyState(state, state.complete ? "generation-completed" : "epoch-committed", {
+    notifyState(state, manifest.complete ? "generation-completed" : "epoch-committed", {
       epochIndex,
     });
   }
@@ -1542,6 +1541,7 @@ export function createHlsPlaybackManager({
     state.currentWorkingDirectory = workingDirectory;
     await writeWriterLease(state, token, epochIndex);
 
+    let committedComplete = false;
     try {
       let outputs;
       try {
@@ -1622,11 +1622,13 @@ export function createHlsPlaybackManager({
         requestedDuration,
         outputs
       );
+      committedComplete = state.manifest.complete;
     } finally {
       await clearWriterLease(state, token).catch(() => {});
       await rm(workingDirectory, { recursive: true, force: true }).catch(() => {});
       state.currentEpoch = null;
       state.rendering = false;
+      if (committedComplete) state.complete = true;
     }
   }
 

@@ -19,6 +19,10 @@ const inputs = [
   ["process-registry.mjs", resolve(root, "agent", "process-registry.mjs")],
   ["persistent-log.mjs", resolve(root, "agent", "persistent-log.mjs")],
   ["recovery-telemetry.mjs", resolve(root, "agent", "recovery-telemetry.mjs")],
+  ["torrent-telemetry.mjs", resolve(root, "agent", "torrent-telemetry.mjs")],
+  ["library-catalog.mjs", resolve(root, "agent", "library-catalog.mjs")],
+  ["http-range.mjs", resolve(root, "agent", "http-range.mjs")],
+  ["magnet-identity.mjs", resolve(root, "lib", "magnet-identity.mjs")],
   ["render-queue.mjs", resolve(root, "agent", "render-queue.mjs")],
   ["scheduled-ffmpeg.mjs", resolve(root, "agent", "scheduled-ffmpeg.mjs")],
   ["job-store.mjs", resolve(root, "agent", "job-store.mjs")],
@@ -43,7 +47,13 @@ const inputs = [
 
 const files = {};
 for (const [name, source] of inputs) {
-  const contents = await readFile(source);
+  let contents = await readFile(source);
+  if (name === "server.mjs") {
+    contents = Buffer.from(contents.toString("utf8").replace(
+      'from "../lib/magnet-identity.mjs"',
+      'from "./magnet-identity.mjs"',
+    ));
+  }
   files[folder + "/" + name] = [
     new Uint8Array(contents),
     { mtime: archiveModifiedAt },

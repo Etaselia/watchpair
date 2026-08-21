@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { createServer } from "node:http";
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, readFile, readdir, realpath, rename, rm, stat, statfs, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, rename, rm, stat, statfs, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { BlockList } from "node:net";
 import { availableParallelism, homedir } from "node:os";
@@ -48,10 +48,12 @@ import { createTorrentBandwidthGovernor } from "./torrent-bandwidth-governor.mjs
 import { createJsonStore } from "./job-store.mjs";
 import {
   RETENTION_METADATA_VERSION,
+  RECENT_PLAYBACK_PROTECTION_MS,
   cacheExpired,
   cleanupSettingsFromEnvironment,
   jobCanBeCleaned,
   jobCleanupReason,
+  prepareAutomaticJobDeletion,
   retentionMetadataReliable,
 } from "./cleanup-policy.mjs";
 import { createSubtitleAssetPipeline } from "./subtitle-pipeline.mjs";
@@ -64,7 +66,6 @@ import { fingerprintPath } from "./media-fingerprint.mjs";
 import {
   createSingleFlightOperation,
   createSingleFlightCache,
-  MANAGED_JOB_DIRECTORY,
   pathLatestMtime,
   pathSize,
   pruneExpiredChildren,
@@ -83,10 +84,18 @@ import {
 } from "./torrent-pressure.mjs";
 import { createPersistentLogger, installProcessDiagnostics } from "./persistent-log.mjs";
 import { createTorrentRecoveryTelemetry } from "./recovery-telemetry.mjs";
+import { createLibraryCatalog } from "./library-catalog.mjs";
+import {
+  classifyTrackerError,
+  createTorrentTelemetry,
+  sanitizeTrackerEndpoint,
+} from "./torrent-telemetry.mjs";
+import { magnetInfoHash } from "../lib/magnet-identity.mjs";
+import { parseByteRange } from "./http-range.mjs";
 
 const HOST = "127.0.0.1";
 const APP_VERSION = process.env.WATCHPAIR_APP_VERSION || "0.10.9"; // x-release-please-version
-const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 2;
 const CONTROL_TOKEN = String(process.env.WATCHPAIR_CONTROL_TOKEN || "");
 const PORT = Number(process.env.WATCHPAIR_AGENT_PORT || 41735);
 const REQUESTED_TORRENT_PORT = Number(process.env.WATCHPAIR_TORRENT_PORT || PORT + 1);
@@ -144,6 +153,10 @@ const IMPORT_DIR = path.join(DOWNLOAD_DIR, ".watchpair-imports");
 const HLS_DIR = path.join(DOWNLOAD_DIR, ".watchpair-hls");
 const SUBTITLE_DIR = path.join(DOWNLOAD_DIR, ".watchpair-subtitles");
 const MEDIA_DIR = path.join(DOWNLOAD_DIR, ".watchpair-media");
+const LIBRARY_CATALOG_PATH = path.join(DOWNLOAD_DIR, ".watchpair-library.json");
+const OWNERSHIP_MARKER_NAME = ".watchpair-owned.json";
+const OWNERSHIP_MARKER_VERSION = 1;
+const OWNERSHIP_TOKEN_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 const LIBRARY_DIRS = Array.from(new Set([
   DOWNLOAD_DIR,
   ...(process.env.WATCHPAIR_LIBRARY_DIRS || "")
@@ -176,6 +189,19 @@ agentLogger.info("transcoder_selected", {
 const ALLOW_PRIVATE_DOWNLOADS = process.env.WATCHPAIR_ALLOW_PRIVATE_DOWNLOADS === "1";
 const CLEANUP_SETTINGS = cleanupSettingsFromEnvironment();
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const SEED_LEASE_DEFAULT_TTL_MS = Math.max(1_000, Math.min(
+  10 * 60_000,
+  Number(process.env.WATCHPAIR_SEED_LEASE_TTL_MS) || 120_000
+));
+const SEED_LEASE_GRACE_MS = Math.max(100, Math.min(
+  10 * 60_000,
+  Number(process.env.WATCHPAIR_SEED_LEASE_GRACE_MS) || 60_000
+));
+const SEED_LEASE_SWEEP_MS = Math.max(50, Math.min(
+  60_000,
+  Number(process.env.WATCHPAIR_SEED_LEASE_SWEEP_MS) || 5_000
+));
+const SEED_LEASE_PATTERN = /^lease-[a-zA-Z0-9_-]{16,128}$/;
 const FFPROBE_PATH = process.env.WATCHPAIR_FFPROBE_PATH || unpackedExecutablePath(ffprobeStatic.path);
 const runFile = promisify(execFile);
 const ALLOWED_ORIGINS = new Set(
@@ -197,8 +223,37 @@ PRIVATE_NETWORKS.addSubnet("fc00::", 7, "ipv6");
 PRIVATE_NETWORKS.addSubnet("fe80::", 10, "ipv6");
 const pairingNonces = new Map();
 const jobs = new Map();
-const libraryEntries = new Map();
 const jobStore = createJsonStore(JOBS_PATH);
+let restoringJobs = false;
+let failedRestoreRecords = [];
+const libraryCatalog = createLibraryCatalog({
+  roots: () => LIBRARY_DIRS,
+  catalogPath: LIBRARY_CATALOG_PATH,
+  getManagedJobs: () => Array.from(jobs.values())
+    .filter((job) => job.managed)
+    .map((job) => ({
+      id: job.id,
+      label: job.label,
+      pinned: job.pinned,
+      identity: job.torrent?.infoHash || magnetInfoHash(job.value) || job.id,
+      root: path.join(DOWNLOAD_DIR, job.id),
+      files: managedLibraryFiles(job),
+    })),
+  async onSetManagedPins(jobIds, pinned, collectionId) {
+    const managedIds = new Set(jobIds);
+    const targets = Array.from(jobs.values()).filter((job) =>
+      managedIds.has(job.id) || job.libraryCollectionId === collectionId);
+    if (pinned && targets.some((job) => job.cleanupCommit)) {
+      throw new Error("This download is already being removed; refresh the library and try again.");
+    }
+    for (const job of targets) {
+      job.pinned = Boolean(pinned);
+      job.updatedAt = Date.now();
+    }
+    persistJobs();
+    await jobStore.flush();
+  },
+});
 const preparationQueue = [];
 let preparationWorker = null;
 const selectedPreparationKeys = new Set();
@@ -313,10 +368,13 @@ const hlsPlayback = createHlsPlaybackManager({
   onEvent: mediaDiagnosticEvent,
 });
 client.on("error", (error) => {
-  agentLogger.error("webtorrent_client_error", { error });
-  console.error(`WebTorrent client error: ${error.message}`);
+  const category = classifyTrackerError(error);
+  agentLogger.error("webtorrent_client_error", { category, code: String(error?.code || "") });
+  console.error(`WebTorrent client error (${category}).`);
 });
-client.on("warning", (warning) => agentLogger.warn("webtorrent_client_warning", { warning }));
+client.on("warning", (warning) => agentLogger.warn("webtorrent_client_warning", {
+  category: classifyTrackerError(warning),
+}));
 client.on("listening", () => {
   agentLogger.info("torrent_listener_ready", { torrentPort: client.torrentPort, dhtPort: client.dhtPort });
   console.log(`Torrent listener ready on TCP ${client.torrentPort}; DHT uses UDP ${client.dhtPort}.`);
@@ -340,7 +398,7 @@ function corsHeaders(request) {
   return {
     "access-control-allow-origin": origin,
     "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
-    "access-control-allow-headers": "content-type",
+    "access-control-allow-headers": "content-type,x-watchpair-control",
     "access-control-allow-private-network": "true",
     vary: "origin",
   };
@@ -847,6 +905,31 @@ function jobFile(job, index) {
   return job.file;
 }
 
+function managedLibraryFiles(job) {
+  const indexes = job.kind === "magnet" && !job.seed
+    ? job.torrent?.files?.map((_, index) => index) || Array.from(job.assets?.keys?.() || [])
+    : job.file ? [0] : [];
+  const infoHash = String(job.torrent?.infoHash || magnetInfoHash(job.value) || "")
+    .toLowerCase();
+  const files = [];
+  for (const index of indexes) {
+    try {
+      const media = jobFile(job, index);
+      const usable = torrentFileIsFullyVerified(job, index);
+      files.push({
+        path: media.path,
+        fingerprint: usable ? fileIdentityFingerprint(job, index, media) : null,
+        infoHash: usable && /^[a-f0-9]{40}$/.test(infoHash) ? infoHash : null,
+        fileIndex: index,
+        usable,
+      });
+    } catch {
+      // Metadata-only and paused torrents have no resolvable local file yet.
+    }
+  }
+  return files;
+}
+
 function streamTrackLabel(stream, fallback) {
   const title = String(stream.tags?.title || "").trim();
   const language = String(stream.tags?.language || "und").toLowerCase();
@@ -1283,9 +1366,13 @@ function snapshot(job) {
     id: job.id,
     kind: job.kind,
     status: job.status,
+    paused: Boolean(job.paused),
     progress: selected?.progress || 0,
     infoHash: job.torrent?.infoHash || null,
-    magnetURI: job.torrent?.magnetURI || job.value || null,
+    // Magnet URLs can carry private tracker credentials. Publication is an
+    // explicit seed/share operation, never part of routine job snapshots.
+    magnetURI: null,
+    sourceIdentity: sourceIdentity(job.kind, job.value),
     seed: Boolean(job.seed),
     seedState: job.seed
       ? job.status === "error"
@@ -1298,12 +1385,15 @@ function snapshot(job) {
               ? "uploading"
               : "seeding"
       : null,
+    seedLeaseCount: job.seed && job.seedLeases instanceof Map
+      ? Array.from(job.seedLeases.values()).filter((expiresAt) => expiresAt > Date.now()).length
+      : 0,
     peers: job.torrent?.numPeers || 0,
     uploadSpeed: job.torrent?.uploadSpeed || 0,
     uploaded: job.torrent?.uploaded || 0,
     creationProgress: job.torrentCreationProgress || 0,
     trackerAnnounces: job.trackerAnnounces || 0,
-    trackerWarnings: job.trackerWarnings || [],
+    torrent: job.torrentTelemetry?.summary() || null,
     seedStartedAt: job.seedStartedAt,
     platform: process.platform,
     torrentPort: client.torrentPort || TORRENT_PORT,
@@ -1321,6 +1411,7 @@ function snapshot(job) {
     preparation: job.preparation,
     managed: Boolean(job.managed),
     pinned: Boolean(job.pinned),
+    libraryCollectionId: job.libraryCollectionId || null,
     createdAt: job.createdAt,
     completedAt: job.completedAt,
     lastAccessedAt: job.lastAccessedAt,
@@ -1464,6 +1555,8 @@ function refreshTorrentSelections(reason = "priority-plan") {
 }
 
 function startTorrent(job, { restoreMetadata = false } = {}) {
+  job.paused = false;
+  job.error = null;
   job.status = "metadata";
   agentLogger.info("torrent_start_requested", { jobId: job.id, managed: Boolean(job.managed) });
   let torrent;
@@ -1474,12 +1567,15 @@ function startTorrent(job, { restoreMetadata = false } = {}) {
     });
   } catch (error) {
     job.status = "error";
-    job.error = error instanceof Error ? error.message : "Torrent could not be started.";
-    agentLogger.error("torrent_start_failed", { jobId: job.id, error });
+    const category = classifyTrackerError(error);
+    job.error = `Torrent could not be started (${category}).`;
+    agentLogger.error("torrent_start_failed", { jobId: job.id, category });
     job.updatedAt = Date.now();
     return;
   }
+  job.torrentTelemetry?.dispose();
   job.torrent = torrent;
+  job.torrentTelemetry = createTorrentTelemetry(torrent);
   torrent.on("wire", () => refreshTorrentPressure("wire-connected"));
   installTorrentPieceRecovery(
     torrent,
@@ -1506,6 +1602,7 @@ function startTorrent(job, { restoreMetadata = false } = {}) {
   );
 
   torrent.on("metadata", () => {
+    if (job.paused) return;
     agentLogger.info("torrent_metadata_ready", {
       jobId: job.id,
       infoHash: torrent.infoHash,
@@ -1535,10 +1632,12 @@ function startTorrent(job, { restoreMetadata = false } = {}) {
     job.updatedAt = Date.now();
   });
   torrent.on("download", () => {
+    if (job.paused) return;
     if (job.status !== "ready") job.status = "downloading";
     job.updatedAt = Date.now();
   });
   torrent.on("done", () => {
+    if (job.paused) return;
     agentLogger.info("torrent_download_complete", { jobId: job.id, infoHash: torrent.infoHash });
     for (const index of orderedTorrentVideoIndexes(torrent)) {
       if (torrent.files[index].done) void completeSelectedFile(job, index);
@@ -1546,48 +1645,91 @@ function startTorrent(job, { restoreMetadata = false } = {}) {
     refreshTorrentSelections("torrent-complete");
   });
   torrent.on("warning", (error) => {
-    agentLogger.warn("torrent_warning", { jobId: job.id, error });
-    job.warning = error.message;
+    const category = classifyTrackerError(error);
+    agentLogger.warn("torrent_warning", { jobId: job.id, category });
+    job.warning = `Torrent tracker ${category}.`;
     job.updatedAt = Date.now();
   });
   torrent.on("error", (error) => {
-    agentLogger.error("torrent_error", { jobId: job.id, error });
+    if (job.paused) return;
+    agentLogger.error("torrent_error", { jobId: job.id, category: classifyTrackerError(error) });
     job.status = "error";
-    job.error = error.message;
+    job.error = `Torrent failed (${classifyTrackerError(error)}).`;
     job.updatedAt = Date.now();
   });
 }
 
 async function startDirect(job) {
+  let writable = null;
   try {
+    job.paused = false;
+    job.error = null;
     job.status = "downloading";
+    const controller = new AbortController();
+    job.abortController = controller;
     const target = await assertPublicHttp(job.value);
-    const response = await fetchPublic(target);
-    await assertPublicHttp(response.url || target.href);
-    if (!response.ok || !response.body) {
-      throw new Error(`Download failed with status ${response.status}.`);
-    }
-
-    const size = Number(response.headers.get("content-length")) || 0;
-    const fileName = safeName(job.label || decodeURIComponent(target.pathname.split("/").pop() || "video.mp4"));
+    if (job.paused || controller.signal.aborted) throw new DOMException("Download paused.", "AbortError");
+    const fileName = safeName(job.file?.name || job.label ||
+      decodeURIComponent(target.pathname.split("/").pop() || "video.mp4"));
     const directory = path.join(DOWNLOAD_DIR, job.id);
+    if (job.managed) {
+      const claim = await claimManagedDirectory(job.id, {
+        ownershipToken: job.ownershipToken,
+        restoreMetadata: !job.ownershipToken,
+      });
+      job.ownershipToken = claim.ownershipToken;
+    }
     await mkdir(directory, { recursive: true });
     const filePath = path.join(directory, fileName);
-    const writable = createWriteStream(filePath);
-    job.file = {
-      name: fileName,
-      size,
-      path: filePath,
-      type: response.headers.get("content-type") || "application/octet-stream",
-    };
+    const existing = await stat(filePath)
+      .then((info) => info.isFile() ? info.size : 0)
+      .catch((error) => error?.code === "ENOENT" ? 0 : Promise.reject(error));
+    const response = await fetchPublic(target, {
+      signal: controller.signal,
+      headers: existing > 0 ? { range: `bytes=${existing}-` } : {},
+    });
+    await assertPublicHttp(response.url || target.href);
+    const completeSize = Number(/^bytes \*\/(\d+)$/.exec(
+      response.headers.get("content-range") || "")?.[1]);
+    if (response.status === 416 && existing > 0 && completeSize === existing) {
+      job.file = {
+        name: fileName,
+        size: existing,
+        path: filePath,
+        type: contentType(fileName),
+      };
+      job.downloaded = existing;
+    } else {
+      if (!response.ok || !response.body) {
+        throw new Error(`Download failed with status ${response.status}.`);
+      }
 
-    for await (const chunk of response.body) {
-      job.downloaded += chunk.length;
-      job.updatedAt = Date.now();
-      if (!writable.write(chunk)) await once(writable, "drain");
+      const contentRange = /^bytes (\d+)-(\d+)\/(\d+|\*)$/.exec(
+        response.headers.get("content-range") || "");
+      const appending = response.status === 206 && existing > 0 && Number(contentRange?.[1]) === existing;
+      const responseSize = Number(response.headers.get("content-length")) || 0;
+      const size = contentRange?.[3] && contentRange[3] !== "*"
+        ? Number(contentRange[3])
+        : (appending ? existing : 0) + responseSize;
+      job.downloaded = appending ? existing : 0;
+      job.file = {
+        name: fileName,
+        size,
+        path: filePath,
+        type: response.headers.get("content-type") || "application/octet-stream",
+      };
+      writable = createWriteStream(filePath, { flags: appending ? "a" : "w" });
+
+      for await (const chunk of response.body) {
+        if (job.paused) throw new DOMException("Download paused.", "AbortError");
+        job.downloaded += chunk.length;
+        job.updatedAt = Date.now();
+        if (!writable.write(chunk)) await once(writable, "drain");
+      }
+      writable.end();
+      await once(writable, "finish");
+      writable = null;
     }
-    writable.end();
-    await once(writable, "finish");
 
     const completed = await stat(filePath);
     job.file.size = completed.size;
@@ -1602,10 +1744,30 @@ async function startDirect(job) {
     refreshPreparationScheduling();
     queueMediaPreparation(job, 0);
   } catch (error) {
-    job.status = "error";
-    job.error = error instanceof Error ? error.message : "Direct download failed.";
+    writable?.destroy();
+    if (job.paused || error?.name === "AbortError") {
+      job.paused = true;
+      job.status = "paused";
+      job.error = null;
+    } else {
+      job.status = "error";
+      job.error = error instanceof Error ? error.message : "Direct download failed.";
+    }
     job.updatedAt = Date.now();
+  } finally {
+    job.abortController = null;
+    persistJobs();
   }
+}
+
+function runDirect(job) {
+  if (job.directPromise) return job.directPromise;
+  const directPromise = startDirect(job);
+  const trackedPromise = directPromise.finally(() => {
+    if (job.directPromise === trackedPromise) job.directPromise = null;
+  });
+  job.directPromise = trackedPromise;
+  return trackedPromise;
 }
 
 function createJob(source) {
@@ -1617,7 +1779,21 @@ function createJob(source) {
     value: String(source.value || "").trim(),
     label: String(source.label || "video").slice(0, 180),
     managed: source.managed === undefined ? !source.seed : Boolean(source.managed),
-    pinned: Boolean(source.pinned),
+    pinned: Boolean(source.pinned) ||
+      (source.libraryCollectionId
+        ? libraryCatalog.isCollectionPinned(source.libraryCollectionId)
+        : libraryCatalog.isManagedJobPinned(source.id)),
+    libraryCollectionId: /^[a-f0-9]{24}$/.test(String(source.libraryCollectionId || ""))
+      ? String(source.libraryCollectionId)
+      : null,
+    transient: Boolean(source.transient),
+    ownershipToken: OWNERSHIP_TOKEN_PATTERN.test(String(source.ownershipToken || ""))
+      ? String(source.ownershipToken)
+      : null,
+    cleanupCommit: false,
+    restoredFromManifest: Boolean(source.restoredFromManifest),
+    legacyUnowned: Boolean(source.legacyUnowned),
+    paused: Boolean(source.paused),
     createdAt: Number(source.createdAt) || now,
     completedAt: Number(source.completedAt) || null,
     lastAccessedAt: Number(source.lastAccessedAt) || now,
@@ -1627,17 +1803,20 @@ function createJob(source) {
         ? RETENTION_METADATA_VERSION
         : 0,
     seed: Boolean(source.seed),
+    seedLeases: new Map(),
+    seedLeaseGraceUntil: null,
     seedPath: source.seedPath || null,
     identityFingerprint: source.identityFingerprint || null,
     identityFingerprintKey: source.identityFingerprintKey || null,
     torrentVerifiedKey: null,
     status: "queued",
     error: null,
-    downloaded: 0,
+    downloaded: Math.max(0, Number(source.downloaded) || 0),
     selectedIndex: null,
     assets: new Map(),
     lastTorrentSelectionKey: null,
     torrent: null,
+    torrentTelemetry: null,
     file: null,
     audioTracks: [],
     chapters: [],
@@ -1659,6 +1838,8 @@ function createJob(source) {
     trackerWarnings: [],
     seedStartedAt: null,
     seedReannounceTimer: null,
+    abortController: null,
+    directPromise: null,
     preparation: { status: "waiting", error: null, encoder: null, fallback: false },
     updatedAt: Number(source.updatedAt) || now,
   };
@@ -1667,20 +1848,24 @@ function createJob(source) {
 }
 
 function persistedJobs() {
-  return Array.from(jobs.values()).map((job) => ({
+  const live = Array.from(jobs.values()).filter((job) => !job.transient).map((job) => ({
     id: job.id,
     kind: job.kind,
     value: job.value,
     label: job.label,
     managed: Boolean(job.managed),
     pinned: Boolean(job.pinned),
+    libraryCollectionId: job.libraryCollectionId,
+    ownershipToken: job.ownershipToken,
     createdAt: job.createdAt,
     completedAt: job.completedAt,
     lastAccessedAt: job.lastAccessedAt,
     retentionMetadataVersion: job.retentionMetadataVersion,
     updatedAt: job.updatedAt,
     seed: Boolean(job.seed),
+    paused: Boolean(job.paused),
     seedPath: job.seedPath,
+    downloaded: job.downloaded,
     identityFingerprint: job.identityFingerprint,
     identityFingerprintKey: job.identityFingerprintKey,
     selectedIndex: job.selectedIndex,
@@ -1688,9 +1873,16 @@ function persistedJobs() {
       ? { name: job.file.name, size: job.file.size, path: job.file.path, type: job.file.type }
       : null,
   }));
+  const liveIds = new Set(live.map((record) => record.id));
+  return [
+    ...live,
+    ...failedRestoreRecords.filter((record) =>
+      !record?.id || !liveIds.has(String(record.id))),
+  ];
 }
 
 function persistJobs() {
+  if (restoringJobs) return;
   jobStore.schedule(persistedJobs());
 }
 
@@ -1727,13 +1919,18 @@ function markJobCompleted(job) {
   return true;
 }
 
-async function addDownload(source, { restoreMetadata = false } = {}) {
+async function addDownload(source, { restoreMetadata = false, ownershipToken = null } = {}) {
   const id = String(source?.id || "");
   if (!/^[a-zA-Z0-9-]{8,80}$/.test(id)) throw new Error("Invalid source id.");
-  if (jobs.has(id)) return jobs.get(id);
-
   const kind = source.kind === "magnet" ? "magnet" : "direct";
   const value = String(source.value || "").trim();
+  const existing = jobs.get(id);
+  if (existing) {
+    if (!existingJobMatchesSource(existing, kind, value)) {
+      throw new Error("This source id is already bound to different media.");
+    }
+    return existing;
+  }
   if (kind === "magnet") {
     if (/^magnet:\?/i.test(value) && !isSupportedMagnet(value)) {
       throw new Error("Magnet link needs a valid BitTorrent v1 info hash (BTIH).");
@@ -1747,6 +1944,9 @@ async function addDownload(source, { restoreMetadata = false } = {}) {
     ? {
         managed: source.managed,
         pinned: source.pinned,
+        libraryCollectionId: source.libraryCollectionId,
+        paused: source.paused,
+        downloaded: source.downloaded,
         createdAt: source.createdAt,
         completedAt: source.completedAt,
         lastAccessedAt: source.lastAccessedAt,
@@ -1757,11 +1957,29 @@ async function addDownload(source, { restoreMetadata = false } = {}) {
         updatedAt: source.updatedAt,
         identityFingerprint: source.identityFingerprint,
         identityFingerprintKey: source.identityFingerprintKey,
+        ownershipToken: source.ownershipToken,
       }
     : {};
-  const job = createJob({ id, kind, value, label: source.label, ...restoredMetadata });
+  const managed = restoredMetadata.managed === undefined ? true : Boolean(restoredMetadata.managed);
+  const claim = managed
+    ? await claimManagedDirectory(id, {
+        ownershipToken: restoreMetadata ? restoredMetadata.ownershipToken : ownershipToken,
+        restoreMetadata,
+      })
+    : null;
+  const job = createJob({
+    id,
+    kind,
+    value,
+    label: source.label,
+    ...restoredMetadata,
+    managed,
+    ownershipToken: claim?.ownershipToken || null,
+    legacyUnowned: Boolean(claim?.legacyUnowned),
+    restoredFromManifest: restoreMetadata,
+  });
   if (kind === "magnet") startTorrent(job, { restoreMetadata });
-  else void startDirect(job);
+  else void runDirect(job);
   persistJobs();
   return job;
 }
@@ -1770,6 +1988,266 @@ function validJobId(value) {
   const id = String(value || "");
   if (!/^[a-zA-Z0-9-]{8,80}$/.test(id)) throw new Error("Invalid source id.");
   return id;
+}
+
+function managedJobDirectory(id) {
+  return path.join(DOWNLOAD_DIR, validJobId(id));
+}
+
+function ownershipMarkerPath(directory) {
+  return path.join(directory, OWNERSHIP_MARKER_NAME);
+}
+
+async function readManagedDirectoryOwnership(directory) {
+  let markerInfo;
+  try {
+    markerInfo = await lstat(ownershipMarkerPath(directory));
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!markerInfo.isFile() || markerInfo.isSymbolicLink()) return null;
+  try {
+    const marker = JSON.parse(await readFile(ownershipMarkerPath(directory), "utf8"));
+    if (
+      Number(marker?.version) !== OWNERSHIP_MARKER_VERSION ||
+      !/^[a-zA-Z0-9-]{8,80}$/.test(String(marker?.id || "")) ||
+      !OWNERSHIP_TOKEN_PATTERN.test(String(marker?.token || ""))
+    ) return null;
+    return { id: String(marker.id), token: String(marker.token) };
+  } catch (error) {
+    if (error instanceof SyntaxError) return null;
+    throw error;
+  }
+}
+
+async function claimManagedDirectory(id, {
+  ownershipToken = null,
+  restoreMetadata = false,
+} = {}) {
+  const validId = validJobId(id);
+  const expectedToken = OWNERSHIP_TOKEN_PATTERN.test(String(ownershipToken || ""))
+    ? String(ownershipToken)
+    : null;
+  const directory = managedJobDirectory(validId);
+  let directoryInfo = await lstat(directory).catch((error) => {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!directoryInfo) {
+    try {
+      await mkdir(directory);
+      directoryInfo = await lstat(directory);
+      const token = expectedToken || randomUUID();
+      await writeFile(ownershipMarkerPath(directory), JSON.stringify({
+        version: OWNERSHIP_MARKER_VERSION,
+        id: validId,
+        token,
+      }), { flag: "wx", mode: 0o600 });
+      return { directory, ownershipToken: token, legacyUnowned: false };
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      directoryInfo = await lstat(directory);
+    }
+  }
+  if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) {
+    throw new Error("The download id collides with an existing filesystem entry.");
+  }
+  const marker = await readManagedDirectoryOwnership(directory);
+  if (marker?.id === validId && expectedToken && marker.token === expectedToken) {
+    return { directory, ownershipToken: marker.token, legacyUnowned: false };
+  }
+  if (restoreMetadata && marker?.id === validId && !expectedToken) {
+    return { directory, ownershipToken: marker.token, legacyUnowned: false };
+  }
+  if (restoreMetadata && !marker && !expectedToken) {
+    // Older manifests predate ownership markers. They may keep using their payload,
+    // but remain intentionally ineligible for recursive deletion.
+    return { directory, ownershipToken: null, legacyUnowned: true };
+  }
+  throw new Error("The download id collides with an existing folder that WatchPair does not own.");
+}
+
+async function managedDirectoryIsOwned(job) {
+  if (!job?.managed || !OWNERSHIP_TOKEN_PATTERN.test(String(job.ownershipToken || ""))) {
+    return false;
+  }
+  const directory = managedJobDirectory(job.id);
+  const directoryInfo = await lstat(directory).catch(() => null);
+  if (!directoryInfo?.isDirectory() || directoryInfo.isSymbolicLink()) return false;
+  const marker = await readManagedDirectoryOwnership(directory).catch(() => null);
+  return marker?.id === job.id && marker.token === job.ownershipToken;
+}
+
+async function claimConfirmedLegacyDirectory(job) {
+  if (!job?.managed || !job.restoredFromManifest || !job.legacyUnowned || job.ownershipToken) {
+    return false;
+  }
+  const directory = managedJobDirectory(job.id);
+  const directoryInfo = await lstat(directory).catch(() => null);
+  if (!directoryInfo?.isDirectory() || directoryInfo.isSymbolicLink()) return false;
+  const resolved = await realpath(directory).catch(() => null);
+  if (!resolved || comparableFilesystemPath(resolved) !== comparableFilesystemPath(directory)) {
+    return false;
+  }
+  if (await readManagedDirectoryOwnership(directory)) return false;
+  const token = randomUUID();
+  try {
+    await writeFile(ownershipMarkerPath(directory), JSON.stringify({
+      version: OWNERSHIP_MARKER_VERSION,
+      id: job.id,
+      token,
+    }), { flag: "wx", mode: 0o600 });
+  } catch {
+    return false;
+  }
+  job.ownershipToken = token;
+  job.legacyUnowned = false;
+  persistJobs();
+  await jobStore.flush();
+  return managedDirectoryIsOwned(job);
+}
+
+function normalizedSourceValue(kind, value) {
+  const normalized = String(value || "").trim();
+  if (kind === "magnet") return magnetInfoHash(normalized) || normalized;
+  try {
+    return new URL(normalized).href;
+  } catch {
+    return normalized;
+  }
+}
+
+function existingJobMatchesSource(job, kind, value) {
+  return !job.seed && job.kind === kind &&
+    normalizedSourceValue(kind, job.value) === normalizedSourceValue(kind, value);
+}
+
+function sourceIdentity(kind, value) {
+  const canonical = normalizedSourceValue(kind, value);
+  if (!canonical) return null;
+  return createHash("sha256").update(`${kind}\0${canonical}`).digest("hex");
+}
+
+function seedPublicationMagnet(job) {
+  if (!job?.seed) return null;
+  const value = String(job.value || "");
+  return /^magnet:\?/i.test(value) && magnetInfoHash(value) ? value : null;
+}
+
+function normalizedSeedLeaseId(value, { create = false } = {}) {
+  const leaseId = String(value || "").trim();
+  if (!leaseId && create) return `lease-${randomUUID().replaceAll("-", "")}`;
+  if (!SEED_LEASE_PATTERN.test(leaseId)) throw new Error("A valid opaque seed lease id is required.");
+  return leaseId;
+}
+
+function seedLeaseTtl(value) {
+  const ttl = Number(value);
+  return Number.isFinite(ttl)
+    ? Math.max(1_000, Math.min(10 * 60_000, Math.floor(ttl)))
+    : SEED_LEASE_DEFAULT_TTL_MS;
+}
+
+function activeSeedLeaseCount(job, now = Date.now()) {
+  if (!(job?.seedLeases instanceof Map)) return 0;
+  for (const [leaseId, expiresAt] of job.seedLeases) {
+    if (!Number.isFinite(expiresAt) || expiresAt <= now) job.seedLeases.delete(leaseId);
+  }
+  return job.seedLeases.size;
+}
+
+async function acquireSeedLease(id, body) {
+  let job = jobs.get(validJobId(id));
+  if (!job) return null;
+  if (!job.seed) throw new Error("Only a local seed can hold a publication lease.");
+  if (job.paused) job = await resumeJob(job.id);
+  const leaseId = normalizedSeedLeaseId(body?.leaseId, { create: true });
+  const expiresAt = Date.now() + seedLeaseTtl(body?.ttlMs);
+  job.seedLeases.set(leaseId, expiresAt);
+  job.seedLeaseGraceUntil = null;
+  return { job, leaseId, expiresAt };
+}
+
+async function endSeedSharing(job) {
+  if (jobs.get(job.id) !== job || activeSeedLeaseCount(job) > 0) return false;
+  job.seedLeaseGraceUntil = null;
+  if (job.managed) {
+    if (!job.paused) await pauseJob(job.id, { ignoreSeedLeases: true });
+    return true;
+  }
+  return stopJob(job.id, { ignoreSeedLeases: true });
+}
+
+async function releaseSeedLease(id, leaseIdValue) {
+  const validId = validJobId(id);
+  const leaseId = normalizedSeedLeaseId(leaseIdValue);
+  const job = jobs.get(validId);
+  if (!job) return { released: false, lastLease: true };
+  if (!job.seed) throw new Error("Only a local seed can hold a publication lease.");
+  activeSeedLeaseCount(job);
+  const released = job.seedLeases.delete(leaseId);
+  const lastLease = activeSeedLeaseCount(job) === 0;
+  if (lastLease) await endSeedSharing(job);
+  return { released, lastLease };
+}
+
+let seedLeaseSweepPromise = null;
+function sweepSeedLeases() {
+  if (seedLeaseSweepPromise) return seedLeaseSweepPromise;
+  seedLeaseSweepPromise = (async () => {
+    const now = Date.now();
+    for (const job of Array.from(jobs.values())) {
+      if (!job.seed || job.paused) continue;
+      const hadLeases = job.seedLeases?.size > 0;
+      const leaseCount = activeSeedLeaseCount(job, now);
+      const graceExpired = Number.isFinite(job.seedLeaseGraceUntil) &&
+        job.seedLeaseGraceUntil <= now;
+      if (!leaseCount && (hadLeases || graceExpired)) await endSeedSharing(job);
+    }
+  })().catch((error) => {
+    agentLogger.warn("seed_lease_sweep_failed", {
+      category: error?.code ? String(error.code) : "unavailable",
+    });
+  }).finally(() => {
+    seedLeaseSweepPromise = null;
+  });
+  return seedLeaseSweepPromise;
+}
+
+function comparableFilesystemPath(value) {
+  const resolved = path.resolve(value);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+async function validateLibraryEntry(entry) {
+  const copies = entry.copies?.length ? entry.copies : [{
+    path: entry.path,
+    physicalKey: entry.physicalKey,
+    size: entry.size,
+    modifiedAt: entry.modifiedAt,
+  }];
+  for (const copy of copies) {
+    try {
+      const resolved = await realpath(copy.path);
+      if (comparableFilesystemPath(resolved) !== comparableFilesystemPath(copy.path)) continue;
+      const info = await stat(resolved, { bigint: true });
+      if (!info.isFile()) continue;
+      const physicalKey = info.ino !== 0n
+        ? `${info.dev}:${info.ino}`
+        : comparableFilesystemPath(resolved);
+      const size = Number(info.size);
+      const modifiedAt = Number(info.mtimeMs);
+      if (
+        physicalKey === copy.physicalKey &&
+        size === copy.size &&
+        modifiedAt === Number(copy.modifiedAt)
+      ) return { path: resolved, info: { size, mtimeMs: modifiedAt } };
+    } catch {
+      // Try another exact physical copy before requiring a rescan.
+    }
+  }
+  throw new Error("The library file changed after it was scanned; scan the library again.");
 }
 
 function confirmedLegacyJobIds(body) {
@@ -1824,13 +2302,31 @@ async function receiveImportChunk(request, id, url) {
   return { uploaded: offset + received, total };
 }
 
-async function seedLocalFile({ id, filePath, label, managed = false, ...metadata }) {
+async function seedLocalFile({
+  id,
+  filePath,
+  label,
+  managed = false,
+  restoreMetadata = false,
+  ownershipToken = null,
+  ...metadata
+}) {
   validJobId(id);
-  if (jobs.has(id)) return jobs.get(id);
-
   const resolvedPath = path.resolve(filePath);
+  const existing = jobs.get(id);
+  if (existing) {
+    const existingSeedPath = existing.seedPath || existing.file?.path;
+    if (existing.seed && existingSeedPath && comparableFilesystemPath(existingSeedPath) ===
+      comparableFilesystemPath(resolvedPath)) {
+      return existing.paused ? resumeJob(existing.id) : existing;
+    }
+    throw new Error("This source id is already bound to different media.");
+  }
   const info = await stat(resolvedPath);
   if (!info.isFile()) throw new Error("The selected library entry is not a file.");
+  const claim = managed
+    ? await claimManagedDirectory(id, { ownershipToken, restoreMetadata })
+    : null;
 
   const job = createJob({
     id,
@@ -1838,7 +2334,10 @@ async function seedLocalFile({ id, filePath, label, managed = false, ...metadata
     value: "",
     label: label || path.basename(resolvedPath),
     managed,
+    ownershipToken: claim?.ownershipToken || null,
     ...metadata,
+    legacyUnowned: Boolean(claim?.legacyUnowned),
+    restoredFromManifest: restoreMetadata,
     seed: true,
     seedPath: resolvedPath,
   });
@@ -1892,11 +2391,16 @@ async function seedLocalFile({ id, filePath, label, managed = false, ...metadata
       serving = true;
       job.status = "ready";
       markJobCompleted(job);
+      if (activeSeedLeaseCount(job) === 0) {
+        job.seedLeaseGraceUntil = Date.now() + SEED_LEASE_GRACE_MS;
+      }
       queueMediaPreparation(job, 0);
       persistJobs();
     };
     const torrent = client.seed(resolvedPath, options, markServing);
+    job.torrentTelemetry?.dispose();
     job.torrent = torrent;
+    job.torrentTelemetry = createTorrentTelemetry(torrent);
     torrent.once("metadata", () => publishMetadata(torrent));
     torrent.once("ready", () => markServing(torrent));
     torrent.on("trackerAnnounce", () => {
@@ -1908,13 +2412,12 @@ async function seedLocalFile({ id, filePath, label, managed = false, ...metadata
       job.updatedAt = Date.now();
     });
     torrent.on("warning", (error) => {
-      const message = String(error?.message || error).slice(0, 240);
-      job.trackerWarnings = [...job.trackerWarnings.filter((item) => item !== message), message].slice(-5);
+      job.trackerWarnings = [classifyTrackerError(error)];
       job.updatedAt = Date.now();
     });
     torrent.once("error", (error) => {
       job.status = "error";
-      job.error = error.message;
+      job.error = `Torrent failed (${classifyTrackerError(error)}).`;
       job.updatedAt = Date.now();
     });
     job.seedReannounceTimer = setInterval(() => {
@@ -1930,6 +2433,8 @@ async function seedLocalFile({ id, filePath, label, managed = false, ...metadata
     throw error;
   }
 
+  persistJobs();
+  if (!restoringJobs) await jobStore.flush();
   return job;
 }
 
@@ -1943,79 +2448,61 @@ async function finalizeImport(id, body) {
     throw new Error(`Import is incomplete; received ${info.size} of ${expectedSize || 0} bytes.`);
   }
 
-  const directory = path.join(DOWNLOAD_DIR, id);
-  await mkdir(directory, { recursive: true });
+  const claim = await claimManagedDirectory(id);
+  const directory = claim.directory;
   const target = path.join(directory, name);
   await rm(target, { force: true });
   await rename(partial, target);
-  return seedLocalFile({ id, filePath: target, label: name, managed: true });
-}
-
-async function walkLibrary(root, directory, query, results, depth = 0) {
-  if (depth > 6 || results.length >= 300) return;
-  let entries;
-  try {
-    entries = await readdir(directory, { withFileTypes: true });
-  } catch {
-    return;
-  }
-
-  for (const entry of entries) {
-    if (results.length >= 300) return;
-    if (entry.name.startsWith(".watchpair")) continue;
-    const candidate = path.join(directory, entry.name);
-    if (entry.isDirectory()) {
-      await walkLibrary(root, candidate, query, results, depth + 1);
-      continue;
-    }
-    if (!entry.isFile() || !VIDEO_EXTENSIONS.test(entry.name)) continue;
-    if (query && !entry.name.toLowerCase().includes(query)) continue;
-    const resolved = await realpath(candidate).catch(() => null);
-    if (!resolved || (resolved !== root && !resolved.startsWith(root + path.sep))) continue;
-    const info = await stat(resolved).catch(() => null);
-    if (!info?.isFile()) continue;
-    const libraryId = createHash("sha256").update(resolved).digest("hex").slice(0, 24);
-    const item = { id: libraryId, name: entry.name, size: info.size };
-    libraryEntries.set(libraryId, { ...item, path: resolved });
-    results.push(item);
-  }
+  return seedLocalFile({
+    id,
+    filePath: target,
+    label: name,
+    managed: true,
+    ownershipToken: claim.ownershipToken,
+  });
 }
 
 async function scanLibrary(queryValue) {
-  const query = String(queryValue || "").trim().toLowerCase();
-  const results = [];
-  libraryEntries.clear();
-  for (const configuredRoot of LIBRARY_DIRS) {
-    const root = await realpath(configuredRoot).catch(() => null);
-    if (root) await walkLibrary(root, root, query, results);
-  }
-  return results.sort((left, right) => left.name.localeCompare(right.name));
+  const scan = libraryCatalog.startScan();
+  const status = await scan.completion;
+  return {
+    files: libraryCatalog.listFiles({ query: queryValue, limit: 300 }),
+    scan: status,
+    stale: status.status !== "complete",
+  };
 }
 
 async function attachLibraryFile({ id, entry, label }) {
   validJobId(id);
-  if (jobs.has(id)) await stopJob(id);
-  const info = await stat(entry.path);
+  if (jobs.has(id) && !(await stopJob(id))) {
+    throw new Error("This source id is still in use by an active room.");
+  }
+  const validated = await validateLibraryEntry(entry);
+  const info = validated.info;
   const job = createJob({
     id,
     kind: "direct",
-    value: entry.path,
+    value: validated.path,
     label: label || entry.name,
     managed: false,
+    libraryCollectionId: entry.collectionId,
+    pinned: libraryCatalog.isCollectionPinned(entry.collectionId),
+    transient: true,
   });
   job.file = {
     name: entry.name,
     size: info.size,
-    path: entry.path,
+    path: validated.path,
     type: contentType(entry.name),
   };
   job.downloaded = info.size;
   job.selectedIndex = 0;
   const asset = mediaAsset(job, 0);
   asset.status = "ready";
-  asset.identityFingerprint = await fingerprintPath(entry.path);
+  asset.identityFingerprint = await fingerprintPath(validated.path);
   asset.identityFingerprintKey = fileIdentityKey(0, job.file);
   syncSelectedAsset(job);
+  await libraryCatalog.setFileFingerprint(entry.id, asset.identityFingerprint, info.size);
   job.status = "ready";
   markJobCompleted(job);
   queueMediaPreparation(job, 0);
@@ -2081,12 +2568,77 @@ function legacyDownloadSummary(job) {
   return { id: job.id, label: safeName(label) };
 }
 
-async function stopJob(id, { deleteFiles = false } = {}) {
-  const job = jobs.get(validJobId(id));
-  if (!job) return false;
-  if (job.seedReannounceTimer) clearInterval(job.seedReannounceTimer);
+async function destroyJobTransfer(job) {
+  job.abortController?.abort();
+  if (job.directPromise) await job.directPromise.catch(() => {});
+  if (job.seedReannounceTimer) {
+    clearInterval(job.seedReannounceTimer);
+    job.seedReannounceTimer = null;
+  }
+  job.torrentTelemetry?.dispose();
+  job.torrentTelemetry = null;
   if (job.torrent && !job.torrent.destroyed) {
     await new Promise((resolve) => job.torrent.destroy(resolve));
+  }
+  job.torrent = null;
+}
+
+async function restoreJobTransferAfterCleanup(job) {
+  job.cleanupCommit = false;
+  if (jobs.get(job.id) !== job) return;
+  if (job.seed) {
+    job.paused = true;
+    job.status = "paused";
+    await resumeJob(job.id);
+    return;
+  }
+  if (job.kind === "magnet") {
+    if (job.managed) {
+      const claim = await claimManagedDirectory(job.id, {
+        ownershipToken: job.ownershipToken,
+        restoreMetadata: !job.ownershipToken,
+      });
+      job.ownershipToken = claim.ownershipToken;
+    }
+    startTorrent(job, { restoreMetadata: true });
+  }
+}
+
+async function stopJob(id, {
+  deleteFiles = false,
+  automatic = false,
+  expectedJob = null,
+  ignoreSeedLeases = false,
+} = {}) {
+  const job = jobs.get(validJobId(id));
+  if (!job || (expectedJob && job !== expectedJob)) return false;
+  if (job.seed && !ignoreSeedLeases && activeSeedLeaseCount(job) > 0) return false;
+  if (deleteFiles && job.managed && !(await managedDirectoryIsOwned(job))) return false;
+
+  if (automatic) {
+    const authorized = await prepareAutomaticJobDeletion(job, {
+      isCurrent: () => jobs.get(job.id) === job,
+      destroy: () => destroyJobTransfer(job),
+      restore: () => restoreJobTransferAfterCleanup(job),
+    });
+    if (!authorized) return false;
+    job.cleanupCommit = true;
+  } else {
+    await destroyJobTransfer(job);
+  }
+
+  if (deleteFiles && job.managed) {
+    if (!(await managedDirectoryIsOwned(job))) {
+      await restoreJobTransferAfterCleanup(job);
+      return false;
+    }
+    try {
+      // Ownership is deliberately checked immediately before recursive removal.
+      await rm(managedJobDirectory(id), { recursive: true, force: true });
+    } catch (error) {
+      await restoreJobTransferAfterCleanup(job);
+      throw error;
+    }
   }
   jobs.delete(id);
   for (let index = preparationQueue.length - 1; index >= 0; index -= 1) {
@@ -2094,11 +2646,91 @@ async function stopJob(id, { deleteFiles = false } = {}) {
   }
   refreshTorrentSelections("job-stopped");
   await removeGeneratedArtifacts(id);
-  if (deleteFiles && job.managed) {
-    await rm(path.join(DOWNLOAD_DIR, id), { recursive: true, force: true });
-  }
   persistJobs();
   return true;
+}
+
+async function pauseJob(id, { ignoreSeedLeases = false } = {}) {
+  const job = jobs.get(validJobId(id));
+  if (!job) return null;
+  if (job.seed && !ignoreSeedLeases && activeSeedLeaseCount(job) > 0) {
+    throw new Error("This local seed is still shared by an active room.");
+  }
+  if (job.paused) return job;
+  job.paused = true;
+  job.status = "paused";
+  job.error = null;
+  job.updatedAt = Date.now();
+  job.abortController?.abort();
+  if (job.directPromise) await job.directPromise.catch(() => {});
+  if (job.seedReannounceTimer) {
+    clearInterval(job.seedReannounceTimer);
+    job.seedReannounceTimer = null;
+  }
+  job.torrentTelemetry?.dispose();
+  job.torrentTelemetry = null;
+  if (job.torrent && !job.torrent.destroyed) {
+    await new Promise((resolve) => job.torrent.destroy(resolve));
+  }
+  job.torrent = null;
+  refreshTorrentSelections("job-paused");
+  persistJobs();
+  await jobStore.flush();
+  return job;
+}
+
+async function resumeJob(id) {
+  const job = jobs.get(validJobId(id));
+  if (!job) return null;
+  if (!job.paused) return job;
+  job.paused = false;
+  job.error = null;
+  job.updatedAt = Date.now();
+  if (job.seed) {
+    const metadata = {
+      id: job.id,
+      filePath: job.seedPath || job.file?.path,
+      label: job.label,
+      managed: job.managed,
+      pinned: job.pinned,
+      libraryCollectionId: job.libraryCollectionId,
+      createdAt: job.createdAt,
+      completedAt: job.completedAt,
+      lastAccessedAt: job.lastAccessedAt,
+      retentionMetadataVersion: job.retentionMetadataVersion,
+      updatedAt: job.updatedAt,
+      ownershipToken: job.ownershipToken,
+      restoreMetadata: true,
+      transient: job.transient,
+    };
+    jobs.delete(job.id);
+    try {
+      const resumed = await seedLocalFile(metadata);
+      persistJobs();
+      await jobStore.flush();
+      return resumed;
+    } catch (error) {
+      jobs.set(job.id, job);
+      job.paused = true;
+      job.status = "paused";
+      throw error;
+    }
+  }
+  if (job.kind === "magnet") {
+    if (job.managed) {
+      const claim = await claimManagedDirectory(job.id, {
+        ownershipToken: job.ownershipToken,
+        restoreMetadata: !job.ownershipToken,
+      });
+      job.ownershipToken = claim.ownershipToken;
+    }
+    startTorrent(job, { restoreMetadata: true });
+  } else {
+    void runDirect(job);
+  }
+  persistJobs();
+  await jobStore.flush();
+  return job;
 }
 
 async function retryJob(id) {
@@ -2106,54 +2738,106 @@ async function retryJob(id) {
   if (!job) throw new Error("Download not found.");
   if (job.seed) throw new Error("A local seed does not need to be retried.");
   const source = { id: job.id, kind: job.kind, value: job.value, label: job.label };
+  const ownershipToken = job.ownershipToken;
   await stopJob(id);
-  return addDownload(source);
+  return addDownload(source, { ownershipToken });
 }
 
 async function restoreJobs() {
   const records = await jobStore.load([]);
   if (!Array.isArray(records)) return;
-  for (const record of records.slice(0, 100)) {
-    try {
-      if (record.seed && record.seedPath) {
-        await seedLocalFile({
-          id: record.id,
-          filePath: record.seedPath,
-          label: record.label,
-          managed: Boolean(record.managed),
-          pinned: Boolean(record.pinned),
-          createdAt: record.createdAt,
-          completedAt: record.completedAt,
-          lastAccessedAt: record.lastAccessedAt,
-          retentionMetadataVersion: RETENTION_METADATA_VERSION,
-          updatedAt: record.updatedAt,
-        });
-      } else if (record.kind === "magnet") {
-        await addDownload(record, { restoreMetadata: true });
-      } else if (record.file?.path) {
-        const info = await stat(record.file.path);
-        const job = createJob({
-          ...record,
-          retentionMetadataVersion: RETENTION_METADATA_VERSION,
-        });
-        job.file = { ...record.file, size: info.size };
-        job.downloaded = info.size;
-        job.selectedIndex = 0;
-        const asset = mediaAsset(job, 0);
-        asset.status = "ready";
-        await identifySelectedFile(job, 0);
-        syncSelectedAsset(job);
-        job.status = "ready";
-        markJobCompleted(job);
-        queueMediaPreparation(job, 0);
-      } else {
-        await addDownload(record, { restoreMetadata: true });
+  restoringJobs = true;
+  failedRestoreRecords = [];
+  try {
+    for (const record of records) {
+      try {
+        if (record.transient || (record.managed === false && record.kind === "direct")) {
+          continue;
+        }
+        if (record.paused) {
+          const pausedInfo = record.file?.path ? await stat(record.file.path) : null;
+          if (pausedInfo && !pausedInfo.isFile()) {
+            throw new Error("Paused download payload is not a file.");
+          }
+          const claim = record.managed
+            ? await claimManagedDirectory(record.id, {
+                ownershipToken: record.ownershipToken,
+                restoreMetadata: true,
+              })
+            : null;
+          const job = createJob({
+            ...record,
+            paused: true,
+            ownershipToken: claim?.ownershipToken || null,
+            legacyUnowned: Boolean(claim?.legacyUnowned),
+            restoredFromManifest: true,
+            retentionMetadataVersion: Number(record.retentionMetadataVersion) || 0,
+          });
+          job.seed = Boolean(record.seed);
+          job.seedPath = record.seedPath || null;
+          if (record.file?.path) {
+            job.file = { ...record.file, size: Number(record.file.size) || pausedInfo.size };
+            job.downloaded = Math.min(pausedInfo.size, Math.max(0, Number(record.downloaded) || pausedInfo.size));
+            job.selectedIndex = Number.isInteger(record.selectedIndex) ? record.selectedIndex : 0;
+          }
+          job.status = "paused";
+          job.paused = true;
+        } else if (record.seed && record.seedPath) {
+          await seedLocalFile({
+            id: record.id,
+            filePath: record.seedPath,
+            label: record.label,
+            managed: Boolean(record.managed),
+            pinned: Boolean(record.pinned),
+            libraryCollectionId: record.libraryCollectionId,
+            createdAt: record.createdAt,
+            completedAt: record.completedAt,
+            lastAccessedAt: record.lastAccessedAt,
+            retentionMetadataVersion: RETENTION_METADATA_VERSION,
+            updatedAt: record.updatedAt,
+            ownershipToken: record.ownershipToken,
+            restoreMetadata: true,
+          });
+        } else if (record.kind === "magnet") {
+          await addDownload(record, { restoreMetadata: true });
+        } else if (record.file?.path) {
+          const info = await stat(record.file.path);
+          const claim = record.managed
+            ? await claimManagedDirectory(record.id, {
+                ownershipToken: record.ownershipToken,
+                restoreMetadata: true,
+              })
+            : null;
+          const job = createJob({
+            ...record,
+            ownershipToken: claim?.ownershipToken || null,
+            legacyUnowned: Boolean(claim?.legacyUnowned),
+            restoredFromManifest: true,
+            retentionMetadataVersion: RETENTION_METADATA_VERSION,
+          });
+          job.file = { ...record.file, size: info.size };
+          job.downloaded = info.size;
+          job.selectedIndex = 0;
+          const asset = mediaAsset(job, 0);
+          asset.status = "ready";
+          await identifySelectedFile(job, 0);
+          syncSelectedAsset(job);
+          job.status = "ready";
+          markJobCompleted(job);
+          queueMediaPreparation(job, 0);
+        } else {
+          await addDownload(record, { restoreMetadata: true });
+        }
+      } catch (error) {
+        failedRestoreRecords.push(record);
+        console.warn(`Could not restore companion job ${record?.id || "unknown"}: ${error.message}`);
       }
-    } catch (error) {
-      console.warn(`Could not restore companion job ${record?.id || "unknown"}: ${error.message}`);
     }
+  } finally {
+    restoringJobs = false;
   }
   persistJobs();
+  await jobStore.flush();
 }
 
 function contentType(fileName, fallback = "application/octet-stream") {
@@ -2670,6 +3354,45 @@ async function streamFile(request, response, job, fileIndex, headers, audioTrack
   pipeResponseStream(createStream({ start, end }), response);
 }
 
+async function streamLibraryPreview(request, response, entry, headers) {
+  const info = await stat(entry.path);
+  if (!info.isFile()) throw new Error("Library file is no longer available.");
+  const size = info.size;
+  const baseHeaders = {
+    ...headers,
+    "accept-ranges": "bytes",
+    "content-type": contentType(entry.name),
+    "content-disposition": `inline; filename="${safeName(entry.name)}"`,
+  };
+  const range = parseByteRange(request.headers.range, size);
+  if (range === false) {
+    response.writeHead(416, { ...baseHeaders, "content-range": `bytes */${size}` });
+    response.end();
+    return;
+  }
+  if (range === null) {
+    response.writeHead(200, { ...baseHeaders, "content-length": size });
+    if (size > 0) {
+      if (request.method !== "HEAD") {
+        pipeResponseStream(createReadStream(entry.path, { start: 0, end: size - 1 }), response);
+        return;
+      }
+    }
+    response.end();
+    return;
+  }
+  response.writeHead(206, {
+    ...baseHeaders,
+    "content-length": range.end - range.start + 1,
+    "content-range": `bytes ${range.start}-${range.end}/${size}`,
+  });
+  if (request.method === "HEAD") {
+    response.end();
+    return;
+  }
+  pipeResponseStream(createReadStream(entry.path, { start: range.start, end: range.end }), response);
+}
+
 
 const storageDiskUsage = createSingleFlightCache({
   ttlMs: 60_000,
@@ -2701,6 +3424,14 @@ async function storageUsage({ fresh = false } = {}) {
 }
 
 let cleanupPromise = null;
+function jobCanBeRemovedForStoragePressure(job, settings, now = Date.now()) {
+  return jobCanBeCleaned(job, settings, {
+    now,
+    recentAccessMs: RECENT_PLAYBACK_PROTECTION_MS,
+    active: mediaPriorityTargets.some((target) => target.jobId === job?.id),
+  });
+}
+
 async function runStorageCleanup({
   force = false,
   includeLegacy = false,
@@ -2720,6 +3451,12 @@ async function runStorageCleanup({
     const result = {
       removedJobs: [], removedEntries: [], legacyJobs: [], legacyDownloads: [], bytes: 0,
     };
+    if (!libraryCatalog.readyForCleanup()) {
+      await libraryCatalog.startScan().completion;
+      if (!libraryCatalog.readyForCleanup()) {
+        return { ...result, deferred: "library-scan" };
+      }
+    }
     for (const job of Array.from(jobs.values())) {
       if (!retentionMetadataReliable(job)) {
         if (!(await legacyJobFilesystemExpired(job, settings, now))) continue;
@@ -2730,7 +3467,20 @@ async function runStorageCleanup({
         }
         const removedBytes = await jobRemovalBytes(job);
         if (!(await legacyJobFilesystemExpired(job, settings, now))) continue;
-        if (!(await stopJob(job.id, { deleteFiles: true }))) continue;
+        if (!(await managedDirectoryIsOwned(job)) && !(await claimConfirmedLegacyDirectory(job))) {
+          result.legacyJobs.push(job.id);
+          result.legacyDownloads.push(legacyDownloadSummary(job));
+          continue;
+        }
+        if (!(await stopJob(job.id, {
+          deleteFiles: true,
+          automatic: true,
+          expectedJob: job,
+        }))) {
+          result.legacyJobs.push(job.id);
+          result.legacyDownloads.push(legacyDownloadSummary(job));
+          continue;
+        }
         result.bytes += removedBytes;
         result.removedJobs.push(job.id);
         continue;
@@ -2738,7 +3488,11 @@ async function runStorageCleanup({
       if (!jobCleanupReason(job, settings, now)) continue;
       const removedBytes = await jobRemovalBytes(job);
       if (jobs.get(job.id) !== job || !jobCleanupReason(job, settings, Date.now())) continue;
-      if (!(await stopJob(job.id, { deleteFiles: true }))) continue;
+      if (!(await stopJob(job.id, {
+        deleteFiles: true,
+        automatic: true,
+        expectedJob: job,
+      }))) continue;
       result.bytes += removedBytes;
       result.removedJobs.push(job.id);
     }
@@ -2747,6 +3501,7 @@ async function runStorageCleanup({
       const assets = Array.from(job.assets?.values?.() || []);
       if (
         !retentionMetadataReliable(job) ||
+        job.pinned ||
         !cacheExpired(job.lastAccessedAt, settings, now) ||
         assets.some((asset) => ["queued", "preparing"].includes(asset.preparation.status))
       ) continue;
@@ -2755,10 +3510,16 @@ async function runStorageCleanup({
       if (
         jobs.get(job.id) !== job ||
         !retentionMetadataReliable(job) ||
+        job.pinned ||
         !cacheExpired(job.lastAccessedAt, settings, Date.now()) ||
         currentAssets.some((asset) => ["queued", "preparing"].includes(asset.preparation.status))
       ) continue;
-      await removeGeneratedArtifacts(job.id);
+      job.cleanupCommit = true;
+      try {
+        await removeGeneratedArtifacts(job.id);
+      } finally {
+        job.cleanupCommit = false;
+      }
       result.bytes += removedBytes;
       for (const asset of currentAssets) asset.preparation = defaultPreparation();
       syncSelectedAsset(job);
@@ -2783,7 +3544,7 @@ async function runStorageCleanup({
       };
     };
     const cleanupCandidates = Array.from(jobs.values())
-      .filter((job) => jobCanBeCleaned(job, settings))
+      .filter((job) => jobCanBeRemovedForStoragePressure(job, settings, now))
       .sort((left, right) =>
         Number(left.lastAccessedAt || left.completedAt || left.updatedAt || 0) -
         Number(right.lastAccessedAt || right.completedAt || right.updatedAt || 0)
@@ -2791,36 +3552,58 @@ async function runStorageCleanup({
     for (const job of cleanupCandidates) {
       if (!overLimit()) break;
       const removedBytes = await jobRemovalBytes(job);
-      if (jobs.get(job.id) !== job || !jobCanBeCleaned(job, settings) || !overLimit()) continue;
-      if (!(await stopJob(job.id, { deleteFiles: true }))) continue;
+      if (jobs.get(job.id) !== job ||
+        !jobCanBeRemovedForStoragePressure(job, settings) || !overLimit()) continue;
+      if (!(await stopJob(job.id, {
+        deleteFiles: true,
+        automatic: true,
+        expectedJob: job,
+      }))) continue;
       result.bytes += removedBytes;
       result.removedJobs.push(job.id);
       accountForRemoval(removedBytes);
     }
 
-    const protectedNames = new Set(jobs.keys());
-    const expiredOwned = await pruneExpiredChildren(DOWNLOAD_DIR, {
-      now,
-      maxAgeMs: settings.downloadRetentionDays * 24 * 60 * 60 * 1000,
-      include: (entry) => entry.isDirectory() && MANAGED_JOB_DIRECTORY.test(entry.name),
-      protectedNames,
-    });
+    // Directory names are user-controlled and are not proof of WatchPair ownership.
+    // Live/manifest jobs are removed through stopJob above; unknown top-level folders
+    // are deliberately left alone rather than risking an external library payload.
+    const expiredOwned = [];
+    const failedRestoreIds = failedRestoreRecords
+      .map((record) => String(record?.id || ""))
+      .filter((id) => /^[a-zA-Z0-9-]{8,80}$/.test(id));
     const expiredPartials = await pruneExpiredChildren(IMPORT_DIR, {
       now,
       maxAgeMs: settings.partialRetentionHours * 60 * 60 * 1000,
       include: (entry) => entry.isFile() && /^[a-zA-Z0-9-]{8,80}\.part$/.test(entry.name),
+      protectedNames: new Set(Array.from(jobs.values())
+        .filter((job) => job.pinned)
+        .map((job) => `${job.id}.part`)
+        .concat(failedRestoreIds.map((id) => `${id}.part`))),
+      isProtected: (entry) => Boolean(jobs.get(entry.name.slice(0, -5))?.pinned) ||
+        failedRestoreIds.includes(entry.name.slice(0, -5)),
     });
     const mediaWork = [
       mediaScheduler.snapshot(),
       subtitleScheduler.snapshot(),
     ];
-    const protectedContentNames = new Set(mediaWork
-      .flatMap((work) => [work.active, ...work.queued])
-      .map((task) => task?.jobId)
-      .filter((jobId) => String(jobId || "").startsWith("content-"))
-      .map((jobId) => jobId.slice("content-".length)));
+    const protectedContentNames = new Set([
+      ...libraryCatalog.pinnedContentKeys(),
+      ...mediaWork
+        .flatMap((work) => [work.active, ...work.queued])
+        .map((task) => task?.jobId)
+        .filter((jobId) => String(jobId || "").startsWith("content-"))
+        .map((jobId) => jobId.slice("content-".length)),
+    ]);
+    for (const record of failedRestoreRecords) {
+      if (!/^[a-f0-9]{16,128}$/.test(String(record?.identityFingerprint || ""))) continue;
+      const size = Number(record?.file?.size);
+      if (Number.isSafeInteger(size) && size >= 0) {
+        protectedContentNames.add(`${record.identityFingerprint}-${size}`);
+      }
+    }
     for (const job of jobs.values()) {
-      if (retentionMetadataReliable(job) && cacheExpired(job.lastAccessedAt, settings, now)) continue;
+      if (!job.pinned && retentionMetadataReliable(job) &&
+        cacheExpired(job.lastAccessedAt, settings, now)) continue;
       for (const [index, asset] of job.assets?.entries?.() || []) {
         if (!asset.identityFingerprint) continue;
         try {
@@ -2832,17 +3615,38 @@ async function runStorageCleanup({
         }
       }
     }
+    const newlyPinnedContentIsProtected = (entry) => {
+      if (libraryCatalog.isContentKeyPinned(entry.name)) return true;
+      for (const job of jobs.values()) {
+        if (!job.pinned) continue;
+        for (const [index, asset] of job.assets?.entries?.() || []) {
+          if (!asset.identityFingerprint) continue;
+          try {
+            const media = jobFile(job, index);
+            if (
+              asset.identityFingerprintKey === fileIdentityKey(index, media) &&
+              `${asset.identityFingerprint}-${media.size}` === entry.name
+            ) return true;
+          } catch {
+            // A stale file asset cannot protect content.
+          }
+        }
+      }
+      return false;
+    };
     const expiredHlsContent = await pruneExpiredChildren(path.join(HLS_DIR, "content"), {
       now,
       maxAgeMs: settings.cacheRetentionDays * 24 * 60 * 60 * 1000,
       include: (entry) => entry.isDirectory() && /^[a-f0-9]{16,128}-\d+$/.test(entry.name),
       protectedNames: protectedContentNames,
+      isProtected: newlyPinnedContentIsProtected,
     });
     const expiredSubtitleContent = await pruneExpiredChildren(path.join(SUBTITLE_DIR, "content"), {
       now,
       maxAgeMs: settings.cacheRetentionDays * 24 * 60 * 60 * 1000,
       include: (entry) => entry.isDirectory() && /^[a-f0-9]{16,128}-\d+$/.test(entry.name),
       protectedNames: protectedContentNames,
+      isProtected: newlyPinnedContentIsProtected,
     });
     for (const entry of [...expiredOwned, ...expiredPartials, ...expiredHlsContent, ...expiredSubtitleContent]) {
       result.removedEntries.push(entry.name);
@@ -3006,7 +3810,20 @@ function writeResourceSnapshot() {
   agentLogger.info("resource_snapshot", snapshot);
 }
 
+await libraryCatalog.load().catch((error) => {
+  agentLogger.warn("library_catalog_load_failed", { error });
+});
 await restoreJobs();
+for (const job of jobs.values()) {
+  if (job.seed && !job.paused && job.status === "ready" && activeSeedLeaseCount(job) === 0) {
+    job.seedLeaseGraceUntil = Date.now() + SEED_LEASE_GRACE_MS;
+  }
+}
+const startupLibraryScan = libraryCatalog.startScan();
+void startupLibraryScan.completion.then((scan) => {
+  const level = scan.status === "complete" ? "info" : "warn";
+  agentLogger[level]("library_scan_finished", scan);
+});
 const torrentBandwidthTimer = setInterval(() => {
   try {
     refreshTorrentSelections("bandwidth-sample");
@@ -3025,6 +3842,10 @@ const cleanupTimer = setInterval(() => {
   startStorageCleanup({ source: "automatic" });
 }, CLEANUP_INTERVAL_MS);
 cleanupTimer.unref?.();
+const seedLeaseTimer = setInterval(() => {
+  void sweepSeedLeases();
+}, SEED_LEASE_SWEEP_MS);
+seedLeaseTimer.unref?.();
 setTimeout(() => {
   startStorageCleanup({ source: "startup" });
 }, 10_000).unref?.();
@@ -3121,6 +3942,48 @@ const server = createServer(async (request, response) => {
     return;
   }
 
+  // Desktop preview requests carry the control token in the main process.
+  // Reject a supplied-but-invalid token before any catalog, attachment, or HLS
+  // route can treat the request as an ordinary browser request.
+  const suppliedControlToken = request.headers["x-watchpair-control"];
+  if (suppliedControlToken && (!CONTROL_TOKEN || suppliedControlToken !== CONTROL_TOKEN)) {
+    sendJson(response, 403, { error: "Invalid companion control token." });
+    return;
+  }
+
+  const localLibraryPreviewMatch = /^\/library\/([a-f0-9]{24})\/preview$/.exec(url.pathname);
+  if (["GET", "HEAD"].includes(request.method) && localLibraryPreviewMatch) {
+    try {
+      const controlAuthorized = Boolean(CONTROL_TOKEN) &&
+        request.headers["x-watchpair-control"] === CONTROL_TOKEN;
+      const originHeaders = request.headers.origin ? corsHeaders(request) : null;
+      if (!controlAuthorized && !originHeaders) {
+        sendJson(response, 403, { error: "Library preview is not authorized." });
+        return;
+      }
+      const entry = libraryCatalog.getFile(localLibraryPreviewMatch[1]);
+      if (!entry) {
+        sendJson(response, 404, { error: "Library file not found." });
+        return;
+      }
+      if (entry.usable === false) {
+        sendJson(response, 409, { error: "Library file has not completed verification." });
+        return;
+      }
+      const validated = await validateLibraryEntry(entry);
+      await streamLibraryPreview(
+        request,
+        response,
+        { ...entry, path: validated.path },
+        originHeaders || {}
+      );
+    } catch {
+      if (!response.headersSent) sendJson(response, 404, { error: "Library file is no longer available." });
+      else response.destroy();
+    }
+    return;
+  }
+
   const headers = corsHeaders(request);
   if (!headers) {
     sendJson(response, 403, { error: "Origin is not allowed. Pair this website with the companion first." });
@@ -3133,6 +3996,51 @@ const server = createServer(async (request, response) => {
   }
 
   try {
+
+    if (url.pathname.startsWith("/control/library")) {
+      if (!CONTROL_TOKEN || request.headers["x-watchpair-control"] !== CONTROL_TOKEN) {
+        sendJson(response, 403, { error: "Invalid companion control token." }, headers);
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/control/library/scan") {
+        const scan = libraryCatalog.startScan();
+        sendJson(response, 202, { ...scan.operation, started: scan.started }, headers);
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/control/library/scan") {
+        const operation = libraryCatalog.scanStatus(url.searchParams.get("id"));
+        if (!operation) {
+          sendJson(response, 404, { error: "Library scan not found." }, headers);
+          return;
+        }
+        sendJson(response, 200, operation, headers);
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/control/library") {
+        sendJson(response, 200, libraryCatalog.list({
+          query: url.searchParams.get("query"),
+          offset: url.searchParams.get("offset"),
+          limit: url.searchParams.get("limit"),
+        }), headers);
+        return;
+      }
+      const controlLibraryMatch = /^\/control\/library\/([a-f0-9]{24})$/.exec(url.pathname);
+      if (request.method === "GET" && controlLibraryMatch) {
+        const collection = libraryCatalog.getCollection(controlLibraryMatch[1]);
+        sendJson(response, collection ? 200 : 404,
+          collection ? { collection } : { error: "Library collection not found." }, headers);
+        return;
+      }
+      const controlLibraryPinMatch = /^\/control\/library\/([a-f0-9]{24})\/pin$/.exec(url.pathname);
+      if (request.method === "POST" && controlLibraryPinMatch) {
+        const body = await readJson(request);
+        const collection = await libraryCatalog.setPinned(controlLibraryPinMatch[1], body.pinned);
+        sendJson(response, collection ? 200 : 404,
+          collection ? { collection } : { error: "Library collection not found." }, headers);
+        return;
+      }
+    }
 
     if (request.method === "GET" && url.pathname === "/health") {
       const scheduler = mediaScheduler.snapshot();
@@ -3156,7 +4064,7 @@ const server = createServer(async (request, response) => {
           port: client.torrentPort || TORRENT_PORT,
           dhtPort: client.dhtPort || DHT_PORT,
           webRtcSupported: WebTorrent.WEBRTC_SUPPORT,
-          trackers: TRACKERS,
+          trackers: Array.from(new Set(TRACKERS.map(sanitizeTrackerEndpoint).filter(Boolean))),
           connectionBudget: torrentPressure.totalBudget,
           perTorrentLimit: torrentPressure.perTorrentLimit,
           maxPerTorrentLimit: torrentPressure.maxPerTorrentLimit,
@@ -3372,34 +4280,68 @@ const server = createServer(async (request, response) => {
     const seedImportMatch = /^\/imports\/([a-zA-Z0-9-]{8,80})\/seed$/.exec(url.pathname);
     if (request.method === "POST" && seedImportMatch) {
       const job = await finalizeImport(seedImportMatch[1], await readJson(request));
-      sendJson(response, 201, { job: snapshot(job), magnetURI: job.value }, headers);
+      sendJson(response, 201, { job: snapshot(job), magnetURI: seedPublicationMagnet(job) }, headers);
       return;
     }
 
     if (request.method === "GET" && url.pathname === "/library") {
-      const files = await scanLibrary(url.searchParams.get("query"));
-      sendJson(response, 200, { files }, headers);
+      const result = await scanLibrary(url.searchParams.get("query"));
+      sendJson(response, result.stale ? 503 : 200, result.stale
+        ? {
+            error: result.scan.error || "The library scan failed; the last-good catalog was kept.",
+            ...result,
+          }
+        : result, headers);
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/library/match") {
+      const currentScan = libraryCatalog.scanStatus();
+      if (currentScan.status === "error") {
+        sendJson(response, 503, {
+          error: currentScan.error || "The library scan failed; automatic matching is unavailable.",
+          scan: currentScan,
+          stale: true,
+        }, headers);
+        return;
+      }
+      const fingerprint = url.searchParams.get("fingerprint");
+      const file = fingerprint
+        ? libraryCatalog.matchFile(fingerprint, Number(url.searchParams.get("size")))
+        : libraryCatalog.matchTorrent(url.searchParams.get("infoHash"), {
+            fileIndex: url.searchParams.get("fileIndex"),
+            relativePath: url.searchParams.get("relativePath"),
+            size: url.searchParams.get("size"),
+          });
+      sendJson(response, file ? 200 : 404,
+        file ? { file } : { error: "Matching library file not found." }, headers);
       return;
     }
 
     const librarySeedMatch = /^\/library\/([a-f0-9]{24})\/seed$/.exec(url.pathname);
     if (request.method === "POST" && librarySeedMatch) {
-      const entry = libraryEntries.get(librarySeedMatch[1]);
+      const entry = libraryCatalog.getFile(librarySeedMatch[1]);
       if (!entry) throw new Error("Scan the companion library again before selecting that file.");
+      if (entry.usable === false) throw new Error("Library file has not completed verification.");
       const body = await readJson(request);
+      const validated = await validateLibraryEntry(entry);
       const job = await seedLocalFile({
         id: validJobId(body.sourceId),
-        filePath: entry.path,
+        filePath: validated.path,
         label: body.label || entry.name,
+        libraryCollectionId: entry.collectionId,
+        pinned: libraryCatalog.isCollectionPinned(entry.collectionId),
       });
-      sendJson(response, 201, { job: snapshot(job), magnetURI: job.value }, headers);
+      await libraryCatalog.setFileFingerprint(entry.id, job.identityFingerprint, entry.size);
+      sendJson(response, 201, { job: snapshot(job), magnetURI: seedPublicationMagnet(job) }, headers);
       return;
     }
 
     const libraryAttachMatch = /^\/library\/([a-f0-9]{24})\/attach$/.exec(url.pathname);
     if (request.method === "POST" && libraryAttachMatch) {
-      const entry = libraryEntries.get(libraryAttachMatch[1]);
+      const entry = libraryCatalog.getFile(libraryAttachMatch[1]);
       if (!entry) throw new Error("Scan the companion library again before selecting that file.");
+      if (entry.usable === false) throw new Error("Library file has not completed verification.");
       const body = await readJson(request);
       const job = await attachLibraryFile({
         id: validJobId(body.sourceId),
@@ -3422,6 +4364,62 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    const leaseCollectionMatch = /^\/downloads\/([a-zA-Z0-9-]{8,80})\/leases$/.exec(url.pathname);
+    if (request.method === "POST" && leaseCollectionMatch) {
+      const lease = await acquireSeedLease(leaseCollectionMatch[1], await readJson(request));
+      sendJson(response, lease ? 200 : 404, lease
+        ? {
+            leaseId: lease.leaseId,
+            expiresAt: lease.expiresAt,
+            job: snapshot(lease.job),
+          }
+        : { error: "Download not found." }, headers);
+      return;
+    }
+
+    const leaseReleaseMatch =
+      /^\/downloads\/([a-zA-Z0-9-]{8,80})\/leases\/(lease-[a-zA-Z0-9_-]{16,128})$/.exec(url.pathname);
+    if (request.method === "DELETE" && leaseReleaseMatch) {
+      sendJson(response, 200,
+        await releaseSeedLease(leaseReleaseMatch[1], leaseReleaseMatch[2]), headers);
+      return;
+    }
+
+    const publicationMatch = /^\/downloads\/([a-zA-Z0-9-]{8,80})\/publication$/.exec(url.pathname);
+    if (request.method === "GET" && publicationMatch) {
+      const job = jobs.get(publicationMatch[1]);
+      if (!job) {
+        sendJson(response, 404, { error: "Download not found." }, headers);
+        return;
+      }
+      if (!job.seed) {
+        sendJson(response, 409, { error: "This download is not a local seed publication." }, headers);
+        return;
+      }
+      const magnetURI = seedPublicationMagnet(job);
+      sendJson(response, magnetURI ? 200 : 202, { magnetURI }, headers);
+      return;
+    }
+
+    const torrentDetailsMatch = /^\/downloads\/([a-zA-Z0-9-]{8,80})\/torrent$/.exec(url.pathname);
+    if (request.method === "GET" && torrentDetailsMatch) {
+      if (!CONTROL_TOKEN || request.headers["x-watchpair-control"] !== CONTROL_TOKEN) {
+        sendJson(response, 403, { error: "Invalid companion control token." }, headers);
+        return;
+      }
+      const job = jobs.get(torrentDetailsMatch[1]);
+      if (!job) {
+        sendJson(response, 404, { error: "Download not found." }, headers);
+        return;
+      }
+      if (!job.torrentTelemetry) {
+        sendJson(response, 409, { error: "Torrent telemetry is not active." }, headers);
+        return;
+      }
+      sendJson(response, 200, { torrent: job.torrentTelemetry.snapshot() }, headers);
+      return;
+    }
+
     const jobMatch = /^\/downloads\/([a-zA-Z0-9-]{8,80})$/.exec(url.pathname);
     if (request.method === "GET" && jobMatch) {
       const job = jobs.get(jobMatch[1]);
@@ -3434,6 +4432,11 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === "DELETE" && jobMatch) {
+      const activeJob = jobs.get(jobMatch[1]);
+      if (activeJob?.seed && activeSeedLeaseCount(activeJob) > 0) {
+        sendJson(response, 409, { error: "This local seed is still shared by an active room." }, headers);
+        return;
+      }
       const stopped = await stopJob(jobMatch[1], {
         deleteFiles: url.searchParams.get("deleteFiles") === "1",
       });
@@ -3446,10 +4449,31 @@ const server = createServer(async (request, response) => {
       const job = jobs.get(pinMatch[1]);
       if (!job) throw new Error("Download not found.");
       const body = await readJson(request);
-      job.pinned = Boolean(body.pinned);
-      job.updatedAt = Date.now();
+      const pinned = Boolean(body.pinned);
+      if (job.libraryCollectionId) {
+        await libraryCatalog.setPinned(job.libraryCollectionId, pinned);
+      } else {
+        await libraryCatalog.setManagedJobPinned(job.id, pinned);
+      }
       persistJobs();
+      await jobStore.flush();
       sendJson(response, 200, { job: snapshot(job) }, headers);
+      return;
+    }
+
+    const pauseMatch = /^\/downloads\/([a-zA-Z0-9-]{8,80})\/pause$/.exec(url.pathname);
+    if (request.method === "POST" && pauseMatch) {
+      const job = await pauseJob(pauseMatch[1]);
+      sendJson(response, job ? 200 : 404,
+        job ? { job: snapshot(job) } : { error: "Download not found." }, headers);
+      return;
+    }
+
+    const resumeMatch = /^\/downloads\/([a-zA-Z0-9-]{8,80})\/resume$/.exec(url.pathname);
+    if (request.method === "POST" && resumeMatch) {
+      const job = await resumeJob(resumeMatch[1]);
+      sendJson(response, job ? 202 : 404,
+        job ? { job: snapshot(job) } : { error: "Download not found." }, headers);
       return;
     }
 
@@ -3614,6 +4638,7 @@ const shutdown = async () => {
   clearInterval(persistenceTimer);
   clearInterval(resourceDiagnosticTimer);
   clearInterval(cleanupTimer);
+  clearInterval(seedLeaseTimer);
   const serverClosed = new Promise((resolve) => server.close(resolve));
   mediaScheduler.beginShutdown();
   subtitleScheduler.beginShutdown();

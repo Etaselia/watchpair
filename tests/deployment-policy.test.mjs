@@ -103,6 +103,8 @@ test("deployment workflow separates Vienna maintenance and approved manual envir
   assert.match(workflow, /production-vps-scheduled/);
   assert.match(workflow, /production-vps/);
   assert.match(workflow, /status \$VERSION \$REVISION/);
+  assert.match(workflow, /github\.event_name.*schedule[\s\S]*releases\/latest/);
+  assert.doesNotMatch(workflow, /\^v\?\[0-9\]\+\\\.\[0-9\]\+\\\.0\$/);
   assert.equal(
     parsed.jobs.deploy.environment.name,
     "${{ github.event_name == 'workflow_dispatch' && 'production-vps' || 'production-vps-scheduled' }}",

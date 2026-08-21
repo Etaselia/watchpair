@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -55,16 +55,40 @@ test("a companion-published local file is discoverable and serves every byte", {
     const published = await waitForJson(
       base + "/downloads/" + sourceId,
       10_000,
-      (body) => body?.job?.status === "ready" && body?.job?.magnetURI,
+      (body) => body?.job?.status === "ready",
       () => companion.exitCode !== null,
     );
+    const publication = await waitForJson(
+      base + "/downloads/" + sourceId + "/publication",
+      10_000,
+      (body) => Boolean(body?.magnetURI),
+      () => companion.exitCode !== null,
+    );
+    const leaseA = "lease-" + "a".repeat(64);
+    const leaseB = "lease-" + "b".repeat(64);
+    for (const leaseId of [leaseA, leaseB]) {
+      const lease = await fetch(`${base}/downloads/${sourceId}/leases`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ leaseId, ttlMs: 30_000 }),
+      });
+      assert.equal(lease.status, 200);
+    }
+    const releasedB = await fetch(`${base}/downloads/${sourceId}/leases/${leaseB}`, {
+      method: "DELETE",
+    });
+    assert.deepEqual(await releasedB.json(), { released: true, lastLease: false });
+    assert.equal((await fetch(`${base}/downloads/${sourceId}?deleteFiles=1`, {
+      method: "DELETE",
+    })).status, 409, "an active room lease prevents stopping its seed");
 
     assert.equal(published.job.seedState, "seeding");
     assert.ok(published.job.torrentPort > 0);
     assert.ok(published.job.dhtPort > 0);
     assert.equal(published.job.webRtcSupported, true);
     assert.equal(published.job.files[0].name, "shared.bin");
-    assert.match(published.job.magnetURI, new RegExp(encodeURIComponent(trackerUrl).replaceAll(".", "\\.")));
+    assert.equal(published.job.magnetURI, null);
+    assert.match(publication.magnetURI, new RegExp(encodeURIComponent(trackerUrl).replaceAll(".", "\\.")));
     const announced = await waitForJson(
       base + "/downloads/" + sourceId,
       5_000,
@@ -76,7 +100,7 @@ test("a companion-published local file is discoverable and serves every byte", {
     const downloadDirectory = path.join(directory, "leecher");
     const downloaded = await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error("Leecher did not finish")), 15_000);
-      const torrent = leecher.add(published.job.magnetURI, { path: downloadDirectory });
+      const torrent = leecher.add(publication.magnetURI, { path: downloadDirectory });
       torrent.once("done", () => {
         clearTimeout(timeout);
         resolve(torrent);
@@ -92,6 +116,19 @@ test("a companion-published local file is discoverable and serves every byte", {
       () => companion.exitCode !== null,
     );
     assert.ok(["seeding", "uploading"].includes(serving.job.seedState));
+    const releasedA = await fetch(`${base}/downloads/${sourceId}/leases/${leaseA}`, {
+      method: "DELETE",
+    });
+    assert.deepEqual(await releasedA.json(), { released: true, lastLease: true });
+    const paused = await waitForJson(
+      base + "/downloads/" + sourceId,
+      5_000,
+      (body) => body?.job?.paused === true,
+      () => companion.exitCode !== null,
+    );
+    assert.equal(paused.job.seedLeaseCount, 0);
+    assert.equal((await stat(path.join(directory, "downloads", sourceId, "shared.bin"))).isFile(), true,
+      "ending the final room lease preserves the imported payload");
   } catch (error) {
     throw new Error(`${error.message}\n${output}`);
   } finally {

@@ -1,4 +1,5 @@
 import { mediaItemId, mediaManifest, sameMediaManifest } from "../lib/media-queue.mjs";
+import { magnetInfoHash } from "../lib/magnet-identity.mjs";
 import {
   initialPlayerState,
   type LocalReadiness,
@@ -201,6 +202,21 @@ function normalizeSources(value: string | null): SharedSource[] {
         : undefined,
       mediaItems: sanitizeStoredMediaItems(source),
     }));
+}
+
+function normalizedSourceIdentity(kind: unknown, value: unknown) {
+  const normalizedKind = String(kind || "");
+  const rawValue = String(value || "").trim();
+  if (normalizedKind === "magnet") {
+    const infoHash = magnetInfoHash(rawValue);
+    return infoHash ? `magnet:${infoHash}` : `magnet:${rawValue}`;
+  }
+  if (normalizedKind !== "direct") return null;
+  try {
+    return `direct:${new URL(rawValue).href}`;
+  } catch {
+    return `direct:${rawValue}`;
+  }
 }
 
 function voiceConfig(value: string | undefined): VoiceConfig {
@@ -623,17 +639,35 @@ async function handlePost(request: Request, store: SessionStore) {
       now
     );
   } else if (action === "source") {
-    if (currentSession.sources.length >= 30) {
-      return Response.json({ error: "A session can queue up to 30 downloads." }, { status: 400 });
-    }
     const candidate = body.source as Partial<SharedSource> | null;
     const sourceId = String(candidate?.id || crypto.randomUUID()).slice(0, 80);
     if (!/^[a-zA-Z0-9-]{8,80}$/.test(sourceId)) {
       return Response.json({ error: "A valid source id is required" }, { status: 400 });
     }
-    if (currentSession.sources.some((source) => source.id === sourceId)) return Response.json({ session: currentSession });
     if (!candidate?.value || !["magnet", "direct"].includes(String(candidate.kind))) {
       return Response.json({ error: "A supported source is required" }, { status: 400 });
+    }
+    const existingSource = currentSession.sources.find((source) => source.id === sourceId);
+    if (existingSource) {
+      const existingIdentity = normalizedSourceIdentity(existingSource.kind, existingSource.value);
+      const candidateIdentity = normalizedSourceIdentity(candidate.kind, candidate.value);
+      if (existingIdentity === candidateIdentity) return Response.json({ session: currentSession });
+      return Response.json(
+        { error: "That source id is already assigned to different media." },
+        { status: 409 }
+      );
+    }
+    const candidateInfoHash = candidate.kind === "magnet"
+      ? magnetInfoHash(candidate.value)
+      : null;
+    if (
+      candidateInfoHash &&
+      currentSession.sources.some(
+        (source) => source.kind === "magnet" && magnetInfoHash(source.value) === candidateInfoHash
+      )
+    ) return Response.json({ session: currentSession });
+    if (currentSession.sources.length >= 30) {
+      return Response.json({ error: "A session can queue up to 30 downloads." }, { status: 400 });
     }
     await store.setSource(
       token,
@@ -694,6 +728,9 @@ async function handlePost(request: Request, store: SessionStore) {
     if (!source) {
       return Response.json({ error: "That queued source was not found." }, { status: 400 });
     }
+    if (source.kind !== "magnet") {
+      return Response.json({ error: "Only torrent sources can publish a synchronized file manifest." }, { status: 409 });
+    }
     const candidates = Array.isArray(body.mediaItems) ? body.mediaItems : [];
     if (!candidates.length || candidates.length > 500) {
       return Response.json({ error: "A torrent can publish between 1 and 500 video files." }, { status: 400 });
@@ -727,10 +764,15 @@ async function handlePost(request: Request, store: SessionStore) {
     if (source.mediaItems?.length && !sameMediaManifest(source.mediaItems, nextManifest)) {
       return Response.json({ error: "This torrent already has a different synchronized file manifest." }, { status: 409 });
     }
-    const infoHash = String(body.infoHash || "").toLowerCase();
-    if (infoHash && !/^[a-f0-9]{40}$/.test(infoHash)) {
+    const submittedInfoHash = String(body.infoHash || "").toLowerCase();
+    if (submittedInfoHash && !/^[a-f0-9]{40}$/.test(submittedInfoHash)) {
       return Response.json({ error: "A valid torrent info hash is required." }, { status: 400 });
     }
+    const expectedInfoHash = source.kind === "magnet" ? magnetInfoHash(source.value) : null;
+    if (expectedInfoHash && submittedInfoHash && expectedInfoHash !== submittedInfoHash) {
+      return Response.json({ error: "The torrent info hash does not match the synchronized source." }, { status: 409 });
+    }
+    const infoHash = expectedInfoHash || submittedInfoHash;
     if (source.infoHash && infoHash && source.infoHash !== infoHash) {
       return Response.json({ error: "The torrent info hash does not match the synchronized source." }, { status: 409 });
     }

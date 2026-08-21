@@ -118,6 +118,30 @@ test("prunes only expired, unprotected, matching children", async () => {
   assert.equal((await stat(path.join(root, unrelated))).isDirectory(), true);
 });
 
+test("rechecks dynamic cleanup protection immediately before removal", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "watchpair-prune-pin-race-"));
+  const candidate = "source-old-1234";
+  await mkdir(path.join(root, candidate));
+  await writeFile(path.join(root, candidate, "video.bin"), Buffer.alloc(5));
+  const old = new Date(Date.now() - 40 * DAY);
+  await utimes(path.join(root, candidate), old, old);
+  let pinned = false;
+
+  const removed = await pruneExpiredChildren(root, {
+    maxAgeMs: 30 * DAY,
+    include: (entry) => entry.isDirectory(),
+    measure: async () => {
+      pinned = true;
+      return 5;
+    },
+    isProtected: () => pinned,
+  });
+
+  assert.deepEqual(removed, []);
+  assert.equal((await stat(path.join(root, candidate))).isDirectory(), true);
+  await rm(root, { recursive: true, force: true });
+});
+
 test("orphan pruning ignores disappearance but surfaces inspection failures", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "watchpair-prune-errors-"));
   const candidate = "source-old-1234";

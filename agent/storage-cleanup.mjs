@@ -244,7 +244,10 @@ export async function pruneExpiredChildren(
     maxAgeMs,
     include = () => true,
     protectedNames = new Set(),
+    isProtected = () => false,
     inspect = stat,
+    measure = pathSize,
+    remove = (target) => rm(target, { recursive: true, force: true }),
   }
 ) {
   const entries = await readdir(root, { withFileTypes: true }).catch((error) => {
@@ -260,8 +263,10 @@ export async function pruneExpiredChildren(
       if (error?.code === "ENOENT") return null;
       throw error;
     });
-    if (!info || now - info.mtimeMs < maxAgeMs) continue;
-    const bytes = await removePathAndMeasure(target);
+    if (!info || now - info.mtimeMs < maxAgeMs || await isProtected(entry)) continue;
+    const bytes = await measure(target);
+    if (await isProtected(entry)) continue;
+    await remove(target);
     removed.push({ name: entry.name, bytes });
   }
   return removed;

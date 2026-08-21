@@ -69,7 +69,7 @@ test("keeps multiple downloads active and prepares completed jobs in the backgro
     );
     assert.equal(health.version, packageVersion);
     assert.equal(health.transcoder.encoder, "cpu");
-    assert.equal(health.protocolVersion, 1);
+    assert.equal(health.protocolVersion, 2);
     assert.equal(health.logging.enabled, true);
     assert.equal(health.logging.fileName, "watchpair-agent.log");
     const rejectedPair = await fetch(base + "/control/pair", {

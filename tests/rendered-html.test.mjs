@@ -262,6 +262,91 @@ test("production session API supports join-in-progress state", async () => {
   assert.deepEqual(queueSession.sources.map((source) => source.label), ["Episode 1", "Episode 2"]);
   assert.deepEqual(queueSession.sources.map((source) => source.id), ["source-episode-one", "source-episode-two"]);
 
+  const duplicateSourceResponse = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      action: "source",
+      token: created.session.token,
+      deviceId: "test-host",
+      name: "Host",
+      source: {
+        id: "source-episode-one-duplicate",
+        kind: "magnet",
+        value: "magnet:?dn=Duplicate&xt=urn:btih:1111111111111111111111111111111111111111&tr=udp%3A%2F%2Ftracker.example%3A80",
+        label: "Duplicate episode 1",
+      },
+    }),
+  });
+  assert.equal(duplicateSourceResponse.status, 200);
+  assert.deepEqual(
+    (await duplicateSourceResponse.json()).session.sources.map((source) => source.id),
+    ["source-episode-one", "source-episode-two"],
+  );
+
+  const conflictingMagnetIdResponse = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      action: "source",
+      token: created.session.token,
+      deviceId: "test-host",
+      name: "Host",
+      source: {
+        id: "source-episode-one",
+        kind: "magnet",
+        value: "magnet:?xt=urn:btih:3333333333333333333333333333333333333333",
+        label: "Conflicting episode",
+      },
+    }),
+  });
+  assert.equal(conflictingMagnetIdResponse.status, 409);
+
+  const directManifestSource = {
+    id: "direct-manifest-source",
+    kind: "direct",
+    value: "https://media.example/direct.mp4",
+    label: "Direct source",
+  };
+  const directSourceResponse = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      action: "source",
+      token: created.session.token,
+      deviceId: "test-host",
+      name: "Host",
+      source: directManifestSource,
+    }),
+  });
+  assert.equal(directSourceResponse.status, 200);
+  const directManifestResponse = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      action: "source-manifest",
+      token: created.session.token,
+      deviceId: "test-host",
+      name: "Host",
+      sourceId: directManifestSource.id,
+      infoHash: "1111111111111111111111111111111111111111",
+      mediaItems: [{ fileIndex: 0, path: "direct.mp4", size: 100 }],
+    }),
+  });
+  assert.equal(directManifestResponse.status, 409);
+  const removeDirectSourceResponse = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      action: "remove-source",
+      token: created.session.token,
+      deviceId: "test-host",
+      name: "Host",
+      sourceId: directManifestSource.id,
+    }),
+  });
+  assert.equal(removeDirectSourceResponse.status, 200);
+
   const playerResponse = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -342,6 +427,20 @@ test("production session API supports join-in-progress state", async () => {
     { fileIndex: 1, path: "Show/Season 1/Episode 1.mkv", size: 110 },
     { fileIndex: 2, path: "Show/Season 2/Episode 2.mkv", size: 210 },
   ];
+  const mismatchedManifest = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      action: "source-manifest",
+      token: created.session.token,
+      deviceId: "test-host",
+      name: "Host",
+      sourceId: manifestSourceId,
+      infoHash: "9999999999999999999999999999999999999999",
+      mediaItems: manifestInput,
+    }),
+  });
+  assert.equal(mismatchedManifest.status, 409);
   const manifested = await mutate("source-manifest", {
     sourceId: manifestSourceId,
     infoHash: "1111111111111111111111111111111111111111",
@@ -415,6 +514,31 @@ test("production session API supports join-in-progress state", async () => {
   const cleared = await mutate("remove-source", { sourceId: "source-episode-two" });
   assert.equal(cleared.selectedMedia, null);
   assert.equal(cleared.sources.length, 0);
+
+  const directSource = {
+    id: "source-direct-video",
+    kind: "direct",
+    value: "https://media.example/video-one.mp4",
+    label: "Direct video",
+  };
+  const directAdded = await mutate("source", { source: directSource });
+  assert.equal(directAdded.sources.length, 1);
+  const normalizedDirectRetry = await mutate("source", {
+    source: { ...directSource, value: "https://MEDIA.example:443/folder/../video-one.mp4" },
+  });
+  assert.equal(normalizedDirectRetry.sources.length, 1);
+  const conflictingDirectIdResponse = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      action: "source",
+      token: created.session.token,
+      deviceId: "test-host",
+      name: "Host",
+      source: { ...directSource, value: "https://media.example/video-two.mp4" },
+    }),
+  });
+  assert.equal(conflictingDirectIdResponse.status, 409);
 });
 
 test("ships the coordination and companion surfaces", async () => {
@@ -434,6 +558,7 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /setAgentMediaPriority\(plan\.selected, plan\.targets\)/);
   assert.match(app, /orderedMediaQueue\(sources, selectedItemId\)/);
   assert.match(app, /source-manifest/);
+  assert.match(app, /crossOrigin="anonymous"/);
   assert.match(app, /getAgentDownloads/);
   assert.match(app, /Download queue/);
   assert.match(app, /const COMPANION_VERSION = "\d+\.\d+\.\d+"; \/\/ x-release-please-version/);
@@ -441,9 +566,42 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /getAgentConnectUrl/);
   assert.match(
     app,
-    /const chooseLibraryFile[\s\S]*const sourceId = crypto\.randomUUID\(\);[\s\S]*seedAgentLibraryFile/
+    /const shareLibraryFile[\s\S]*seedAgentLibraryFile/
   );
-  assert.doesNotMatch(app, /attachAgentLibraryFile/);
+  assert.match(app, /const bindLibraryFileLocally[\s\S]*attachAgentLibraryFile/);
+  assert.match(app, /getAgentLibraryPreviewUrl/);
+  assert.match(app, /libraryPreviewNeedsHls/);
+  assert.match(app, /preview-\$\{crypto\.randomUUID\(\)\}/);
+  assert.match(app, /attachAgentLibraryFile\([\s\S]*Preview ·/);
+  assert.match(app, /function LibraryVideoPreview/);
+  assert.match(app, /void import\("hls\.js"\)/);
+  assert.match(app, /stopAgentDownload\(previewJobId, false\)/);
+  assert.match(app, /!isLibraryPreviewJobId\(job\.id\)/);
+  assert.match(agentClient, /\/downloads\/\$\{encodeURIComponent\(sourceId\)\}\/publication/);
+  assert.match(agentClient, /AGENT_PROTOCOL_VERSION = 2/);
+  assert.match(agentClient, /result\.protocolVersion !== AGENT_PROTOCOL_VERSION/);
+  assert.match(app, /Companion update required/);
+  assert.match(app, /opaqueSeedLeaseId/);
+  assert.match(app, /ensureSeedLease\(sourceId, roomToken, deviceId\)/);
+  assert.match(app, /releaseSeedLeases\(\[removedId\]\)/);
+  assert.match(app, /verifiedRoomAgentJobs\.token === roomToken/);
+  assert.match(app, /roomAgentJob\(source\.id\)\?\.seed/);
+  assert.match(app, /agentJobMatchesSourceIdentity\(job, expectedSourceIdentities\.get\(job\.id\)\)/);
+  assert.match(app, /different media under the same source ID/);
+  assert.match(app, /publishedMagnetRoomSourceId/);
+  assert.match(app, /existing queue item was kept/);
+  assert.match(app, /await releaseSeedLeases\(\[sourceId\]\)[\s\S]*stopAgentDownload\(sourceId, true\)/);
+  assert.match(app, /Use on this device/);
+  assert.match(app, /Share \/ Add to room/);
+  assert.match(app, /selectedLibraryFile\.usable === false/);
+  assert.match(app, /Still downloading or verifying/);
+  assert.match(app, /local copies/);
+  assert.match(app, /libraryCatalogStale/);
+  assert.match(app, /latest library scan failed/);
+  assert.match(agentClient, /error instanceof AgentRequestError && error\.status === 503/);
+  assert.match(app, /let refreshRunning = false/);
+  assert.match(app, /automaticLibraryBindingsRef\.current\.delete\(automaticMatchKey\)/);
+  assert.doesNotMatch(app, />Share local files</);
   assert.match(app, /toggleQueuedSourcePin/);
   assert.match(app, /embeddedChapters/);
   assert.match(app, /queueReadinessForJob/);
@@ -452,7 +610,8 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /preparation\.diagnostics/);
   assert.match(app, /uploadAndSeedAgentFile/);
   assert.match(app, /Seeding \/ waiting for peers/);
-  assert.match(app, /downloadMode === "automatic"/);
+  assert.match(app, /type AcquisitionPolicy = "automatic" \| "ask" \| "never"/);
+  assert.match(app, /shouldAcquireSource\(acquisitionPolicy/);
   assert.match(app, /synchronizePlayback/);
   assert.match(app, /shouldHoldLocalSeek/);
   assert.match(app, /shouldHoldLocalPlayback/);
@@ -576,6 +735,10 @@ test("packages the pairable magnet and subtitle companion", async () => {
     "WatchPair Companion/media-governor.mjs",
     "WatchPair Companion/process-registry.mjs",
     "WatchPair Companion/persistent-log.mjs",
+    "WatchPair Companion/library-catalog.mjs",
+    "WatchPair Companion/http-range.mjs",
+    "WatchPair Companion/torrent-telemetry.mjs",
+    "WatchPair Companion/magnet-identity.mjs",
     "WatchPair Companion/render-queue.mjs",
     "WatchPair Companion/scheduled-ffmpeg.mjs",
     "WatchPair Companion/subtitle-pipeline.mjs",

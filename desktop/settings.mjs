@@ -5,6 +5,7 @@ const RESOURCE_MODES = new Set(["eco", "balanced", "fast"]);
 
 export const DEFAULT_DESKTOP_SETTINGS = Object.freeze({
   downloadDirectory: "",
+  libraryDirectories: Object.freeze([]),
   startAtLogin: true,
   transcoder: "auto",
   resourceMode: "balanced",
@@ -27,13 +28,35 @@ function boundedNumber(value, fallback, minimum, maximum) {
   return Number.isFinite(parsed) ? Math.max(minimum, Math.min(maximum, parsed)) : fallback;
 }
 
+export function isFilesystemRoot(value) {
+  const resolved = path.resolve(String(value || ""));
+  const root = path.parse(resolved).root;
+  return process.platform === "win32"
+    ? resolved.toLowerCase() === root.toLowerCase()
+    : resolved === root;
+}
+
 export function normalizeDesktopSettings(value = {}, { defaultDownloadDirectory = "" } = {}) {
   const cleanup = value.cleanup || {};
   const updates = value.updates || {};
   const requestedDirectory = String(value.downloadDirectory || defaultDownloadDirectory).trim();
   const requestedResourceMode = String(value.resourceMode ?? "").trim().toLowerCase();
+  const libraryDirectories = [];
+  const seenLibraryDirectories = new Set();
+  for (const candidate of Array.isArray(value.libraryDirectories) ? value.libraryDirectories : []) {
+    const requested = String(candidate || "").trim();
+    if (!requested) continue;
+    const resolved = path.resolve(requested);
+    if (isFilesystemRoot(resolved)) continue;
+    const identity = process.platform === "win32" ? resolved.toLowerCase() : resolved;
+    if (seenLibraryDirectories.has(identity)) continue;
+    seenLibraryDirectories.add(identity);
+    libraryDirectories.push(resolved);
+    if (libraryDirectories.length >= 32) break;
+  }
   return {
     downloadDirectory: requestedDirectory ? path.resolve(requestedDirectory) : "",
+    libraryDirectories,
     startAtLogin: value.startAtLogin !== false,
     transcoder: TRANSCODERS.has(value.transcoder) ? value.transcoder : "auto",
     resourceMode: RESOURCE_MODES.has(requestedResourceMode) ? requestedResourceMode : "balanced",
@@ -55,6 +78,7 @@ export function normalizeDesktopSettings(value = {}, { defaultDownloadDirectory 
 export function settingsEnvironment(settings) {
   return {
     WATCHPAIR_DOWNLOAD_DIR: settings.downloadDirectory,
+    WATCHPAIR_LIBRARY_DIRS: settings.libraryDirectories.join(path.delimiter),
     WATCHPAIR_TRANSCODER: settings.transcoder,
     WATCHPAIR_RESOURCE_MODE: settings.resourceMode,
     WATCHPAIR_CLEANUP_ENABLED: settings.cleanup.enabled ? "1" : "0",

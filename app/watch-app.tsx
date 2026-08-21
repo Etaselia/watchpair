@@ -53,16 +53,24 @@ import {
 } from "react";
 import {
   AGENT_URL,
+  acquireAgentSeedLease,
   addAgentDownload,
+  attachAgentLibraryFile,
   detectAgent,
   getAgentActivityAge,
   getAgentDownloads,
   getAgentPermissionState,
   getAgentConnectUrl,
+  getAgentLibraryPreviewUrl,
   getAgentSubtitle,
   getAgentSubtitleBytes,
+  isAgentProtocolVersionError,
+  matchAgentLibraryFile,
+  pauseAgentDownload,
   reportAgentPlaybackEvent,
+  releaseAgentSeedLease,
   resolveAgentSource,
+  resumeAgentDownload,
   retryAgentDownload,
   scanAgentLibrary,
   seedAgentLibraryFile,
@@ -71,6 +79,7 @@ import {
   setAgentMediaPriority,
   stopAgentDownload,
   uploadAndSeedAgentFile,
+  waitForAgentSeed,
   type AgentAudioTrack,
   type AgentChapter,
   type AgentFile,
@@ -81,6 +90,27 @@ import {
   type AgentJob,
   type AgentSubtitleTrack,
 } from "../lib/agent-client";
+import {
+  acquisitionStatus,
+  cachedLibraryBindingIsLive,
+  isVerifiedLibraryMatch,
+  libraryShareIntentKey,
+  normalizeAcquisitionPolicy,
+  pausableJobIds,
+  shouldRetryLibraryMatch,
+  shouldAcquireSource,
+  transferRefreshIsCurrent,
+} from "../lib/acquisition-policy.mjs";
+import { opaqueSeedLeaseId } from "../lib/seed-lease.mjs";
+import {
+  isLibraryPreviewJobId,
+  libraryPreviewNeedsHls,
+} from "../lib/library-preview.mjs";
+import {
+  agentJobMatchesSourceIdentity,
+  publishedMagnetRoomSourceId,
+  sharedSourceIdentity,
+} from "../lib/source-identity.mjs";
 import { mapWithConcurrency } from "../lib/agent-subtitle-fetch.mjs";
 import { VoiceDock, useRoomVoice } from "./room-voice";
 import {
@@ -140,7 +170,7 @@ const EMPTY_AUDIO_TRACKS: AgentAudioTrack[] = [];
 const EMPTY_CHAPTERS: AgentChapter[] = [];
 const EMPTY_SUBTITLE_TRACKS: AgentSubtitleTrack[] = [];
 
-type DownloadMode = "automatic" | "manual" | "external";
+type AcquisitionPolicy = "automatic" | "ask" | "never";
 
 const emptyReadiness = (): LocalReadiness => ({
   ready: false,
@@ -216,7 +246,9 @@ function queueReadinessForJob(job: AgentJob, file: AgentFile | null): QueueReadi
     return {
       ready: false,
       progress: 0,
-      status: job.status === "metadata" ? "Reading torrent metadata" : "Starting download",
+      status: agentJobIsPaused(job)
+        ? "Download paused on this device"
+        : job.status === "metadata" ? "Reading torrent metadata" : "Starting download",
       fileName: null,
       fileSize: null,
       fingerprint: null,
@@ -227,7 +259,9 @@ function queueReadinessForJob(job: AgentJob, file: AgentFile | null): QueueReadi
   const fingerprint = file.fingerprint === undefined
     ? (file.selected ? job.identityFingerprint : null)
     : file.fingerprint;
-  const status = job.status === "error"
+  const status = agentJobIsPaused(job)
+    ? "Download paused on this device"
+    : job.status === "error"
     ? job.error || "Download failed"
     : !file.ready
       ? job.status === "metadata" ? "Reading torrent metadata" : "Downloading locally"
@@ -499,16 +533,27 @@ export default function WatchApp() {
   const [agentAvailable, setAgentAvailable] = useState(false);
   const [agentPermission, setAgentPermission] = useState<AgentPermissionState | "checking">("checking");
   const [agentPairing, setAgentPairing] = useState(false);
+  const [agentUpdateRequired, setAgentUpdateRequired] = useState(false);
   const [agentJobs, setAgentJobs] = useState<Record<string, AgentJob>>({});
+  const [verifiedRoomAgentJobs, setVerifiedRoomAgentJobs] = useState<{
+    token: string;
+    ids: string[];
+  }>({ token: "", ids: [] });
   const [localAgentBinding, setLocalAgentBinding] = useState<LocalAgentBinding | null>(null);
-  const [downloadMode, setDownloadMode] = useState<DownloadMode>("automatic");
-  const [shareLocalFiles, setShareLocalFiles] = useState(true);
-  const [manualStartedSources, setManualStartedSources] = useState<string[]>([]);
+  const [acquisitionPolicy, setAcquisitionPolicy] = useState<AcquisitionPolicy>("automatic");
+  const [preferLocalCopies, setPreferLocalCopies] = useState(true);
+  const [approvedSourceIds, setApprovedSourceIds] = useState<string[]>([]);
   const [libraryFiles, setLibraryFiles] = useState<AgentLibraryFile[]>([]);
   const [libraryOpen, setLibraryOpen] = useState(false);
   const [libraryBusy, setLibraryBusy] = useState(false);
+  const [libraryCatalogStale, setLibraryCatalogStale] = useState(false);
+  const [libraryScanWarning, setLibraryScanWarning] = useState("");
+  const [selectedLibraryId, setSelectedLibraryId] = useState("");
+  const [libraryPreviewUrl, setLibraryPreviewUrl] = useState("");
+  const [libraryPreviewBusy, setLibraryPreviewBusy] = useState(false);
   const [connection, setConnection] = useState<"syncing" | "online" | "offline">("syncing");
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const shareFileInputRef = useRef<HTMLInputElement>(null);
   const subtitleInputRef = useRef<HTMLInputElement>(null);
   const readinessRef = useRef(readiness);
   const handledSourceRef = useRef("");
@@ -523,6 +568,28 @@ export default function WatchApp() {
   const recoveryJoinAttemptedRef = useRef(false);
   const pairingTimerRef = useRef<number | null>(null);
   const roomSourcesRef = useRef<{ token: string; ids: string[] }>({ token: "", ids: [] });
+  const libraryShareIntentsRef = useRef(new Map<string, string>());
+  const libraryPreviewJobIdRef = useRef("");
+  const libraryPreviewEpochRef = useRef(0);
+  const pendingLibrarySharesRef = useRef(new Set<string>());
+  const locallySatisfiedSourceIdsRef = useRef(new Set<string>());
+  const browserDownloadControllerRef = useRef<AbortController | null>(null);
+  const pausingDownloadIdsRef = useRef(new Set<string>());
+  const automaticLibraryBindingsRef = useRef(new Map<string, Promise<{
+    sourceId: string;
+    job: AgentJob;
+    file: AgentFile;
+  } | null>>());
+  const localLibraryBindingJobIdsRef = useRef(new Set<string>());
+  const seedLeasesRef = useRef(new Map<string, { leaseId: string; roomToken: string }>());
+  const seedLeaseSecretRef = useRef("");
+  const seedLeaseTabIdRef = useRef("");
+  const sourceIdentityCacheRef = useRef(new Map<string, Promise<string | null>>());
+  const sourceIdentityConflictIdsRef = useRef(new Set<string>());
+  const automaticLibraryMissesRef = useRef(new Map<string, number>());
+  const roomBindingEpochRef = useRef(0);
+  const transferPolicyRoomRef = useRef("");
+  const localAgentBindingRef = useRef<LocalAgentBinding | null>(null);
   const localFileBindingRef = useRef<{
     fingerprint: string;
     url: string;
@@ -534,9 +601,24 @@ export default function WatchApp() {
     || null;
   const activeSourceId = activeSource?.id || "";
   const activeSourceKind = activeSource?.kind || "";
-  const localAgentMedia = findLocalAgentMedia(agentJobs, session?.selectedMedia, localAgentBinding);
+  const currentRoomSourceIds = new Set(sources.map((source) => source.id));
+  const verifiedRoomSourceIds = verifiedRoomAgentJobs.token === roomToken
+    ? new Set(verifiedRoomAgentJobs.ids)
+    : new Set<string>();
+  const playbackEligibleAgentJobs = Object.fromEntries(
+    Object.entries(agentJobs).filter(([sourceId]) =>
+      (!isLibraryPreviewJobId(sourceId) || currentRoomSourceIds.has(sourceId)) &&
+      (!currentRoomSourceIds.has(sourceId) || verifiedRoomSourceIds.has(sourceId))
+    )
+  );
+  const roomAgentJob = (sourceId: string) => verifiedRoomSourceIds.has(sourceId)
+    ? agentJobs[sourceId]
+    : undefined;
+  const localAgentMedia = preferLocalCopies
+    ? findLocalAgentMedia(playbackEligibleAgentJobs, session?.selectedMedia, localAgentBinding)
+    : null;
   const playbackSourceId = localAgentMedia?.sourceId || activeSourceId;
-  const agentJob = localAgentMedia?.job || (activeSource ? agentJobs[activeSource.id] || null : null);
+  const agentJob = localAgentMedia?.job || (activeSource ? roomAgentJob(activeSource.id) || null : null);
   const selectedAgentFile = localAgentMedia?.file
     || (agentJob ? preferredAgentFile(agentJob, session?.selectedMedia) : null);
   const synchronizedMedia = mediaQueue(sources);
@@ -548,12 +630,12 @@ export default function WatchApp() {
     || null;
   const orderedSynchronizedMedia = orderedMediaQueue(sources, selectedItemId);
   const episodeTargets: AgentMediaTarget[] = orderedSynchronizedMedia.flatMap((item) => {
-    const job = agentJobs[item.sourceId];
+    const job = roomAgentJob(item.sourceId);
     const file = job?.files.find((candidate) =>
       candidate.index === item.fileIndex &&
       candidate.size === item.size
     );
-    return file ? [{ jobId: job.id, fileIndex: file.index, itemId: item.id }] : [];
+    return job && file ? [{ jobId: job.id, fileIndex: file.index, itemId: item.id }] : [];
   });
   let selectedTarget = episodeTargets.find((target) => target.itemId === selectedItemId) || null;
   if (localAgentMedia && session?.selectedMedia) {
@@ -581,6 +663,12 @@ export default function WatchApp() {
   const embeddedSubtitleAssetError =
     selectedAgentFile?.subtitleAssetError || agentJob?.subtitleAssetError || null;
   const sourcesKey = sources.map((source) => source.id).join(":");
+  const seedSourceIdsKey = sources
+    .filter((source) => roomAgentJob(source.id)?.seed)
+    .map((source) => source.id)
+    .sort()
+    .join(":");
+  const selectedLibraryFile = libraryFiles.find((file) => file.id === selectedLibraryId) || null;
 
   useEffect(() => {
     if (!agentAvailable) return;
@@ -600,11 +688,13 @@ export default function WatchApp() {
       }
 
       const savedName = localStorage.getItem("watchpair-display-name") || "Guest";
-      const savedMode = localStorage.getItem("watchpair-download-mode");
-      if (savedMode === "automatic" || savedMode === "manual" || savedMode === "external") {
-        setDownloadMode(savedMode);
-      }
-      setShareLocalFiles(localStorage.getItem("watchpair-share-local-files") !== "0");
+      const policy = normalizeAcquisitionPolicy(
+        localStorage.getItem("watchpair-acquisition-policy"),
+        localStorage.getItem("watchpair-download-mode")
+      ) as AcquisitionPolicy;
+      setAcquisitionPolicy(policy);
+      localStorage.setItem("watchpair-acquisition-policy", policy);
+      setPreferLocalCopies(localStorage.getItem("watchpair-prefer-local-copies") !== "0");
       const invitedToken = normalizeToken(new URLSearchParams(window.location.search).get("room") || "");
       setDeviceId(id);
       setDisplayName(savedName);
@@ -620,6 +710,158 @@ export default function WatchApp() {
   }, [readiness]);
 
   useEffect(() => {
+    localAgentBindingRef.current = localAgentBinding;
+  }, [localAgentBinding]);
+
+  const pauseIncomingJobs = useCallback(async (
+    jobs: Record<string, AgentJob>,
+    roomSourceIds: string[]
+  ) => {
+    const jobIds = (pausableJobIds(jobs, roomSourceIds) as string[]).filter(
+      (sourceId) => !pausingDownloadIdsRef.current.has(sourceId)
+    );
+    if (!jobIds.length) return;
+    const failures: string[] = [];
+    await Promise.all(jobIds.map(async (sourceId) => {
+      pausingDownloadIdsRef.current.add(sourceId);
+      try {
+        const pausedJob = await pauseAgentDownload(sourceId);
+        setAgentJobs((current) => {
+          const next = { ...current };
+          if (pausedJob) next[sourceId] = pausedJob;
+          else delete next[sourceId];
+          return next;
+        });
+      } catch {
+        failures.push(sourceId);
+      } finally {
+        pausingDownloadIdsRef.current.delete(sourceId);
+      }
+    }));
+    if (failures.length) {
+      setError(`Downloads are disabled, but ${failures.length} active transfer${failures.length === 1 ? "" : "s"} could not be paused.`);
+    }
+  }, []);
+
+  const releaseSeedLeases = useCallback(async (sourceIds?: Iterable<string>) => {
+    const selected = sourceIds ? new Set(sourceIds) : null;
+    const releases: Promise<unknown>[] = [];
+    for (const [sourceId, lease] of seedLeasesRef.current) {
+      if (selected && !selected.has(sourceId)) continue;
+      seedLeasesRef.current.delete(sourceId);
+      releases.push(releaseAgentSeedLease(sourceId, lease.leaseId).catch(() => null));
+    }
+    await Promise.all(releases);
+  }, []);
+
+  const ensureSeedLease = useCallback(async (
+    sourceId: string,
+    targetRoomToken: string,
+    targetDeviceId: string
+  ) => {
+    const leaseEpoch = roomBindingEpochRef.current;
+    let secret = seedLeaseSecretRef.current;
+    if (!secret) {
+      try {
+        secret = localStorage.getItem("watchpair-seed-lease-secret") || "";
+      } catch {
+        // A memory-only secret still protects the room token for this page lifetime.
+      }
+      if (!secret) {
+        secret = Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) =>
+          byte.toString(16).padStart(2, "0")
+        ).join("");
+        try {
+          // codeql[js/clear-text-storage-of-sensitive-data]: locally generated per-device pepper used only to derive opaque lease ids; it is never transmitted off the device and holds no user data.
+          localStorage.setItem("watchpair-seed-lease-secret", secret);
+        } catch {
+          // Storage can be unavailable in strict browser privacy modes.
+        }
+      }
+      seedLeaseSecretRef.current = secret;
+    }
+    let tabId = seedLeaseTabIdRef.current;
+    if (!tabId) {
+      tabId = crypto.randomUUID();
+      seedLeaseTabIdRef.current = tabId;
+    }
+    const leaseId = await opaqueSeedLeaseId({
+      secret,
+      tabId,
+      roomToken: targetRoomToken,
+      deviceId: targetDeviceId,
+      sourceId,
+    });
+    const previous = seedLeasesRef.current.get(sourceId);
+    if (previous && previous.leaseId !== leaseId) {
+      seedLeasesRef.current.delete(sourceId);
+      void releaseAgentSeedLease(sourceId, previous.leaseId).catch(() => {});
+    }
+    const lease = await acquireAgentSeedLease(sourceId, leaseId);
+    if (
+      leaseEpoch !== roomBindingEpochRef.current ||
+      transferPolicyRoomRef.current !== targetRoomToken
+    ) {
+      await releaseAgentSeedLease(sourceId, leaseId).catch(() => {});
+      throw new Error("The room changed before local sharing was ready.");
+    }
+    seedLeasesRef.current.set(sourceId, { leaseId, roomToken: targetRoomToken });
+    return lease;
+  }, []);
+
+  const clearLibraryPreview = useCallback((updateState = true) => {
+    libraryPreviewEpochRef.current += 1;
+    const previewJobId = libraryPreviewJobIdRef.current;
+    libraryPreviewJobIdRef.current = "";
+    if (previewJobId) void stopAgentDownload(previewJobId, false).catch(() => {});
+    if (!updateState) return;
+    setLibraryPreviewUrl("");
+    setLibraryPreviewBusy(false);
+  }, []);
+
+  const resetRoomTransferState = useCallback((updateState = true) => {
+    roomBindingEpochRef.current += 1;
+    void releaseSeedLeases();
+    clearLibraryPreview(updateState);
+    browserDownloadControllerRef.current?.abort();
+    browserDownloadControllerRef.current = null;
+    handledSourceRef.current = "";
+    locallySatisfiedSourceIdsRef.current.clear();
+    automaticLibraryBindingsRef.current.clear();
+    automaticLibraryMissesRef.current.clear();
+    sourceIdentityCacheRef.current.clear();
+    sourceIdentityConflictIdsRef.current.clear();
+    setVerifiedRoomAgentJobs({ token: "", ids: [] });
+    const localJobIds = [...localLibraryBindingJobIdsRef.current];
+    localLibraryBindingJobIdsRef.current.clear();
+    for (const sourceId of localJobIds) {
+      void stopAgentDownload(sourceId, false).catch(() => {});
+    }
+    localFileBindingRef.current = null;
+    if (mediaUrlRef.current.startsWith("blob:")) URL.revokeObjectURL(mediaUrlRef.current);
+    if (!updateState) return;
+    setApprovedSourceIds([]);
+    localAgentBindingRef.current = null;
+    setLocalAgentBinding(null);
+    setMediaUrl("");
+    setAgentJobs({});
+  }, [clearLibraryPreview, releaseSeedLeases]);
+
+  useEffect(() => {
+    const nextRoom = joined ? roomToken : "";
+    const previousRoom = transferPolicyRoomRef.current;
+    if (previousRoom && previousRoom !== nextRoom) resetRoomTransferState();
+    transferPolicyRoomRef.current = nextRoom;
+  }, [joined, resetRoomTransferState, roomToken]);
+
+  useEffect(() => () => resetRoomTransferState(false), [resetRoomTransferState]);
+
+  useEffect(() => {
+    if (!agentAvailable || acquisitionPolicy !== "never") return;
+    void pauseIncomingJobs(agentJobs, sourcesKey ? sourcesKey.split(":") : []);
+  }, [acquisitionPolicy, agentAvailable, agentJobs, pauseIncomingJobs, sourcesKey]);
+
+  useEffect(() => {
     sessionRef.current = session;
   }, [session]);
 
@@ -630,7 +872,7 @@ export default function WatchApp() {
     if (previous.token === roomToken) {
       const current = new Set(currentIds);
       for (const removedId of previous.ids.filter((id) => !current.has(id))) {
-        void stopAgentDownload(removedId).catch(() => {});
+        void releaseSeedLeases([removedId]);
         setAgentJobs((jobs) => {
           const next = { ...jobs };
           delete next[removedId];
@@ -639,7 +881,25 @@ export default function WatchApp() {
       }
     }
     roomSourcesRef.current = { token: roomToken, ids: currentIds };
-  }, [joined, roomToken, sourcesKey]);
+  }, [joined, releaseSeedLeases, roomToken, sourcesKey]);
+
+  useEffect(() => {
+    if (!joined || !agentAvailable || !roomToken || !deviceId || !seedSourceIdsKey) return;
+    let active = true;
+    let timer: number | null = null;
+    const renew = async () => {
+      const sourceIds = seedSourceIdsKey.split(":").filter(Boolean);
+      await Promise.all(sourceIds.map((sourceId) =>
+        ensureSeedLease(sourceId, roomToken, deviceId).catch(() => null)
+      ));
+      if (active) timer = window.setTimeout(() => void renew(), 30_000);
+    };
+    void renew();
+    return () => {
+      active = false;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [agentAvailable, deviceId, ensureSeedLease, joined, roomToken, seedSourceIdsKey]);
 
   useEffect(() => {
     let active = true;
@@ -666,6 +926,7 @@ export default function WatchApp() {
         failures = 0;
         missedChecks = 0;
         setAgentAvailable(available);
+        setAgentUpdateRequired(false);
         if (available && recoveredChecks) {
           void reportAgentPlaybackEvent({
             event: "companion_health_recovered",
@@ -678,6 +939,12 @@ export default function WatchApp() {
         }
       } catch (caught) {
         if (!active) return;
+        if (isAgentProtocolVersionError(caught)) {
+          failures = 0;
+          setAgentAvailable(false);
+          setAgentUpdateRequired(true);
+          return;
+        }
         missedChecks += 1;
         const recentActivityAgeMs = getAgentActivityAge();
         if (recentActivityAgeMs <= 20_000) {
@@ -717,7 +984,14 @@ export default function WatchApp() {
         setAgentPairing(false);
         return;
       }
-    } catch {
+    } catch (caught) {
+      if (isAgentProtocolVersionError(caught)) {
+        setAgentAvailable(false);
+        setAgentUpdateRequired(true);
+        setAgentPairing(false);
+        setError(caught.message);
+        return;
+      }
       // Launching the native app below also starts its local agent.
     }
 
@@ -736,12 +1010,22 @@ export default function WatchApp() {
         .then((available) => {
           if (!available) return;
           setAgentAvailable(true);
+          setAgentUpdateRequired(false);
           setAgentPermission("granted");
           setAgentPairing(false);
           if (pairingTimerRef.current !== null) window.clearInterval(pairingTimerRef.current);
           pairingTimerRef.current = null;
         })
-        .catch(() => {
+        .catch((caught) => {
+          if (isAgentProtocolVersionError(caught)) {
+            setAgentAvailable(false);
+            setAgentUpdateRequired(true);
+            setAgentPairing(false);
+            setError(caught.message);
+            if (pairingTimerRef.current !== null) window.clearInterval(pairingTimerRef.current);
+            pairingTimerRef.current = null;
+            return;
+          }
           if (attempts < 120) return;
           setAgentPairing(false);
           setError("The companion did not answer. Install or open the WatchPair Companion app, then connect again.");
@@ -1034,6 +1318,7 @@ export default function WatchApp() {
             : readinessRef.current.queue,
         };
         localFileBindingRef.current = { fingerprint, url, readiness: itemReadiness };
+        localAgentBindingRef.current = null;
         setLocalAgentBinding(null);
         setReadiness(nextReadiness);
         readinessRef.current = nextReadiness;
@@ -1062,6 +1347,8 @@ export default function WatchApp() {
   const publishLocalFile = useCallback(
     async (file: File) => {
       const sourceId = crypto.randomUUID();
+      let sourceAddedToRoom = false;
+      let leaseAcquired = false;
       setBusy("file");
       setError("");
       try {
@@ -1089,8 +1376,11 @@ export default function WatchApp() {
         const job = published.job;
         const target = preferredAgentFile(job);
         if (!target || !job.infoHash) throw new Error("The companion did not publish the selected video.");
+        if (!roomToken || !deviceId) throw new Error("Join the room before sharing a local video.");
+        await ensureSeedLease(sourceId, roomToken, deviceId);
+        leaseAcquired = true;
 
-        await sendAction("source", {
+        const publishedSession = await sendAction("source", {
           source: {
             id: sourceId,
             kind: "magnet",
@@ -1098,6 +1388,27 @@ export default function WatchApp() {
             label: file.name,
           },
         });
+        const retainedSourceId = publishedMagnetRoomSourceId(
+          publishedSession.sources,
+          sourceId,
+          published.magnetURI
+        );
+        if (!retainedSourceId) {
+          throw new Error("The room did not retain the published video.");
+        }
+        if (retainedSourceId !== sourceId) {
+          await releaseSeedLeases([sourceId]);
+          leaseAcquired = false;
+          await stopAgentDownload(sourceId, true).catch(() => {});
+          setAgentJobs((current) => {
+            const next = { ...current };
+            delete next[sourceId];
+            return next;
+          });
+          setError("That video is already in the room, so the existing queue item was kept.");
+          return;
+        }
+        sourceAddedToRoom = true;
         setAgentJobs((current) => ({ ...current, [sourceId]: job }));
 
         const item = queueReadinessForJob(job, target);
@@ -1113,11 +1424,13 @@ export default function WatchApp() {
           voice: readinessRef.current.voice,
           queue: nextQueue,
         };
-        setLocalAgentBinding(item.fingerprint ? {
+        const nextLocalAgentBinding = item.fingerprint ? {
           sourceId,
           fileIndex: target.index,
           fingerprint: item.fingerprint,
-        } : null);
+        } : null;
+        localAgentBindingRef.current = nextLocalAgentBinding;
+        setLocalAgentBinding(nextLocalAgentBinding);
         localFileBindingRef.current = null;
         readinessRef.current = next;
         setReadiness(next);
@@ -1136,30 +1449,39 @@ export default function WatchApp() {
         }
         await sendAction("heartbeat", { readiness: next });
       } catch (caught) {
+        if (leaseAcquired && !sourceAddedToRoom) await releaseSeedLeases([sourceId]);
+        if (!sourceAddedToRoom) await stopAgentDownload(sourceId, true).catch(() => {});
         setError(caught instanceof Error ? caught.message : "Could not share that local video.");
       } finally {
         setBusy(null);
       }
     },
-    [sendAction]
+    [deviceId, ensureSeedLease, releaseSeedLeases, roomToken, sendAction]
   );
 
   const onChooseFile = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) return;
-    if (shareLocalFiles && agentAvailable) {
-      const warned = localStorage.getItem("watchpair-local-share-warning") === "1";
-      const accepted = warned || window.confirm(
-        "Share this file directly with the room using BitTorrent? Participants can see the seeder's IP address."
-      );
-      if (accepted) {
-        localStorage.setItem("watchpair-local-share-warning", "1");
-        await publishLocalFile(file);
-        return;
-      }
+    if (!activeSource?.id) {
+      setError("There is no room item to match. Use Share a local file to add this video to the room.");
+      return;
     }
-    await attachLocalFile(file, file.name, activeSource?.id);
+    await attachLocalFile(file, file.name, activeSource.id);
+  };
+
+  const onShareFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!agentAvailable) {
+      setError("Connect the companion before sharing a local file.");
+      return;
+    }
+    if (!window.confirm(
+      "Add this file to the room and share it using BitTorrent? Other participants may see this device's IP address."
+    )) return;
+    await publishLocalFile(file);
   };
 
   const onChooseSubtitle = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -1202,9 +1524,11 @@ export default function WatchApp() {
   };
 
   useEffect(() => {
-    const browserDownloadEnabled =
-      downloadMode === "automatic" ||
-      (downloadMode === "manual" && manualStartedSources.includes(activeSourceId));
+    const browserDownloadEnabled = shouldAcquireSource(
+      acquisitionPolicy,
+      activeSourceId,
+      approvedSourceIds
+    );
     if (!joined || agentAvailable || !browserDownloadEnabled || activeSourceKind !== "direct" || !activeSourceId) return;
     if (handledSourceRef.current === activeSourceId) return;
 
@@ -1214,6 +1538,8 @@ export default function WatchApp() {
     if (!source) return;
     handledSourceRef.current = source.id;
     const controller = new AbortController();
+    browserDownloadControllerRef.current?.abort();
+    browserDownloadControllerRef.current = controller;
     const updateItem = (item: QueueReadiness) => {
       const next: LocalReadiness = {
         ...item,
@@ -1268,16 +1594,35 @@ export default function WatchApp() {
             : "Automatic download was blocked. Choose the local file when it is ready."
         );
       })
-      .finally(() => setBusy(null));
+      .finally(() => {
+        if (browserDownloadControllerRef.current === controller) {
+          browserDownloadControllerRef.current = null;
+        }
+        setBusy(null);
+      });
 
-    return () => controller.abort();
-  }, [activeSourceId, activeSourceKind, agentAvailable, attachLocalFile, downloadMode, joined, manualStartedSources]);
+    return () => {
+      controller.abort();
+      if (browserDownloadControllerRef.current === controller) {
+        browserDownloadControllerRef.current = null;
+      }
+    };
+  }, [activeSourceId, activeSourceKind, acquisitionPolicy, agentAvailable, approvedSourceIds, attachLocalFile, joined]);
 
   useEffect(() => {
     if (!joined || !agentAvailable || !sourcesKey) return;
 
     let active = true;
-    const refresh = async () => {
+    let refreshRunning = false;
+    const pendingBindingKeys = new Set<string>();
+    const automaticLibraryBindings = automaticLibraryBindingsRef.current;
+    const performRefresh = async () => {
+      const roomBindingEpoch = roomBindingEpochRef.current;
+      const refreshIsCurrent = () => transferRefreshIsCurrent(
+        active,
+        roomBindingEpoch,
+        roomBindingEpochRef.current
+      );
       const currentSession = sessionRef.current;
       const queueSources = currentSession?.sources?.length
         ? currentSession.sources
@@ -1290,17 +1635,252 @@ export default function WatchApp() {
       } catch {
         return;
       }
-      const existingById = new Map(localJobs.map((job) => [job.id, job]));
+      if (!refreshIsCurrent()) return;
+      const expectedIdentityEntries = await Promise.all(queueSources.map(async (source) => {
+        const cacheKey = `${source.kind}\u0000${source.value}`;
+        let pendingIdentity = sourceIdentityCacheRef.current.get(cacheKey);
+        if (!pendingIdentity) {
+          pendingIdentity = sharedSourceIdentity(source.kind, source.value);
+          sourceIdentityCacheRef.current.set(cacheKey, pendingIdentity);
+        }
+        try {
+          return [source.id, await pendingIdentity] as const;
+        } catch {
+          if (sourceIdentityCacheRef.current.get(cacheKey) === pendingIdentity) {
+            sourceIdentityCacheRef.current.delete(cacheKey);
+          }
+          return [source.id, null] as const;
+        }
+      }));
+      if (!refreshIsCurrent()) return;
+      const expectedSourceIdentities = new Map(expectedIdentityEntries);
+      const compatibleJobs = localJobs.filter((job) => {
+        if (!expectedSourceIdentities.has(job.id)) return !isLibraryPreviewJobId(job.id);
+        return agentJobMatchesSourceIdentity(job, expectedSourceIdentities.get(job.id));
+      });
+      const existingById = new Map(compatibleJobs.map((job) => [job.id, job]));
+      const allJobsById = Object.fromEntries(compatibleJobs.map((job) => [job.id, job]));
+      for (const source of queueSources) {
+        if (existingById.has(source.id)) sourceIdentityConflictIdsRef.current.delete(source.id);
+      }
+      let selectedMediaForLibrary = currentSession?.selectedMedia;
+      let automaticLocalBinding: LocalAgentBinding | null = null;
+      const selectedSourceId = selectedMediaForLibrary?.sourceId;
+      const selectedRoomSource = selectedSourceId
+        ? queueSources.find((source) => source.id === selectedSourceId) || null
+        : null;
+      const selectedRoomItemForMatch = selectedRoomSource?.mediaItems?.find((item) =>
+        (selectedMediaForLibrary?.itemId ? item.id === selectedMediaForLibrary.itemId : true) &&
+        (selectedMediaForLibrary?.fileIndex === undefined || item.fileIndex === selectedMediaForLibrary.fileIndex)
+      ) || null;
+      const automaticMatchKey = selectedMediaForLibrary && selectedSourceId
+        ? JSON.stringify({
+          sourceId: selectedSourceId,
+          fingerprint: selectedMediaForLibrary.fingerprint || null,
+          infoHash: selectedRoomSource?.infoHash || existingById.get(selectedSourceId)?.infoHash || null,
+          size: selectedMediaForLibrary.size,
+          fileIndex: selectedMediaForLibrary.fileIndex ?? selectedRoomItemForMatch?.fileIndex ?? null,
+          path: selectedRoomItemForMatch?.path || null,
+          itemId: selectedMediaForLibrary.itemId || null,
+        })
+        : "";
+      const mayRetryAutomaticMatch = shouldRetryLibraryMatch(
+        automaticLibraryMissesRef.current.get(automaticMatchKey)
+      );
+      if (
+        preferLocalCopies &&
+        selectedMediaForLibrary &&
+        selectedSourceId &&
+        automaticMatchKey &&
+        mayRetryAutomaticMatch
+      ) {
+        let pendingBinding = automaticLibraryBindingsRef.current.get(automaticMatchKey);
+        if (!pendingBinding) {
+          pendingBinding = createVerifiedLibraryBinding(
+            selectedMediaForLibrary,
+            selectedRoomSource,
+            existingById.get(selectedSourceId)
+          );
+          automaticLibraryBindingsRef.current.set(automaticMatchKey, pendingBinding);
+          pendingBindingKeys.add(automaticMatchKey);
+        }
+        try {
+          const binding = await pendingBinding;
+          if (!binding) {
+            if (automaticLibraryBindingsRef.current.get(automaticMatchKey) === pendingBinding) {
+              automaticLibraryBindingsRef.current.delete(automaticMatchKey);
+            }
+            pendingBindingKeys.delete(automaticMatchKey);
+            if (refreshIsCurrent()) {
+              automaticLibraryMissesRef.current.set(automaticMatchKey, Date.now());
+            }
+          } else {
+            const ownsPendingBinding = pendingBindingKeys.has(automaticMatchKey);
+            if (!refreshIsCurrent()) {
+              if (ownsPendingBinding) {
+                if (automaticLibraryBindingsRef.current.get(automaticMatchKey) === pendingBinding) {
+                  automaticLibraryBindingsRef.current.delete(automaticMatchKey);
+                }
+                pendingBindingKeys.delete(automaticMatchKey);
+                await stopAgentDownload(binding.sourceId, false).catch(() => {});
+              }
+              return;
+            }
+            if (!cachedLibraryBindingIsLive(
+              ownsPendingBinding,
+              binding.sourceId,
+              existingById.keys()
+            )) {
+              if (automaticLibraryBindingsRef.current.get(automaticMatchKey) === pendingBinding) {
+                automaticLibraryBindingsRef.current.delete(automaticMatchKey);
+              }
+              localLibraryBindingJobIdsRef.current.delete(binding.sourceId);
+              locallySatisfiedSourceIdsRef.current.delete(selectedSourceId);
+              if (localAgentBindingRef.current?.sourceId === binding.sourceId) {
+                localAgentBindingRef.current = null;
+                setLocalAgentBinding(null);
+                if (mediaUrlRef.current.startsWith(AGENT_URL)) setMediaUrl("");
+              }
+              return;
+            }
+            const liveBindingJob = existingById.get(binding.sourceId) || binding.job;
+            const liveBindingFile = liveBindingJob.files.find((file) => file.index === binding.file.index)
+              || binding.file;
+            const fingerprint = agentFileFingerprint(liveBindingJob, liveBindingFile) as string;
+            automaticLocalBinding = {
+              sourceId: binding.sourceId,
+              fileIndex: liveBindingFile.index,
+              fingerprint,
+            };
+            const canonicalJob = existingById.get(selectedSourceId);
+            if (canonicalJob && !canonicalJob.seed && !agentJobIsPaused(canonicalJob) && (
+              canonicalJob.status === "queued" ||
+              canonicalJob.status === "metadata" ||
+              canonicalJob.status === "downloading"
+            )) {
+              const pausedJob = await pauseAgentDownload(selectedSourceId);
+              if (pausedJob) {
+                existingById.set(selectedSourceId, pausedJob);
+                allJobsById[selectedSourceId] = pausedJob;
+              } else {
+                existingById.delete(selectedSourceId);
+                delete allJobsById[selectedSourceId];
+              }
+            }
+            if (!refreshIsCurrent()) {
+              if (ownsPendingBinding) {
+                if (automaticLibraryBindingsRef.current.get(automaticMatchKey) === pendingBinding) {
+                  automaticLibraryBindingsRef.current.delete(automaticMatchKey);
+                }
+                pendingBindingKeys.delete(automaticMatchKey);
+                await stopAgentDownload(binding.sourceId, false).catch(() => {});
+              }
+              return;
+            }
+            pendingBindingKeys.delete(automaticMatchKey);
+            automaticLibraryMissesRef.current.delete(automaticMatchKey);
+            localLibraryBindingJobIdsRef.current.add(binding.sourceId);
+            existingById.set(binding.sourceId, liveBindingJob);
+            allJobsById[binding.sourceId] = liveBindingJob;
+            locallySatisfiedSourceIdsRef.current.add(selectedSourceId);
+            const currentLocalBinding = localAgentBindingRef.current;
+            if (
+              currentLocalBinding?.sourceId !== automaticLocalBinding.sourceId ||
+              currentLocalBinding.fileIndex !== automaticLocalBinding.fileIndex ||
+              currentLocalBinding.fingerprint !== automaticLocalBinding.fingerprint
+            ) {
+              localAgentBindingRef.current = automaticLocalBinding;
+              setLocalAgentBinding(automaticLocalBinding);
+            }
+            if (activeSourceId === selectedSourceId) {
+              browserDownloadControllerRef.current?.abort();
+              browserDownloadControllerRef.current = null;
+            }
+            if (!selectedMediaForLibrary.fingerprint) {
+              selectedMediaForLibrary = { ...selectedMediaForLibrary, fingerprint };
+              try {
+                await sendAction("select-media", { media: selectedMediaForLibrary });
+              } catch {
+                // The next companion refresh retries publishing verified identity.
+              }
+            }
+          }
+        } catch {
+          if (automaticLibraryBindingsRef.current.get(automaticMatchKey) === pendingBinding) {
+            automaticLibraryBindingsRef.current.delete(automaticMatchKey);
+          }
+          pendingBindingKeys.delete(automaticMatchKey);
+          if (refreshIsCurrent()) {
+            automaticLibraryMissesRef.current.set(automaticMatchKey, Date.now());
+          }
+        }
+      }
+      if (!refreshIsCurrent()) return;
+      const preferredLocalMatch = preferLocalCopies
+        ? findLocalAgentMedia(
+          allJobsById,
+          selectedMediaForLibrary,
+          automaticLocalBinding || localAgentBindingRef.current
+        )
+        : null;
       const canStart = (sourceId: string) =>
-        downloadMode === "automatic" ||
-        (downloadMode === "manual" && manualStartedSources.includes(sourceId));
+        !locallySatisfiedSourceIdsRef.current.has(sourceId) &&
+        shouldAcquireSource(acquisitionPolicy, sourceId, approvedSourceIds);
+      const usesVerifiedLocalCopy = (sourceId: string) => Boolean(
+        preferredLocalMatch &&
+        preferredLocalMatch.sourceId !== sourceId &&
+        selectedMediaForLibrary?.sourceId === sourceId
+      );
+      const resumed = await Promise.all(
+        queueSources
+          .filter((source) => {
+            const job = existingById.get(source.id);
+            return Boolean(job && agentJobIsPaused(job) && canStart(source.id));
+          })
+          .map(async (source) => {
+            if (!refreshIsCurrent()) return null;
+            try {
+              return await resumeAgentDownload(source.id);
+            } catch {
+              return null;
+            }
+          })
+      );
+      for (const job of resumed) {
+        if (job) existingById.set(job.id, job);
+      }
+      if (!refreshIsCurrent()) return;
       const started = await Promise.all(
         queueSources
-          .filter((source) => !existingById.has(source.id) && canStart(source.id))
+          .filter(
+            (source) =>
+              !existingById.has(source.id) &&
+              canStart(source.id) &&
+              !usesVerifiedLocalCopy(source.id)
+          )
           .map(async (source) => {
+            if (!refreshIsCurrent()) return null;
             try {
-              return await addAgentDownload(source);
-            } catch {
+              const job = await addAgentDownload(source);
+              if (!refreshIsCurrent()) return null;
+              const expectedIdentity = expectedSourceIdentities.get(source.id);
+              if (!agentJobMatchesSourceIdentity(job, expectedIdentity)) {
+                throw new Error("The companion returned a different source identity.");
+              }
+              sourceIdentityConflictIdsRef.current.delete(source.id);
+              return job;
+            } catch (caught) {
+              if (
+                refreshIsCurrent() &&
+                caught instanceof Error &&
+                /(?:source id.*different|bound to different|different source identity)/i.test(caught.message) &&
+                !sourceIdentityConflictIdsRef.current.has(source.id)
+              ) {
+                sourceIdentityConflictIdsRef.current.add(source.id);
+                setError(
+                  "This device already has different media under the same source ID. Pause or remove the conflicting Companion transfer, then retry."
+                );
+              }
               return null;
             }
           })
@@ -1308,16 +1888,39 @@ export default function WatchApp() {
       for (const job of started) {
         if (job) existingById.set(job.id, job);
       }
-      if (!active) return;
+      if (!refreshIsCurrent()) return;
 
-      const jobsById = Object.fromEntries(
-        queueSources
-          .map((source) => [source.id, existingById.get(source.id)] as const)
-          .filter((entry): entry is readonly [string, AgentJob] => Boolean(entry[1]))
+      const jobsById: Record<string, AgentJob> = preferLocalCopies ? { ...allJobsById } : {};
+      for (const source of queueSources) {
+        const job = existingById.get(source.id);
+        if (job) jobsById[source.id] = job;
+      }
+      const verifiedIds = queueSources
+        .filter((source) => existingById.has(source.id))
+        .map((source) => source.id);
+      const verifiedToken = currentSession?.token || "";
+      setVerifiedRoomAgentJobs((current) =>
+        current.token === verifiedToken &&
+        current.ids.length === verifiedIds.length &&
+        current.ids.every((sourceId, index) => sourceId === verifiedIds[index])
+          ? current
+          : { token: verifiedToken, ids: verifiedIds }
       );
-      setAgentJobs((current) => ({ ...current, ...jobsById }));
+      setAgentJobs((current) => {
+        const next = { ...current, ...jobsById };
+        for (const sourceId of Object.keys(next)) {
+          if (isLibraryPreviewJobId(sourceId) && !expectedSourceIdentities.has(sourceId)) {
+            delete next[sourceId];
+          }
+        }
+        for (const source of queueSources) {
+          if (!jobsById[source.id]) delete next[source.id];
+        }
+        return next;
+      });
 
       for (const source of queueSources) {
+        if (!refreshIsCurrent()) return;
         const job = jobsById[source.id];
         if (!job || source.mediaItems?.length) continue;
         const manifest = mediaManifest(job.files, source.id);
@@ -1335,12 +1938,14 @@ export default function WatchApp() {
             infoHash: job.infoHash,
             mediaItems: manifest,
           });
+          if (!refreshIsCurrent()) return;
         } catch {
           manifestSyncedRef.current.delete(manifestKey);
         }
       }
 
       for (const source of queueSources) {
+        if (!refreshIsCurrent()) return;
         const job = jobsById[source.id];
         const videoFiles = job ? mediaManifest(job.files, source.id) : [];
         if (videoFiles.length !== 1) continue;
@@ -1352,6 +1957,7 @@ export default function WatchApp() {
         filenameSyncedRef.current.add(renameKey);
         try {
           await sendAction("rename-source", { sourceId: source.id, label: target.name });
+          if (!refreshIsCurrent()) return;
         } catch {
           filenameSyncedRef.current.delete(renameKey);
         }
@@ -1364,9 +1970,10 @@ export default function WatchApp() {
         if (selectedJob?.kind === "magnet" && selectedFile && !selectedFile.selected) {
           try {
             const updated = await selectAgentFile(selectedJob.id, selectedFile.index);
+            if (!refreshIsCurrent()) return;
             jobsById[selectedJob.id] = updated;
             selectedFile = preferredAgentFile(updated, selectedMedia);
-            if (active) setAgentJobs((current) => ({ ...current, [updated.id]: updated }));
+            setAgentJobs((current) => ({ ...current, [updated.id]: updated }));
           } catch {
             // The next poll retries a transient companion selection failure.
           }
@@ -1375,6 +1982,7 @@ export default function WatchApp() {
 
       if (!selectedMedia) {
         for (const source of queueSources) {
+          if (!refreshIsCurrent()) return;
           const job = jobsById[source.id];
           const target = job ? preferredAgentFile(job) : null;
           if (!job || !target) continue;
@@ -1392,6 +2000,7 @@ export default function WatchApp() {
                 fingerprint: queueReadinessForJob(job, target).fingerprint || undefined,
               },
             });
+            if (!refreshIsCurrent()) return;
             selectedMedia = nextSession.selectedMedia;
           } catch {
             if (selectionSentRef.current === selectionKey) {
@@ -1407,11 +2016,7 @@ export default function WatchApp() {
         ready: false,
         progress: 0,
         status:
-          downloadMode === "automatic"
-            ? "Waiting for companion"
-            : downloadMode === "manual"
-              ? "Ready to start locally"
-              : "Use an external client or local file",
+          acquisitionStatus(acquisitionPolicy),
         fileName: null,
         fileSize: null,
         fingerprint: null,
@@ -1445,13 +2050,14 @@ export default function WatchApp() {
       const logicalSourceId = selectedMedia?.sourceId || queueSources[0]?.id;
       const logicalItemId = selectedMedia?.itemId || logicalSourceId;
       const localFileBinding = localFileBindingRef.current;
-      let localMatch = findLocalAgentMedia(jobsById, selectedMedia, localAgentBinding);
+      let localMatch = findLocalAgentMedia(jobsById, selectedMedia, localAgentBindingRef.current);
       if (localMatch?.job.kind === "magnet" && !localMatch.file.selected) {
         try {
           const updated = await selectAgentFile(localMatch.sourceId, localMatch.file.index);
+          if (!refreshIsCurrent()) return;
           jobsById[localMatch.sourceId] = updated;
-          localMatch = findLocalAgentMedia(jobsById, selectedMedia, localAgentBinding);
-          if (active) setAgentJobs((current) => ({ ...current, [updated.id]: updated }));
+          localMatch = findLocalAgentMedia(jobsById, selectedMedia, localAgentBindingRef.current);
+          setAgentJobs((current) => ({ ...current, [updated.id]: updated }));
         } catch {
           // The next poll retries a transient participant-specific selection failure.
         }
@@ -1481,6 +2087,7 @@ export default function WatchApp() {
         queue,
         voice: readinessRef.current.voice,
       };
+      if (!refreshIsCurrent()) return;
       const previous = readinessRef.current;
       const queueKeys = Object.keys(queue);
       const queueChanged =
@@ -1518,17 +2125,34 @@ export default function WatchApp() {
         await sendAction("select-media", {
           media: { ...selectedMedia, fingerprint: next.fingerprint },
         });
+        if (!refreshIsCurrent()) return;
       }
       if (readinessChanged) await sendAction("heartbeat", { readiness: next });
     };
 
+    let refreshTimer: number | null = null;
+    const refresh = async () => {
+      if (!active || refreshRunning) return;
+      refreshRunning = true;
+      try {
+        await performRefresh();
+      } catch {
+        // The next serialized poll retries a transient refresh failure.
+      } finally {
+        refreshRunning = false;
+        if (active) refreshTimer = window.setTimeout(() => void refresh(), 1_000);
+      }
+    };
+
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 1_000);
     return () => {
       active = false;
-      window.clearInterval(timer);
+      if (refreshTimer !== null) window.clearTimeout(refreshTimer);
+      for (const key of pendingBindingKeys) {
+        automaticLibraryBindings.delete(key);
+      }
     };
-  }, [agentAvailable, downloadMode, joined, localAgentBinding, manualStartedSources, sendAction, sourcesKey]);
+  }, [acquisitionPolicy, activeSourceId, agentAvailable, approvedSourceIds, joined, preferLocalCopies, sendAction, sourcesKey]);
 
   useEffect(() => {
     if (!joined || agentAvailable || !activeSourceId || !agentJobs[activeSourceId]) return;
@@ -1702,11 +2326,13 @@ export default function WatchApp() {
         queue: nextQueue,
       };
       selectionSentRef.current = `${sourceId}:${file.index}`;
-      setLocalAgentBinding(item.fingerprint ? {
+      const nextLocalAgentBinding = item.fingerprint ? {
         sourceId,
         fileIndex: selectedFile.index,
         fingerprint: item.fingerprint,
-      } : null);
+      } : null;
+      localAgentBindingRef.current = nextLocalAgentBinding;
+      setLocalAgentBinding(nextLocalAgentBinding);
       localFileBindingRef.current = null;
       setMediaUrl(item.ready ? selectedFile.hlsUrl || selectedFile.streamUrl : "");
       readinessRef.current = next;
@@ -1747,26 +2373,27 @@ export default function WatchApp() {
     return () => window.clearTimeout(timer);
   }, [readiness, sendAction, session]);
 
-  const changeDownloadMode = (mode: DownloadMode) => {
-    setDownloadMode(mode);
-    localStorage.setItem("watchpair-download-mode", mode);
+  const changeAcquisitionPolicy = async (policy: AcquisitionPolicy) => {
+    setAcquisitionPolicy(policy);
+    localStorage.setItem("watchpair-acquisition-policy", policy);
+    handledSourceRef.current = "";
+    if (policy !== "never") return;
+
+    setApprovedSourceIds([]);
+    await pauseIncomingJobs(agentJobs, sourcesKey ? sourcesKey.split(":") : []);
   };
 
   const startQueuedSource = (sourceId: string) => {
-    setManualStartedSources((current) => current.includes(sourceId) ? current : [...current, sourceId]);
+    setApprovedSourceIds((current) => current.includes(sourceId) ? current : [...current, sourceId]);
   };
 
-  const stopQueuedSource = async (sourceId: string) => {
+  const pauseQueuedSource = async (sourceId: string) => {
     try {
-      await stopAgentDownload(sourceId);
-      setManualStartedSources((current) => current.filter((id) => id !== sourceId));
-      setAgentJobs((current) => {
-        const next = { ...current };
-        delete next[sourceId];
-        return next;
-      });
+      const pausedJob = await pauseAgentDownload(sourceId);
+      setApprovedSourceIds((current) => current.filter((id) => id !== sourceId));
+      if (pausedJob) setAgentJobs((current) => ({ ...current, [sourceId]: pausedJob }));
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Could not stop that download.");
+      setError(caught instanceof Error ? caught.message : "Could not pause that download.");
     }
   };
 
@@ -1824,7 +2451,6 @@ export default function WatchApp() {
   const removeQueuedSource = async (sourceId: string) => {
     if (!window.confirm("Remove this item from the shared queue? Downloaded files will be kept.")) return;
     await sendAction("remove-source", { sourceId });
-    void stopAgentDownload(sourceId).catch(() => {});
     setAgentJobs((current) => {
       const next = { ...current };
       delete next[sourceId];
@@ -1838,23 +2464,283 @@ export default function WatchApp() {
 
   const openLibrary = async () => {
     setLibraryOpen(true);
+    clearLibraryPreview();
     setLibraryBusy(true);
     try {
-      setLibraryFiles(await scanAgentLibrary());
+      const result = await scanAgentLibrary();
+      const files = result.files;
+      setLibraryFiles(files);
+      setLibraryCatalogStale(result.stale);
+      setLibraryScanWarning(result.stale
+        ? result.error || result.scan?.error || "The latest library scan failed; these results may be out of date."
+        : "");
+      setSelectedLibraryId((current) =>
+        files.some((file) => file.id === current) ? current : files[0]?.id || ""
+      );
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Could not scan the companion library.");
+      const message = caught instanceof Error ? caught.message : "Could not scan the companion library.";
+      setLibraryCatalogStale(true);
+      setLibraryScanWarning(message);
     } finally {
       setLibraryBusy(false);
     }
   };
 
-  const chooseLibraryFile = async (libraryFile: AgentLibraryFile) => {
-    setLibraryBusy(true);
+  const startLibraryHlsPreview = async (libraryFile: AgentLibraryFile) => {
+    clearLibraryPreview();
+    const previewEpoch = libraryPreviewEpochRef.current;
+    const previewSourceId = `preview-${crypto.randomUUID()}`;
+    setSelectedLibraryId(libraryFile.id);
+    setLibraryPreviewBusy(true);
     setError("");
     try {
-      const sourceId = crypto.randomUUID();
-      const published = await seedAgentLibraryFile(sourceId, libraryFile.id, libraryFile.name);
-      await sendAction("source", {
+      const job = await attachAgentLibraryFile(
+        previewSourceId,
+        libraryFile.id,
+        `Preview · ${libraryFile.name}`
+      );
+      if (previewEpoch !== libraryPreviewEpochRef.current) {
+        await stopAgentDownload(previewSourceId, false).catch(() => {});
+        return;
+      }
+      const target = preferredAgentFile(job);
+      if (!target?.hlsUrl) {
+        throw new Error("The Companion could not prepare an HLS preview for this video.");
+      }
+      libraryPreviewJobIdRef.current = previewSourceId;
+      setLibraryPreviewUrl(target.hlsUrl);
+    } catch (caught) {
+      await stopAgentDownload(previewSourceId, false).catch(() => {});
+      if (previewEpoch !== libraryPreviewEpochRef.current) return;
+      setLibraryPreviewBusy(false);
+      setError(caught instanceof Error ? caught.message : "Could not prepare that library preview.");
+    }
+  };
+
+  const previewLibraryFile = (libraryFile: AgentLibraryFile) => {
+    if (libraryCatalogStale) {
+      setError("Rescan the Companion library before previewing an out-of-date entry.");
+      return;
+    }
+    if (libraryFile.usable === false) {
+      setLibraryPreviewUrl("");
+      setError("That library video is still downloading or being verified.");
+      return;
+    }
+    if (libraryPreviewNeedsHls(libraryFile.name)) {
+      void startLibraryHlsPreview(libraryFile);
+      return;
+    }
+    clearLibraryPreview();
+    setSelectedLibraryId(libraryFile.id);
+    setLibraryPreviewBusy(true);
+    setError("");
+    setLibraryPreviewUrl(getAgentLibraryPreviewUrl(libraryFile.id));
+  };
+
+  const handleLibraryPreviewError = () => {
+    if (!selectedLibraryFile) return;
+    if (!libraryPreviewJobIdRef.current) {
+      void startLibraryHlsPreview(selectedLibraryFile);
+      return;
+    }
+    clearLibraryPreview();
+    setError("The Companion could not preview that library file.");
+  };
+
+  const bindLibraryFileLocally = async (libraryFile: AgentLibraryFile) => {
+    if (libraryCatalogStale) {
+      setError("Rescan the Companion library before using an out-of-date entry.");
+      return;
+    }
+    if (libraryFile.usable === false) {
+      setError("That library video is still downloading or being verified.");
+      return;
+    }
+    setLibraryBusy(true);
+    setError("");
+    let localSourceId = "";
+    try {
+      const selectedMedia = sessionRef.current?.selectedMedia;
+      const selectedSourceId = selectedMedia?.sourceId;
+      if (!selectedMedia || !selectedSourceId) {
+        throw new Error("Select a room video before choosing a local copy.");
+      }
+      const canonicalJob = agentJobs[selectedSourceId];
+      const canonicalFile = canonicalJob?.files.find((candidate) =>
+        (selectedMedia.itemId ? candidate.itemId === selectedMedia.itemId : true) &&
+        (selectedMedia.fileIndex === undefined || candidate.index === selectedMedia.fileIndex)
+      );
+      const currentSession = sessionRef.current;
+      const currentSources = currentSession?.sources?.length
+        ? currentSession.sources
+        : currentSession?.source ? [currentSession.source] : [];
+      const roomSource = currentSources.find((source) => source.id === selectedSourceId) || null;
+      const roomMediaItem = roomSource?.mediaItems?.find((item) =>
+        (selectedMedia.itemId ? item.id === selectedMedia.itemId : true) &&
+        (selectedMedia.fileIndex === undefined || item.fileIndex === selectedMedia.fileIndex)
+      ) || null;
+      const torrentIdentity = {
+        selectedInfoHash: roomSource?.infoHash || canonicalJob?.infoHash,
+        libraryInfoHash: libraryFile.infoHash,
+        selectedFileIndex: selectedMedia.fileIndex ?? roomMediaItem?.fileIndex,
+        libraryFileIndex: libraryFile.torrentFileIndex ?? libraryFile.fileIndex,
+        selectedPath: roomMediaItem?.path,
+        libraryPath: libraryFile.relativePath,
+      };
+      const expectedFingerprint = selectedMedia.fingerprint || (
+        canonicalJob && canonicalFile ? agentFileFingerprint(canonicalJob, canonicalFile) : null
+      );
+      if (!expectedFingerprint && !isVerifiedLibraryMatch(
+        selectedMedia,
+        null,
+        libraryFile.size,
+        torrentIdentity
+      )) {
+        throw new Error("Wait for the room video's identity check before replacing it with a library copy.");
+      }
+
+      localSourceId = `local-${crypto.randomUUID()}`;
+      const job = await attachAgentLibraryFile(localSourceId, libraryFile.id, libraryFile.name);
+      const target = preferredAgentFile(job);
+      const fingerprint = target ? agentFileFingerprint(job, target) : null;
+      if (!target || !fingerprint || !isVerifiedLibraryMatch(
+        expectedFingerprint ? { ...selectedMedia, fingerprint: expectedFingerprint } : selectedMedia,
+        fingerprint,
+        target.size,
+        torrentIdentity
+      )) {
+        throw new Error("That library file is not the same video as the selected room item.");
+      }
+
+      browserDownloadControllerRef.current?.abort();
+      browserDownloadControllerRef.current = null;
+      const canonicalIsActive = canonicalJob && !canonicalJob.seed && (
+        canonicalJob.status === "queued" ||
+        canonicalJob.status === "metadata" ||
+        canonicalJob.status === "downloading"
+      );
+      if (canonicalIsActive) {
+        const pausedJob = await pauseAgentDownload(selectedSourceId);
+        setAgentJobs((current) => {
+          const next = { ...current };
+          if (pausedJob) next[selectedSourceId] = pausedJob;
+          else delete next[selectedSourceId];
+          return next;
+        });
+      }
+      locallySatisfiedSourceIdsRef.current.add(selectedSourceId);
+
+      const item = queueReadinessForJob(job, target);
+      const logicalItemId = selectedMedia.itemId || selectedSourceId;
+      const nextQueue = {
+        ...readinessRef.current.queue,
+        [localSourceId]: item,
+        [selectedSourceId]: item,
+        [logicalItemId]: item,
+      };
+      const next: LocalReadiness = {
+        ...item,
+        voice: readinessRef.current.voice,
+        queue: nextQueue,
+      };
+      setAgentJobs((current) => ({ ...current, [localSourceId]: job }));
+      localLibraryBindingJobIdsRef.current.add(localSourceId);
+      const nextLocalAgentBinding = {
+        sourceId: localSourceId,
+        fileIndex: target.index,
+        fingerprint: fingerprint as string,
+      };
+      localAgentBindingRef.current = nextLocalAgentBinding;
+      setLocalAgentBinding(nextLocalAgentBinding);
+      setPreferLocalCopies(true);
+      localStorage.setItem("watchpair-prefer-local-copies", "1");
+      localFileBindingRef.current = null;
+      readinessRef.current = next;
+      setReadiness(next);
+      setMediaUrl(item.ready ? target.hlsUrl || target.streamUrl : "");
+      if (!selectedMedia.fingerprint) {
+        await sendAction("select-media", {
+          media: { ...selectedMedia, fingerprint },
+        });
+      }
+      await sendAction("heartbeat", { readiness: next });
+    } catch (caught) {
+      const selectedSourceId = sessionRef.current?.selectedMedia?.sourceId;
+      if (selectedSourceId) locallySatisfiedSourceIdsRef.current.delete(selectedSourceId);
+      if (localSourceId) {
+        localLibraryBindingJobIdsRef.current.delete(localSourceId);
+        void stopAgentDownload(localSourceId, false).catch(() => {});
+      }
+      setError(caught instanceof Error ? caught.message : "Could not use that library file locally.");
+    } finally {
+      setLibraryBusy(false);
+    }
+  };
+
+  const shareLibraryFile = async (libraryFile: AgentLibraryFile) => {
+    if (libraryCatalogStale) {
+      setError("Rescan the Companion library before sharing an out-of-date entry.");
+      return;
+    }
+    if (libraryFile.usable === false) {
+      setError("That library video is still downloading or being verified.");
+      return;
+    }
+    const intentKey = libraryShareIntentKey(libraryFile);
+    if (pendingLibrarySharesRef.current.has(intentKey)) return;
+    const existingSeed = Object.entries(agentJobs).find(([, job]) =>
+      job.seed &&
+      (
+        Boolean(job.infoHash && job.files.some((file) =>
+          libraryShareIntentKey({
+            id: job.id,
+            size: file.size,
+            infoHash: job.infoHash,
+            torrentFileIndex: file.index,
+            relativePath: file.path,
+          }) === intentKey
+        )) ||
+        Boolean(libraryFile.fingerprint && job.files.some((file) =>
+          agentFileFingerprint(job, file) === libraryFile.fingerprint &&
+          file.size === libraryFile.size
+        ))
+      )
+    );
+    const existingSourceId = libraryShareIntentsRef.current.get(intentKey) || existingSeed?.[0];
+    if (existingSourceId) libraryShareIntentsRef.current.set(intentKey, existingSourceId);
+    const existingJob = existingSourceId ? agentJobs[existingSourceId] : null;
+    if (existingSourceId && sources.some((source) => source.id === existingSourceId)) {
+      if (existingJob?.seed && roomToken && deviceId) {
+        void ensureSeedLease(existingSourceId, roomToken, deviceId).catch(() => {});
+      }
+      return;
+    }
+    if (!window.confirm(
+      `Add “${libraryFile.name}” to the room and share it using BitTorrent? Other participants may see this device's IP address.`
+    )) return;
+
+    pendingLibrarySharesRef.current.add(intentKey);
+    setLibraryBusy(true);
+    setError("");
+    let shareSourceId = "";
+    let leasedSourceId = "";
+    let createdNewSeed = false;
+    try {
+      const sourceId = existingSourceId && existingJob?.seed
+        ? existingSourceId
+        : crypto.randomUUID();
+      shareSourceId = sourceId;
+      const published = existingSourceId && existingJob?.seed
+        ? await waitForAgentSeed(existingSourceId)
+        : await seedAgentLibraryFile(sourceId, libraryFile.id, libraryFile.name);
+      createdNewSeed = !(existingSourceId && existingJob?.seed);
+      if (!roomToken || !deviceId) throw new Error("Join the room before sharing a library video.");
+      await ensureSeedLease(sourceId, roomToken, deviceId);
+      leasedSourceId = sourceId;
+      libraryShareIntentsRef.current.set(intentKey, sourceId);
+      setAgentJobs((current) => ({ ...current, [sourceId]: published.job }));
+      const publishedSession = await sendAction("source", {
         source: {
           id: sourceId,
           kind: "magnet",
@@ -1862,12 +2748,34 @@ export default function WatchApp() {
           label: libraryFile.name,
         },
       });
-      setAgentJobs((current) => ({ ...current, [sourceId]: published.job }));
-      const target = preferredAgentFile(published.job);
-      if (target) await chooseAgentMedia(sourceId, published.job, target);
+      const retainedSourceId = publishedMagnetRoomSourceId(
+        publishedSession.sources,
+        sourceId,
+        published.magnetURI
+      );
+      if (!retainedSourceId) throw new Error("The room did not retain the shared library video.");
+      if (retainedSourceId !== sourceId) {
+        await releaseSeedLeases([sourceId]);
+        leasedSourceId = "";
+        if (createdNewSeed) await stopAgentDownload(sourceId, false).catch(() => {});
+        setAgentJobs((current) => {
+          const next = { ...current };
+          delete next[sourceId];
+          return next;
+        });
+        libraryShareIntentsRef.current.set(intentKey, retainedSourceId);
+        setError("That video is already in the room, so the existing queue item was kept.");
+        return;
+      }
+      leasedSourceId = "";
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Could not use that library file.");
+      if (leasedSourceId) await releaseSeedLeases([leasedSourceId]);
+      if (createdNewSeed && shareSourceId) {
+        void stopAgentDownload(shareSourceId, false).catch(() => {});
+      }
+      setError(caught instanceof Error ? caught.message : "Could not share that library file.");
     } finally {
+      pendingLibrarySharesRef.current.delete(intentKey);
       setLibraryBusy(false);
     }
   };
@@ -1883,6 +2791,8 @@ export default function WatchApp() {
 
   const leaveSession = () => {
     voice.stop();
+    transferPolicyRoomRef.current = "";
+    resetRoomTransferState();
     setJoined(false);
     sessionRef.current = null;
     setSession(null);
@@ -1911,7 +2821,7 @@ export default function WatchApp() {
     if (itemId === selectedItemId) return;
     const mediaItem = synchronizedMedia.find((item) => item.id === itemId);
     const sourceId = mediaItem?.sourceId || itemId;
-    const job = agentJobs[sourceId];
+    const job = roomAgentJob(sourceId);
     const target = mediaItem
       ? job?.files.find((file) =>
           file.index === mediaItem.fileIndex && file.size === mediaItem.size
@@ -2140,30 +3050,52 @@ export default function WatchApp() {
           </form>
 
           <div className="download-controls">
-            <div className="mode-switch" role="group" aria-label="Local download behavior">
-              {(["automatic", "manual", "external"] as DownloadMode[]).map((mode) => (
+            <span className="session-label">Download here</span>
+            <div className="mode-switch" role="group" aria-label="Download room media on this device">
+              {(["automatic", "ask", "never"] as AcquisitionPolicy[]).map((policy) => (
                 <button
-                  key={mode}
+                  key={policy}
                   type="button"
-                  className={downloadMode === mode ? "selected" : ""}
-                  aria-pressed={downloadMode === mode}
-                  onClick={() => changeDownloadMode(mode)}
+                  className={acquisitionPolicy === policy ? "selected" : ""}
+                  aria-pressed={acquisitionPolicy === policy}
+                  onClick={() => void changeAcquisitionPolicy(policy)}
+                  title={policy === "automatic"
+                    ? "Download new room media automatically"
+                    : policy === "ask"
+                      ? "Wait for you to start each download"
+                      : "Do not download room media on this device"}
                 >
-                  {mode === "automatic" ? "Auto" : mode === "manual" ? "Manual" : "External"}
+                  {policy === "automatic" ? "Auto" : policy === "ask" ? "Ask" : "Never"}
                 </button>
               ))}
             </div>
             <label className="toggle-control">
               <input
                 type="checkbox"
-                checked={shareLocalFiles}
+                checked={preferLocalCopies}
                 onChange={(event) => {
-                  setShareLocalFiles(event.target.checked);
-                  localStorage.setItem("watchpair-share-local-files", event.target.checked ? "1" : "0");
+                  const enabled = event.target.checked;
+                  setPreferLocalCopies(enabled);
+                  localStorage.setItem("watchpair-prefer-local-copies", enabled ? "1" : "0");
+                  if (!enabled) {
+                    locallySatisfiedSourceIdsRef.current.clear();
+                    localAgentBindingRef.current = null;
+                    setLocalAgentBinding(null);
+                  }
                 }}
               />
-              <span>Share local files</span>
+              <span>Prefer library copies</span>
             </label>
+            <button
+              className="secondary-button compact-button"
+              type="button"
+              onClick={() => shareFileInputRef.current?.click()}
+              disabled={!agentAvailable || busy === "file"}
+              title="Explicitly add and share a local file with this room"
+            >
+              <Share2 />
+              Share file
+            </button>
             <button
               className="secondary-button compact-button"
               type="button"
@@ -2180,8 +3112,10 @@ export default function WatchApp() {
               <div>
                 <span className="companion-icon"><Plug /></span>
                 <span>
-                  <strong>Companion needed</strong>
-                  <small>Connect it for magnet pages, torrent downloads, and embedded MKV subtitles.</small>
+                  <strong>{agentUpdateRequired ? "Companion update required" : "Companion needed"}</strong>
+                  <small>{agentUpdateRequired
+                    ? "Install the latest Companion before reconnecting; this version cannot safely identify or share local media."
+                    : "Connect it for magnet pages, torrent downloads, and embedded MKV subtitles."}</small>
                 </span>
               </div>
               <div className="companion-actions">
@@ -2192,7 +3126,7 @@ export default function WatchApp() {
                   disabled={agentPairing}
                 >
                   {agentPairing ? <LoaderCircle className="spin" /> : <Plug />}
-                  {agentPairing ? "Waiting for approval" : "Connect"}
+                  {agentPairing ? "Waiting for approval" : agentUpdateRequired ? "Check again" : "Connect"}
                 </button>
                 <a className="secondary-button" href={`https://github.com/Etaselia/WatchPair/releases/tag/v${COMPANION_VERSION}`} target="_blank" rel="noreferrer">
                   <PackageOpen />
@@ -2205,7 +3139,7 @@ export default function WatchApp() {
           {sources.length ? (
             <div className="queue-list" aria-label="Synchronized download queue">
               {sources.map((source, queueIndex) => {
-                const job = agentJobs[source.id];
+                const job = roomAgentJob(source.id);
                 const manifestItems = source.mediaItems?.length
                   ? source.mediaItems
                   : job ? mediaManifest(job.files, source.id) : [];
@@ -2280,7 +3214,7 @@ export default function WatchApp() {
                     </div>
 
                     <div className="queue-actions">
-                      {!job && downloadMode === "manual" && (
+                      {(!job || agentJobIsPaused(job)) && acquisitionPolicy === "ask" && (
                         <button
                           className="secondary-button compact-button"
                           type="button"
@@ -2290,7 +3224,7 @@ export default function WatchApp() {
                           Start
                         </button>
                       )}
-                      {!job && downloadMode === "external" && (
+                      {(!job || agentJobIsPaused(job)) && acquisitionPolicy === "never" && (
                         <>
                           <a
                             className="secondary-button compact-button"
@@ -2312,7 +3246,7 @@ export default function WatchApp() {
                           </button>
                         </>
                       )}
-                      {job?.status === "error" && !job.seed && (
+                      {job?.status === "error" && !job.seed && acquisitionPolicy !== "never" && (
                         <button
                           className="secondary-button compact-button"
                           type="button"
@@ -2322,15 +3256,15 @@ export default function WatchApp() {
                           Retry
                         </button>
                       )}
-                      {job && downloadMode !== "automatic" && !job.seed && (
+                      {job && acquisitionPolicy !== "automatic" && !job.seed && !agentJobIsPaused(job) && (
                         <button
                           className="icon-button"
                           type="button"
-                          title="Stop local download"
-                          aria-label="Stop local download"
-                          onClick={() => void stopQueuedSource(source.id)}
+                          title="Pause local download"
+                          aria-label="Pause local download"
+                          onClick={() => void pauseQueuedSource(source.id)}
                         >
-                          <X />
+                          <Pause />
                         </button>
                       )}
                       {job?.managed && (
@@ -2348,7 +3282,7 @@ export default function WatchApp() {
                       {job?.seed && (
                         <span
                           className="seed-status"
-                          title={job.trackerWarnings?.at(-1) || `Torrent TCP ${job.torrentPort || "dynamic"}, DHT UDP ${job.dhtPort || "dynamic"}`}
+                          title={torrentSummaryTitle(job)}
                         >
                           <Upload />
                           {job.seedState === "creating"
@@ -2486,9 +3420,9 @@ export default function WatchApp() {
               })}
             </div>
           ) : (
-            <button className="drop-zone" type="button" onClick={() => fileInputRef.current?.click()}>
-              <Upload />
-              <span><strong>Use a local video</strong> already on this device</span>
+            <button className="drop-zone" type="button" onClick={() => shareFileInputRef.current?.click()}>
+              <Share2 />
+              <span><strong>Share a local video</strong> with this room</span>
             </button>
           )}
 
@@ -2501,29 +3435,116 @@ export default function WatchApp() {
                   type="button"
                   title="Close library"
                   aria-label="Close library"
-                  onClick={() => setLibraryOpen(false)}
+                  onClick={() => {
+                    setLibraryOpen(false);
+                    clearLibraryPreview();
+                  }}
                 >
                   <X />
                 </button>
               </div>
               <div className="library-list">
                 {libraryBusy && <LoaderCircle className="spin" />}
+                {libraryScanWarning && (
+                  <p className="library-file-unavailable" role="alert">
+                    {libraryScanWarning} Rescan the Companion library before using these entries.
+                  </p>
+                )}
                 {!libraryBusy && !libraryFiles.length && <span>No videos found in configured library folders.</span>}
                 {libraryFiles.map((file) => (
                   <button
                     type="button"
                     key={file.id}
-                    onClick={() => void chooseLibraryFile(file)}
+                    className={selectedLibraryId === file.id ? "selected" : ""}
+                    aria-expanded={selectedLibraryId === file.id}
+                    onClick={() => {
+                      clearLibraryPreview();
+                      setSelectedLibraryId(file.id);
+                    }}
                     disabled={libraryBusy}
                   >
                     <FileVideo2 />
                     <span>
                       <strong>{file.name}</strong>
-                      <small>{formatBytes(file.size)}</small>
+                      <small>
+                        {formatBytes(file.size)}
+                        {(file.copyCount || 1) > 1
+                          ? ` · ${file.copyCount} local copies`
+                          : ""}
+                        {file.usable === false ? " · Still downloading or verifying" : ""}
+                      </small>
                     </span>
                   </button>
                 ))}
               </div>
+              {selectedLibraryFile && (
+                <div className="library-details" aria-label={`Actions for ${selectedLibraryFile.name}`}>
+                  <div className="queue-actions">
+                    <button
+                      className="secondary-button compact-button"
+                      type="button"
+                      onClick={() => previewLibraryFile(selectedLibraryFile)}
+                      disabled={libraryBusy || libraryCatalogStale || selectedLibraryFile.usable === false}
+                      title={libraryCatalogStale
+                        ? "Rescan the Companion library before previewing this entry"
+                        : selectedLibraryFile.usable === false
+                        ? "Preview is available after the download is complete and verified"
+                        : "Preview this library video"}
+                    >
+                      <Play />
+                      Preview
+                    </button>
+                    <button
+                      className="secondary-button compact-button"
+                      type="button"
+                      onClick={() => void bindLibraryFileLocally(selectedLibraryFile)}
+                      disabled={libraryBusy || libraryCatalogStale || selectedLibraryFile.usable === false || !session?.selectedMedia}
+                      title={libraryCatalogStale
+                        ? "Rescan the Companion library before using this entry"
+                        : selectedLibraryFile.usable === false
+                        ? "This copy is still downloading or being verified"
+                        : session?.selectedMedia
+                          ? "Use this copy only on this device; nothing is shared"
+                          : "Select a room video first"}
+                    >
+                      <MonitorUp />
+                      Use on this device
+                    </button>
+                    <button
+                      className="primary-button compact-button"
+                      type="button"
+                      onClick={() => void shareLibraryFile(selectedLibraryFile)}
+                      disabled={libraryBusy || libraryCatalogStale || selectedLibraryFile.usable === false}
+                      title={libraryCatalogStale
+                        ? "Rescan the Companion library before sharing this entry"
+                        : selectedLibraryFile.usable === false
+                        ? "Sharing is available after the download is complete and verified"
+                        : "Add this library video to the room and share it"}
+                    >
+                      <Share2 />
+                      Share / Add to room
+                    </button>
+                  </div>
+                  {selectedLibraryFile.usable === false && (
+                    <p className="library-file-unavailable" role="status">
+                      Still downloading or verifying. Preview, local use, and sharing will unlock when it is complete.
+                    </p>
+                  )}
+                  {libraryPreviewUrl && (
+                    <LibraryVideoPreview
+                      url={libraryPreviewUrl}
+                      label={selectedLibraryFile.name}
+                      onReady={() => setLibraryPreviewBusy(false)}
+                      onError={handleLibraryPreviewError}
+                    />
+                  )}
+                  {libraryPreviewBusy && (
+                    <p className="library-file-unavailable" role="status">
+                      <LoaderCircle className="spin" /> Preparing browser-compatible preview…
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -2533,6 +3554,13 @@ export default function WatchApp() {
             type="file"
             accept="video/*,.mkv,.m4v,.mov,.webm"
             onChange={onChooseFile}
+          />
+          <input
+            ref={shareFileInputRef}
+            className="sr-only"
+            type="file"
+            accept="video/*,.mkv,.m4v,.mov,.webm"
+            onChange={onShareFile}
           />
           <input
             ref={subtitleInputRef}
@@ -2672,6 +3700,92 @@ export default function WatchApp() {
     </>
   );
 }
+
+function LibraryVideoPreview({
+  url,
+  label,
+  onReady,
+  onError,
+}: {
+  url: string;
+  label: string;
+  onReady: () => void;
+  onError: () => void;
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const onReadyRef = useRef(onReady);
+  const onErrorRef = useRef(onError);
+
+  useEffect(() => {
+    onReadyRef.current = onReady;
+    onErrorRef.current = onError;
+  }, [onError, onReady]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !url) return;
+    let active = true;
+    let instance: Hls | null = null;
+    let failed = false;
+    const notifyReady = () => {
+      if (active) onReadyRef.current();
+    };
+    const notifyError = () => {
+      if (!active || failed) return;
+      failed = true;
+      onErrorRef.current();
+    };
+    video.addEventListener("loadedmetadata", notifyReady);
+    video.addEventListener("error", notifyError);
+
+    if (!url.includes(".m3u8")) {
+      video.src = url;
+      video.load();
+    } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = url;
+      video.load();
+    } else {
+      void import("hls.js")
+        .then(({ default: HlsRuntime, Events }) => {
+          if (!active) return;
+          if (!HlsRuntime.isSupported()) {
+            notifyError();
+            return;
+          }
+          const hls = new HlsRuntime({ enableWorker: true });
+          instance = hls;
+          hls.on(Events.MANIFEST_PARSED, notifyReady);
+          hls.on(Events.ERROR, (_event, data) => {
+            if (data.fatal) notifyError();
+          });
+          hls.loadSource(url);
+          hls.attachMedia(video);
+        })
+        .catch(notifyError);
+    }
+
+    return () => {
+      active = false;
+      instance?.destroy();
+      video.removeEventListener("loadedmetadata", notifyReady);
+      video.removeEventListener("error", notifyError);
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+    };
+  }, [url]);
+
+  return (
+    <video
+      ref={videoRef}
+      controls
+      crossOrigin="anonymous"
+      preload="metadata"
+      aria-label={`Preview ${label}`}
+    />
+  );
+}
+
 interface PlayerQueueItem {
   sourceId: string;
   itemId: string;
@@ -4285,4 +5399,72 @@ function SyncedPlayer({
       </div>
     </main>
   );
+}
+
+async function createVerifiedLibraryBinding(
+  selectedMedia: NonNullable<WatchSession["selectedMedia"]>,
+  roomSource: WatchSession["sources"][number] | null,
+  canonicalJob: AgentJob | undefined
+) {
+  const roomItem = roomSource?.mediaItems?.find((item) =>
+    (selectedMedia.itemId ? item.id === selectedMedia.itemId : true) &&
+    (selectedMedia.fileIndex === undefined || item.fileIndex === selectedMedia.fileIndex)
+  ) || null;
+  const infoHash = roomSource?.infoHash || canonicalJob?.infoHash;
+  if (!selectedMedia.fingerprint && !infoHash) return null;
+  if (
+    !selectedMedia.fingerprint &&
+    !Number.isInteger(selectedMedia.fileIndex ?? roomItem?.fileIndex) &&
+    !roomItem?.path
+  ) return null;
+  const libraryFile = await matchAgentLibraryFile({
+    fingerprint: selectedMedia.fingerprint,
+    infoHash,
+    size: selectedMedia.size,
+    fileIndex: selectedMedia.fileIndex ?? roomItem?.fileIndex,
+    relativePath: roomItem?.path,
+  });
+  if (!libraryFile) return null;
+
+  const sourceId = `local-${crypto.randomUUID()}`;
+  try {
+    const job = await attachAgentLibraryFile(sourceId, libraryFile.id, libraryFile.name);
+    const file = preferredAgentFile(job, selectedMedia);
+    const fingerprint = file ? agentFileFingerprint(job, file) : null;
+    const verified = file && fingerprint && isVerifiedLibraryMatch(
+      selectedMedia,
+      fingerprint,
+      file.size,
+      {
+        selectedInfoHash: infoHash,
+        libraryInfoHash: libraryFile.infoHash,
+        selectedFileIndex: selectedMedia.fileIndex ?? roomItem?.fileIndex,
+        libraryFileIndex: libraryFile.torrentFileIndex ?? libraryFile.fileIndex,
+        selectedPath: roomItem?.path,
+        libraryPath: libraryFile.relativePath,
+      }
+    );
+    if (!file || !verified) {
+      throw new Error("The companion library match did not pass identity verification.");
+    }
+    return { sourceId, job, file };
+  } catch (error) {
+    await stopAgentDownload(sourceId, false).catch(() => {});
+    throw error;
+  }
+}
+
+function agentJobIsPaused(job: AgentJob) {
+  return Boolean(job.paused || job.status === "paused");
+}
+
+function torrentSummaryTitle(job: AgentJob) {
+  const torrent = job.torrent;
+  if (!torrent) {
+    return `Torrent TCP ${job.torrentPort || "dynamic"}, DHT UDP ${job.dhtPort || "dynamic"}`;
+  }
+  const reportedSeeds = torrent.trackerReportedSeeders === null
+    ? "tracker seeders unknown"
+    : `${torrent.trackerReportedSeeders} tracker-reported seed${torrent.trackerReportedSeeders === 1 ? "" : "s"}`;
+  return `${torrent.connectedPeers} connected peer${torrent.connectedPeers === 1 ? "" : "s"}, ${torrent.connectedSeeds} connected seed${torrent.connectedSeeds === 1 ? "" : "s"}; ${reportedSeeds}; ${torrent.respondingTrackers}/${torrent.configuredTrackers} trackers responding`;
 }
