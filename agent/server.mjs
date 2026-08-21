@@ -94,7 +94,7 @@ import { magnetInfoHash } from "../lib/magnet-identity.mjs";
 import { parseByteRange } from "./http-range.mjs";
 
 const HOST = "127.0.0.1";
-const APP_VERSION = process.env.WATCHPAIR_APP_VERSION || "0.11.0"; // x-release-please-version
+const APP_VERSION = process.env.WATCHPAIR_APP_VERSION || "0.11.1"; // x-release-please-version
 const PROTOCOL_VERSION = 2;
 const CONTROL_TOKEN = String(process.env.WATCHPAIR_CONTROL_TOKEN || "");
 const PORT = Number(process.env.WATCHPAIR_AGENT_PORT || 41735);
