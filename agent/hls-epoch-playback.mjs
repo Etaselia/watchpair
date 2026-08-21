@@ -1425,7 +1425,8 @@ export function createHlsPlaybackManager({
     epochIndex,
     epochStart,
     requestedDuration,
-    outputs
+    outputs,
+    token
   ) {
     if (state.manifest.epochs.length !== epochIndex) {
       throw new Error("The HLS epoch commit order changed while rendering.");
@@ -1479,6 +1480,11 @@ export function createHlsPlaybackManager({
       throw new Error("The committed HLS epoch failed cache validation.");
     }
     await atomicWriteJson(path.join(state.generationPath, MANIFEST_FILE), manifest);
+    // Remove the writer lease before completion becomes observable. The
+    // completion flag and the ENDLIST playlists are published next, and a
+    // "complete" generation must never leave a stale writer.json behind
+    // (restart recovery depends on that invariant).
+    await clearWriterLease(state, token).catch(() => {});
     // The completion flag must be observable before the ENDLIST playlist is
     // published; publishGeneration writes the #EXT-X-ENDLIST-bearing playlists.
     if (manifest.complete) state.complete = true;
@@ -1623,7 +1629,8 @@ export function createHlsPlaybackManager({
         epochIndex,
         epochStart,
         requestedDuration,
-        outputs
+        outputs,
+        token
       );
       committedComplete = state.manifest.complete;
     } finally {
