@@ -92,6 +92,12 @@ import {
 } from "./torrent-telemetry.mjs";
 import { magnetInfoHash } from "../lib/magnet-identity.mjs";
 import { parseByteRange } from "./http-range.mjs";
+import {
+  normalizeNetworkSettings,
+  restoreTorrentNetworking,
+  silenceTorrentNetworking,
+  torrentSelectedFilesComplete,
+} from "./network-control.mjs";
 
 const HOST = "127.0.0.1";
 const APP_VERSION = process.env.WATCHPAIR_APP_VERSION || "0.11.1"; // x-release-please-version
@@ -333,6 +339,7 @@ function refreshTorrentPressure(reason) {
     mode: RESOURCE_MODE,
     totalBudget: basePlan.totalBudget,
     limitForTorrent: (_torrent, index) => limits[index],
+    skipTorrent: (torrent) => Boolean(jobsByTorrent.get(torrent)?.torrentSilenced),
   });
   const planKey = JSON.stringify({ roles, limits });
   const now = Date.now();
@@ -384,12 +391,18 @@ await mkdir(DOWNLOAD_DIR, { recursive: true });
 await mkdir(IMPORT_DIR, { recursive: true });
 await mkdir(path.dirname(CONFIG_PATH), { recursive: true });
 
-try {
-  const config = JSON.parse(await readFile(CONFIG_PATH, "utf8"));
-  for (const origin of config.allowedOrigins || []) ALLOWED_ORIGINS.add(origin);
-} catch (error) {
-  if (error?.code !== "ENOENT") console.warn(`Could not read ${CONFIG_PATH}: ${error.message}`);
+let agentConfig = {};
+async function loadAgentConfig() {
+  try {
+    agentConfig = JSON.parse(await readFile(CONFIG_PATH, "utf8"));
+  } catch (error) {
+    if (error?.code !== "ENOENT") console.warn(`Could not read ${CONFIG_PATH}: ${error.message}`);
+  }
+  if (!agentConfig || typeof agentConfig !== "object") agentConfig = {};
+  for (const origin of agentConfig.allowedOrigins || []) ALLOWED_ORIGINS.add(origin);
+  return agentConfig;
 }
+const networkState = normalizeNetworkSettings((await loadAgentConfig()).network);
 
 function corsHeaders(request) {
   const origin = request.headers.origin;
@@ -439,10 +452,13 @@ function normalizePairOrigin(value) {
   return url.origin;
 }
 
-async function persistOrigins() {
+async function persistAgentConfig() {
   await writeFile(
     CONFIG_PATH,
-    JSON.stringify({ allowedOrigins: Array.from(ALLOWED_ORIGINS).sort() }, null, 2),
+    JSON.stringify({
+      allowedOrigins: Array.from(ALLOWED_ORIGINS).sort(),
+      network: { ...networkState },
+    }, null, 2),
     { mode: 0o600 }
   );
 }
@@ -463,6 +479,11 @@ function safeName(value) {
 }
 
 async function assertPublicHttp(value) {
+  if (networkState.offline) {
+    const error = new Error("Offline mode is enabled; outbound downloads are paused until it is turned off.");
+    error.code = "EROFFLINE";
+    throw error;
+  }
   const url = new URL(value);
   if (!["http:", "https:"].includes(url.protocol)) {
     throw new Error("Only HTTP and HTTPS direct downloads are supported.");
@@ -1367,6 +1388,7 @@ function snapshot(job) {
     kind: job.kind,
     status: job.status,
     paused: Boolean(job.paused),
+    torrentSilenced: Boolean(job.torrentSilenced),
     progress: selected?.progress || 0,
     infoHash: job.torrent?.infoHash || null,
     // Magnet URLs can carry private tracker credentials. Publication is an
@@ -1528,6 +1550,7 @@ function refreshTorrentSelections(reason = "priority-plan") {
       .map((selection) => selection.fileIndex + ":" + selection.priority)
       .join(",");
     if (!force && job.lastTorrentSelectionKey === selectionKey) continue;
+    if (job.torrentSilenced && selections.length > 0) restoreLiveTorrentNetworking(job);
     replaceTorrentSelections(job.torrent, selections);
     job.lastTorrentSelectionKey = selectionKey;
     agentLogger.info("torrent_download_priority_changed", {
@@ -1554,6 +1577,136 @@ function refreshTorrentSelections(reason = "priority-plan") {
   return torrentBandwidth;
 }
 
+function liveTorrentPeerCount(torrent) {
+  if (!torrent || !Array.isArray(torrent.wires)) return 0;
+  let count = 0;
+  for (const wire of torrent.wires) {
+    if (wire && !wire.destroyed) count += 1;
+  }
+  return count;
+}
+
+function stopSeedReannounceTimer(job) {
+  if (job.seedReannounceTimer) {
+    clearInterval(job.seedReannounceTimer);
+    job.seedReannounceTimer = null;
+  }
+}
+
+function startSeedReannounceTimer(job, torrent) {
+  stopSeedReannounceTimer(job);
+  if (!job.seed || !torrent || torrent.destroyed) return;
+  if (!networkState.torrentEnabled || networkState.offline) return;
+  job.seedReannounceTimer = setInterval(() => {
+    if (torrent.destroyed || liveTorrentPeerCount(torrent) > 0) return;
+    torrent.discovery?.tracker?.update({ numwant: 50 });
+  }, 25_000);
+  job.seedReannounceTimer.unref?.();
+}
+
+function silenceLiveTorrentNetworking(job) {
+  const torrent = job.torrent;
+  if (!torrent || torrent.destroyed) return false;
+  const changed = silenceTorrentNetworking(torrent);
+  job.torrentSilenced = true;
+  stopSeedReannounceTimer(job);
+  return changed;
+}
+
+function restoreLiveTorrentNetworking(job) {
+  if (!networkState.torrentEnabled || networkState.offline) return false;
+  const torrent = job.torrent;
+  if (!torrent || torrent.destroyed) return false;
+  const changed = restoreTorrentNetworking(torrent);
+  job.torrentSilenced = false;
+  if (job.seed) startSeedReannounceTimer(job, torrent);
+  return changed;
+}
+
+/**
+ * Silence a finished magnet download that is not actively shared, so it stops
+ * announcing to trackers/DHT. "Finished" uses the files this job actually
+ * needs (media-priority plan, or every video file when no plan exists), not
+ * `torrent.done`, which only fires when every file of the torrent is complete.
+ * "Not actively shared" means no live peer wires remain; while peers are
+ * connected the torrent keeps announcing, and the periodic sweep silences it
+ * once the last peer disconnects.
+ */
+function maybeSilenceCompletedTorrent(job) {
+  if (job.seed || job.kind !== "magnet") return false;
+  if (!networkState.torrentEnabled || networkState.offline) return false;
+  const torrent = job.torrent;
+  if (!torrent || torrent.destroyed || !torrent.files?.length) return false;
+  if (torrent.discovery && torrent.discovery.destroyed) return false;
+  const indexes = requiredTorrentMediaIndexes(job);
+  if (!torrentSelectedFilesComplete(torrent, indexes)) return false;
+  if (liveTorrentPeerCount(torrent) > 0) return false;
+  silenceLiveTorrentNetworking(job);
+  agentLogger.info("torrent_networking_silenced", {
+    jobId: job.id,
+    infoHash: torrent.infoHash,
+    reason: "download-complete",
+  });
+  return true;
+}
+
+/**
+ * Apply the runtime network policy to every live torrent. With the kill switch
+ * off (or offline mode on) every torrent is silenced and seed re-announce
+ * timers stop; re-enabling restores every torrent and then re-silences only
+ * finished downloads that are not shared (feature #1).
+ */
+function applyNetworkPolicy(reason) {
+  const silenceAll = !networkState.torrentEnabled || networkState.offline;
+  let silenced = 0;
+  let restored = 0;
+  if (networkState.offline) {
+    for (const job of jobs.values()) {
+      if (job.kind === "direct" && job.abortController) job.abortController.abort();
+    }
+  }
+  for (const job of jobs.values()) {
+    const torrent = job.torrent;
+    if (!torrent || torrent.destroyed) continue;
+    if (silenceAll) {
+      if (silenceLiveTorrentNetworking(job)) silenced += 1;
+    } else {
+      if (job.torrentSilenced && restoreLiveTorrentNetworking(job)) restored += 1;
+      if (job.kind === "magnet" && !job.seed) {
+        if (maybeSilenceCompletedTorrent(job)) silenced += 1;
+      }
+    }
+  }
+  agentLogger.info("network_policy_applied", {
+    reason,
+    torrentEnabled: networkState.torrentEnabled,
+    offline: networkState.offline,
+    silenced,
+    restored,
+  });
+  void persistAgentConfig().catch((error) => {
+    agentLogger.warn("network_policy_persist_failed", { error });
+  });
+}
+
+/**
+ * Background consistency sweep: torrents whose discovery started after they
+ * were added (metadata/seeding) are silenced while the policy is off, and
+ * finished non-shared downloads are silenced as soon as their last peer leaves.
+ */
+function enforceNetworkPolicy() {
+  const silenceAll = !networkState.torrentEnabled || networkState.offline;
+  for (const job of jobs.values()) {
+    const torrent = job.torrent;
+    if (!torrent || torrent.destroyed) continue;
+    if (silenceAll) {
+      if (!torrent.discovery || !torrent.discovery.destroyed) silenceLiveTorrentNetworking(job);
+    } else if (job.kind === "magnet" && !job.seed && !job.torrentSilenced) {
+      maybeSilenceCompletedTorrent(job);
+    }
+  }
+}
+
 function startTorrent(job, { restoreMetadata = false } = {}) {
   job.paused = false;
   job.error = null;
@@ -1575,7 +1728,15 @@ function startTorrent(job, { restoreMetadata = false } = {}) {
   }
   job.torrentTelemetry?.dispose();
   job.torrent = torrent;
+  job.torrentSilenced = false;
   job.torrentTelemetry = createTorrentTelemetry(torrent);
+  if (!networkState.torrentEnabled || networkState.offline) {
+    // The torrent's discovery is created asynchronously; silence it once it
+    // exists so the kill switch / offline mode also covers new starts.
+    queueMicrotask(() => {
+      if (job.torrent === torrent && !torrent.destroyed) silenceLiveTorrentNetworking(job);
+    });
+  }
   torrent.on("wire", () => refreshTorrentPressure("wire-connected"));
   installTorrentPieceRecovery(
     torrent,
@@ -1624,11 +1785,13 @@ function startTorrent(job, { restoreMetadata = false } = {}) {
         agentLogger.info("torrent_file_downloaded", { jobId: job.id, fileIndex: index, size: file.length });
         refreshTorrentSelections("file-downloaded");
         if (VIDEO_EXTENSIONS.test(file.path || file.name)) void completeSelectedFile(job, index);
+        maybeSilenceCompletedTorrent(job);
       });
     });
     job.status = "downloading";
     if (torrent.files[job.selectedIndex]?.done) void completeSelectedFile(job);
     refreshTorrentSelections("metadata-ready");
+    maybeSilenceCompletedTorrent(job);
     job.updatedAt = Date.now();
   });
   torrent.on("download", () => {
@@ -1643,6 +1806,7 @@ function startTorrent(job, { restoreMetadata = false } = {}) {
       if (torrent.files[index].done) void completeSelectedFile(job, index);
     }
     refreshTorrentSelections("torrent-complete");
+    maybeSilenceCompletedTorrent(job);
   });
   torrent.on("warning", (error) => {
     const category = classifyTrackerError(error);
@@ -1745,7 +1909,7 @@ async function startDirect(job) {
     queueMediaPreparation(job, 0);
   } catch (error) {
     writable?.destroy();
-    if (job.paused || error?.name === "AbortError") {
+    if (job.paused || error?.name === "AbortError" || error?.code === "EROFFLINE") {
       job.paused = true;
       job.status = "paused";
       job.error = null;
@@ -1816,6 +1980,7 @@ function createJob(source) {
     assets: new Map(),
     lastTorrentSelectionKey: null,
     torrent: null,
+    torrentSilenced: false,
     torrentTelemetry: null,
     file: null,
     audioTracks: [],
@@ -2166,6 +2331,7 @@ async function acquireSeedLease(id, body) {
   const expiresAt = Date.now() + seedLeaseTtl(body?.ttlMs);
   job.seedLeases.set(leaseId, expiresAt);
   job.seedLeaseGraceUntil = null;
+  if (job.torrentSilenced) restoreLiveTorrentNetworking(job);
   return { job, leaseId, expiresAt };
 }
 
@@ -2400,7 +2566,13 @@ async function seedLocalFile({
     const torrent = client.seed(resolvedPath, options, markServing);
     job.torrentTelemetry?.dispose();
     job.torrent = torrent;
+    job.torrentSilenced = false;
     job.torrentTelemetry = createTorrentTelemetry(torrent);
+    if (!networkState.torrentEnabled || networkState.offline) {
+      queueMicrotask(() => {
+        if (job.torrent === torrent && !torrent.destroyed) silenceLiveTorrentNetworking(job);
+      });
+    }
     torrent.once("metadata", () => publishMetadata(torrent));
     torrent.once("ready", () => markServing(torrent));
     torrent.on("trackerAnnounce", () => {
@@ -2420,11 +2592,7 @@ async function seedLocalFile({
       job.error = `Torrent failed (${classifyTrackerError(error)}).`;
       job.updatedAt = Date.now();
     });
-    job.seedReannounceTimer = setInterval(() => {
-      if (torrent.destroyed || torrent.numPeers > 0) return;
-      torrent.discovery?.tracker?.update({ numwant: 50 });
-    }, 25_000);
-    job.seedReannounceTimer.unref?.();
+    startSeedReannounceTimer(job, torrent);
     torrent.on("upload", () => {
       job.updatedAt = Date.now();
     });
@@ -2592,6 +2760,7 @@ async function destroyJobTransfer(job) {
     await new Promise((resolve) => job.torrent.destroy(resolve));
   }
   job.torrent = null;
+  job.torrentSilenced = false;
 }
 
 async function restoreJobTransferAfterCleanup(job) {
@@ -2684,6 +2853,7 @@ async function pauseJob(id, { ignoreSeedLeases = false } = {}) {
     await new Promise((resolve) => job.torrent.destroy(resolve));
   }
   job.torrent = null;
+  job.torrentSilenced = false;
   refreshTorrentSelections("job-paused");
   persistJobs();
   await jobStore.flush();
@@ -3825,6 +3995,7 @@ await libraryCatalog.load().catch((error) => {
   agentLogger.warn("library_catalog_load_failed", { error });
 });
 await restoreJobs();
+applyNetworkPolicy("startup");
 for (const job of jobs.values()) {
   if (job.seed && !job.paused && job.status === "ready" && activeSeedLeaseCount(job) === 0) {
     job.seedLeaseGraceUntil = Date.now() + SEED_LEASE_GRACE_MS;
@@ -3838,6 +4009,7 @@ void startupLibraryScan.completion.then((scan) => {
 const torrentBandwidthTimer = setInterval(() => {
   try {
     refreshTorrentSelections("bandwidth-sample");
+    enforceNetworkPolicy();
   } catch (error) {
     agentLogger.warn("torrent_bandwidth_sample_failed", { error });
   }
@@ -3928,7 +4100,7 @@ const server = createServer(async (request, response) => {
         throw new Error("This pairing request expired. Return to WatchPair and try again.");
       }
       ALLOWED_ORIGINS.add(origin);
-      await persistOrigins();
+      await persistAgentConfig();
       sendHtml(response, 200, pairingPage(origin, "", true));
     } catch (error) {
       sendHtml(response, 400, "<!doctype html><title>WatchPair Companion</title><p>" + escapeHtml(error.message) + "</p>");
@@ -3945,7 +4117,7 @@ const server = createServer(async (request, response) => {
       const body = await readJson(request);
       const origin = normalizePairOrigin(body.origin);
       ALLOWED_ORIGINS.add(origin);
-      await persistOrigins();
+      await persistAgentConfig();
       sendJson(response, 200, { ok: true, origin });
     } catch (error) {
       sendJson(response, 400, { error: error.message });
@@ -4053,6 +4225,37 @@ const server = createServer(async (request, response) => {
       }
     }
 
+    if (url.pathname.startsWith("/control/network")) {
+      if (!CONTROL_TOKEN || request.headers["x-watchpair-control"] !== CONTROL_TOKEN) {
+        sendJson(response, 403, { error: "Invalid companion control token." }, headers);
+        return;
+      }
+      if (request.method === "GET") {
+        sendJson(response, 200, { network: { ...networkState } }, headers);
+        return;
+      }
+      if (request.method === "POST") {
+        const body = await readJson(request);
+        if (body && typeof body === "object") {
+          if (body.torrentEnabled !== undefined && typeof body.torrentEnabled !== "boolean") {
+            throw new Error("torrentEnabled must be a boolean.");
+          }
+          if (body.offline !== undefined && typeof body.offline !== "boolean") {
+            throw new Error("offline must be a boolean.");
+          }
+        }
+        networkState.torrentEnabled = body?.torrentEnabled === undefined
+          ? networkState.torrentEnabled
+          : Boolean(body.torrentEnabled);
+        networkState.offline = body?.offline === undefined
+          ? networkState.offline
+          : Boolean(body.offline);
+        applyNetworkPolicy("control-network");
+        sendJson(response, 200, { network: { ...networkState } }, headers);
+        return;
+      }
+    }
+
     if (request.method === "GET" && url.pathname === "/health") {
       const scheduler = mediaScheduler.snapshot();
       const subtitleWork = subtitleScheduler.snapshot();
@@ -4071,6 +4274,10 @@ const server = createServer(async (request, response) => {
           maxFiles: logDetails.maxFiles,
         },
         platform: process.platform,
+        network: {
+          torrentEnabled: networkState.torrentEnabled,
+          offline: networkState.offline,
+        },
         torrent: {
           port: client.torrentPort || TORRENT_PORT,
           dhtPort: client.dhtPort || DHT_PORT,
@@ -4664,6 +4871,7 @@ const shutdown = async () => {
   persistJobs();
   await Promise.all([
     jobStore.flush(),
+    persistAgentConfig(),
     serverClosed,
     new Promise((resolve) => {
       if (client.destroyed) resolve();

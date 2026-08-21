@@ -104,3 +104,50 @@ test("applies per-torrent limits without dropping metadata connectivity", () => 
   assert.equal(expanded.pausedTorrents, 0);
   assert.equal(torrents.every((torrent) => !torrent.paused), true);
 });
+
+test("never resumes or trims torrents skipped by the network policy", () => {
+  const silent = {
+    paused: true,
+    pause() { this.paused = true; },
+    resume() { this.paused = false; },
+    wires: Array.from({ length: 2 }, (_, index) => ({
+      index,
+      destroyed: false,
+      downloadSpeed: () => index,
+      uploadSpeed: () => 0,
+      destroy() {
+        this.destroyed = true;
+      },
+    })),
+  };
+  const active = {
+    paused: false,
+    pause() { this.paused = true; },
+    resume() { this.paused = false; },
+    wires: Array.from({ length: 3 }, (_, index) => ({
+      index,
+      destroyed: false,
+      downloadSpeed: () => index,
+      uploadSpeed: () => 0,
+      destroy() {
+        this.destroyed = true;
+      },
+    })),
+  };
+  const client = { maxConns: 8, torrents: [silent, active] };
+
+  const result = applyTorrentConnectionPlan(client, {
+    mode: "balanced",
+    totalBudget: 8,
+    limitForTorrent: () => 2,
+    skipTorrent: (torrent) => torrent === silent,
+  });
+
+  // The silenced torrent keeps its paused state and all of its wires.
+  assert.equal(silent.paused, true);
+  assert.equal(silent.wires.filter((wire) => !wire.destroyed).length, 2);
+  // The active torrent is trimmed to its limit.
+  assert.equal(active.wires.filter((wire) => !wire.destroyed).length, 2);
+  assert.equal(result.pausedTorrents, 1);
+  assert.equal(active.paused, true);
+});
