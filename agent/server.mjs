@@ -98,6 +98,12 @@ import {
   silenceTorrentNetworking,
   torrentSelectedFilesComplete,
 } from "./network-control.mjs";
+import {
+  applyRestoredTorrentState,
+  fileIdentityKey,
+  persistedTorrentState,
+  shouldSkipTorrentVerification,
+} from "./torrent-state.mjs";
 
 const HOST = "127.0.0.1";
 const APP_VERSION = process.env.WATCHPAIR_APP_VERSION || "0.12.2"; // x-release-please-version
@@ -745,11 +751,6 @@ function syncSelectedAsset(job) {
   return asset;
 }
 
-function fileIdentityKey(index, file) {
-  return String(index) + ":" + file.name + ":" + file.size;
-}
-
-
 function fileIdentityFingerprint(job, index, file) {
   const asset = mediaAsset(job, index);
   return asset.identityFingerprintKey === fileIdentityKey(index, file)
@@ -800,7 +801,13 @@ async function verifySelectedTorrentFile(job, index) {
   if (!file) throw new Error("Torrent file not found.");
   const asset = mediaAsset(job, index);
   const verificationKey = fileIdentityKey(index, jobFile(job, index));
-  if (asset.torrentVerifiedKey === verificationKey) return true;
+  if (shouldSkipTorrentVerification(asset.torrentVerifiedKey, verificationKey, file.done)) {
+    // The file was fully verified before (persisted key still matches the
+    // current name+size) and WebTorrent re-verified the store contents on
+    // restore (`file.done` is only set after its own piece hashing). Trusting
+    // both avoids re-hashing every piece after every agent restart.
+    return true;
+  }
   if (
     asset.torrentVerificationPromise &&
     asset.torrentVerificationPromiseKey === verificationKey
@@ -1672,6 +1679,7 @@ function maybeSilenceCompletedTorrent(job) {
  * timers stop; re-enabling restores every torrent and then re-silences only
  * finished downloads that are not shared (feature #1).
  */
+let networkPolicyApplied = false;
 function applyNetworkPolicy(reason) {
   const silenceAll = !networkState.torrentEnabled || networkState.offline;
   let silenced = 0;
@@ -1687,12 +1695,20 @@ function applyNetworkPolicy(reason) {
     if (silenceAll) {
       if (silenceLiveTorrentNetworking(job)) silenced += 1;
     } else {
-      if (job.torrentSilenced && restoreLiveTorrentNetworking(job)) restored += 1;
+      // Only restore networking on a policy transition within this process
+      // (e.g. the kill switch being re-enabled). On the very first, startup
+      // application a `torrentSilenced` flag can only mean a persisted
+      // download-complete silence (or a persisted kill-switch silence, which
+      // the silenceAll branch already re-applied); restoring it here would
+      // make fully-downloaded torrents announce again until a re-completion
+      // event re-silenced them.
+      if (networkPolicyApplied && job.torrentSilenced && restoreLiveTorrentNetworking(job)) restored += 1;
       if (job.kind === "magnet" && !job.seed) {
         if (maybeSilenceCompletedTorrent(job)) silenced += 1;
       }
     }
   }
+  networkPolicyApplied = true;
   agentLogger.info("network_policy_applied", {
     reason,
     torrentEnabled: networkState.torrentEnabled,
@@ -1744,11 +1760,14 @@ function startTorrent(job, { restoreMetadata = false } = {}) {
   }
   job.torrentTelemetry?.dispose();
   job.torrent = torrent;
+  const restoreSilenced = Boolean(job.torrentSilenced);
   job.torrentSilenced = false;
   job.torrentTelemetry = createTorrentTelemetry(torrent);
-  if (!networkState.torrentEnabled || networkState.offline) {
+  if (!networkState.torrentEnabled || networkState.offline || restoreSilenced) {
     // The torrent's discovery is created asynchronously; silence it once it
-    // exists so the kill switch / offline mode also covers new starts.
+    // exists so the kill switch / offline mode also covers new starts, and a
+    // torrent restored with persisted download-complete silence stays silent
+    // instead of re-announcing to trackers after an agent restart.
     queueMicrotask(() => {
       if (job.torrent === torrent && !torrent.destroyed) silenceLiveTorrentNetworking(job);
     });
@@ -1988,7 +2007,7 @@ function createJob(source) {
     seedPath: source.seedPath || null,
     identityFingerprint: source.identityFingerprint || null,
     identityFingerprintKey: source.identityFingerprintKey || null,
-    torrentVerifiedKey: null,
+    torrentVerifiedKey: source.torrentVerifiedKey || null,
     status: "queued",
     error: null,
     downloaded: Math.max(0, Number(source.downloaded) || 0),
@@ -2025,6 +2044,7 @@ function createJob(source) {
     updatedAt: Number(source.updatedAt) || now,
   };
   jobs.set(job.id, job);
+  applyRestoredTorrentState(job, source, mediaAsset);
   return job;
 }
 
@@ -2049,6 +2069,8 @@ function persistedJobs() {
     downloaded: job.downloaded,
     identityFingerprint: job.identityFingerprint,
     identityFingerprintKey: job.identityFingerprintKey,
+    torrentVerifiedKey: job.torrentVerifiedKey || null,
+    ...persistedTorrentState(job),
     selectedIndex: job.selectedIndex,
     file: job.file
       ? { name: job.file.name, size: job.file.size, path: job.file.path, type: job.file.type }
@@ -2138,6 +2160,9 @@ async function addDownload(source, { restoreMetadata = false, ownershipToken = n
         updatedAt: source.updatedAt,
         identityFingerprint: source.identityFingerprint,
         identityFingerprintKey: source.identityFingerprintKey,
+        torrentVerifiedKey: source.torrentVerifiedKey || null,
+        torrentSilenced: Boolean(source.torrentSilenced),
+        torrentVerifiedKeys: source.torrentVerifiedKeys,
         ownershipToken: source.ownershipToken,
       }
     : {};

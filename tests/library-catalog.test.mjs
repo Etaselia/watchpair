@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -796,6 +796,101 @@ test("markScanError updates the shared scan status without a scan", async () => 
     assert.equal(marked.error, "folders disappeared");
     assert.equal(catalog.scanStatus().status, "error",
       "the shared scan status must become error so stale-data consumers refuse to match");
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("external collections inside bare job-UUID folders are named after the file", async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "watchpair-library-uuid-"));
+  const root = path.join(temporary, "library");
+  const catalogPath = path.join(temporary, "catalog.json");
+  const firstJobDir = path.join(root, "0f2267be-fa87-4894-9225-0a60b40994f5");
+  const secondJobDir = path.join(root, "1a2b3c4d-5e6f-4789-8abc-def012345678");
+  const showDir = path.join(root, "Real Show");
+  await mkdir(firstJobDir, { recursive: true });
+  await mkdir(secondJobDir, { recursive: true });
+  await mkdir(showDir, { recursive: true });
+  await writeFile(path.join(firstJobDir, "movie.mp4"), Buffer.alloc(31, 0x11));
+  await writeFile(path.join(secondJobDir, "episode.mkv"), Buffer.alloc(37, 0x22));
+  await writeFile(path.join(showDir, "S01E01.mkv"), Buffer.alloc(43, 0x33));
+
+  try {
+    const catalog = createLibraryCatalog({ roots: [root], catalogPath });
+    await catalog.load();
+    await scan(catalog);
+    const collections = catalog.list({ limit: 100 }).collections;
+    assert.equal(collections.length, 3);
+    const names = collections.map((collection) => collection.name).sort();
+    assert.deepEqual(names, ["Real Show", "episode", "movie"],
+      "a UUID boundary folder names the collection after its file, a real folder keeps its name");
+    assert.equal(collections.every((collection) => collection.itemCount === 1), true);
+    assert.equal(collections.some((collection) =>
+      /^[a-f0-9]{8}-[a-f0-9]{4}-/.test(collection.name)), false,
+      "no collection is named after a bare job UUID");
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("UUID job folders holding the same file merge into one file-derived collection", async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "watchpair-library-uuid-merge-"));
+  const root = path.join(temporary, "library");
+  const catalogPath = path.join(temporary, "catalog.json");
+  const firstJobDir = path.join(root, "0f2267be-fa87-4894-9225-0a60b40994f5");
+  const secondJobDir = path.join(root, "1a2b3c4d-5e6f-4789-8abc-def012345678");
+  await mkdir(firstJobDir, { recursive: true });
+  await mkdir(secondJobDir, { recursive: true });
+  const episode = Buffer.alloc(47, 0x44);
+  await writeFile(path.join(firstJobDir, "S01E01.mkv"), episode);
+  await writeFile(path.join(secondJobDir, "S01E01.mkv"), episode);
+
+  try {
+    const catalog = createLibraryCatalog({ roots: [root], catalogPath });
+    await catalog.load();
+    await scan(catalog);
+    const listed = catalog.list({ limit: 100 });
+    assert.equal(listed.total, 1, "identical file sets inside UUID folders still merge");
+    assert.equal(listed.collections[0].name, "S01E01",
+      "the merged collection is named after the file, not the UUID folders");
+    assert.equal(listed.collections[0].itemCount, 1);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("a previously persisted UUID collection name is replaced by the file-derived name", async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "watchpair-library-uuid-rename-"));
+  const root = path.join(temporary, "library");
+  const catalogPath = path.join(temporary, "catalog.json");
+  const jobDir = path.join(root, "0f2267be-fa87-4894-9225-0a60b40994f5");
+  await mkdir(jobDir, { recursive: true });
+  await writeFile(path.join(jobDir, "movie.mp4"), Buffer.alloc(53, 0x55));
+
+  try {
+    let catalog = createLibraryCatalog({ roots: [root], catalogPath });
+    await catalog.load();
+    await scan(catalog);
+    const collectionId = catalog.list().collections[0].id;
+    assert.equal(catalog.list().collections[0].name, "movie");
+
+    // Simulate a catalog persisted by an older agent version that named the
+    // collection after the job UUID: rewrite the stored name in place.
+    const persisted = JSON.parse(await readFile(catalogPath, "utf8"));
+    const storedCollection = persisted.collections.find((entry) => entry.id === collectionId);
+    assert.ok(storedCollection);
+    storedCollection.name = "0f2267be-fa87-4894-9225-0a60b40994f5";
+    await writeFile(catalogPath, JSON.stringify(persisted, null, 2));
+
+    catalog = createLibraryCatalog({ roots: [root], catalogPath });
+    await catalog.load();
+    assert.equal(catalog.list().collections[0].name, "0f2267be-fa87-4894-9225-0a60b40994f5",
+      "the stale UUID name loads from the old catalog");
+    await scan(catalog);
+    assert.equal(catalog.list().collections[0].name, "movie",
+      "the next scan replaces the stale UUID name with the file-derived name");
+    assert.equal(catalog.list().collections[0].id, collectionId,
+      "the collection identity (and any pins) is untouched by the rename");
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }
