@@ -1444,6 +1444,10 @@ export function createHlsPlaybackManager({
       outputs.videoPlaylist,
       epochIndex
     );
+    const videoSegmentDuration = video.segments.reduce(
+      (total, segment) => total + Number(segment.duration || 0),
+      0
+    );
     const audio = {};
     for (const track of state.audioTracks) {
       const id = trackDirectory(track);
@@ -1461,7 +1465,7 @@ export function createHlsPlaybackManager({
       // an audible A/V desync over long videos. Lock the audio stream's
       // declared duration to the video stream's so both playlists stay on the
       // same cumulative timeline across arbitrary epoch counts.
-      alignAudioTimelineToVideo(audio[id], video.presentationDuration);
+      alignAudioTimelineToVideo(audio[id], videoSegmentDuration);
     }
 
     const presentedEnd = epochStart + video.presentationDuration;
@@ -1960,18 +1964,27 @@ export function createHlsPlaybackManager({
   };
 }
 
-export function alignAudioTimelineToVideo(stream, videoPresentationDuration) {
-  const target = Number(videoPresentationDuration);
+export function alignAudioTimelineToVideo(stream, videoSegmentDuration) {
+  const target = Number(videoSegmentDuration);
   if (!stream || !Number.isFinite(target) || target <= 0) return stream;
-  const current = Number(stream.presentationDuration);
+  const segments = Array.isArray(stream.segments) ? stream.segments : [];
+  if (!segments.length) return stream;
+  const current = segments.reduce(
+    (total, segment) => total + Number(segment.duration || 0),
+    0
+  );
   if (!Number.isFinite(current) || current <= 0) return stream;
-  const delta = timelineRounded(target - current);
+  const delta = target - current;
   if (Math.abs(delta) < 0.000001) return stream;
   if (Math.abs(delta) > MAX_AUDIO_TIMELINE_ADJUSTMENT_SECONDS) return stream;
-  const last = stream.segments[stream.segments.length - 1];
-  if (!last) return stream;
+  const last = segments[segments.length - 1];
   last.duration = timelineRounded(Number(last.duration || 0) + delta);
-  stream.presentationDuration = timelineRounded(target);
+  // Recompute presentationDuration from the adjusted segments so the manifest
+  // invariant (presentationDuration === sum of segment durations) holds exactly,
+  // and the published audio playlist's cumulative EXTINF matches the video's.
+  stream.presentationDuration = timelineRounded(
+    segments.reduce((total, segment) => total + Number(segment.duration || 0), 0)
+  );
   return stream;
 }
 
