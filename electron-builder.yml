@@ -10,6 +10,7 @@ directories:
 files:
   - desktop/**/*
   - agent/**/*
+  - lib/**/*
   - build/icon.png
   - package.json
   - '!**/*.test.*'

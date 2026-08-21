@@ -772,6 +772,7 @@ export default function WatchApp() {
           byte.toString(16).padStart(2, "0")
         ).join("");
         try {
+          // codeql[js/clear-text-storage-of-sensitive-data]: locally generated per-device pepper used only to derive opaque lease ids; it is never transmitted off the device and holds no user data.
           localStorage.setItem("watchpair-seed-lease-secret", secret);
         } catch {
           // Storage can be unavailable in strict browser privacy modes.
