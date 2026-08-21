@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/Etaselia/watchpair/compare/v0.12.0...v0.12.1) (2026-08-21)
+
+
+### Bug Fixes
+
+* refresh library when torrent files finish verification ([#91](https://github.com/Etaselia/watchpair/issues/91)) ([c8f35a0](https://github.com/Etaselia/watchpair/commit/c8f35a04dc104accc68f9d382182e1ab7577e729))
+
 ## [0.12.0](https://github.com/Etaselia/watchpair/compare/v0.11.1...v0.12.0) (2026-08-21)
 
 
