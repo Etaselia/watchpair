@@ -155,6 +155,23 @@ export function installWebTorrentSafetyGuards() {
     return request.call(this, wire, index, hotswap);
   };
 
+  // webtorrent's `_destroy` returns without invoking its callback when the
+  // torrent is already destroyed, and a double-destroyed discovery drops the
+  // callback too. A concurrent stop/cleanup path can therefore hang forever on
+  // `torrent.destroy(cb)`. Guarantee the callback always fires.
+  const destroy = prototype.destroy;
+  prototype.destroy = function destroyAlwaysCallsBack(opts, cb) {
+    if (typeof opts === "function") {
+      cb = opts;
+      opts = null;
+    }
+    if (this.destroyed) {
+      if (typeof cb === "function") queueMicrotask(cb);
+      return;
+    }
+    return destroy.call(this, opts, cb);
+  };
+
   Object.defineProperty(prototype, PATCH_MARKER, {
     configurable: false,
     value: true,

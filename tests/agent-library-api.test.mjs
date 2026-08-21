@@ -393,8 +393,11 @@ test("external seed leases renew after restart and the final lease never deletes
     await terminateChildProcess(child, { graceMs: 4_000 });
     child = await start();
     const cleanup = await (await localFetch(`${base}/cleanup`, { method: "POST" })).json();
-    await waitForJson(`${base}/cleanup?id=${cleanup.id}`, 10_000,
-      (body) => body?.status === "complete", () => child.exitCode !== null);
+    const cleanupResult = await waitForJson(`${base}/cleanup?id=${cleanup.id}`, 10_000,
+      (body) => body?.status === "complete" || body?.status === "error",
+      () => child.exitCode !== null);
+    assert.equal(cleanupResult.status, "complete",
+      cleanupResult.error || "cleanup operation did not complete");
     for (const cachePath of sharedCaches) {
       assert.equal((await stat(cachePath)).isFile(), true,
         "a durable external collection pin protects shared content cache after restart");

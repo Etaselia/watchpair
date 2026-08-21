@@ -3866,9 +3866,17 @@ async function runStorageCleanup({
     else storageDiskUsage.invalidate();
     persistJobs();
     return result;
-  })().finally(() => {
-    cleanupPromise = null;
-  });
+  })()
+    .catch((error) => {
+      agentLogger.error("storage_cleanup_failed", { error });
+      return {
+        removedJobs: [], removedEntries: [], legacyJobs: [], legacyDownloads: [], bytes: 0,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    })
+    .finally(() => {
+      cleanupPromise = null;
+    });
   return cleanupPromise;
 }
 
