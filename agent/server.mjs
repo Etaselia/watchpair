@@ -2463,12 +2463,29 @@ async function finalizeImport(id, body) {
 }
 
 async function scanLibrary(queryValue) {
+  const files = libraryCatalog.listFiles({ query: queryValue, limit: 300 });
+  if (!(await libraryCatalog.rootsReachable())) {
+    // The configured folders are gone right now: keep serving the last-good
+    // catalog, but surface it as stale instead of making this request wait for
+    // a scan that is guaranteed to fail.
+    const previous = libraryCatalog.scanStatus();
+    return {
+      files,
+      scan: {
+        ...previous,
+        status: "error",
+        error: "One or more configured library folders could not be scanned; the previous catalog was kept.",
+      },
+      stale: true,
+    };
+  }
+  // Refresh in the background; the listing itself never waits on the scan, so a
+  // slow first scan (large library, cold fingerprint cache) cannot block the UI.
   const scan = libraryCatalog.startScan();
-  const status = await scan.completion;
   return {
-    files: libraryCatalog.listFiles({ query: queryValue, limit: 300 }),
-    scan: status,
-    stale: status.status !== "complete",
+    files,
+    scan: scan.operation,
+    stale: false,
   };
 }
 

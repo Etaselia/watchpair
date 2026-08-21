@@ -633,3 +633,103 @@ test("catalog does not follow directory symlinks outside a library root", async 
     await rm(temporary, { recursive: true, force: true });
   }
 });
+
+test("unchanged external files reuse the persisted fingerprint instead of re-hashing", async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "watchpair-library-reuse-"));
+  const root = path.join(temporary, "library");
+  const catalogPath = path.join(temporary, "catalog.json");
+  await mkdir(root);
+  const firstPath = path.join(root, "movie.mp4");
+  await writeFile(firstPath, Buffer.alloc(64, 0x11));
+  const fingerprintCalls = [];
+  const fingerprintFile = async (target) => {
+    fingerprintCalls.push(path.basename(target));
+    return "a".repeat(32);
+  };
+  const options = { roots: [root], catalogPath, fingerprintFile };
+
+  try {
+    let catalog = createLibraryCatalog(options);
+    await catalog.load();
+    await scan(catalog);
+    assert.equal(fingerprintCalls.length, 1, "the first scan computes the external identity");
+    assert.equal(catalog.listFiles()[0].fingerprint, "a".repeat(32));
+
+    fingerprintCalls.length = 0;
+    await scan(catalog);
+    assert.equal(fingerprintCalls.length, 0,
+      "a same-process rescan reuses the fingerprint when size, mtime and physical key are unchanged");
+
+    // The important production case: the agent restarts and re-reads the catalog
+    // from disk, where modifiedAt survived a JSON round-trip.
+    fingerprintCalls.length = 0;
+    catalog = createLibraryCatalog(options);
+    await catalog.load();
+    await scan(catalog);
+    assert.equal(fingerprintCalls.length, 0,
+      "a restart rescan reuses the persisted fingerprint instead of re-hashing the file");
+    assert.equal(catalog.listFiles()[0].fingerprint, "a".repeat(32));
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("external fingerprinting runs with bounded concurrency", async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "watchpair-library-concurrency-"));
+  const root = path.join(temporary, "library");
+  const catalogPath = path.join(temporary, "catalog.json");
+  await mkdir(root);
+  for (let index = 0; index < 6; index += 1) {
+    await writeFile(path.join(root, `movie-${index}.mp4`), Buffer.alloc(64 + index, index));
+  }
+  let active = 0;
+  let peak = 0;
+  let serial = 0;
+  const fingerprintFile = async () => {
+    active += 1;
+    peak = Math.max(peak, active);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    active -= 1;
+    serial += 1;
+    return serial.toString(16).padStart(32, "0");
+  };
+
+  try {
+    const catalog = createLibraryCatalog({
+      roots: [root],
+      catalogPath,
+      fingerprintConcurrency: 3,
+      fingerprintFile,
+    });
+    await catalog.load();
+    await scan(catalog);
+    assert.equal(catalog.listFiles().length, 6);
+    assert.ok(peak >= 2, `expected overlapping fingerprint work, peak was ${peak}`);
+    assert.ok(peak <= 3, `fingerprint concurrency exceeded the pool limit, peak was ${peak}`);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("rootsReachable reports configured library folder availability", async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "watchpair-library-roots-"));
+  const root = path.join(temporary, "library");
+  const missing = path.join(temporary, "missing");
+  const catalogPath = path.join(temporary, "catalog.json");
+  await mkdir(root);
+  await writeFile(path.join(root, "movie.mp4"), Buffer.alloc(9));
+  let roots = [root];
+
+  try {
+    const catalog = createLibraryCatalog({ roots: () => roots, catalogPath });
+    await catalog.load();
+    assert.equal(await catalog.rootsReachable(), true);
+    roots = [root, missing];
+    assert.equal(await catalog.rootsReachable(), false,
+      "a vanished configured folder must be reported without running a full scan");
+    roots = [missing];
+    assert.equal(await catalog.rootsReachable(), false);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
