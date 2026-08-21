@@ -40,7 +40,7 @@ subtitle timing synchronized.
 ## Architecture
 
 ```text
-Browser A ---- polling/JIP + WebRTC signaling ---- Coordinator + D1 / memory ---- Browser B
+Browser A ---- polling/JIP + WebRTC signaling ---- Coordinator (in-memory) ---- Browser B
    |                                                                  |
 localhost companion                                              localhost companion
    |                                                                  |
@@ -144,30 +144,8 @@ The coordinator listens on port 3000 and exposes `GET /api/health`. Set
 `WATCHPAIR_ICE_SERVERS` to the JSON configuration shown above. Put the service behind HTTPS using
 Caddy, Traefik, Nginx, or the hosting provider's managed proxy.
 
-Docker sessions are held in memory. Run exactly one coordinator replica; restarts invalidate active
-room tokens. Cloudflare Workers deployments use D1 for durable session state and can scale
-independently.
-
-### Automated site deployment
-
-The CI workflow publishes the tested `main` commit to Cloudflare Workers only after the application
-and Docker jobs pass. Configure the repository's `production` environment with:
-
-- Secret `CLOUDFLARE_ACCOUNT_ID`
-- Secret `CLOUDFLARE_API_TOKEN` using Cloudflare's **Edit Cloudflare Workers** template with D1 edit access
-- Optional secret `WATCHPAIR_ICE_SERVERS` containing the voice relay JSON shown above
-- Repository variable `CLOUDFLARE_DEPLOY_ENABLED=true`
-- Optional repository variable `WATCHPAIR_WORKER_NAME` (defaults to `watchpair`)
-
-On its first run, CI creates a Western Europe D1 database named `watchpair`; later deploys discover
-and reuse it. The generated Wrangler configuration is deliberately ignored so account resource IDs
-do not enter source control.
-
-The managed `chatgpt.site` deployment remains separate because it uses short-lived publishing
-credentials that cannot be stored safely in GitHub Actions. Use the Worker URL or attach a custom
-domain after enabling automated deployment.
-
-The Docker path uses the same Worker-compatible build with its in-memory fallback store.
+Sessions are held in memory on the coordinator. Run exactly one coordinator replica; restarts
+invalidate active room tokens.
 
 ## Development and releases
 

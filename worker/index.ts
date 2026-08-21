@@ -1,36 +1,29 @@
-/** Cloudflare Worker entry point for WatchPair. */
-import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
+/**
+ * Universal server entry for WatchPair.
+ *
+ * Bundled into dist/server/index.js by `vinext build` (see vite.config.ts,
+ * which points the RSC environment's input at this file) and served by the
+ * Node production server in scripts/start-container.mjs. Handles the
+ * coordinator's own endpoints and passes everything else to vinext's App
+ * Router handler.
+ */
 import handler from "vinext/server/app-router-entry";
-import {
-  isMissingStaticAssetStatus,
-  isStaticChunkModule,
-  staticChunkRecoveryModule,
-} from "../lib/static-asset-recovery.mjs";
 import { handleSessionApi } from "./session-api";
 
 interface Env {
-  ASSETS: Fetcher;
-  DB?: D1Database;
   WATCHPAIR_ICE_SERVERS?: string;
-  IMAGES: {
-    input(stream: ReadableStream): {
-      transform(options: Record<string, unknown>): {
-        output(options: { format: string; quality: number }): Promise<{ response(): Response }>;
-      };
-    };
-  };
+  /**
+   * Never provided by the self-hosted Node runtime. Declared so this env is
+   * structurally compatible with vinext's App Router handler, which accepts
+   * an optional Cloudflare-style ASSETS binding and only reads it when set.
+   */
+  ASSETS?: never;
 }
 
 interface ExecutionContext {
   waitUntil(promise: Promise<unknown>): void;
   passThroughOnException(): void;
 }
-
-// Image security config. SVG sources with .svg extension auto-skip the
-// optimization endpoint on the client side (served directly, no proxy).
-// To route SVGs through the optimizer (with security headers), set
-// dangerouslyAllowSVG: true in next.config.js and uncomment below:
-// const imageConfig: ImageConfig = { dangerouslyAllowSVG: true };
 
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -42,48 +35,6 @@ const worker = {
 
     if (url.pathname === "/api/sessions") {
       return handleSessionApi(request, env);
-    }
-
-    if (
-      (request.method === "GET" || request.method === "HEAD") &&
-      isStaticChunkModule(url.pathname)
-    ) {
-      const asset = await env.ASSETS.fetch(request);
-      if (!isMissingStaticAssetStatus(asset.status)) return asset;
-      const source = staticChunkRecoveryModule();
-      return new Response(request.method === "HEAD" ? null : source, {
-        status: 200,
-        headers: {
-          "cache-control": "no-store",
-          "content-length": String(new TextEncoder().encode(source).byteLength),
-          "content-type": "text/javascript; charset=utf-8",
-          "x-content-type-options": "nosniff",
-          "x-watchpair-recovery": "stale-static-module",
-        },
-      });
-    }
-
-    if (url.pathname.startsWith("/_next/static/") && url.pathname.endsWith(".wasm")) {
-      const asset = await env.ASSETS.fetch(request);
-      if (!asset.ok) return asset;
-      const headers = new Headers(asset.headers);
-      headers.set("content-type", "application/wasm");
-      return new Response(asset.body, {
-        status: asset.status,
-        statusText: asset.statusText,
-        headers,
-      });
-    }
-
-    if (url.pathname === "/_vinext/image") {
-      const allowedWidths = [...DEFAULT_DEVICE_SIZES, ...DEFAULT_IMAGE_SIZES];
-      return handleImageOptimization(request, {
-        fetchAsset: (path) => env.ASSETS.fetch(new Request(new URL(path, request.url))),
-        transformImage: async (body, { width, format, quality }) => {
-          const result = await env.IMAGES.input(body).transform(width > 0 ? { width } : {}).output({ format, quality });
-          return result.response();
-        },
-      }, allowedWidths);
     }
 
     return handler.fetch(request, env, ctx);

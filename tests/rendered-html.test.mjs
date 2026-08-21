@@ -677,7 +677,7 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(voice, /playVoiceCue\("disconnect"\)/);
   assert.match(route, /action === "heartbeat"/);
   assert.match(route, /action === "voice-signal"/);
-  assert.match(route, /watch_voice_signals/);
+  assert.match(route, /voiceSignals/);
   assert.match(route, /action === "player"/);
   assert.match(route, /action === "select-media"/);
   assert.match(route, /action === "remove-source"/);
@@ -685,7 +685,6 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(route, /COMPLETE_TOKEN/);
   assert.match(route, /!currentSession && action === "join"/);
   assert.match(route, /action === "rename-source"/);
-  assert.match(route, /normalizeSources/);
   assert.match(route, /action === "source-manifest"/);
   assert.match(route, /action === "prioritize-media"/);
   assert.match(route, /action === "include-media"/);
