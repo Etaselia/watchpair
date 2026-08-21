@@ -125,7 +125,14 @@ test("imports, seeds, restores, and cleans an expired companion file", { timeout
     assert.equal(seeded.job.seed, true);
     assert.equal(seeded.job.status, "ready");
     assert.equal(seeded.job.creationProgress, 100);
-    assert.match(seeded.job.magnetURI, /^magnet:\?xt=urn:btih:/i);
+    assert.equal(seeded.job.magnetURI, null);
+    const publication = await waitForJson(
+      base + "/downloads/" + sourceId + "/publication",
+      10_000,
+      (body) => Boolean(body?.magnetURI),
+      () => companion.exitCode !== null,
+    );
+    assert.match(publication.magnetURI, /^magnet:\?xt=urn:btih:/i);
     assert.equal(seeded.job.files[0].size, bytes.length);
     const expectedFingerprint = createHash("sha256")
       .update(bytes.subarray(0, 512 * 1024))
@@ -317,6 +324,7 @@ test("imports, seeds, restores, and cleans an expired companion file", { timeout
       file: null,
       identityFingerprint: null,
       identityFingerprintKey: null,
+      ownershipToken: null,
     });
     await writeFile(manifestPath, JSON.stringify(legacyManifest, null, 2));
 
@@ -432,6 +440,28 @@ test("imports, seeds, restores, and cleans an expired companion file", { timeout
     assert.equal((await localFetch(base + "/downloads/" + sourceId)).status, 404);
     assert.equal((await stat(omittedJobDirectory)).isDirectory(), true);
     assert.equal((await localFetch(base + "/downloads/" + omittedLegacyId)).status, 200);
+
+    const migratedCleanupResponse = await localFetch(base + "/cleanup?includeLegacy=1", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-watchpair-control": "test-control-token",
+      },
+      body: JSON.stringify({ legacyJobs: [omittedLegacyId] }),
+    });
+    assert.equal(migratedCleanupResponse.status, 202);
+    const migratedCleanup = await migratedCleanupResponse.json();
+    const migratedFinished = await waitForJson(
+      `${base}/cleanup?id=${encodeURIComponent(migratedCleanup.id)}`,
+      10_000,
+      (body) => body?.status === "complete" || body?.status === "error",
+      () => companion.exitCode !== null,
+    );
+    assert.equal(migratedFinished.status, "complete", migratedFinished.error);
+    assert.deepEqual(migratedFinished.result.removedJobs, [omittedLegacyId]);
+    assert.deepEqual(migratedFinished.result.legacyJobs, []);
+    await assert.rejects(stat(omittedJobDirectory), { code: "ENOENT" });
+    assert.equal((await localFetch(base + "/downloads/" + omittedLegacyId)).status, 404);
   } catch (error) {
     const diagnosticLog = await readFile(
       path.join(directory, "logs", "watchpair-agent.log"),

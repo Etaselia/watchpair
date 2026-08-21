@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; media-src watchpair-media:; connect-src watchpair-media:">
   <title>WatchPair Companion</title>
   <link rel="stylesheet" href="./styles.css">
 </head>
@@ -18,6 +18,41 @@
   </header>
 
   <main>
+    <section aria-labelledby="transfers-title">
+      <div class="section-heading">
+        <div>
+          <h2 id="transfers-title">Transfers</h2>
+          <p id="transfers-summary">Reading active downloads and shares</p>
+        </div>
+        <button id="refresh-transfers" class="secondary" type="button">Refresh</button>
+      </div>
+      <div id="transfer-list" class="transfer-list" aria-live="polite"></div>
+    </section>
+
+    <section aria-labelledby="library-title">
+      <div class="section-heading">
+        <div>
+          <h2 id="library-title">Library</h2>
+          <p id="library-summary">Reading the local media catalog</p>
+        </div>
+        <div class="button-row">
+          <button id="add-library-folder" class="secondary" type="button">Add folder</button>
+          <button id="scan-library" class="secondary" type="button">Rescan</button>
+        </div>
+      </div>
+      <div id="library-folders" class="library-folders" aria-label="Library folders"></div>
+      <label class="field wide library-search-field">
+        <span>Find shows or episodes</span>
+        <input id="library-search" type="search" maxlength="200" placeholder="Search the local library">
+      </label>
+      <div id="library-list" class="library-list" aria-live="polite"></div>
+      <div class="library-pagination">
+        <button id="library-previous" class="secondary" type="button">Previous</button>
+        <span id="library-page">Page 1</span>
+        <button id="library-next" class="secondary" type="button">Next</button>
+      </div>
+    </section>
+
     <section aria-labelledby="storage-title">
       <div class="section-heading">
         <div>
@@ -144,6 +179,28 @@
       <div id="update-progress" class="progress hidden"><span></span></div>
     </section>
   </main>
+
+  <dialog id="torrent-details" aria-labelledby="torrent-details-title">
+    <div class="dialog-heading">
+      <div>
+        <h2 id="torrent-details-title">Torrent details</h2>
+        <p id="torrent-details-subtitle">Live swarm information</p>
+      </div>
+      <button id="close-torrent-details" class="secondary icon-button" type="button" aria-label="Close torrent details">Close</button>
+    </div>
+    <div id="torrent-details-content" class="torrent-details-content"></div>
+  </dialog>
+
+  <dialog id="library-details" aria-labelledby="library-details-title">
+    <div class="dialog-heading">
+      <div>
+        <h2 id="library-details-title">Library item</h2>
+        <p id="library-details-subtitle">Local files and cleanup protection</p>
+      </div>
+      <button id="close-library-details" class="secondary icon-button" type="button" aria-label="Close library details">Close</button>
+    </div>
+    <div id="library-details-content" class="library-details-content"></div>
+  </dialog>
 
   <footer>
     <span id="message" role="status"></span>

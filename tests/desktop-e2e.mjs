@@ -89,7 +89,7 @@ try {
 }
 assert.equal(report.error, undefined, report.error || output.join(""));
 assert.equal(report.initial.agent.health.ok, true);
-assert.equal(report.initial.agent.health.protocolVersion, 1);
+assert.equal(report.initial.agent.health.protocolVersion, 2);
 assert.equal(report.initial.agent.health.version, report.initial.version);
 assert.equal(report.initial.version, packageVersion);
 assert.equal(report.initial.agent.health.logging.enabled, true);
@@ -116,7 +116,7 @@ assert.deepEqual(report.dom, {
   downloadDirectory: downloads,
   logs: "watchpair-main.log · watchpair-agent.log",
   openLogs: true,
-  sections: 4,
+  sections: 6,
 });
 assert.ok(report.screenshotSize.width >= 650);
 assert.ok(report.screenshotSize.height >= 620);

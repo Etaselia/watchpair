@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,7 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  protocol,
   shell,
   Tray,
   utilityProcess,
@@ -25,6 +26,7 @@ import {
 } from "./cleanup-operation.mjs";
 import {
   deepLinkOrigin,
+  isFilesystemRoot,
   normalizeDesktopSettings,
   settingsEnvironment,
   settingsRequireAgentRestart,
@@ -49,6 +51,21 @@ const AGENT_PORT = Number(process.env.WATCHPAIR_AGENT_PORT || 41735);
 const AGENT_URL = "http://127.0.0.1:" + AGENT_PORT;
 const CONTROL_TOKEN = randomBytes(32).toString("hex");
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const LIBRARY_FILE_ID_PATTERN = /^[a-f0-9]{24}$/;
+const PREVIEW_JOB_ID_PATTERN = /^preview-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
+const HLS_ASSET_PATTERN = /^(?:master\.m3u8|video\/(?:index\.m3u8|epoch-\d{6}-(?:init\.mp4|segment-\d{6}\.m4s))|audio\/\d+\/(?:index\.m3u8|epoch-\d{6}-(?:init\.mp4|segment-\d{6}\.m4s)))$/;
+const RAW_PREVIEW_EXTENSIONS = new Set([".m4v", ".mov", ".mp4", ".webm"]);
+
+protocol.registerSchemesAsPrivileged([{
+  scheme: "watchpair-media",
+  privileges: {
+    standard: true,
+    secure: true,
+    stream: true,
+    supportFetchAPI: true,
+    corsEnabled: true,
+  },
+}]);
 
 let mainWindow = null;
 let tray = null;
@@ -69,6 +86,9 @@ let lastStorageRefreshAttemptAt = 0;
 let storageRevision = 0;
 let lastAgentDiagnosticStatus = null;
 let agentRefreshPromise = null;
+const libraryPreviewsBySender = new Map();
+const libraryPreviewsBySource = new Map();
+let libraryPreviewTransition = Promise.resolve();
 
 const singleInstance = app.requestSingleInstanceLock();
 if (!singleInstance) app.quit();
@@ -416,7 +436,9 @@ function createWindow() {
   mainWindow.removeMenu();
   rendererReady = mainWindow.loadFile(path.join(moduleDirectory, "renderer", "index.html"));
   mainWindow.once("ready-to-show", () => mainWindow.show());
+  const rendererId = mainWindow.webContents.id;
   mainWindow.on("close", (event) => {
+    void releaseLibraryPreviewForSender(rendererId);
     if (TEST_MODE) {
       quitting = true;
       return;
@@ -434,7 +456,9 @@ function createWindow() {
   });
   mainWindow.webContents.on("render-process-gone", (_event, details) => {
     electronLog.error("Companion renderer process exited", details);
+    void releaseLibraryPreviewForSender(rendererId);
   });
+  mainWindow.webContents.once("destroyed", () => void releaseLibraryPreviewForSender(rendererId));
   mainWindow.on("unresponsive", () => electronLog.warn("Companion window became unresponsive"));
   mainWindow.on("responsive", () => electronLog.info("Companion window became responsive again"));
   return mainWindow;
@@ -624,11 +648,223 @@ async function runSelfTest() {
   }, null, 2));
 }
 
+function assertMainRenderer(event) {
+  if (
+    !mainWindow ||
+    mainWindow.isDestroyed() ||
+    event.sender.isDestroyed() ||
+    event.sender !== mainWindow.webContents
+  ) throw new Error("This companion action is only available to the main settings window.");
+}
+
+function runLibraryPreviewTransition(task) {
+  const result = libraryPreviewTransition.then(task, task);
+  libraryPreviewTransition = result.catch(() => {});
+  return result;
+}
+
+function rawPreviewSupported(name) {
+  return RAW_PREVIEW_EXTENSIONS.has(path.extname(String(name || "")).toLowerCase());
+}
+
+async function releaseLibraryPreview(record) {
+  if (!record) return;
+  if (libraryPreviewsBySender.get(record.senderId) === record) {
+    libraryPreviewsBySender.delete(record.senderId);
+  }
+  if (record.sourceId && libraryPreviewsBySource.get(record.sourceId) === record) {
+    libraryPreviewsBySource.delete(record.sourceId);
+  }
+  if (!record.sourceId || record.mode !== "hls") return;
+  try {
+    await agentFetch(`/downloads/${encodeURIComponent(record.sourceId)}?deleteFiles=0`, {
+      method: "DELETE",
+      headers: { "x-watchpair-control": CONTROL_TOKEN },
+      timeoutMs: 15_000,
+    });
+  } catch (error) {
+    electronLog.warn("Could not release transient library preview", {
+      sourceId: record.sourceId,
+      error,
+    });
+  }
+}
+
+function releaseLibraryPreviewForSender(senderId) {
+  return runLibraryPreviewTransition(() => releaseLibraryPreview(
+    libraryPreviewsBySender.get(senderId)
+  ));
+}
+
+function releaseAllLibraryPreviews() {
+  return runLibraryPreviewTransition(async () => {
+    for (const record of Array.from(libraryPreviewsBySender.values())) {
+      await releaseLibraryPreview(record);
+    }
+  });
+}
+
+function registerRawLibraryPreview(senderId, fileId) {
+  const sourceId = `preview-${randomUUID()}`;
+  const record = { senderId, fileId, sourceId, mode: "raw" };
+  libraryPreviewsBySender.set(senderId, record);
+  libraryPreviewsBySource.set(sourceId, record);
+  return {
+    sourceId,
+    mode: record.mode,
+    url: `watchpair-media://library/${encodeURIComponent(fileId)}`,
+  };
+}
+
+async function startLibraryPreview(event, value) {
+  assertMainRenderer(event);
+  const senderId = event.sender.id;
+  const fileId = value?.id;
+  const name = String(value?.name || "video").slice(0, 180);
+  const forceHls = value?.forceHls === true;
+  if (typeof fileId !== "string" || !LIBRARY_FILE_ID_PATTERN.test(fileId)) {
+    throw new Error("Invalid library file identifier.");
+  }
+
+  return runLibraryPreviewTransition(async () => {
+    await releaseLibraryPreview(libraryPreviewsBySender.get(senderId));
+    assertMainRenderer(event);
+    if (!forceHls && rawPreviewSupported(name)) {
+      return registerRawLibraryPreview(senderId, fileId);
+    }
+
+    const sourceId = `preview-${randomUUID()}`;
+    let attached = false;
+    try {
+      const result = await agentFetch(`/library/${encodeURIComponent(fileId)}/attach`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-watchpair-control": CONTROL_TOKEN,
+        },
+        body: JSON.stringify({ sourceId, label: name }),
+        timeoutMs: 30_000,
+      });
+      attached = true;
+      assertMainRenderer(event);
+      if (result?.job?.id !== sourceId) throw new Error("The companion returned an invalid preview job.");
+      const file = result.job.files?.find((candidate) => candidate.selected) || result.job.files?.[0];
+      if (!file || !Number.isInteger(file.index) || file.index < 0 || file.index > 10_000) {
+        throw new Error("The companion returned an invalid preview file.");
+      }
+      const record = { senderId, fileId, sourceId, mode: "hls", fileIndex: file.index };
+      libraryPreviewsBySender.set(senderId, record);
+      libraryPreviewsBySource.set(sourceId, record);
+      return {
+        sourceId,
+        mode: record.mode,
+        url: `watchpair-media://hls/${encodeURIComponent(sourceId)}/${file.index}/h264/master.m3u8`,
+      };
+    } catch (error) {
+      if (attached) {
+        await releaseLibraryPreview({ senderId, fileId, sourceId, mode: "hls" });
+      }
+      throw error;
+    }
+  });
+}
+
+async function stopLibraryPreview(event, sourceId) {
+  assertMainRenderer(event);
+  if (!PREVIEW_JOB_ID_PATTERN.test(String(sourceId || ""))) {
+    throw new Error("Invalid library preview identifier.");
+  }
+  return runLibraryPreviewTransition(async () => {
+    const record = libraryPreviewsBySender.get(event.sender.id);
+    if (!record) return { ok: true };
+    if (record.sourceId !== sourceId) {
+      throw new Error("That library preview does not belong to this window.");
+    }
+    await releaseLibraryPreview(record);
+    return { ok: true };
+  });
+}
+
 function registerIpc() {
   ipcMain.handle("companion:get-state", async () => {
     await refreshAgentState();
     return publicState();
   });
+  ipcMain.handle("companion:get-transfers", async (event) => {
+    assertMainRenderer(event);
+    const result = await agentFetch("/downloads", {
+      headers: { "x-watchpair-control": CONTROL_TOKEN },
+    });
+    return {
+      ...result,
+      jobs: Array.isArray(result?.jobs)
+        ? result.jobs.filter((job) => !PREVIEW_JOB_ID_PATTERN.test(String(job?.id || "")))
+        : [],
+    };
+  });
+  ipcMain.handle("companion:get-torrent-details", (event, id) => {
+    assertMainRenderer(event);
+    if (typeof id !== "string" || !/^[a-zA-Z0-9-]{8,80}$/.test(id)) {
+      throw new Error("Invalid transfer identifier.");
+    }
+    return agentFetch(`/downloads/${encodeURIComponent(id)}/torrent`, {
+      headers: { "x-watchpair-control": CONTROL_TOKEN },
+    });
+  });
+  ipcMain.handle("companion:get-library", (event, options = {}) => {
+    assertMainRenderer(event);
+    const query = String(options?.query || "").trim().slice(0, 200);
+    const offset = Math.max(0, Math.floor(Number(options?.offset) || 0));
+    const limit = Math.max(1, Math.min(200, Math.floor(Number(options?.limit) || 50)));
+    const search = new URLSearchParams({ query, offset: String(offset), limit: String(limit) });
+    return agentFetch(`/control/library?${search}`, {
+      headers: { "x-watchpair-control": CONTROL_TOKEN },
+      timeoutMs: 15_000,
+    });
+  });
+  ipcMain.handle("companion:scan-library", (event) => {
+    assertMainRenderer(event);
+    return agentFetch("/control/library/scan", {
+      method: "POST",
+      headers: { "x-watchpair-control": CONTROL_TOKEN },
+      timeoutMs: 15_000,
+    });
+  });
+  ipcMain.handle("companion:get-library-scan", (event, id) => {
+    assertMainRenderer(event);
+    if (typeof id !== "string" || !/^[a-zA-Z0-9-]{8,80}$/.test(id)) {
+      throw new Error("Invalid library scan identifier.");
+    }
+    return agentFetch(`/control/library/scan?id=${encodeURIComponent(id)}`, {
+      headers: { "x-watchpair-control": CONTROL_TOKEN },
+    });
+  });
+  ipcMain.handle("companion:get-library-collection", (event, id) => {
+    assertMainRenderer(event);
+    if (typeof id !== "string" || !/^[a-f0-9]{24}$/.test(id)) {
+      throw new Error("Invalid library collection identifier.");
+    }
+    return agentFetch(`/control/library/${encodeURIComponent(id)}`, {
+      headers: { "x-watchpair-control": CONTROL_TOKEN },
+    });
+  });
+  ipcMain.handle("companion:set-library-pinned", (event, value) => {
+    assertMainRenderer(event);
+    const id = value?.id;
+    if (typeof id !== "string" || !/^[a-f0-9]{24}$/.test(id)) {
+      throw new Error("Invalid library collection identifier.");
+    }
+    return agentFetch(`/control/library/${encodeURIComponent(id)}/pin`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-watchpair-control": CONTROL_TOKEN,
+      },
+      body: JSON.stringify({ pinned: Boolean(value?.pinned) }),
+    });
+  });
+  ipcMain.handle("companion:start-library-preview", startLibraryPreview);
+  ipcMain.handle("companion:stop-library-preview", stopLibraryPreview);
   ipcMain.handle("companion:choose-download-folder", async () => {
     const selection = await dialog.showOpenDialog(mainWindow, {
       title: "Choose download folder",
@@ -636,6 +872,19 @@ function registerIpc() {
       properties: ["openDirectory", "createDirectory"],
     });
     return selection.canceled ? null : selection.filePaths[0];
+  });
+  ipcMain.handle("companion:choose-library-folder", async (event) => {
+    assertMainRenderer(event);
+    const selection = await dialog.showOpenDialog(mainWindow, {
+      title: "Add library folder",
+      defaultPath: settings.libraryDirectories.at(-1) || settings.downloadDirectory,
+      properties: ["openDirectory"],
+    });
+    if (selection.canceled) return null;
+    if (isFilesystemRoot(selection.filePaths[0])) {
+      throw new Error("Choose a library folder inside the drive or share, not the filesystem root.");
+    }
+    return selection.filePaths[0];
   });
   ipcMain.handle("companion:save-settings", async (_event, next) => {
     const previousSettings = settings;
@@ -693,6 +942,96 @@ function registerIpc() {
   ipcMain.handle("companion:install-update", () => installUpdate());
 }
 
+function mediaProtocolResponse(upstream) {
+  const headers = new Headers({
+    "access-control-allow-origin": "*",
+    "x-content-type-options": "nosniff",
+  });
+  for (const name of [
+    "accept-ranges",
+    "cache-control",
+    "content-length",
+    "content-range",
+    "content-type",
+    "etag",
+    "last-modified",
+  ]) {
+    const value = upstream.headers.get(name);
+    if (value) headers.set(name, value);
+  }
+  return new Response(upstream.body, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers,
+  });
+}
+
+async function proxyLibraryPreview(request, route, { range = false } = {}) {
+  const headers = new Headers({ "x-watchpair-control": CONTROL_TOKEN });
+  const requestedRange = range ? request.headers.get("range") : null;
+  if (requestedRange) headers.set("range", requestedRange);
+  const upstream = await fetch(AGENT_URL + route, {
+    method: request.method,
+    headers,
+    redirect: "error",
+    signal: request.signal,
+  });
+  return mediaProtocolResponse(upstream);
+}
+
+function rawLibraryPreviewRoute(url) {
+  if (url.hostname !== "library" || url.search || url.hash) return null;
+  const fileId = url.pathname.replace(/^\//u, "");
+  if (!LIBRARY_FILE_ID_PATTERN.test(fileId)) return null;
+  const active = Array.from(libraryPreviewsBySender.values()).some((record) =>
+    record.mode === "raw" && record.fileId === fileId
+  );
+  return active ? `/library/${encodeURIComponent(fileId)}/preview` : null;
+}
+
+function hlsLibraryPreviewRoute(url) {
+  if (url.hostname !== "hls" || url.hash) return null;
+  const parts = url.pathname.split("/").filter(Boolean);
+  if (parts.length < 5) return null;
+  const [sourceId, fileIndexValue, rendition, ...assetParts] = parts;
+  const record = libraryPreviewsBySource.get(sourceId);
+  const fileIndex = Number(fileIndexValue);
+  const asset = assetParts.join("/");
+  if (
+    !record ||
+    !PREVIEW_JOB_ID_PATTERN.test(sourceId) ||
+    rendition !== "h264" ||
+    !Number.isInteger(fileIndex) ||
+    fileIndex !== record.fileIndex ||
+    !HLS_ASSET_PATTERN.test(asset)
+  ) return null;
+  const parameters = new URLSearchParams(url.search);
+  const audio = parameters.get("audio");
+  if (Array.from(parameters.keys()).some((name) => name !== "audio")) return null;
+  if (audio !== null && !["stereo", "surround"].includes(audio)) return null;
+  const query = audio ? `?audio=${encodeURIComponent(audio)}` : "";
+  return `/hls/${encodeURIComponent(sourceId)}/${fileIndex}/h264/${asset}${query}`;
+}
+
+function registerLibraryPreviewProtocol() {
+  protocol.handle("watchpair-media", async (request) => {
+    if (!["GET", "HEAD"].includes(request.method)) {
+      return new Response("Not found", { status: 404 });
+    }
+    try {
+      const url = new URL(request.url);
+      const rawRoute = rawLibraryPreviewRoute(url);
+      if (rawRoute) return proxyLibraryPreview(request, rawRoute, { range: true });
+      const hlsRoute = hlsLibraryPreviewRoute(url);
+      if (hlsRoute) return proxyLibraryPreview(request, hlsRoute);
+      return new Response("Not found", { status: 404 });
+    } catch (error) {
+      if (error?.name !== "AbortError") electronLog.warn("Library preview proxy failed", error);
+      return new Response("Library preview unavailable", { status: 502 });
+    }
+  });
+}
+
 app.on("child-process-gone", (_event, details) => {
   electronLog.error("Electron child process exited", details);
 });
@@ -716,7 +1055,9 @@ app.on("before-quit", (event) => {
   quitting = true;
   if (agentProcess) {
     event.preventDefault();
-    void stopAgent().finally(() => app.quit());
+    void releaseAllLibraryPreviews()
+      .finally(() => stopAgent())
+      .finally(() => app.quit());
   }
 });
 
@@ -742,6 +1083,7 @@ async function initialize() {
     iconPath: windowIcon(),
   });
   if (!TEST_MODE) registerProtocol();
+  registerLibraryPreviewProtocol();
   registerIpc();
   createWindow();
   if (!TEST_MODE) createTray();

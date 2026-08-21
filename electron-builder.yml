@@ -19,6 +19,7 @@ files:
   - '!node_modules/react-dom/**/*'
   - '!node_modules/styled-jsx/**/*'
   - '!node_modules/hls.js/**/*'
+  - node_modules/hls.js/dist/hls.light.min.mjs
   - '!node_modules/jassub/**/*'
   - '!node_modules/lucide-react/**/*'
   - '!node_modules/@img/**/*'

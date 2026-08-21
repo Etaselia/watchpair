@@ -851,6 +851,7 @@ svg {
 .download-controls {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   margin-top: 10px;
 }
@@ -981,6 +982,10 @@ svg {
   background: #f4f8e9;
 }
 
+.library-list button.selected {
+  background: #edf5d7;
+}
+
 .library-list button > svg {
   width: 18px;
   flex: none;
@@ -1002,6 +1007,31 @@ svg {
 .library-list button small {
   color: var(--muted);
   font-size: 10px;
+}
+
+.library-details {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid #cfd2c8;
+  padding-top: 10px;
+}
+
+.library-details .queue-actions {
+  flex-wrap: wrap;
+  margin: 0;
+}
+
+.library-details video {
+  width: 100%;
+  max-height: 320px;
+  background: #111;
+}
+
+.library-file-unavailable {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
 }
 
 .drop-zone {
