@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.2](https://github.com/Etaselia/watchpair/compare/v0.12.1...v0.12.2) (2026-08-21)
+
+
+### Bug Fixes
+
+* prevent torrent destroy from hanging cleanup ([#93](https://github.com/Etaselia/watchpair/issues/93)) ([edaa025](https://github.com/Etaselia/watchpair/commit/edaa02518bd5de76f4b0ac33488a682d0bb8b341))
+
 ## [0.12.1](https://github.com/Etaselia/watchpair/compare/v0.12.0...v0.12.1) (2026-08-21)
 
 
