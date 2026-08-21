@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.3](https://github.com/Etaselia/watchpair/compare/v0.12.2...v0.12.3) (2026-08-21)
+
+
+### Bug Fixes
+
+* persist torrent verification and silence state, name UUID collections ([#95](https://github.com/Etaselia/watchpair/issues/95)) ([5b0214c](https://github.com/Etaselia/watchpair/commit/5b0214c08e1d66ea62e3f8b0f9129195610e4303))
+
 ## [0.12.2](https://github.com/Etaselia/watchpair/compare/v0.12.1...v0.12.2) (2026-08-21)
 
 
