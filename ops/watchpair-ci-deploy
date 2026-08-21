@@ -32,6 +32,15 @@ run_app() {
   local name=$1
   local source_image=$2
 
+  # Persistent session store: the coordinator mirrors watch rooms to
+  # /data/sessions.json with debounced atomic writes, so active rooms survive
+  # the hard container cutover below. The image runs as the non-root `node`
+  # user (UID 1000 on the official node image), so the bind-mounted host
+  # directory must be writable by UID 1000. This script runs as root, so it
+  # creates and chowns the directory before every docker run (idempotent).
+  mkdir -p /opt/watchpair/data
+  chown 1000:1000 /opt/watchpair/data
+
   docker run --detach \
     --name "$name" \
     --network watchpair-net \
@@ -46,7 +55,9 @@ run_app() {
     --cap-drop ALL \
     --log-opt max-size=10m \
     --log-opt max-file=3 \
+    --mount type=bind,source=/opt/watchpair/data,target=/data \
     --env NODE_OPTIONS=--max-old-space-size=128 \
+    --env WATCHPAIR_SESSION_FILE=/data/sessions.json \
     "$source_image" >/dev/null
 }
 

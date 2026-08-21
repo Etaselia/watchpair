@@ -13,4 +13,6 @@ The server uses a locked `watchpair-ci` account whose authorized key forces `/us
 
 The deployer skips revisions that are already live. For new revisions it boots and checks a candidate container before replacing the live coordinator. It keeps the previous image as `watchpair:rollback` and restores it if the public HTTPS health check fails. The Caddy proxy and unrelated containers are left in place.
 
+Coordinator watch rooms survive the hard container cutover: `watchpair-ci-deploy` creates `/opt/watchpair/data` (owned by UID 1000, the image's non-root `node` user), bind-mounts it at `/data`, and sets `WATCHPAIR_SESSION_FILE=/data/sessions.json`. The coordinator mirrors sessions to that file with debounced atomic writes, so `docker rm --force` + rename keeps active rooms and their tokens live. Restore the host directory from backups together with `/opt/watchpair/DEPLOYMENT` if you need to recover after a VPS rebuild.
+
 When the repository plan supports required reviewers for private repositories, configure them on `production-vps` as an additional approval layer. Keep `production-vps-scheduled` unprotected so eligible releases can roll out automatically at 04:07 Europe/Vienna.

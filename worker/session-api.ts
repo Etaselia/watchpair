@@ -1,3 +1,5 @@
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { mediaItemId, mediaManifest, sameMediaManifest } from "../lib/media-queue.mjs";
 import { magnetInfoHash } from "../lib/magnet-identity.mjs";
 import {
@@ -14,7 +16,7 @@ import {
   type VoiceSignal,
   type VoiceSignalType,
   type WatchSession,
-} from "../lib/session-types";
+} from "../lib/session-types.ts";
 
 const TOKEN_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const COMPLETE_TOKEN = /^[A-Z2-9]{4}-[A-Z2-9]{4}$/;
@@ -29,6 +31,12 @@ const DEFAULT_VOICE_CONFIG: VoiceConfig = {
 
 export interface SessionRuntimeEnv {
   WATCHPAIR_ICE_SERVERS?: string;
+  /**
+   * Optional JSON snapshot file that mirrors watch-room state across process
+   * restarts. When unset, sessions live in memory only (the default for local
+   * `compose` and development runs without a persistent volume).
+   */
+  WATCHPAIR_SESSION_FILE?: string;
 }
 
 interface SessionStore {
@@ -191,18 +199,23 @@ interface MemorySession {
   voiceSignals: VoiceSignal[];
 }
 
-const memorySessions = new Map<string, MemorySession>();
-
 class MemorySessionStore implements SessionStore {
-  constructor(private readonly voice: VoiceConfig) {}
+  protected readonly sessions = new Map<string, MemorySession>();
+  protected readonly voice: VoiceConfig;
+  protected readonly clock: () => number;
+
+  constructor(voice: VoiceConfig, clock: () => number = Date.now) {
+    this.voice = voice;
+    this.clock = clock;
+  }
 
   async initialize() {}
 
   async get(token: string, recipientId?: string): Promise<WatchSession | null> {
-    const record = memorySessions.get(token);
-    const now = Date.now();
+    const record = this.sessions.get(token);
+    const now = this.clock();
     if (!record || record.expiresAt <= now) {
-      memorySessions.delete(token);
+      this.sessions.delete(token);
       return null;
     }
 
@@ -234,8 +247,8 @@ class MemorySessionStore implements SessionStore {
   }
 
   async create(token: string, hostId: string, now: number) {
-    if (memorySessions.has(token)) return;
-    memorySessions.set(token, {
+    if (this.sessions.has(token)) return;
+    this.sessions.set(token, {
       token,
       hostId,
       sources: [],
@@ -257,7 +270,7 @@ class MemorySessionStore implements SessionStore {
     readiness: Partial<LocalReadiness> | undefined,
     now: number
   ) {
-    const record = memorySessions.get(token);
+    const record = this.sessions.get(token);
     if (!record) return;
     record.participants.set(deviceId, {
       deviceId,
@@ -269,7 +282,7 @@ class MemorySessionStore implements SessionStore {
   }
 
   async setSource(token: string, source: SharedSource, now: number) {
-    const record = memorySessions.get(token);
+    const record = this.sessions.get(token);
     if (!record) return;
     record.sources.push(source);
     record.seq += 1;
@@ -277,7 +290,7 @@ class MemorySessionStore implements SessionStore {
   }
 
   async setSources(token: string, sources: SharedSource[], now: number) {
-    const record = memorySessions.get(token);
+    const record = this.sessions.get(token);
     if (!record) return;
     record.sources = sources;
     record.seq += 1;
@@ -285,7 +298,7 @@ class MemorySessionStore implements SessionStore {
   }
 
   async setSelectedMedia(token: string, media: SelectedMedia | null, now: number) {
-    const record = memorySessions.get(token);
+    const record = this.sessions.get(token);
     if (!record) return;
     record.selectedMedia = media;
     record.player = initialPlayerState(now);
@@ -294,7 +307,7 @@ class MemorySessionStore implements SessionStore {
   }
 
   async setPlayer(token: string, player: PlayerState, now: number) {
-    const record = memorySessions.get(token);
+    const record = this.sessions.get(token);
     if (!record) return;
     record.player = player;
     record.seq += 1;
@@ -302,12 +315,259 @@ class MemorySessionStore implements SessionStore {
   }
 
   async addVoiceSignal(token: string, signal: VoiceSignal) {
-    const record = memorySessions.get(token);
+    const record = this.sessions.get(token);
     if (!record) return;
     record.voiceSignals = record.voiceSignals
       .filter((item) => item.createdAt >= signal.createdAt - VOICE_SIGNAL_TTL_MS)
       .concat(signal)
       .slice(-400);
+  }
+}
+
+interface SessionPersistenceOptions {
+  /** Debounce window for snapshot writes. Defaults to ~1s. */
+  debounceMs?: number;
+  /** Injectable clock used for expiry checks. Defaults to Date.now. */
+  now?: () => number;
+  /** Injectable timer scheduler (tests use this for determinism). */
+  schedule?: (callback: () => void, delayMs: number) => unknown;
+  /** Cancels a scheduled timer handle returned by `schedule`. */
+  clearSchedule?: (timer: unknown) => void;
+  /** Handles snapshot load/write failures without failing the request. */
+  onError?: (error: unknown) => void;
+}
+
+interface PersistedSessionRecord {
+  token?: unknown;
+  hostId?: unknown;
+  sources?: unknown;
+  selectedMedia?: unknown;
+  player?: unknown;
+  seq?: unknown;
+  createdAt?: unknown;
+  expiresAt?: unknown;
+  updatedAt?: unknown;
+  participants?: Array<Record<string, unknown>>;
+  voiceSignals?: Array<Record<string, unknown>>;
+}
+
+const SESSION_SNAPSHOT_VERSION = 1;
+
+function parseSessionSnapshot(raw: string): PersistedSessionRecord[] | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (Array.isArray(parsed)) return parsed as PersistedSessionRecord[];
+  if (
+    parsed &&
+    typeof parsed === "object" &&
+    Array.isArray((parsed as { sessions?: unknown }).sessions)
+  ) {
+    return (parsed as { sessions: unknown }).sessions as PersistedSessionRecord[];
+  }
+  return null;
+}
+
+/**
+ * A session store that mirrors every mutation to a JSON snapshot file.
+ *
+ * Reads stay in-memory for latency. Writes are debounced (~1s) and atomic: the
+ * snapshot is written to a `.tmp` file and renamed into place, so the on-disk
+ * state is always a recent, consistent JSON document even if the process is
+ * SIGKILLed (deploys use `docker rm --force`, so there is no graceful
+ * shutdown). Expired sessions and stale participants/voice signals are dropped
+ * when the snapshot is loaded.
+ *
+ * Pass `filePath: null` (or omit it) to keep everything in memory with no file
+ * I/O at all.
+ */
+export class FileSessionStore extends MemorySessionStore implements SessionStore {
+  private readonly filePath: string | null;
+  private readonly debounceMs: number;
+  private readonly schedule: (callback: () => void, delayMs: number) => unknown;
+  private readonly clearSchedule: (timer: unknown) => void;
+  private readonly onError: (error: unknown) => void;
+  private persistTimer: unknown = null;
+  private writeChain: Promise<void> = Promise.resolve();
+  private initialized = false;
+
+  constructor(voice: VoiceConfig, filePath: string | null, options: SessionPersistenceOptions = {}) {
+    super(voice, options.now ?? Date.now);
+    this.filePath = filePath;
+    this.debounceMs = options.debounceMs ?? 1_000;
+    this.schedule = options.schedule ?? ((callback, delayMs) => setTimeout(callback, delayMs));
+    this.clearSchedule =
+      options.clearSchedule ?? ((timer) => clearTimeout(timer as ReturnType<typeof setTimeout>));
+    this.onError =
+      options.onError ?? ((error) => console.error("[watchpair] Session persistence failed:", error));
+  }
+
+  async initialize() {
+    if (this.initialized) return;
+    this.initialized = true;
+    if (this.filePath === null) return;
+    await mkdir(path.dirname(this.filePath), { recursive: true });
+    let raw: string;
+    try {
+      raw = await readFile(this.filePath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return;
+      this.onError(error);
+      return;
+    }
+    const records = parseSessionSnapshot(raw);
+    if (!records) return;
+    const now = this.clock();
+    for (const item of records) {
+      const record = item as PersistedSessionRecord;
+      if (typeof record?.token !== "string" || typeof record.expiresAt !== "number") continue;
+      if (!Number.isFinite(record.expiresAt) || record.expiresAt <= now) continue;
+      const participants = new Map<string, ParticipantState>();
+      for (const candidate of Array.isArray(record.participants) ? record.participants : []) {
+        if (
+          typeof candidate.deviceId === "string" &&
+          typeof candidate.updatedAt === "number" &&
+          candidate.updatedAt >= now - PARTICIPANT_ACTIVE_MS
+        ) {
+          participants.set(candidate.deviceId, candidate as unknown as ParticipantState);
+        }
+      }
+      const voiceSignals: VoiceSignal[] = (
+        Array.isArray(record.voiceSignals) ? record.voiceSignals : []
+      )
+        .filter(
+          (signal) =>
+            typeof signal.createdAt === "number" &&
+            signal.createdAt >= now - VOICE_SIGNAL_TTL_MS
+        )
+        .map((signal) => signal as unknown as VoiceSignal)
+        .slice(-400);
+      this.sessions.set(record.token, {
+        token: record.token,
+        hostId: typeof record.hostId === "string" ? record.hostId : "",
+        sources: Array.isArray(record.sources) ? (record.sources as SharedSource[]) : [],
+        selectedMedia: record.selectedMedia ? (record.selectedMedia as SelectedMedia) : null,
+        player: record.player ? (record.player as PlayerState) : initialPlayerState(now),
+        seq: typeof record.seq === "number" && Number.isFinite(record.seq) ? record.seq : 0,
+        createdAt:
+          typeof record.createdAt === "number" && Number.isFinite(record.createdAt)
+            ? record.createdAt
+            : now,
+        expiresAt: record.expiresAt,
+        updatedAt:
+          typeof record.updatedAt === "number" && Number.isFinite(record.updatedAt)
+            ? record.updatedAt
+            : now,
+        participants,
+        voiceSignals,
+      });
+    }
+  }
+
+  async create(token: string, hostId: string, now: number) {
+    await super.create(token, hostId, now);
+    this.schedulePersist();
+  }
+
+  async touch(
+    token: string,
+    deviceId: string,
+    name: string,
+    readiness: Partial<LocalReadiness> | undefined,
+    now: number
+  ) {
+    await super.touch(token, deviceId, name, readiness, now);
+    this.schedulePersist();
+  }
+
+  async setSource(token: string, source: SharedSource, now: number) {
+    await super.setSource(token, source, now);
+    this.schedulePersist();
+  }
+
+  async setSources(token: string, sources: SharedSource[], now: number) {
+    await super.setSources(token, sources, now);
+    this.schedulePersist();
+  }
+
+  async setSelectedMedia(token: string, media: SelectedMedia | null, now: number) {
+    await super.setSelectedMedia(token, media, now);
+    this.schedulePersist();
+  }
+
+  async setPlayer(token: string, player: PlayerState, now: number) {
+    await super.setPlayer(token, player, now);
+    this.schedulePersist();
+  }
+
+  async addVoiceSignal(token: string, signal: VoiceSignal) {
+    await super.addVoiceSignal(token, signal);
+    this.schedulePersist();
+  }
+
+  /**
+   * Persists any pending changes immediately and awaits the in-flight write.
+   * Used by tests; a graceful-shutdown hook could call this too.
+   */
+  async flush() {
+    if (this.persistTimer !== null) {
+      this.clearSchedule(this.persistTimer);
+      this.persistTimer = null;
+    }
+    if (this.filePath !== null) this.enqueueWrite();
+    await this.writeChain;
+  }
+
+  private schedulePersist() {
+    if (this.filePath === null || this.persistTimer !== null) return;
+    this.persistTimer = this.schedule(() => {
+      this.persistTimer = null;
+      this.enqueueWrite();
+    }, this.debounceMs);
+  }
+
+  private enqueueWrite() {
+    this.writeChain = this.writeChain
+      .then(() => this.writeNow())
+      .catch(() => undefined);
+  }
+
+  private async writeNow() {
+    if (this.filePath === null) return;
+    const temporaryPath = `${this.filePath}.tmp`;
+    try {
+      await mkdir(path.dirname(this.filePath), { recursive: true });
+      await writeFile(temporaryPath, JSON.stringify(this.serializeSnapshot()), "utf8");
+      await rename(temporaryPath, this.filePath);
+    } catch (error) {
+      this.onError(error);
+    }
+  }
+
+  private serializeSnapshot() {
+    const now = this.clock();
+    return {
+      version: SESSION_SNAPSHOT_VERSION,
+      savedAt: now,
+      sessions: Array.from(this.sessions.values())
+        .filter((record) => record.expiresAt > now)
+        .map((record) => ({
+          token: record.token,
+          hostId: record.hostId,
+          sources: record.sources,
+          selectedMedia: record.selectedMedia,
+          player: record.player,
+          seq: record.seq,
+          createdAt: record.createdAt,
+          expiresAt: record.expiresAt,
+          updatedAt: record.updatedAt,
+          participants: Array.from(record.participants.values()),
+          voiceSignals: record.voiceSignals,
+        })),
+    };
   }
 }
 
@@ -652,11 +912,36 @@ async function handlePost(request: Request, store: SessionStore) {
   return Response.json({ session: await store.get(token, deviceId) });
 }
 
+const sessionStores = new Map<string, Promise<SessionStore>>();
+
+/**
+ * Returns the process-wide session store for a runtime environment. One store
+ * is created per (session file, ICE servers) pair and cached, so in-memory
+ * state and the persistence debounce are shared across requests (the previous
+ * per-request construction only worked because the session map was module
+ * global).
+ */
+function sessionStoreFor(runtimeEnv: SessionRuntimeEnv): Promise<SessionStore> {
+  const filePath = runtimeEnv.WATCHPAIR_SESSION_FILE?.trim() || null;
+  const key = `${filePath ?? "memory"}\u0000${runtimeEnv.WATCHPAIR_ICE_SERVERS ?? ""}`;
+  let pending = sessionStores.get(key);
+  if (!pending) {
+    const configuredVoice = voiceConfig(runtimeEnv.WATCHPAIR_ICE_SERVERS);
+    const store: SessionStore = filePath === null
+      ? new MemorySessionStore(configuredVoice)
+      : new FileSessionStore(configuredVoice, filePath);
+    pending = store.initialize().then(() => store).catch((error) => {
+      sessionStores.delete(key);
+      throw error;
+    });
+    sessionStores.set(key, pending);
+  }
+  return pending;
+}
+
 export async function handleSessionApi(request: Request, runtimeEnv: SessionRuntimeEnv = {}) {
   try {
-    const configuredVoice = voiceConfig(runtimeEnv.WATCHPAIR_ICE_SERVERS);
-    const store: SessionStore = new MemorySessionStore(configuredVoice);
-    await store.initialize();
+    const store = await sessionStoreFor(runtimeEnv);
 
     if (request.method === "GET") return handleGet(request, store);
     if (request.method === "POST") return handlePost(request, store);
