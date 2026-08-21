@@ -6,6 +6,7 @@ import { fingerprintPath } from "./media-fingerprint.mjs";
 export const LIBRARY_CATALOG_VERSION = 1;
 const DEFAULT_MAX_DEPTH = 12;
 const DEFAULT_MAX_FILES = 20_000;
+const DEFAULT_FINGERPRINT_CONCURRENCY = 4;
 const DEFAULT_PAGE_SIZE = 50;
 const MAX_PAGE_SIZE = 200;
 
@@ -176,6 +177,7 @@ export function createLibraryCatalog({
   onSetManagedPins = async () => {},
   maxDepth = DEFAULT_MAX_DEPTH,
   maxFiles = DEFAULT_MAX_FILES,
+  fingerprintConcurrency = DEFAULT_FINGERPRINT_CONCURRENCY,
   readDirectory = readdir,
   resolvePath = realpath,
   inspectPath = inspectFilesystemPath,
@@ -388,6 +390,69 @@ export function createLibraryCatalog({
     }
     const maxDepthValue = clampInteger(maxDepth, DEFAULT_MAX_DEPTH, 1, 64);
     const maxFilesValue = clampInteger(maxFiles, DEFAULT_MAX_FILES, 1, 1_000_000);
+    const fingerprintConcurrencyValue = clampInteger(
+      fingerprintConcurrency, DEFAULT_FINGERPRINT_CONCURRENCY, 1, 16);
+
+    // External files whose cached identity is stale are fingerprinted by a small
+    // worker pool after the directory walk, so a large first scan or a batch of
+    // new files does not serialize one multi-hundred-megabyte read after another.
+    const fingerprintTasks = [];
+    const deferredPhysicalKeys = new Set();
+    let collectedCount = 0;
+
+    const buildFile = (pending) => {
+      const known = pending.known;
+      const managed = pending.managed;
+      const mayReusePreviousIdentity = pending.mayReusePreviousIdentity;
+      const previous = pending.previous;
+      return {
+        id: pending.fileId,
+        priorLogicalId: previous?.id || null,
+        collectionId: pending.collectionId,
+        name: pending.name,
+        relativePath: pending.relativePath,
+        size: pending.info.size,
+        modifiedAt: pending.modifiedAt,
+        managed: Boolean(managed),
+        fingerprint: known?.usable
+          ? known.fingerprint
+          : managed ? (mayReusePreviousIdentity ? previous.fingerprint : null) : pending.externalFingerprint,
+        infoHash: known?.usable
+          ? known.infoHash
+          : mayReusePreviousIdentity ? previous.infoHash : null,
+        torrentFileIndex: known?.usable
+          ? known.fileIndex
+          : mayReusePreviousIdentity ? previous.torrentFileIndex : null,
+        usable: managed
+          ? Boolean(known?.usable === true ||
+              (mayReusePreviousIdentity && previous.usable === true))
+          : true,
+        path: pending.resolved,
+        physicalKey: pending.physicalKey,
+        copies: [{ path: pending.resolved, physicalKey: pending.physicalKey, size: pending.info.size, modifiedAt: pending.modifiedAt }],
+        copyCount: 1,
+      };
+    };
+
+    const registerFile = (file, pending) => {
+      nextFilesByPhysicalKey.set(file.physicalKey, file);
+      record.scannedFiles = nextFilesByPhysicalKey.size;
+      const managed = pending.managed;
+      let seed = collectionSeeds.get(pending.collectionId);
+      if (!seed) {
+        seed = {
+          id: pending.collectionId,
+          name: pending.collectionName,
+          managed: Boolean(managed),
+          managedJobIds: managed ? [managed.id] : [],
+          files: [],
+        };
+        collectionSeeds.set(pending.collectionId, seed);
+      } else if (managed && !seed.managedJobIds.includes(managed.id)) {
+        seed.managedJobIds.push(managed.id);
+      }
+      seed.files.push(file);
+    };
 
     rootLoop: for (const root of rootResult.roots) {
       const queue = [{ directory: root, depth: 0 }];
@@ -426,11 +491,12 @@ export function createLibraryCatalog({
           });
           if (!info?.isFile()) continue;
           const physicalKey = physicalFileKey(info, resolved);
-          if (nextFilesByPhysicalKey.has(physicalKey)) continue;
-          if (nextFilesByPhysicalKey.size >= maxFilesValue) {
+          if (nextFilesByPhysicalKey.has(physicalKey) || deferredPhysicalKeys.has(physicalKey)) continue;
+          if (collectedCount >= maxFilesValue) {
             record.truncated = true;
             break rootLoop;
           }
+          collectedCount += 1;
 
           const normalizedResolved = normalizedPath(resolved);
           const managed = managedJobs.find((job) => isWithin(job.root, normalizedResolved));
@@ -459,75 +525,82 @@ export function createLibraryCatalog({
             previousCopy?.size === info.size &&
             previousCopy?.modifiedAt === modifiedAt;
           const mayReusePreviousIdentity = previousIdentityIsCurrent && known === undefined;
-          let externalFingerprint = mayReusePreviousIdentity ? previous.fingerprint : null;
-          if (!managed && !externalFingerprint) {
-            externalFingerprint = await fingerprintFile(resolved).catch((error) => {
-              if (error?.code !== "ENOENT") record.failedRoots += 1;
-              return null;
-            });
-            if (!externalFingerprint) continue;
-            const checked = await inspectPath(resolved).catch((error) => {
-              if (error?.code !== "ENOENT") record.failedRoots += 1;
-              return null;
-            });
-            const checkedPhysicalKey = physicalFileKey(checked, resolved);
-            if (
-              !checked?.isFile() ||
-              checkedPhysicalKey !== physicalKey ||
-              checked.size !== info.size ||
-              Number(checked.mtimeMs) !== modifiedAt
-            ) {
-              record.failedRoots += 1;
-              continue;
-            }
-          }
-          const file = {
-            id: fileId,
-            priorLogicalId: previous?.id || null,
+          const pending = {
+            resolved,
+            info,
+            physicalKey,
+            modifiedAt,
+            managed,
             collectionId,
+            collectionName,
+            known,
+            fileId,
+            previous,
+            mayReusePreviousIdentity,
+            externalFingerprint: mayReusePreviousIdentity ? previous.fingerprint : null,
             name: entry.name,
             relativePath: managed
               ? path.relative(managed.root, resolved) || entry.name
               : relativeParts.join(path.sep) || entry.name,
-            size: info.size,
-            modifiedAt,
-            managed: Boolean(managed),
-            fingerprint: known?.usable
-              ? known.fingerprint
-              : managed ? (mayReusePreviousIdentity ? previous.fingerprint : null) : externalFingerprint,
-            infoHash: known?.usable
-              ? known.infoHash
-              : mayReusePreviousIdentity ? previous.infoHash : null,
-            torrentFileIndex: known?.usable
-              ? known.fileIndex
-              : mayReusePreviousIdentity ? previous.torrentFileIndex : null,
-            usable: managed
-              ? Boolean(known?.usable === true ||
-                  (mayReusePreviousIdentity && previous.usable === true))
-              : true,
-            path: resolved,
-            physicalKey,
-            copies: [{ path: resolved, physicalKey, size: info.size, modifiedAt }],
-            copyCount: 1,
           };
-          nextFilesByPhysicalKey.set(physicalKey, file);
-          record.scannedFiles = nextFilesByPhysicalKey.size;
-          let seed = collectionSeeds.get(collectionId);
-          if (!seed) {
-            seed = {
-              id: collectionId,
-              name: collectionName,
-              managed: Boolean(managed),
-              managedJobIds: managed ? [managed.id] : [],
-              files: [],
-            };
-            collectionSeeds.set(collectionId, seed);
-          } else if (managed && !seed.managedJobIds.includes(managed.id)) {
-            seed.managedJobIds.push(managed.id);
+          if (!managed && !pending.externalFingerprint) {
+            // Identity must be computed; defer to the bounded fingerprint pool.
+            deferredPhysicalKeys.add(physicalKey);
+            fingerprintTasks.push(pending);
+            continue;
           }
-          seed.files.push(file);
+          const file = buildFile(pending);
+          registerFile(file, pending);
         }
       }
+    }
+
+    if (!record.truncated && fingerprintTasks.length) {
+      let nextTask = 0;
+      let fingerprintResolved = 0;
+      const workers = Array.from({
+        length: Math.min(fingerprintConcurrencyValue, fingerprintTasks.length),
+      }, async () => {
+        while (nextTask < fingerprintTasks.length) {
+          const taskIndex = nextTask;
+          nextTask += 1;
+          const pending = fingerprintTasks[taskIndex];
+          const fingerprintPromise = fingerprintFile(pending.resolved);
+          // Surface fingerprint progress as soon as each hash settles, without
+          // waiting for the post-hash verification stat, so scanStatus() is
+          // monotonic while a scan is still running.
+          fingerprintPromise.then(() => {
+            fingerprintResolved += 1;
+            record.scannedFiles = Math.max(record.scannedFiles, fingerprintResolved);
+          }).catch(() => {});
+          const fingerprint = await fingerprintPromise.catch((error) => {
+            if (error?.code !== "ENOENT") record.failedRoots += 1;
+            return null;
+          });
+          if (!fingerprint) {
+            deferredPhysicalKeys.delete(pending.physicalKey);
+            continue;
+          }
+          const checked = await inspectPath(pending.resolved).catch((error) => {
+            if (error?.code !== "ENOENT") record.failedRoots += 1;
+            return null;
+          });
+          const checkedPhysicalKey = physicalFileKey(checked, pending.resolved);
+          if (
+            !checked?.isFile() ||
+            checkedPhysicalKey !== pending.physicalKey ||
+            checked.size !== pending.info.size ||
+            Number(checked.mtimeMs) !== pending.modifiedAt
+          ) {
+            record.failedRoots += 1;
+            deferredPhysicalKeys.delete(pending.physicalKey);
+            continue;
+          }
+          const file = buildFile({ ...pending, externalFingerprint: fingerprint });
+          registerFile(file, pending);
+        }
+      });
+      await Promise.all(workers);
     }
 
     if (record.failedRoots) {
@@ -820,6 +893,24 @@ export function createLibraryCatalog({
     },
     readyForCleanup() {
       return Number.isFinite(lastSuccessfulScanAt);
+    },
+    async rootsReachable() {
+      const result = await canonicalRoots();
+      return result.failedRoots === 0;
+    },
+    markScanError(error) {
+      const record = {
+        id: null,
+        status: "error",
+        startedAt: now(),
+        finishedAt: now(),
+        scannedFiles: filesById.size,
+        failedRoots: 1,
+        truncated: false,
+        error: String(error || "The library scan failed; the previous catalog was kept."),
+      };
+      latestScan = record;
+      return scanSnapshot(record);
     },
     list,
     listFiles,
