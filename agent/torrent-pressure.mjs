@@ -76,7 +76,7 @@ function wireScore(wire) {
 
 export function applyTorrentConnectionPlan(
   client,
-  { mode, totalBudget, trim = true, limitForTorrent } = {},
+  { mode, totalBudget, trim = true, limitForTorrent, skipTorrent } = {},
 ) {
   const torrents = Array.isArray(client?.torrents) ? client.torrents : [];
   const plan = torrentConnectionPlan(mode, torrents.length, { totalBudget });
@@ -94,6 +94,11 @@ export function applyTorrentConnectionPlan(
   let pausedTorrents = 0;
   if (trim) {
     for (const [torrentIndex, torrent] of torrents.entries()) {
+      // Silenced torrents (network kill switch / offline mode / finished
+      // non-shared downloads) must stay paused and wire-free: pausing is what
+      // rejects inbound peer connections, so the pressure plan must not resume
+      // them just because they have no live connections.
+      if (typeof skipTorrent === "function" && skipTorrent(torrent)) continue;
       const wires = Array.isArray(torrent?.wires) ? torrent.wires.filter((wire) => !wire.destroyed) : [];
       const limit = torrentLimits[torrentIndex] ?? plan.perTorrentLimit;
       if (wires.length > limit) {

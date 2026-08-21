@@ -1,4 +1,5 @@
 import Torrent from "webtorrent/lib/torrent.js";
+import { NETWORK_SILENCED } from "./network-control.mjs";
 
 const PATCH_MARKER = Symbol.for("watchpair.webtorrent.scheduler-guard");
 const RECOVERY_MARKER = Symbol.for("watchpair.webtorrent.piece-recovery");
@@ -133,6 +134,15 @@ export function installWebTorrentSafetyGuards() {
   prototype._onWire = function onWireWithBufferCopies(wire, ...args) {
     stabilizeWireBitfieldWrites(wire);
     return onWire.call(this, wire, ...args);
+  };
+
+  const startDiscovery = prototype._startDiscovery;
+  prototype._startDiscovery = function startDiscoveryUnlessSilenced() {
+    if (this[NETWORK_SILENCED]) {
+      this._debug("network control: ignoring _startDiscovery while silenced");
+      return;
+    }
+    return startDiscovery.call(this);
   };
 
   const request = prototype._request;
