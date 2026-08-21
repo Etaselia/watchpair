@@ -733,3 +733,20 @@ test("rootsReachable reports configured library folder availability", async () =
     await rm(temporary, { recursive: true, force: true });
   }
 });
+
+test("markScanError updates the shared scan status without a scan", async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "watchpair-library-mark-"));
+  const catalogPath = path.join(temporary, "catalog.json");
+
+  try {
+    const catalog = createLibraryCatalog({ roots: [], catalogPath });
+    await catalog.load();
+    const marked = catalog.markScanError("folders disappeared");
+    assert.equal(marked.status, "error");
+    assert.equal(marked.error, "folders disappeared");
+    assert.equal(catalog.scanStatus().status, "error",
+      "the shared scan status must become error so stale-data consumers refuse to match");
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});

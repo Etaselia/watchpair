@@ -2466,18 +2466,12 @@ async function scanLibrary(queryValue) {
   const files = libraryCatalog.listFiles({ query: queryValue, limit: 300 });
   if (!(await libraryCatalog.rootsReachable())) {
     // The configured folders are gone right now: keep serving the last-good
-    // catalog, but surface it as stale instead of making this request wait for
-    // a scan that is guaranteed to fail.
-    const previous = libraryCatalog.scanStatus();
-    return {
-      files,
-      scan: {
-        ...previous,
-        status: "error",
-        error: "One or more configured library folders could not be scanned; the previous catalog was kept.",
-      },
-      stale: true,
-    };
+    // catalog, but mark the scan errored (so /library/match and friends also
+    // refuse stale data) without making this request wait for a doomed scan.
+    const scan = libraryCatalog.markScanError(
+      "One or more configured library folders could not be scanned; the previous catalog was kept."
+    );
+    return { files, scan, stale: true };
   }
   // Refresh in the background; the listing itself never waits on the scan, so a
   // slow first scan (large library, cold fingerprint cache) cannot block the UI.

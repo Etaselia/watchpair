@@ -898,6 +898,20 @@ export function createLibraryCatalog({
       const result = await canonicalRoots();
       return result.failedRoots === 0;
     },
+    markScanError(error) {
+      const record = {
+        id: null,
+        status: "error",
+        startedAt: now(),
+        finishedAt: now(),
+        scannedFiles: filesById.size,
+        failedRoots: 1,
+        truncated: false,
+        error: String(error || "The library scan failed; the previous catalog was kept."),
+      };
+      latestScan = record;
+      return scanSnapshot(record);
+    },
     list,
     listFiles,
     getCollection(id) {
