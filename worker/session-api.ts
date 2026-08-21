@@ -28,36 +28,7 @@ const DEFAULT_VOICE_CONFIG: VoiceConfig = {
 };
 
 export interface SessionRuntimeEnv {
-  DB?: D1Database;
   WATCHPAIR_ICE_SERVERS?: string;
-}
-
-interface SessionRow {
-  token: string;
-  host_id: string;
-  source_json: string | null;
-  selected_media_json: string | null;
-  player_json: string;
-  seq: number;
-  created_at: number;
-  expires_at: number;
-  updated_at: number;
-}
-
-interface ParticipantRow {
-  device_id: string;
-  name: string;
-  state_json: string;
-  updated_at: number;
-}
-
-interface VoiceSignalRow {
-  id: string;
-  from_id: string;
-  to_id: string;
-  signal_type: string;
-  data: string;
-  created_at: number;
 }
 
 interface SessionStore {
@@ -76,15 +47,6 @@ interface SessionStore {
   setSelectedMedia(token: string, media: SelectedMedia | null, now: number): Promise<void>;
   setPlayer(token: string, player: PlayerState, now: number): Promise<void>;
   addVoiceSignal(token: string, signal: VoiceSignal): Promise<void>;
-}
-
-function json<T>(value: string | null, fallback: T): T {
-  if (!value) return fallback;
-  try {
-    return JSON.parse(value) as T;
-  } catch {
-    return fallback;
-  }
 }
 
 function normalizeToken(value: unknown) {
@@ -166,44 +128,6 @@ function sanitizeReadiness(value: Partial<LocalReadiness> | undefined): LocalRea
   };
 }
 
-function sanitizeStoredMediaItems(source: SharedSource): SharedMediaItem[] | undefined {
-  if (!Array.isArray(source.mediaItems)) return undefined;
-  try {
-    const items = mediaManifest(
-      source.mediaItems.slice(0, 500).map((item) => ({
-        index: item.fileIndex,
-        path: item.path,
-        size: item.size,
-        included: item.included,
-        priority: item.priority,
-      })),
-      source.id
-    );
-    const controls = new Map(source.mediaItems.map((item) => [item.id, item]));
-    return items.map((item) => ({
-      ...item,
-      included: controls.get(item.id)?.included !== false,
-      priority: Boolean(controls.get(item.id)?.priority),
-    }));
-  } catch {
-    return undefined;
-  }
-}
-
-function normalizeSources(value: string | null): SharedSource[] {
-  const stored = json<SharedSource | SharedSource[] | null>(value, null);
-  if (!stored) return [];
-  return (Array.isArray(stored) ? stored : [stored])
-    .filter((item) => item && typeof item.id === "string" && typeof item.value === "string")
-    .map((source) => ({
-      ...source,
-      infoHash: /^[a-f0-9]{40}$/i.test(String(source.infoHash || ""))
-        ? String(source.infoHash).toLowerCase()
-        : undefined,
-      mediaItems: sanitizeStoredMediaItems(source),
-    }));
-}
-
 function normalizedSourceIdentity(kind: unknown, value: unknown) {
   const normalizedKind = String(kind || "");
   const rawValue = String(value || "").trim();
@@ -251,196 +175,6 @@ function stableParticipants(participants: ParticipantState[], hostId: string) {
       left.name.localeCompare(right.name) ||
       left.deviceId.localeCompare(right.deviceId)
   );
-}
-
-class D1SessionStore implements SessionStore {
-  constructor(
-    private readonly db: D1Database,
-    private readonly voice: VoiceConfig
-  ) {}
-
-  async initialize() {
-    await this.db.batch([
-      this.db.prepare(`CREATE TABLE IF NOT EXISTS watch_sessions (
-        token TEXT PRIMARY KEY,
-        host_id TEXT NOT NULL,
-        source_json TEXT,
-        selected_media_json TEXT,
-        player_json TEXT NOT NULL,
-        seq INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
-      )`),
-      this.db.prepare(`CREATE TABLE IF NOT EXISTS watch_participants (
-        session_token TEXT NOT NULL,
-        device_id TEXT NOT NULL,
-        name TEXT NOT NULL,
-        state_json TEXT NOT NULL,
-        updated_at INTEGER NOT NULL,
-        PRIMARY KEY (session_token, device_id)
-      )`),
-      this.db.prepare(
-        "CREATE INDEX IF NOT EXISTS watch_participants_session_idx ON watch_participants (session_token, updated_at)"
-      ),
-      this.db.prepare(`CREATE TABLE IF NOT EXISTS watch_voice_signals (
-        session_token TEXT NOT NULL,
-        id TEXT NOT NULL,
-        from_id TEXT NOT NULL,
-        to_id TEXT NOT NULL,
-        signal_type TEXT NOT NULL,
-        data TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        PRIMARY KEY (session_token, id)
-      )`),
-      this.db.prepare(
-        "CREATE INDEX IF NOT EXISTS watch_voice_signals_recipient_idx ON watch_voice_signals (session_token, to_id, created_at)"
-      ),
-    ]);
-  }
-
-  async get(token: string, recipientId?: string): Promise<WatchSession | null> {
-    const now = Date.now();
-    const row = await this.db
-      .prepare("SELECT * FROM watch_sessions WHERE token = ? AND expires_at > ?")
-      .bind(token, now)
-      .first<SessionRow>();
-    if (!row) return null;
-
-    const participantRows = await this.db
-      .prepare(
-        "SELECT device_id, name, state_json, updated_at FROM watch_participants WHERE session_token = ? AND updated_at >= ? ORDER BY updated_at DESC"
-      )
-      .bind(token, now - PARTICIPANT_ACTIVE_MS)
-      .all<ParticipantRow>();
-    const participants = stableParticipants(
-      participantRows.results.map((participant) => ({
-        deviceId: participant.device_id,
-        name: participant.name,
-        ...sanitizeReadiness(json<LocalReadiness>(participant.state_json, defaultReadiness())),
-        updatedAt: participant.updated_at,
-      })),
-      row.host_id
-    );
-
-    const signalRows = recipientId
-      ? await this.db
-          .prepare(`SELECT id, from_id, to_id, signal_type, data, created_at
-            FROM watch_voice_signals
-            WHERE session_token = ? AND to_id = ? AND created_at >= ?
-            ORDER BY created_at ASC LIMIT 200`)
-          .bind(token, recipientId, now - VOICE_SIGNAL_TTL_MS)
-          .all<VoiceSignalRow>()
-      : { results: [] as VoiceSignalRow[] };
-    const voiceSignals = signalRows.results.map((signal) => ({
-      id: signal.id,
-      fromId: signal.from_id,
-      toId: signal.to_id,
-      type: signal.signal_type as VoiceSignalType,
-      data: signal.data,
-      createdAt: signal.created_at,
-    }));
-
-    const sources = normalizeSources(row.source_json);
-    const selectedMedia = json<SelectedMedia | null>(row.selected_media_json, null);
-    return {
-      token: row.token,
-      hostId: row.host_id,
-      sources,
-      source: activeSource(sources, selectedMedia),
-      selectedMedia,
-      player: json<PlayerState>(row.player_json, initialPlayerState(row.updated_at)),
-      seq: row.seq,
-      createdAt: row.created_at,
-      expiresAt: row.expires_at,
-      updatedAt: row.updated_at,
-      serverTime: now,
-      participants,
-      voiceSignals,
-      voice: this.voice,
-    };
-  }
-
-  async create(token: string, hostId: string, now: number) {
-    await this.db
-      .prepare(`INSERT OR IGNORE INTO watch_sessions
-        (token, host_id, source_json, selected_media_json, player_json, seq, created_at, expires_at, updated_at)
-        VALUES (?, ?, NULL, NULL, ?, 0, ?, ?, ?)`)
-      .bind(token, hostId, JSON.stringify(initialPlayerState(now)), now, now + SESSION_TTL_MS, now)
-      .run();
-  }
-
-  async touch(
-    token: string,
-    deviceId: string,
-    name: string,
-    readiness: Partial<LocalReadiness> | undefined,
-    now: number
-  ) {
-    await this.db
-      .prepare(`INSERT INTO watch_participants (session_token, device_id, name, state_json, updated_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(session_token, device_id) DO UPDATE SET
-          name = excluded.name,
-          state_json = excluded.state_json,
-          updated_at = excluded.updated_at`)
-      .bind(token, deviceId, safeName(name), JSON.stringify(sanitizeReadiness(readiness)), now)
-      .run();
-    await this.db
-      .prepare("UPDATE watch_sessions SET expires_at = ? WHERE token = ?")
-      .bind(now + SESSION_TTL_MS, token)
-      .run();
-  }
-
-  async setSource(token: string, source: SharedSource, now: number) {
-    const serialized = JSON.stringify(source);
-    await this.db
-      .prepare(`UPDATE watch_sessions SET
-        source_json = CASE
-          WHEN source_json IS NULL OR NOT json_valid(source_json) THEN json_array(json(?))
-          WHEN json_type(source_json) = 'array' THEN json_insert(source_json, '$[#]', json(?))
-          ELSE json_array(json(source_json), json(?))
-        END,
-        seq = seq + 1,
-        updated_at = ?
-        WHERE token = ?`)
-      .bind(serialized, serialized, serialized, now, token)
-      .run();
-  }
-
-  async setSources(token: string, sources: SharedSource[], now: number) {
-    await this.db
-      .prepare("UPDATE watch_sessions SET source_json = ?, seq = seq + 1, updated_at = ? WHERE token = ?")
-      .bind(JSON.stringify(sources), now, token)
-      .run();
-  }
-
-  async setSelectedMedia(token: string, media: SelectedMedia | null, now: number) {
-    await this.db
-      .prepare("UPDATE watch_sessions SET selected_media_json = ?, player_json = ?, seq = seq + 1, updated_at = ? WHERE token = ?")
-      .bind(media ? JSON.stringify(media) : null, JSON.stringify(initialPlayerState(now)), now, token)
-      .run();
-  }
-
-  async setPlayer(token: string, player: PlayerState, now: number) {
-    await this.db
-      .prepare("UPDATE watch_sessions SET player_json = ?, seq = seq + 1, updated_at = ? WHERE token = ?")
-      .bind(JSON.stringify(player), now, token)
-      .run();
-  }
-
-  async addVoiceSignal(token: string, signal: VoiceSignal) {
-    await this.db.batch([
-      this.db
-        .prepare(`INSERT INTO watch_voice_signals
-          (session_token, id, from_id, to_id, signal_type, data, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?)`)
-        .bind(token, signal.id, signal.fromId, signal.toId, signal.type, signal.data, signal.createdAt),
-      this.db
-        .prepare("DELETE FROM watch_voice_signals WHERE session_token = ? AND created_at < ?")
-        .bind(token, signal.createdAt - VOICE_SIGNAL_TTL_MS),
-    ]);
-  }
 }
 
 interface MemorySession {
@@ -921,9 +655,7 @@ async function handlePost(request: Request, store: SessionStore) {
 export async function handleSessionApi(request: Request, runtimeEnv: SessionRuntimeEnv = {}) {
   try {
     const configuredVoice = voiceConfig(runtimeEnv.WATCHPAIR_ICE_SERVERS);
-    const store: SessionStore = runtimeEnv?.DB
-      ? new D1SessionStore(runtimeEnv.DB, configuredVoice)
-      : new MemorySessionStore(configuredVoice);
+    const store: SessionStore = new MemorySessionStore(configuredVoice);
     await store.initialize();
 
     if (request.method === "GET") return handleGet(request, store);
