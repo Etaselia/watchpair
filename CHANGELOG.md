@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.12.0](https://github.com/Etaselia/watchpair/compare/v0.11.1...v0.12.0) (2026-08-21)
+
+
+### Features
+
+* add torrent network controls and offline mode ([#88](https://github.com/Etaselia/watchpair/issues/88)) ([ce8c5af](https://github.com/Etaselia/watchpair/commit/ce8c5af415619020fdf2bef545119a389c3986be))
+* persist coordinator sessions across restarts ([#90](https://github.com/Etaselia/watchpair/issues/90)) ([c846ae3](https://github.com/Etaselia/watchpair/commit/c846ae3f69adb1e829b5aa516b401a7824a8ed8f))
+
 ## [0.11.1](https://github.com/Etaselia/watchpair/compare/v0.11.0...v0.11.1) (2026-08-21)
 
 
