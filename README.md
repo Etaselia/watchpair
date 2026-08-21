@@ -40,7 +40,7 @@ subtitle timing synchronized.
 ## Architecture
 
 ```text
-Browser A ---- polling/JIP + WebRTC signaling ---- Coordinator (in-memory) ---- Browser B
+Browser A ---- polling/JIP + WebRTC signaling ---- Coordinator (state + snapshot file) ---- Browser B
    |                                                                  |
 localhost companion                                              localhost companion
    |                                                                  |
@@ -144,8 +144,21 @@ The coordinator listens on port 3000 and exposes `GET /api/health`. Set
 `WATCHPAIR_ICE_SERVERS` to the JSON configuration shown above. Put the service behind HTTPS using
 Caddy, Traefik, Nginx, or the hosting provider's managed proxy.
 
-Sessions are held in memory on the coordinator. Run exactly one coordinator replica; restarts
-invalidate active room tokens.
+Run exactly one coordinator replica. Sessions are held in memory on the coordinator and mirrored to
+a JSON snapshot file, so active rooms survive restarts and deploys. Set `WATCHPAIR_SESSION_FILE` to
+a writable path inside the container and mount a persistent volume there. The image runs as the
+non-root `node` user (UID 1000), so the mounted directory must be writable by UID 1000. Writes are
+debounced (about once per second) and atomic (a `.tmp` file is renamed into place), so the on-disk
+state stays recent and consistent even when the container is force-killed; only changes from the
+final second before a kill can be lost. If the path is unset or unwritable, the coordinator falls
+back to in-memory sessions (with an error logged) so the site still works.
+
+With `docker compose`, sessions persist to `./data/sessions.json` (a bind mount). Before the first
+`docker compose up`, create that directory owned by UID 1000:
+
+```bash
+mkdir -p ./data && sudo chown 1000:1000 ./data
+```
 
 ## Development and releases
 

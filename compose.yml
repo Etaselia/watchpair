@@ -7,8 +7,19 @@ services:
     environment:
       PORT: 3000
       WATCHPAIR_ICE_SERVERS: ${WATCHPAIR_ICE_SERVERS:-}
+      # Persist watch rooms across coordinator restarts: the coordinator
+      # mirrors sessions to this JSON snapshot file (debounced + atomic
+      # writes, see worker/session-api.ts).
+      WATCHPAIR_SESSION_FILE: /data/sessions.json
     ports:
       - "3000:3000"
     security_opt:
       - no-new-privileges:true
     stop_grace_period: 20s
+    volumes:
+      # Bind mount rather than a named volume: Docker initializes named
+      # volumes as root-owned, but the image runs as the non-root `node` user
+      # (UID 1000). Before the first `docker compose up`, create the host
+      # directory owned by UID 1000, e.g.:
+      #   mkdir -p ./data && sudo chown 1000:1000 ./data
+      - ./data:/data

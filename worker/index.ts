@@ -13,6 +13,13 @@ import { handleSessionApi } from "./session-api";
 interface Env {
   WATCHPAIR_ICE_SERVERS?: string;
   /**
+   * Optional JSON snapshot file that mirrors watch-room state across restarts
+   * (see worker/session-api.ts). The Node prod server passes the process
+   * environment through, so set this in the container/compose environment and
+   * mount a persistent volume at the path.
+   */
+  WATCHPAIR_SESSION_FILE?: string;
+  /**
    * Never provided by the self-hosted Node runtime. Declared so this env is
    * structurally compatible with vinext's App Router handler, which accepts
    * an optional Cloudflare-style ASSETS binding and only reads it when set.
