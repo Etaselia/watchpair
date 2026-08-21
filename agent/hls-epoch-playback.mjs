@@ -1479,6 +1479,9 @@ export function createHlsPlaybackManager({
       throw new Error("The committed HLS epoch failed cache validation.");
     }
     await atomicWriteJson(path.join(state.generationPath, MANIFEST_FILE), manifest);
+    // The completion flag must be observable before the ENDLIST playlist is
+    // published; publishGeneration writes the #EXT-X-ENDLIST-bearing playlists.
+    if (manifest.complete) state.complete = true;
     await publishGeneration(state.generationPath, manifest, state.audioTracks);
     state.manifest = manifest;
     state.contiguousReadySeconds = manifestPreparedSeconds(manifest);
