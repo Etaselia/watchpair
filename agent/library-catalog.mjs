@@ -10,6 +10,12 @@ const DEFAULT_FINGERPRINT_CONCURRENCY = 4;
 const DEFAULT_PAGE_SIZE = 50;
 const MAX_PAGE_SIZE = 200;
 
+// A bare UUID used as a folder name — typically an orphaned WatchPair managed
+// download directory (named after its job id) scanned as an EXTERNAL file.
+// Such a boundary is not a meaningful collection name; the collection is named
+// after the file itself instead.
+const BARE_JOB_UUID_NAME_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+
 function normalizedPath(value) {
   const resolved = path.resolve(value);
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
@@ -511,8 +517,10 @@ export function createLibraryCatalog({
           const collectionId = managed
             ? managedCollectionIds.get(managed.identity)
             : opaqueId(salt, "collection", collectionKey);
-          const collectionName = managed?.label || (relativeParts.length > 1
-            ? relativeParts[0]
+          const boundaryName = relativeParts.length > 1 ? relativeParts[0] : null;
+          const collectionName = managed?.label || (boundaryName &&
+            !BARE_JOB_UUID_NAME_PATTERN.test(boundaryName)
+            ? boundaryName
             : path.parse(entry.name).name);
           const known = managed?.knownFiles.get(normalizedResolved);
           const fileId = opaqueId(salt, "file", normalizedResolved);
@@ -688,14 +696,23 @@ export function createLibraryCatalog({
         } while (reservedCollectionIds.has(id));
       }
       reservedCollectionIds.add(id);
+      const previousName = collectionsById.get(id)?.name;
+      const seedNames = seeds.map((seed) => seed.name);
+      const compareNames = (left, right) => left.localeCompare(right, "en", {
+        numeric: true,
+        sensitivity: "base",
+      });
       finalSeeds.push({
         id,
-        name: collectionsById.get(id)?.name || seeds
-          .map((seed) => seed.name)
-          .sort((left, right) => left.localeCompare(right, "en", {
-            numeric: true,
-            sensitivity: "base",
-          }))[0],
+        // A previously persisted UUID name (orphaned managed download folder)
+        // is replaced by the meaningful file-derived seed name; non-UUID
+        // previous names keep winning exactly as before.
+        name: previousName && !BARE_JOB_UUID_NAME_PATTERN.test(previousName)
+          ? previousName
+          : (seedNames
+              .filter((name) => !BARE_JOB_UUID_NAME_PATTERN.test(name))
+              .sort(compareNames)[0]
+            ?? seedNames.sort(compareNames)[0]),
         managed: false,
         managedJobIds: [],
         pinAliases: rankedIds,

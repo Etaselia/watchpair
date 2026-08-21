@@ -36,6 +36,7 @@ const inputs = [
   ["torrent-pressure.mjs", resolve(root, "agent", "torrent-pressure.mjs")],
   ["network-control.mjs", resolve(root, "agent", "network-control.mjs")],
   ["webtorrent-safety.mjs", resolve(root, "agent", "webtorrent-safety.mjs")],
+  ["torrent-state.mjs", resolve(root, "agent", "torrent-state.mjs")],
   ["package.json", resolve(root, "companion", "package.json")],
   ["pnpm-lock.yaml", resolve(root, "companion", "pnpm-lock.yaml")],
   ["pnpm-workspace.yaml", resolve(root, "companion", "pnpm-workspace.yaml")],
