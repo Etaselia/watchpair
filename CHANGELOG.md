@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.11.1](https://github.com/Etaselia/watchpair/compare/v0.11.0...v0.11.1) (2026-08-21)
+
+
+### Bug Fixes
+
+* mark HLS generation complete before publishing ENDLIST ([#85](https://github.com/Etaselia/watchpair/issues/85)) ([8cbea79](https://github.com/Etaselia/watchpair/commit/8cbea79e6aaec518062808e74b323b3c7617c7b4))
+
+
+### Performance Improvements
+
+* decouple library listing from scan and parallelize fingerprinting ([#84](https://github.com/Etaselia/watchpair/issues/84)) ([e1c5706](https://github.com/Etaselia/watchpair/commit/e1c57063e36cacd6dbafa073930ba6da8ee5621f))
+
 ## [0.11.0](https://github.com/Etaselia/watchpair/compare/v0.10.9...v0.11.0) (2026-08-21)
 
 
