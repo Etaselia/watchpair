@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/Etaselia/watchpair/compare/v0.10.9...v0.11.0) (2026-08-21)
+
+
+### Features
+
+* add companion library and torrent insights ([#82](https://github.com/Etaselia/watchpair/issues/82)) ([93ca1aa](https://github.com/Etaselia/watchpair/commit/93ca1aaacfc92efa70296ad803240fd3d8767a0e))
+
 ## [0.10.9](https://github.com/Etaselia/watchpair/compare/v0.10.8...v0.10.9) (2026-08-20)
 
 
