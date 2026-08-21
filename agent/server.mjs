@@ -260,6 +260,21 @@ const libraryCatalog = createLibraryCatalog({
     await jobStore.flush();
   },
 });
+
+let libraryRescanTimer = null;
+function scheduleLibraryRescan() {
+  if (libraryRescanTimer) return;
+  libraryRescanTimer = setTimeout(() => {
+    libraryRescanTimer = null;
+    try {
+      libraryCatalog.startScan();
+    } catch (error) {
+      agentLogger.warn("library_rescan_failed", { error });
+    }
+  }, 1_000);
+  libraryRescanTimer.unref?.();
+}
+
 const preparationQueue = [];
 let preparationWorker = null;
 const selectedPreparationKeys = new Set();
@@ -876,6 +891,7 @@ async function completeSelectedFile(job, index = job.selectedIndex) {
     });
     refreshPreparationScheduling();
     queueMediaPreparation(job, index);
+    scheduleLibraryRescan();
   } catch (error) {
     agentLogger.error("media_file_completion_failed", { jobId: job.id, fileIndex: index, error });
     asset.status = "error";
@@ -2414,6 +2430,16 @@ async function validateLibraryEntry(entry) {
     }
   }
   throw new Error("The library file changed after it was scanned; scan the library again.");
+}
+
+async function requireVerifiedLibraryEntry(entry) {
+  if (entry.usable !== false) return entry;
+  // The catalog can be stale: a managed torrent file finished verifying after
+  // the last scan. Re-scan once and re-read the entry before rejecting.
+  const scan = libraryCatalog.startScan();
+  await scan.completion;
+  const refreshed = libraryCatalog.getFile(entry.id);
+  return refreshed && refreshed.usable !== false ? refreshed : null;
 }
 
 function confirmedLegacyJobIds(body) {
@@ -4144,12 +4170,13 @@ const server = createServer(async (request, response) => {
         sendJson(response, 403, { error: "Library preview is not authorized." });
         return;
       }
-      const entry = libraryCatalog.getFile(localLibraryPreviewMatch[1]);
-      if (!entry) {
+      const rawEntry = libraryCatalog.getFile(localLibraryPreviewMatch[1]);
+      if (!rawEntry) {
         sendJson(response, 404, { error: "Library file not found." });
         return;
       }
-      if (entry.usable === false) {
+      const entry = await requireVerifiedLibraryEntry(rawEntry);
+      if (!entry) {
         sendJson(response, 409, { error: "Library file has not completed verification." });
         return;
       }
@@ -4538,9 +4565,10 @@ const server = createServer(async (request, response) => {
 
     const librarySeedMatch = /^\/library\/([a-f0-9]{24})\/seed$/.exec(url.pathname);
     if (request.method === "POST" && librarySeedMatch) {
-      const entry = libraryCatalog.getFile(librarySeedMatch[1]);
-      if (!entry) throw new Error("Scan the companion library again before selecting that file.");
-      if (entry.usable === false) throw new Error("Library file has not completed verification.");
+      const rawEntry = libraryCatalog.getFile(librarySeedMatch[1]);
+      if (!rawEntry) throw new Error("Scan the companion library again before selecting that file.");
+      const entry = await requireVerifiedLibraryEntry(rawEntry);
+      if (!entry) throw new Error("Library file has not completed verification.");
       const body = await readJson(request);
       const validated = await validateLibraryEntry(entry);
       const job = await seedLocalFile({
@@ -4557,9 +4585,10 @@ const server = createServer(async (request, response) => {
 
     const libraryAttachMatch = /^\/library\/([a-f0-9]{24})\/attach$/.exec(url.pathname);
     if (request.method === "POST" && libraryAttachMatch) {
-      const entry = libraryCatalog.getFile(libraryAttachMatch[1]);
-      if (!entry) throw new Error("Scan the companion library again before selecting that file.");
-      if (entry.usable === false) throw new Error("Library file has not completed verification.");
+      const rawEntry = libraryCatalog.getFile(libraryAttachMatch[1]);
+      if (!rawEntry) throw new Error("Scan the companion library again before selecting that file.");
+      const entry = await requireVerifiedLibraryEntry(rawEntry);
+      if (!entry) throw new Error("Library file has not completed verification.");
       const body = await readJson(request);
       const job = await attachLibraryFile({
         id: validJobId(body.sourceId),
