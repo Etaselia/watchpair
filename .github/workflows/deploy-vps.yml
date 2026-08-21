@@ -75,12 +75,10 @@ jobs:
           set -euo pipefail
 
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
-            tag=$(
-              gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-                --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' |
-                grep -E '^v?[0-9]+\.[0-9]+\.0$' |
-                head -n 1 || true
-            )
+            if ! tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name'); then
+              echo "Could not resolve the latest stable release for scheduled reconciliation." >&2
+              exit 69
+            fi
           elif [[ "${{ github.event_name }}" == "workflow_run" ]]; then
             if [[ ! "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
               echo "The completed release workflow did not provide a valid commit SHA." >&2
