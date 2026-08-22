@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.12.4](https://github.com/Etaselia/watchpair/compare/v0.12.3...v0.12.4) (2026-08-22)
+
+
+### Bug Fixes
+
+* lock audio timeline to video to prevent long-video desync ([#97](https://github.com/Etaselia/watchpair/issues/97)) ([c95bf79](https://github.com/Etaselia/watchpair/commit/c95bf79ca8d89e2a1201615e2d834d1468ae7e58))
+* publish HLS completion after final playlists are on disk ([#99](https://github.com/Etaselia/watchpair/issues/99)) ([d8b1a75](https://github.com/Etaselia/watchpair/commit/d8b1a75649d2113f61a67f49a5b577ac852ffa1c))
+
 ## [0.12.3](https://github.com/Etaselia/watchpair/compare/v0.12.2...v0.12.3) (2026-08-21)
 
 
