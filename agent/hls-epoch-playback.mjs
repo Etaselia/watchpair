@@ -1977,8 +1977,14 @@ export function alignAudioTimelineToVideo(stream, videoSegmentDuration) {
   const delta = target - current;
   if (Math.abs(delta) < 0.000001) return stream;
   if (Math.abs(delta) > MAX_AUDIO_TIMELINE_ADJUSTMENT_SECONDS) return stream;
-  const last = segments[segments.length - 1];
-  last.duration = timelineRounded(Number(last.duration || 0) + delta);
+  // Absorb the delta into the largest segment. A negative delta (audio cut
+  // slightly long) must never be sunk into a tiny trailing AAC-frame remainder,
+  // which would drive it non-positive and trip the manifest cache validation.
+  let sink = segments[0];
+  for (const segment of segments) {
+    if (Number(segment.duration || 0) > Number(sink.duration || 0)) sink = segment;
+  }
+  sink.duration = timelineRounded(Number(sink.duration || 0) + delta);
   // Recompute presentationDuration from the adjusted segments so the manifest
   // invariant (presentationDuration === sum of segment durations) holds exactly,
   // and the published audio playlist's cumulative EXTINF matches the video's.
