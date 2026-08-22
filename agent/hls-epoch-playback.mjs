@@ -1505,9 +1505,11 @@ export function createHlsPlaybackManager({
     // "complete" generation must never leave a stale writer.json behind
     // (restart recovery depends on that invariant).
     await clearWriterLease(state, token).catch(() => {});
-    // The completion flag must be observable before the ENDLIST playlist is
-    // published; publishGeneration writes the #EXT-X-ENDLIST-bearing playlists.
-    if (manifest.complete) state.complete = true;
+    // Publish the ENDLIST-bearing playlists and the generation pointers before
+    // the completion flag becomes observable. Observers of `complete` read the
+    // published playlist and manifest together, so every derived asset must be
+    // on disk before `state.complete` flips; otherwise a reader can observe a
+    // stale playlist (one epoch short) alongside the final manifest.
     await publishGeneration(state.generationPath, manifest, state.audioTracks);
     state.manifest = manifest;
     state.contiguousReadySeconds = manifestPreparedSeconds(manifest);
@@ -1531,6 +1533,7 @@ export function createHlsPlaybackManager({
         await promoteGeneration(state, "contiguous-window");
       }
     }
+    if (manifest.complete) state.complete = true;
 
     emit("hls_epoch_committed", {
       jobId: state.jobId,
