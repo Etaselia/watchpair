@@ -28,6 +28,13 @@ const CACHE_DIRECTORY_VERSION = "v13";
 const DEFAULT_SEGMENT_SECONDS = 4;
 const DEFAULT_PLAYABLE_SECONDS = 120;
 const DEFAULT_EPOCH_SECONDS = 30;
+// The largest per-epoch audio/video duration difference that is absorbed by
+// timeline alignment. Video and audio streams are cut on different sample
+// grids (video frames vs 48kHz AAC frames), so each 30s epoch's measured
+// durations differ by up to ~one video frame plus one AAC frame. Anything
+// beyond a quarter second means the audio stream is genuinely shorter and
+// must not be padded by playlist arithmetic.
+const MAX_AUDIO_TIMELINE_ADJUSTMENT_SECONDS = 0.25;
 const FRAGMENT_VALIDATION_TIMEOUT_MS = 15_000;
 const PLAYABLE_WINDOW_TOLERANCE_SECONDS = 0.25;
 const VIDEO_END_TOLERANCE_SECONDS = 0.025;
@@ -448,7 +455,7 @@ function streamForEpoch(epoch, kind, trackId = null) {
     : epoch.streams?.audio?.[String(trackId)];
 }
 
-function publicMediaPlaylist(manifest, kind, trackId = null) {
+export function publicMediaPlaylist(manifest, kind, trackId = null) {
   const audioMode = descriptorAudioMode(manifest);
   const streams = manifest.epochs
     .map((epoch) => ({ epoch, stream: streamForEpoch(epoch, kind, trackId) }))
@@ -1437,6 +1444,10 @@ export function createHlsPlaybackManager({
       outputs.videoPlaylist,
       epochIndex
     );
+    const videoSegmentDuration = video.segments.reduce(
+      (total, segment) => total + Number(segment.duration || 0),
+      0
+    );
     const audio = {};
     for (const track of state.audioTracks) {
       const id = trackDirectory(track);
@@ -1446,6 +1457,15 @@ export function createHlsPlaybackManager({
         outputs.audioPlaylists[id],
         epochIndex
       );
+      // The audio and video streams of an epoch are cut on different sample
+      // grids (video frames vs 48kHz AAC frames), so their measured playlist
+      // durations differ by up to one frame each. Publishing them as-is makes
+      // the audio playlist's cumulative duration drift from the video
+      // playlist's by that frame difference per epoch, which accumulates into
+      // an audible A/V desync over long videos. Lock the audio stream's
+      // declared duration to the video stream's so both playlists stay on the
+      // same cumulative timeline across arbitrary epoch counts.
+      alignAudioTimelineToVideo(audio[id], videoSegmentDuration);
     }
 
     const presentedEnd = epochStart + video.presentationDuration;
@@ -1942,6 +1962,36 @@ export function createHlsPlaybackManager({
       })),
     }),
   };
+}
+
+export function alignAudioTimelineToVideo(stream, videoSegmentDuration) {
+  const target = Number(videoSegmentDuration);
+  if (!stream || !Number.isFinite(target) || target <= 0) return stream;
+  const segments = Array.isArray(stream.segments) ? stream.segments : [];
+  if (!segments.length) return stream;
+  const current = segments.reduce(
+    (total, segment) => total + Number(segment.duration || 0),
+    0
+  );
+  if (!Number.isFinite(current) || current <= 0) return stream;
+  const delta = target - current;
+  if (Math.abs(delta) < 0.000001) return stream;
+  if (Math.abs(delta) > MAX_AUDIO_TIMELINE_ADJUSTMENT_SECONDS) return stream;
+  // Absorb the delta into the largest segment. A negative delta (audio cut
+  // slightly long) must never be sunk into a tiny trailing AAC-frame remainder,
+  // which would drive it non-positive and trip the manifest cache validation.
+  let sink = segments[0];
+  for (const segment of segments) {
+    if (Number(segment.duration || 0) > Number(sink.duration || 0)) sink = segment;
+  }
+  sink.duration = timelineRounded(Number(sink.duration || 0) + delta);
+  // Recompute presentationDuration from the adjusted segments so the manifest
+  // invariant (presentationDuration === sum of segment durations) holds exactly,
+  // and the published audio playlist's cumulative EXTINF matches the video's.
+  stream.presentationDuration = timelineRounded(
+    segments.reduce((total, segment) => total + Number(segment.duration || 0), 0)
+  );
+  return stream;
 }
 
 async function readStableAsset(filePath) {
