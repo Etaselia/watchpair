@@ -164,9 +164,13 @@ export function createSingleFlightCache({
   };
 }
 
-export async function pathStats(target, { concurrency = DEFAULT_SIZE_CONCURRENCY } = {}) {
+export async function pathStats(target, {
+  concurrency = DEFAULT_SIZE_CONCURRENCY,
+  exclude = () => false,
+} = {}) {
   const limit = Math.max(1, Math.min(32, Math.floor(Number(concurrency) || DEFAULT_SIZE_CONCURRENCY)));
   const queue = [target];
+  const excluded = (candidate) => candidate !== target && Boolean(exclude(candidate));
   let cursor = 0;
   let active = 0;
   let total = 0;
@@ -204,7 +208,11 @@ export async function pathStats(target, { concurrency = DEFAULT_SIZE_CONCURRENCY
               return;
             }
             const entries = await readdir(current, { withFileTypes: true });
-            for (const entry of entries) queue.push(path.join(current, entry.name));
+            for (const entry of entries) {
+              const childPath = path.join(current, entry.name);
+              if (excluded(childPath)) continue;
+              queue.push(childPath);
+            }
           })
           .then(() => {
             active -= 1;
