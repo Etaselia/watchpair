@@ -2286,7 +2286,11 @@ async function managedDirectoryIsOwned(job) {
 }
 
 async function claimConfirmedLegacyDirectory(job) {
-  if (!job?.managed || !job.restoredFromManifest || !job.legacyUnowned || job.ownershipToken) {
+  // Claim any managed job that lacks an ownership token (not just restored
+  // legacy manifests). Retention cleanup authorizes deletion for these jobs, and
+  // the realpath-containment plus no-existing-marker checks below keep the claim
+  // safe.
+  if (!job?.managed || job.ownershipToken) {
     return false;
   }
   const directory = managedJobDirectory(job.id);
@@ -3718,6 +3722,14 @@ async function runStorageCleanup({
         continue;
       }
       if (!jobCleanupReason(job, settings, now)) continue;
+      // Managed downloads restored before the ownership-marker feature carry no
+      // ownership token. They already passed the retention gate, so claim their
+      // directory (a real, contained path with no existing marker) before
+      // deleting — otherwise stopJob silently bails on the ownership check and
+      // these jobs survive cleanup forever.
+      if (!(await managedDirectoryIsOwned(job)) && !(await claimConfirmedLegacyDirectory(job))) {
+        continue;
+      }
       const removedBytes = await jobRemovalBytes(job);
       if (jobs.get(job.id) !== job || !jobCleanupReason(job, settings, Date.now())) continue;
       if (!(await stopJob(job.id, {
