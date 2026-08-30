@@ -212,6 +212,40 @@ test("keeps sessions in memory only when no file is configured", async () => {
   assert.equal(await second.get("ABCD-EFGH"), null);
 });
 
+test("rejoin with an empty queue preserves previously published per-video readiness", async (t) => {
+  const file = await tempSessionFile(t);
+  const now = 1_700_000_000_000;
+  const store = new FileSessionStore(VOICE, file, { now: () => now });
+  await store.initialize();
+  await store.create("ABCD-EFGH", "host-device", now);
+
+  const readyItem = {
+    ready: true,
+    progress: 100,
+    status: "Ready to watch",
+    fileName: "video.mp4",
+    fileSize: 123,
+    fingerprint: "fp-0001",
+    preparation: "ready",
+  };
+  await store.touch("ABCD-EFGH", "guest-device", "Guest", {
+    ...readyItem,
+    queue: { "source-0001": readyItem },
+    voice: { enabled: false, muted: true, deafened: false },
+  }, now);
+
+  // A fresh page load (or a leave/rejoin) publishes an empty readiness. The
+  // merge must keep the previously published per-video queue instead of wiping
+  // it, so the coordinator does not regress to "not ready" on rejoin.
+  await store.touch("ABCD-EFGH", "guest-device", "Guest", undefined, now);
+
+  const session = await store.get("ABCD-EFGH");
+  const guest = session.participants.find((participant) => participant.deviceId === "guest-device");
+  assert.ok(guest);
+  assert.equal(guest.queue?.["source-0001"]?.ready, true);
+  assert.equal(guest.queue?.["source-0001"]?.preparation, "ready");
+});
+
 test("wires WATCHPAIR_SESSION_FILE through the session API", async (t) => {
   const file = await tempSessionFile(t);
   const env = { WATCHPAIR_SESSION_FILE: file, WATCHPAIR_ICE_SERVERS: "{}" };
