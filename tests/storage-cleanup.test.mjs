@@ -36,6 +36,25 @@ test("measures and removes owned directory trees", async () => {
   await assert.rejects(stat(root), { code: "ENOENT" });
 });
 
+test("pathSize skips excluded subtrees without counting them", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "watchpair-pathsize-exclude-"));
+  const kept = path.join(root, "kept");
+  const skipped = path.join(root, ".watchpair-hls");
+  await mkdir(kept);
+  await mkdir(skipped);
+  await writeFile(path.join(kept, "video.bin"), Buffer.alloc(7));
+  await writeFile(path.join(skipped, "segment.m4s"), Buffer.alloc(11));
+
+  assert.equal(
+    await pathSize(root, {
+      exclude: (candidate) => path.basename(candidate) === ".watchpair-hls",
+    }),
+    7
+  );
+  assert.equal(await pathSize(root), 18, "without exclude both subtrees are counted");
+  await rm(root, { recursive: true, force: true });
+});
+
 test("finds the latest mtime anywhere in an owned directory tree", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "watchpair-storage-mtime-"));
   const nested = path.join(root, "nested");
