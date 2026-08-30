@@ -272,10 +272,18 @@ class MemorySessionStore implements SessionStore {
   ) {
     const record = this.sessions.get(token);
     if (!record) return;
+    const existing = record.participants.get(deviceId);
+    const incoming = sanitizeReadiness(readiness);
     record.participants.set(deviceId, {
       deviceId,
       name: safeName(name),
-      ...sanitizeReadiness(readiness),
+      ...incoming,
+      // A rejoin/heartbeat that carries an empty queue (fresh page load, or a
+      // network switch before the companion refresh has rebuilt state) must not
+      // erase the per-video ready states this peer already published. Merge so
+      // the coordinator keeps the last-known-good queue until the client
+      // re-publishes fresh data for every entry.
+      queue: { ...(existing?.queue || {}), ...incoming.queue },
       updatedAt: now,
     });
     record.expiresAt = now + SESSION_TTL_MS;
