@@ -106,7 +106,7 @@ import {
 } from "./torrent-state.mjs";
 
 const HOST = "127.0.0.1";
-const APP_VERSION = process.env.WATCHPAIR_APP_VERSION || "0.12.4"; // x-release-please-version
+const APP_VERSION = process.env.WATCHPAIR_APP_VERSION || "0.12.5"; // x-release-please-version
 const PROTOCOL_VERSION = 2;
 const CONTROL_TOKEN = String(process.env.WATCHPAIR_CONTROL_TOKEN || "");
 const PORT = Number(process.env.WATCHPAIR_AGENT_PORT || 41735);

@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.12.5](https://github.com/Etaselia/watchpair/compare/v0.12.4...v0.12.5) (2026-08-30)
+
+
+### Bug Fixes
+
+* honor download retention for jobs restored without an ownership marker ([#104](https://github.com/Etaselia/watchpair/issues/104)) ([e4469d4](https://github.com/Etaselia/watchpair/commit/e4469d40ae3da3ae8983b212a08e4cd5bfb2658e))
+* restore select buttons and readiness after reload or rejoin ([#103](https://github.com/Etaselia/watchpair/issues/103)) ([3bc2b7d](https://github.com/Etaselia/watchpair/commit/3bc2b7d1ae311fa2cdaf77a3c9d9d97fc56725a8))
+
 ## [0.12.4](https://github.com/Etaselia/watchpair/compare/v0.12.3...v0.12.4) (2026-08-22)
 
 
