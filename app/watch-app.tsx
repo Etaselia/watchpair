@@ -1610,7 +1610,13 @@ export default function WatchApp() {
   }, [activeSourceId, activeSourceKind, acquisitionPolicy, agentAvailable, approvedSourceIds, attachLocalFile, joined]);
 
   useEffect(() => {
-    if (!joined || !agentAvailable || !sourcesKey) return;
+    // The queue rebuild and readiness publish must not depend on the
+    // permissions/keep-alive pipeline: after a reload or rejoin the companion
+    // job list is the only source that can restore per-video readiness, and the
+    // keep-alive loop (gated on agentPermission) may never open on some
+    // networks. Poll optimistically; getAgentDownloads() fails fast when the
+    // companion is genuinely unreachable.
+    if (!joined || !sourcesKey) return;
 
     let active = true;
     let refreshRunning = false;
@@ -3187,17 +3193,20 @@ export default function WatchApp() {
                         <strong>{Math.round(localState?.progress || 0)}%</strong>
                         <span>{readyCount}/{Math.max(2, session?.participants.length || 0)} ready</span>
                       </div>
-                      {target && job && (
-                        <button
-                          className={selected ? "secondary-button compact-button selected" : "secondary-button compact-button"}
-                          type="button"
-                          onClick={() => void chooseAgentMedia(source.id, job, target)}
-                          title={selected ? "Currently selected" : "Select for playback"}
-                        >
-                          {selected ? <Check /> : <Play />}
-                          {selected ? "Selected" : "Select"}
-                        </button>
-                      )}
+                      <button
+                        className={selected ? "secondary-button compact-button selected" : "secondary-button compact-button"}
+                        type="button"
+                        disabled={!job || !target}
+                        onClick={() => { if (job && target) void chooseAgentMedia(source.id, job, target); }}
+                        title={
+                          selected ? "Currently selected"
+                            : !job || !target ? "Waiting for the companion to verify this job"
+                              : "Select for playback"
+                        }
+                      >
+                        {selected ? <Check /> : <Play />}
+                        {selected ? "Selected" : "Select"}
+                      </button>
                     </div>
 
                     <div className="queue-preparation" title={preparation.title || undefined}>
