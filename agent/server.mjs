@@ -1799,6 +1799,13 @@ function startTorrent(job, { restoreMetadata = false } = {}) {
 
   torrent.on("metadata", () => {
     if (job.paused) return;
+    // A torrent that was replaced (re-added) can still emit its metadata event
+    // after job.torrent has moved on to a new torrent object. Its file list may
+    // differ, so selectTorrentFile would throw "Torrent file not found." (and
+    // WebTorrent's async _onMetadata turns that into an unhandled rejection).
+    // Ignore metadata events from a torrent that is no longer the job's current
+    // torrent.
+    if (job.torrent !== torrent) return;
     agentLogger.info("torrent_metadata_ready", {
       jobId: job.id,
       infoHash: torrent.infoHash,
@@ -3630,6 +3637,29 @@ async function streamLibraryPreview(request, response, entry, headers) {
 }
 
 
+const CACHE_DIRECTORY_BASENAMES = new Set([
+  path.basename(IMPORT_DIR),
+  path.basename(HLS_DIR),
+  path.basename(SUBTITLE_DIR),
+  path.basename(MEDIA_DIR),
+]);
+
+// The regenerable cache directories (HLS segments, subtitles, media, partial
+// imports) contain many small files, so walking them dominates the storage
+// scan. Measure them on a longer cadence and skip them from the per-minute
+// walk so the /storage endpoint stays fast even on a large library.
+const storageCacheDiskUsage = createSingleFlightCache({
+  ttlMs: 5 * 60_000,
+  retryDelayMs: 60_000,
+  async load() {
+    const targets = [IMPORT_DIR, HLS_DIR, SUBTITLE_DIR, MEDIA_DIR];
+    const sizes = await Promise.all(targets.map((target) =>
+      pathSize(target, { concurrency: 8 })
+    ));
+    return sizes.reduce((total, size) => total + size, 0);
+  },
+});
+
 const storageDiskUsage = createSingleFlightCache({
   ttlMs: 60_000,
   retryDelayMs: 60_000,
@@ -3637,8 +3667,15 @@ const storageDiskUsage = createSingleFlightCache({
     const startedAt = Date.now();
     agentLogger.info("storage_scan_started", { concurrency: 8 });
     const filesystem = await statfs(DOWNLOAD_DIR).catch(() => null);
+    const [downloadBytes, cacheBytes] = await Promise.all([
+      pathSize(DOWNLOAD_DIR, {
+        concurrency: 8,
+        exclude: (candidate) => CACHE_DIRECTORY_BASENAMES.has(path.basename(candidate)),
+      }),
+      storageCacheDiskUsage.get(),
+    ]);
     const usage = {
-      bytes: await pathSize(DOWNLOAD_DIR, { concurrency: 8 }),
+      bytes: downloadBytes + cacheBytes,
       availableBytes: filesystem ? filesystem.bavail * filesystem.bsize : null,
       totalBytes: filesystem ? filesystem.blocks * filesystem.bsize : null,
     };
