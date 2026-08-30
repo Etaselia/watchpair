@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.6](https://github.com/Etaselia/watchpair/compare/v0.12.5...v0.12.6) (2026-08-30)
+
+
+### Bug Fixes
+
+* ignore stale torrent metadata and speed up storage scans ([#107](https://github.com/Etaselia/watchpair/issues/107)) ([4c069b2](https://github.com/Etaselia/watchpair/commit/4c069b254fcce892aa3090f955e51d6ab125c221))
+
 ## [0.12.5](https://github.com/Etaselia/watchpair/compare/v0.12.4...v0.12.5) (2026-08-30)
 
 
