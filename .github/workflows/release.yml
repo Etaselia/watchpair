@@ -41,7 +41,7 @@ jobs:
     if: needs.release.outputs.release_created == 'true' || inputs.version != ''
     needs: release
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     permissions:
       contents: write
       packages: write
@@ -84,6 +84,8 @@ jobs:
           push: true
           provenance: true
           sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           build-args: VCS_REF=${{ steps.source.outputs.sha }}
           tags: |
             ${{ env.IMAGE }}:${{ env.VERSION }}
