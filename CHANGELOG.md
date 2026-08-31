@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.7](https://github.com/Etaselia/watchpair/compare/v0.12.6...v0.12.7) (2026-08-31)
+
+
+### Bug Fixes
+
+* restore downloaded torrents and playback state after a restart ([#110](https://github.com/Etaselia/watchpair/issues/110)) ([3a01204](https://github.com/Etaselia/watchpair/commit/3a0120456a042d9d4a7b44f717fca5bf2d2937bd))
+
 ## [0.12.6](https://github.com/Etaselia/watchpair/compare/v0.12.5...v0.12.6) (2026-08-30)
 
 
