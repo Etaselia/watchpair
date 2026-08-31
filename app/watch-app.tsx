@@ -263,17 +263,21 @@ function queueReadinessForJob(job: AgentJob, file: AgentFile | null): QueueReadi
     ? "Download paused on this device"
     : job.status === "error"
     ? job.error || "Download failed"
-    : !file.ready
-      ? job.status === "metadata" ? "Reading torrent metadata" : "Downloading locally"
-      : !fingerprint
-        ? "Verifying file identity"
-      : preparation === "error"
-        ? file?.preparation.error || job.preparation.error || "Browser preparation failed"
-        : preparation === "queued"
-          ? "Queued for browser preparation"
-          : preparation === "preparing"
-            ? "Preparing initial video buffer"
-            : "Ready to watch";
+    : file.status === "verifying"
+      ? "Downloaded — verifying on disk"
+      : !file.downloadReady
+        ? job.status === "metadata" ? "Reading torrent metadata" : "Downloading locally"
+        : !file.ready
+          ? "Downloaded — preparing browser copy"
+          : !fingerprint
+            ? "Verifying file identity"
+            : preparation === "error"
+              ? file?.preparation.error || job.preparation.error || "Browser preparation failed"
+              : preparation === "queued"
+                ? "Queued for browser preparation"
+                : preparation === "preparing"
+                  ? "Preparing initial video buffer"
+                  : "Ready to watch";
 
   return {
     ready: file.ready && Boolean(fingerprint) && (preparation === "ready" || preparation === "direct"),
@@ -1047,9 +1051,14 @@ export default function WatchApp() {
 
   const applySession = useCallback((nextSession: WatchSession) => {
     const current = sessionRef.current;
+    // A coordinator restart can restore a seq lower than the client's in-memory
+    // value (the session snapshot is written on a ~1s debounce, so a force-killed
+    // process may lose the last bump). Accept such a session when the server
+    // clock has advanced, so the client never permanently ignores the
+    // coordinator's state after a restart.
     const older =
       current?.token === nextSession.token &&
-      (nextSession.seq < current.seq ||
+      ((nextSession.seq < current.seq && nextSession.serverTime <= current.serverTime) ||
         (nextSession.seq === current.seq && nextSession.serverTime < current.serverTime));
     if (older) return false;
     sessionRef.current = nextSession;
@@ -1986,9 +1995,13 @@ export default function WatchApp() {
         }
       }
 
-      if (!selectedMedia) {
+      if (!selectedMedia && !sessionRef.current?.selectedMedia) {
         for (const source of queueSources) {
           if (!refreshIsCurrent()) return;
+          // A user (or another client) may have selected media while this tick
+          // was fetching and verifying jobs; never override it with the
+          // auto-select, otherwise a fresh selection gets reverted ~1s later.
+          if (sessionRef.current?.selectedMedia) return;
           const job = jobsById[source.id];
           const target = job ? preferredAgentFile(job) : null;
           if (!job || !target) continue;

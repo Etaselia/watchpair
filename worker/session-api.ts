@@ -308,8 +308,20 @@ class MemorySessionStore implements SessionStore {
   async setSelectedMedia(token: string, media: SelectedMedia | null, now: number) {
     const record = this.sessions.get(token);
     if (!record) return;
+    const previous = record.selectedMedia;
+    const sameMedia = Boolean(
+      media &&
+      previous &&
+      (media.sourceId ?? null) === (previous.sourceId ?? null) &&
+      (media.fileIndex ?? null) === (previous.fileIndex ?? null) &&
+      media.size === previous.size
+    );
     record.selectedMedia = media;
-    record.player = initialPlayerState(now);
+    // Re-selecting the same media (the client re-publishes select-media to
+    // attach a fingerprint once the file is identified) must not reset the room
+    // player, otherwise every such POST pauses playback for all participants
+    // about a second after the initial selection.
+    if (!sameMedia) record.player = initialPlayerState(now);
     record.seq += 1;
     record.updatedAt = now;
   }

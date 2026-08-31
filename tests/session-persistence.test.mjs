@@ -246,6 +246,37 @@ test("rejoin with an empty queue preserves previously published per-video readin
   assert.equal(guest.queue?.["source-0001"]?.preparation, "ready");
 });
 
+test("re-selecting the same media preserves the room player", async (t) => {
+  const file = await tempSessionFile(t);
+  const now = 1_700_000_000_000;
+  const store = new FileSessionStore(VOICE, file, { now: () => now });
+  await store.initialize();
+  await store.create("ABCD-EFGH", "host-device", now);
+
+  const media = { sourceId: "source-0001", fileIndex: 0, name: "video.mkv", size: 123 };
+  await store.setSelectedMedia("ABCD-EFGH", media, now);
+  await store.setPlayer(
+    "ABCD-EFGH",
+    { ...playerAt(now), paused: false, position: 42.5 },
+    now
+  );
+
+  // The client re-publishes the same media once it knows the fingerprint; this
+  // must not reset the room player (it used to pause everyone ~1s after a
+  // fresh selection).
+  await store.setSelectedMedia("ABCD-EFGH", { ...media, fingerprint: "fp-1" }, now);
+  const preserved = await store.get("ABCD-EFGH");
+  assert.equal(preserved.selectedMedia.fingerprint, "fp-1");
+  assert.equal(preserved.player.paused, false);
+  assert.equal(preserved.player.position, 42.5);
+
+  // Selecting a genuinely different media still resets the player.
+  await store.setSelectedMedia("ABCD-EFGH", { ...media, fileIndex: 1 }, now);
+  const reset = await store.get("ABCD-EFGH");
+  assert.equal(reset.player.paused, true);
+  assert.equal(reset.player.position, 0);
+});
+
 test("wires WATCHPAIR_SESSION_FILE through the session API", async (t) => {
   const file = await tempSessionFile(t);
   const env = { WATCHPAIR_SESSION_FILE: file, WATCHPAIR_ICE_SERVERS: "{}" };
