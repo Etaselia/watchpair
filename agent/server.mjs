@@ -1760,18 +1760,21 @@ function startTorrent(job, { restoreMetadata = false } = {}) {
   }
   job.torrentTelemetry?.dispose();
   job.torrent = torrent;
-  const restoreSilenced = Boolean(job.torrentSilenced);
   job.torrentSilenced = false;
   job.torrentTelemetry = createTorrentTelemetry(torrent);
-  if (!networkState.torrentEnabled || networkState.offline || restoreSilenced) {
-    // The torrent's discovery is created asynchronously; silence it once it
-    // exists so the kill switch / offline mode also covers new starts, and a
-    // torrent restored with persisted download-complete silence stays silent
-    // instead of re-announcing to trackers after an agent restart.
+  if (!networkState.torrentEnabled || networkState.offline) {
+    // The kill switch / offline mode must also cover newly started torrents:
+    // silence them as soon as their discovery exists.
     queueMicrotask(() => {
       if (job.torrent === torrent && !torrent.destroyed) silenceLiveTorrentNetworking(job);
     });
   }
+  // A persisted "download-complete" silence is deliberately NOT re-applied here.
+  // Re-silencing before WebTorrent starts discovery would permanently block the
+  // magnet's metadata fetch and strand the restored job at "metadata" with an
+  // empty file list. Once metadata loads and the on-disk files verify,
+  // maybeSilenceCompletedTorrent (invoked from the metadata/file-done/torrent-done
+  // handlers and the periodic network sweep) re-silences the finished download.
   torrent.on("wire", () => refreshTorrentPressure("wire-connected"));
   installTorrentPieceRecovery(
     torrent,
