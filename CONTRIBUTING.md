@@ -13,9 +13,24 @@ npm run check
 npm test
 npm run test:desktop:e2e
 docker build -t watchpair:test .
+npm audit --omit=dev
+npx --yes pnpm@10.34.5 --dir companion audit --prod
 ```
 
 The pre-commit hook runs lint, type checking, and the fast unit suite. The pre-push hook runs the production build and all integration tests. CI repeats both, exercises development and packaged Electron clients on Windows and Linux, and verifies the production Docker image.
+
+Audit both lockfiles: desktop builds use the root npm tree, while the portable companion ZIP
+ships `companion/pnpm-lock.yaml`. Use the companion's pinned pnpm version when refreshing it
+so its `ip` security override is preserved. CI checks both production dependency trees.
+
+As of 2026-10-22, the full root audit also reports two upstream advisories without published
+patched versions: [braces](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm) in build/lint glob
+processing and [sprintf-js](https://github.com/advisories/GHSA-hp3w-g68c-fv3c) in Electron's
+build-time download/proxy logging. These propagate to multiple development dependencies;
+they are not present in the companion production dependency audit. Do not use `npm audit fix
+--force` to resolve them: its proposed downgrades cross supported framework/builder versions.
+Recheck upstream fixes during dependency maintenance and review any change that exposes these
+tools to untrusted patterns or format strings.
 
 ## Commits and releases
 
