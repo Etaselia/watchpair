@@ -79,8 +79,9 @@ test("production serves libass WebAssembly with the streaming MIME type", async 
 
 test("production recovers stale JavaScript chunk requests without caching the miss", async () => {
   const chunks = await readdir(new URL("../dist/client/_next/static/chunks/", import.meta.url));
-  const currentChunk = chunks.find((file) => file.startsWith("hls-") && file.endsWith(".js"));
-  assert.ok(currentChunk);
+  // Vinext emits content-hash-only names; recovery must not depend on a library prefix.
+  const currentChunk = chunks.find((file) => file.endsWith(".js"));
+  assert.ok(currentChunk, "the production build should emit a JavaScript chunk");
   const current = await fetch(
     `http://127.0.0.1:${port}/_next/static/chunks/${currentChunk}`,
     { method: "HEAD" },

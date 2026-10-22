@@ -261,6 +261,26 @@ test("imports, seeds, restores, and cleans an expired companion file", { timeout
     assert.equal(restoredDownload.job.lastAccessedAt, oldTimestamp);
     assert.equal(restoredDownload.job.pinned, false);
 
+    if (process.platform === "win32") {
+      // Reproduce a probe/scanner retaining a non-delete-sharing handle during cleanup.
+      const lock = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", [
+        "$file = [System.IO.File]::Open($env:WATCHPAIR_TEST_LOCK_FILE, 'Open', 'Read', 'Read')",
+        "try { [Console]::WriteLine('locked'); Start-Sleep -Milliseconds 600 } finally { $file.Dispose() }",
+      ].join("; ")], {
+        env: {
+          ...process.env,
+          WATCHPAIR_TEST_LOCK_FILE: path.join(directory, "downloads", sourceId, "shared-video.mkv"),
+        },
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      await new Promise((resolve, reject) => {
+        lock.once("error", reject);
+        lock.once("exit", (code) => reject(new Error(`File lock exited before readiness: ${code}`)));
+        lock.stdout.once("data", () => resolve());
+      });
+    }
+
     const expiredCleanupResponse = await localFetch(base + "/cleanup", { method: "POST" });
     assert.equal(expiredCleanupResponse.status, 202);
     const expiredCleanupStarted = await expiredCleanupResponse.json();
