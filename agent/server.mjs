@@ -2879,7 +2879,11 @@ async function stopJob(id, {
     }
     try {
       // Ownership is deliberately checked immediately before recursive removal.
-      await rm(managedJobDirectory(id), { recursive: true, force: true });
+      // Windows probes/scanners can retain a handle briefly after the transfer stops.
+      // Let transient locks clear before treating a partially removed tree as a failure.
+      await rm(managedJobDirectory(id), {
+        recursive: true, force: true, maxRetries: 5, retryDelay: 100,
+      });
     } catch (error) {
       await restoreJobTransferAfterCleanup(job);
       throw error;
