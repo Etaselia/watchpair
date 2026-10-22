@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.8](https://github.com/Etaselia/watchpair/compare/v0.12.7...v0.12.8) (2026-10-22)
+
+
+### Bug Fixes
+
+* update vulnerable dependencies and stabilize desktop validation ([#133](https://github.com/Etaselia/watchpair/issues/133)) ([c7921c2](https://github.com/Etaselia/watchpair/commit/c7921c214024cbdbc93b3ab343a1371ffe5cfe3e))
+
 ## [0.12.7](https://github.com/Etaselia/watchpair/compare/v0.12.6...v0.12.7) (2026-08-31)
 
 
