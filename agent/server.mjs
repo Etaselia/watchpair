@@ -2102,10 +2102,11 @@ function effectiveDownloadSelection(job) {
 function bindDownload(job, id, indexes) {
   const existing = jobs.get(id) || downloadAliases.get(id);
   if (existing && existing !== job) throw new Error("This source id is already bound to different media.");
-  job.downloadBindings.set(id, normalizeDownloadFileIndexes(indexes));
+  const selection = normalizeDownloadFileIndexes(indexes);
   if (id !== job.id) downloadAliases.set(id, job);
-  job.downloadFileIndexes = effectiveDownloadSelection(job);
+  applyFileSelection(job, selection, id);
   touchJob(job);
+  refreshTorrentSelections("source-bound");
   return job;
 }
 
@@ -2153,7 +2154,8 @@ function persistedJob(job) {
     seed: Boolean(job.seed),
     paused: Boolean(job.paused),
     seedPath: job.seedPath,
-    downloaded: job.downloaded,
+    downloaded: job.kind === "magnet" && !job.seed && job.torrent?.ready
+      ? job.torrent.downloaded : job.downloaded,
     identityFingerprint: job.identityFingerprint,
     identityFingerprintKey: job.identityFingerprintKey,
     torrentVerifiedKey: job.torrentVerifiedKey || null,
@@ -3229,7 +3231,13 @@ async function restoreJobs() {
   restoringJobs = true;
   failedRestoreRecords = [];
   try {
-    for (const record of records) {
+    // A failed duplicate may precede the useful copy in older manifests. Start
+    // the most complete active payload first so later aliases reuse its bytes.
+    const restoreOrder = [...records].sort((left, right) =>
+      Number(Boolean(left.paused)) - Number(Boolean(right.paused)) ||
+      (Number(right.downloaded) || 0) - (Number(left.downloaded) || 0) ||
+      Object.keys(right.torrentVerifiedKeys || {}).length - Object.keys(left.torrentVerifiedKeys || {}).length);
+    for (const record of restoreOrder) {
       try {
         if (record.transient || (record.managed === false && record.kind === "direct")) {
           continue;

@@ -176,9 +176,10 @@ test("companion downloads chosen nested seasons, preserves an empty selection on
     await writeFile(path.join(legacyDirectory, ".watchpair-owned.json"), JSON.stringify({ version: 1, id: legacyId, token: legacyToken }));
     await writeFile(path.join(legacyDirectory, "keep.txt"), "preserved old duplicate folder");
     const legacyDuplicate = { ...recordsBeforeRestart[0], id: legacyId, storageId: legacyId,
-      ownershipToken: legacyToken, downloadFileIndexes: [] };
+      ownershipToken: legacyToken, downloaded: 0, downloadFileIndexes: [],
+      torrentVerifiedKeys: null, torrentVerifiedKey: null, identityFingerprint: null };
     delete legacyDuplicate.downloadBindings;
-    await writeFile(path.join(downloads, ".watchpair-jobs.json"), JSON.stringify([...recordsBeforeRestart, legacyDuplicate]));
+    await writeFile(path.join(downloads, ".watchpair-jobs.json"), JSON.stringify([legacyDuplicate, ...recordsBeforeRestart]));
     aliasIds.push(legacyId);
     await start();
     const aliasJob = async (key = aliasId) => (await fetch(`${base}/downloads/${key}`).then((response) => response.json())).job;
