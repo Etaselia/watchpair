@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { mediaItemId, mediaManifest, sameMediaManifest } from "../lib/media-queue.mjs";
+import { mediaItemId, mediaManifest, sameMediaManifest, mediaQueue } from "../lib/media-queue.mjs";
 import { magnetInfoHash } from "../lib/magnet-identity.mjs";
 import { isMediaWatched, mediaWatchKey, mergeWatchedRanges, watchedFraction } from "../lib/watch-history.mjs";
 import {
@@ -691,7 +691,12 @@ async function handleGet(request: Request, store: SessionStore) {
 
 async function handlePost(request: Request, store: SessionStore) {
   const body = (await request.json()) as Record<string, unknown>;
-  const action = String(body.action ?? "");
+  let action = String(body.action ?? "");
+  const companionAction = action.startsWith("companion-");
+  if (companionAction) action = action.slice("companion-".length);
+  if (companionAction && !["select-files", "reorder-sources", "watch-state", "source", "source-manifest"].includes(action)) {
+    return Response.json({ error: "Unsupported Companion action." }, { status: 400 });
+  }
   const deviceId = String(body.deviceId ?? "").slice(0, 80);
   const name = safeName(body.name);
   const now = Date.now();
@@ -724,6 +729,12 @@ async function handlePost(request: Request, store: SessionStore) {
   }
   if (!currentSession) {
     return Response.json({ error: "Session not found or expired" }, { status: 404 });
+  }
+  if (companionAction) {
+    if (!["select-files", "reorder-sources", "watch-state", "source", "source-manifest"].includes(action) || deviceId !== currentSession.hostId) {
+      return Response.json({ error: "Only the room host can control the shared queue from Companion." }, { status: 403 });
+    }
+    if (body.expectedSeq !== currentSession.seq) return Response.json({ error: "The room changed. Refresh and apply the selection again." }, { status: 409 });
   }
 
   if (action === "join" || action === "heartbeat") {
@@ -829,8 +840,8 @@ async function handlePost(request: Request, store: SessionStore) {
       return Response.json({ error: "Only torrent sources can publish a synchronized file manifest." }, { status: 409 });
     }
     const candidates = Array.isArray(body.mediaItems) ? body.mediaItems : [];
-    if (!candidates.length || candidates.length > 500) {
-      return Response.json({ error: "A torrent can publish between 1 and 500 video files." }, { status: 400 });
+    if (!candidates.length || candidates.length > 10000) {
+      return Response.json({ error: "A torrent can publish between 1 and 10000 video files." }, { status: 400 });
     }
     const indexes = candidates.map((value) => Number((value as Partial<SharedMediaItem>).fileIndex));
     if (
@@ -896,20 +907,31 @@ async function handlePost(request: Request, store: SessionStore) {
     const sourceId = String(body.sourceId || "");
     const source = currentSession.sources.find((item) => item.id === sourceId);
     const ids = Array.isArray(body.itemIds) ? body.itemIds.map(String) : null;
+    const manifestIds = new Set(source?.mediaItems?.map(item => item.id));
+    const selectedIds = new Set(ids);
     if (!source?.mediaItems?.length || !ids || new Set(ids).size !== ids.length ||
-      ids.some((id) => !source.mediaItems!.some((item) => item.id === id))) {
+      ids.some((id) => !manifestIds.has(id))) {
       return Response.json({ error: "Choose files from this torrent's manifest." }, { status: 400 });
     }
     const selectedItem = source.mediaItems.find((item) => item.id === currentSession.selectedMedia?.itemId);
-    if (selectedItem && !ids.includes(selectedItem.id) && !currentSession.player.paused) {
+    if (selectedItem && !ids.includes(selectedItem.id) && !currentSession.player.paused && !companionAction) {
       return Response.json({ error: "Pause playback before excluding the current video." }, { status: 409 });
     }
-    await store.setSources(token, currentSession.sources.map((item) => item.id === sourceId ? {
+    const nextSources = currentSession.sources.map((item) => item.id === sourceId ? {
       ...item, selectionConfirmed: true,
-      selectedFileIndexes: item.mediaItems!.filter((media) => ids.includes(media.id)).map((media) => media.fileIndex),
-      mediaItems: item.mediaItems!.map((media) => ({ ...media, included: ids.includes(media.id) })),
-    } : item), now);
-    if (selectedItem && !ids.includes(selectedItem.id)) await store.setSelectedMedia(token, null, now);
+      selectedFileIndexes: item.mediaItems!.filter((media) => selectedIds.has(media.id)).map((media) => media.fileIndex),
+      mediaItems: item.mediaItems!.map((media) => ({ ...media, included: selectedIds.has(media.id) })),
+    } : item);
+    await store.setSources(token, nextSources, now);
+    if (selectedItem && !ids.includes(selectedItem.id)) {
+      const queue = mediaQueue(nextSources, currentSession.watchRecords);
+      const originalQueue = currentSession.sources.flatMap(source => source.mediaItems || []);
+      const currentIndex = originalQueue.findIndex(item => item.id === selectedItem.id);
+      const next = companionAction ? queue.find(item => originalQueue.findIndex(candidate => candidate.id === item.id) > currentIndex) || queue[0] : null;
+      await store.setSelectedMedia(token, next ? { sourceId: next.sourceId, itemId: next.id, fileIndex: next.fileIndex, name: next.name, size: next.size } : null, now);
+      if (companionAction) await store.setPlayer(token, { ...currentSession.player, position: 0, paused: !next,
+        changedAt: now, actorId: deviceId }, now);
+    }
   } else if (action === "watch-state" || action === "watch-progress") {
     let targets: WatchTarget[] = [];
     const watchAction = action === "watch-progress" ? "progress" : String(body.state) as WatchAction;

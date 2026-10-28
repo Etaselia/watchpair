@@ -6,6 +6,8 @@ const invoke = (channel, value) => ipcRenderer.invoke(channel, value);
 contextBridge.exposeInMainWorld("watchpair", {
   getState: () => invoke("companion:get-state"),
   getTransfers: () => invoke("companion:get-transfers"),
+  getTransferControls: () => invoke("companion:get-transfer-controls"),
+  transferCommand: (command) => invoke("companion:transfer-command", command),
   getTorrentDetails: (id) => invoke("companion:get-torrent-details", id),
   getLibrary: (options) => invoke("companion:get-library", options),
   scanLibrary: () => invoke("companion:scan-library"),

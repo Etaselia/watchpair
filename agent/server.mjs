@@ -47,6 +47,8 @@ import {
 } from "./media-priority.mjs";
 import { createTorrentBandwidthGovernor } from "./torrent-bandwidth-governor.mjs";
 import { createJsonStore } from "./job-store.mjs";
+import { normalizeTransferControls, validateBandwidthSettings, orderTransferTargets } from "./transfer-controls.mjs";
+import { createRoomControl } from "./room-control.mjs";
 import {
   RETENTION_METADATA_VERSION,
   RECENT_PLAYBACK_PROTECTION_MS,
@@ -241,6 +243,16 @@ const pairingNonces = new Map();
 const jobs = new Map();
 const downloadAliases = new Map();
 const jobStore = createJsonStore(JOBS_PATH);
+const transferControlStore = createJsonStore(path.join(DOWNLOAD_DIR, ".watchpair-transfer-controls.json"));
+const transferControls = normalizeTransferControls(await transferControlStore.load({}));
+const roomControl = createRoomControl();
+const transferActivity = new Map();
+function recordTransferActivity(job, message) {
+  const events = transferActivity.get(job.id) || [];
+  events.unshift({ at: Date.now(), message });
+  transferActivity.set(job.id, events.slice(0, 80));
+}
+function persistTransferControls() { transferControlStore.schedule(transferControls); }
 let restoringJobs = false;
 let failedRestoreRecords = [];
 const libraryCatalog = createLibraryCatalog({
@@ -341,6 +353,8 @@ const client = new WebTorrent({
   dhtPort: DHT_PORT,
   seedOutgoingConnections: true,
 });
+client.throttleDownload(transferControls.downloadLimit || -1);
+client.throttleUpload(transferControls.uploadLimit || -1);
 let torrentPressure = { ...INITIAL_TORRENT_PRESSURE, trimmedPeers: 0, pausedTorrents: 0 };
 let lastTorrentPressurePlanKey = "";
 let lastTorrentPressureLogAt = 0;
@@ -672,8 +686,8 @@ async function readBody(request, limit = 64 * 1024) {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-async function readJson(request) {
-  return JSON.parse((await readBody(request)) || "{}");
+async function readJson(request, limit = 64 * 1024) {
+  return JSON.parse((await readBody(request, limit)) || "{}");
 }
 
 function torrentFileName(file) {
@@ -1380,7 +1394,7 @@ function torrentFiles(job) {
   if (job.seed && job.file) {
     return [agentFileSnapshot(job, 0, job.file, job.file.size, 100, job.status === "ready")];
   }
-  if (!job.torrent) return [];
+  if (!job.torrent) return job.pausedFiles || [];
   return job.torrent.files.map((file, index) => {
     const progress = verifiedTorrentFileProgress(file);
     return agentFileSnapshot(
@@ -1413,11 +1427,17 @@ function snapshot(job, sourceId = job.id) {
   const indexes = job.downloadBindings?.get(sourceId);
   if (job.downloadBindings) files = files.map((file) => ({ ...file,
     itemId: `${sourceId}-f${file.index}`,
-    included: indexes == null || indexes.includes(file.index),
+    included: VIDEO_EXTENSIONS.test(file.path || file.name) && (indexes == null || indexes.includes(file.index)),
   }));
   const selected = files.find((file) => file.selected);
+  files = files.map(file => ({ ...file, downloadPriority: transferControls.priorities[job.id]?.[file.index] || "normal" }));
   return {
     id: sourceId,
+    label: job.label,
+    manualPaused: transferControls.paused.includes(job.id),
+    manualSelection: Object.hasOwn(transferControls.selections, sourceId),
+    downloadRole: torrentDownloadRoles.get(job.id) || "waiting",
+    checking: Boolean(job.checking),
     sharedTransferId: job.downloadBindings ? job.id : null,
     kind: job.kind,
     status: job.status,
@@ -1499,22 +1519,30 @@ let lastTorrentBandwidthPlanKey = "";
 
 function pendingTorrentTargets() {
   const targets = [];
-  if (mediaPriorityTargets.length) {
+  if (mediaPriorityTargets.length && transferControls.queueMode !== "manual") {
     for (const target of mediaPriorityTargets) {
       const job = jobs.get(target.jobId);
       const file = job?.torrent?.files?.[target.fileIndex];
-      if (job?.kind !== "magnet" || job.seed || !file || file.done || !torrentFileAllowed(job, target.fileIndex)) continue;
+      if (job?.kind !== "magnet" || job.seed || job.checking || !file || file.done || !torrentFileAllowed(job, target.fileIndex)) continue;
       targets.push({ jobId: job.id, fileIndex: target.fileIndex });
       if (targets.length >= MAX_BANDWIDTH_TARGETS) break;
     }
-    return targets;
+    if (targets.length >= MAX_BANDWIDTH_TARGETS) return targets;
   }
 
-  for (const job of jobs.values()) {
-    if (job.kind !== "magnet" || job.seed || !job.torrent?.files?.length) continue;
-    for (const fileIndex of orderedTorrentVideoIndexes(job.torrent)) {
+  const orderedJobs = Array.from(jobs.values()).sort((left, right) => {
+    const rank = id => { const index = transferControls.order.indexOf(id); return index < 0 ? Infinity : index; };
+    return rank(left.id) - rank(right.id);
+  });
+  for (const job of orderedJobs) {
+    if (job.kind !== "magnet" || job.seed || job.checking || !job.torrent?.files?.length) continue;
+    const priority = { high: 0, normal: 1, low: 2 };
+    const indexes = orderedTorrentVideoIndexes(job.torrent).sort((left, right) =>
+      priority[transferControls.priorities[job.id]?.[left] || "normal"] - priority[transferControls.priorities[job.id]?.[right] || "normal"]);
+    for (const fileIndex of indexes) {
       if (!torrentFileAllowed(job, fileIndex)) continue;
       if (job.torrent.files[fileIndex].done) continue;
+      if (targets.some(target => target.jobId === job.id && target.fileIndex === fileIndex)) continue;
       targets.push({ jobId: job.id, fileIndex });
       if (targets.length >= MAX_BANDWIDTH_TARGETS) return targets;
     }
@@ -1543,7 +1571,7 @@ function bandwidthTargetSnapshot(target) {
 }
 
 function refreshTorrentSelections(reason = "priority-plan") {
-  const targets = pendingTorrentTargets()
+  const targets = orderTransferTargets(pendingTorrentTargets(), transferControls)
     .map(bandwidthTargetSnapshot)
     .filter(Boolean);
   torrentBandwidth = torrentBandwidthGovernor.update({
@@ -2019,6 +2047,7 @@ function createJob(source) {
     restoredFromManifest: Boolean(source.restoredFromManifest),
     legacyUnowned: Boolean(source.legacyUnowned),
     paused: Boolean(source.paused),
+    pausedFiles: Array.isArray(source.pausedFiles) ? source.pausedFiles.filter(file => Number.isSafeInteger(file?.index) && file.index >= 0 && typeof file.name === "string" && Number.isSafeInteger(file.size) && file.size >= 0).slice(0, 10000) : [],
     createdAt: Number(source.createdAt) || now,
     completedAt: Number(source.completedAt) || null,
     lastAccessedAt: Number(source.lastAccessedAt) || now,
@@ -2154,6 +2183,7 @@ function persistedJob(job) {
     updatedAt: job.updatedAt,
     seed: Boolean(job.seed),
     paused: Boolean(job.paused),
+    pausedFiles: job.pausedFiles,
     seedPath: job.seedPath,
     downloaded: job.kind === "magnet" && !job.seed && job.torrent?.ready
       ? job.torrent.downloaded : job.downloaded,
@@ -2204,6 +2234,7 @@ function requiredTorrentMediaIndexes(job) {
 
 function applyFileSelection(job, indexes, sourceId = job?.id) {
   if (!job || job.seed) return;
+  if (Object.hasOwn(transferControls.selections, sourceId)) indexes = transferControls.selections[sourceId];
   if (job.downloadBindings) {
     if (JSON.stringify(job.downloadBindings.get(sourceId)) === JSON.stringify(indexes)) return;
     job.downloadBindings.set(sourceId, indexes);
@@ -2238,6 +2269,118 @@ function markJobCompleted(job) {
 
 const pendingDownloads = new Map();
 const pendingDownloadSources = new Map();
+
+async function desktopTransferCommand(body) {
+  const command = String(body.command || "");
+  if (command === "limits") {
+    Object.assign(transferControls, validateBandwidthSettings(body));
+    client.throttleDownload(transferControls.downloadLimit || -1);
+    client.throttleUpload(transferControls.uploadLimit || -1);
+    refreshTorrentSelections("desktop-limits");
+  } else if (command === "order") {
+    if (!Array.isArray(body.ids) || body.ids.length > 10000) throw new Error("Invalid queue order.");
+    const ids = body.ids.map(id => downloadJob(validJobId(id))?.id);
+    if (ids.some(id => !id) || new Set(ids).size !== ids.length) throw new Error("Refresh the transfer list before reordering.");
+    if (body.roomId) {
+      const room = roomControl.list().find(room => room.id === body.roomId);
+      if (!room?.host) throw new Error("Only the host can reorder the room queue.");
+      const sourceIds = ids.flatMap(id => room.sources.filter(source => downloadJob(source.id)?.id === id).map(source => source.id));
+      sourceIds.push(...room.sources.filter(source => !sourceIds.includes(source.id)).map(source => source.id));
+      await roomControl.act(body.roomId, { action: "companion-reorder-sources", sourceIds });
+    }
+    transferControls.order = ids;
+    refreshTorrentSelections("desktop-order");
+  } else if (command === "add") {
+    const source = await resolveSource(String(body.value || "").slice(0, 8000));
+    if (source.kind !== "magnet") throw new Error("Add a magnet, torrent link, or Nyaa link.");
+    const job = await addDownload({ ...source, id: randomUUID(), downloadFileIndexes: [] });
+    recordTransferActivity(job, "Added in Companion; waiting for a file selection");
+    return { job: snapshot(job, Array.from(job.downloadBindings.keys()).at(-1)) };
+  } else if (command === "watch") {
+    if (!body.roomId) throw new Error("Choose a connected host room first.");
+    await roomControl.act(body.roomId, { action: "companion-watch-state", key: body.key, state: body.state });
+  } else {
+    const id = validJobId(body.id);
+    const job = downloadJob(id);
+    if (!job) throw new Error("Transfer not found. Refresh the list.");
+    if (job.checking) throw new Error("Wait for file verification to finish.");
+    if (command === "pause") {
+      await pauseJob(id);
+      if (!transferControls.paused.includes(job.id)) transferControls.paused.push(job.id);
+    } else if (command === "resume") {
+      transferControls.paused = transferControls.paused.filter(value => value !== job.id);
+      await resumeJob(id);
+    } else if (command === "retry") {
+      transferControls.paused = transferControls.paused.filter(value => value !== job.id);
+      await retryJob(id);
+    } else if (command === "follow-room") {
+      delete transferControls.selections[id];
+    } else if (command === "selection") {
+      const files = torrentFiles(job);
+      if (job.kind !== "magnet" || job.seed || !files.length) throw new Error("Wait for this torrent's file list before choosing files.");
+      const indexes = normalizeDownloadFileIndexes(body.fileIndexes);
+      if (!indexes || indexes.some(index => !files.some(file => file.index === index && VIDEO_EXTENSIONS.test(file.path || file.name)))) throw new Error("Choose video files from this torrent.");
+      const priorities = {};
+      for (const [index, priority] of Object.entries(body.priorities || {})) {
+        if (!indexes.includes(Number(index)) || !["low", "normal", "high"].includes(priority)) throw new Error("Invalid file priority.");
+        priorities[index] = priority;
+      }
+      let selectionId = id;
+      if (body.roomId) {
+        const room = roomControl.list().find(room => room.id === body.roomId);
+        if (!room?.host) throw new Error("Only the host can update the room's file selection.");
+        const roomSource = room.sources.find(source => source.id === id) || room.sources.find(source =>
+          source.kind === "magnet" && magnetInfoHash(source.value) === magnetInfoHash(job.value));
+        if (roomSource) {
+          selectionId = roomSource.id;
+          if (!downloadJob(selectionId)) bindDownload(job, selectionId, roomSource.selectedFileIndexes || []);
+        } else {
+          await roomControl.act(body.roomId, { action: "companion-source", source: { id: selectionId, kind: job.kind, value: job.value, label: job.label } });
+        }
+        if (!roomSource?.mediaItems?.length) {
+          await roomControl.act(body.roomId, { action: "companion-source-manifest", sourceId: selectionId,
+            infoHash: job.torrent?.infoHash || magnetInfoHash(job.value), mediaItems: files.filter(file => VIDEO_EXTENSIONS.test(file.path || file.name))
+              .map(file => ({ fileIndex: file.index, path: file.path, name: file.name, size: file.size, included: file.included })) });
+        }
+        await roomControl.act(body.roomId, { action: "companion-select-files", sourceId: selectionId, itemIds: indexes.map(index => `${selectionId}-f${index}`) });
+      }
+      transferControls.selections[selectionId] = indexes;
+      transferControls.priorities[job.id] = priorities;
+      applyFileSelection(job, indexes, selectionId);
+      refreshTorrentSelections("desktop-selection");
+      persistJobs();
+    } else if (command === "pin") {
+      if (job.cleanupCommit) throw new Error("Cleanup is already removing this transfer.");
+      if (job.libraryCollectionId) await libraryCatalog.setPinned(job.libraryCollectionId, Boolean(body.pinned));
+      else await libraryCatalog.setManagedJobPinned(job.id, Boolean(body.pinned));
+      job.pinned = Boolean(body.pinned);
+      persistJobs();
+    } else if (command === "remove") {
+      if (body.deleteFiles === true && (job.downloadBindings?.size || 0) > 1) throw new Error("These files are shared by multiple sources. Remove a room link without deleting files.");
+      if (job.seed && activeSeedLeaseCount(job)) throw new Error("This media is still shared by an active room.");
+      await stopJob(id, { deleteFiles: body.deleteFiles === true });
+      delete transferControls.selections[id];
+    } else if (command === "recheck") {
+      if (!job.torrent?.ready || job.seed) throw new Error("Resume this torrent and wait for metadata before rechecking.");
+      job.checking = true;
+      refreshTorrentSelections("verification-started");
+      job.torrent.rescanFiles(error => {
+        job.checking = false;
+        recordTransferActivity(job, error ? "Verification failed; retry this transfer" : "File verification finished");
+        refreshTorrentSelections("verification-retry");
+        persistJobs();
+      });
+    } else if (command === "reannounce") {
+      if (!job.torrent?.discovery?.tracker || job.torrentSilenced) throw new Error("Trackers are inactive. Resume a transfer with selected files first.");
+      job.torrent.discovery.tracker.update();
+    } else throw new Error("Unsupported transfer command.");
+    recordTransferActivity(job, `Companion: ${command}${body.roomId ? " · active room synchronized" : " · this device"}`);
+  }
+  persistTransferControls();
+  await transferControlStore.flush();
+  return { ok: true };
+}
+let desktopTransferCommands = Promise.resolve();
 
 async function addDownload(source, options = {}) {
   const id = validJobId(source?.id);
@@ -3131,6 +3274,8 @@ async function pauseJob(id, { ignoreSeedLeases = false } = {}) {
     throw new Error("This local seed is still shared by an active room.");
   }
   if (job.paused) return job;
+  job.pausedFiles = torrentFiles(job).map(file => ({ index: file.index, path: file.path, name: file.name, size: file.size,
+    downloaded: file.downloaded, progress: file.progress, downloadReady: file.downloadReady, selected: file.selected, ready: false, status: "paused" }));
   job.paused = true;
   job.status = "paused";
   job.error = null;
@@ -3157,6 +3302,7 @@ async function pauseJob(id, { ignoreSeedLeases = false } = {}) {
 async function resumeJob(id) {
   const job = downloadJob(validJobId(id));
   if (!job) return null;
+  if (transferControls.paused.includes(job.id)) return job;
   if (!job.paused) return job;
   const duplicate = matchingTorrentJob(job.kind, job.value, job);
   if (duplicate) {
@@ -4549,6 +4695,31 @@ const server = createServer(async (request, response) => {
 
   try {
 
+    if (request.method === "POST" && url.pathname === "/room-context") {
+      if (!request.headers.origin || !ALLOWED_ORIGINS.has(request.headers.origin)) throw new Error("Connect the room from a paired browser.");
+      const result = await roomControl.register(request.headers.origin, await readJson(request));
+      sendJson(response, 200, result, headers);
+      return;
+    }
+    if (url.pathname === "/control/transfers") {
+      if (!CONTROL_TOKEN || request.headers["x-watchpair-control"] !== CONTROL_TOKEN) {
+        sendJson(response, 403, { error: "Invalid companion control token." }, headers);
+        return;
+      }
+      if (request.method === "GET") {
+        sendJson(response, 200, { controls: transferControls, rooms: roomControl.list(),
+          activity: Object.fromEntries(transferActivity), directory: DOWNLOAD_DIR }, headers);
+        return;
+      }
+      if (request.method === "POST") {
+        const body = await readJson(request, 2 * 1024 * 1024);
+        const operation = desktopTransferCommands.then(() => desktopTransferCommand(body));
+        desktopTransferCommands = operation.catch(() => {});
+        sendJson(response, 200, await operation, headers);
+        return;
+      }
+    }
+
     if (url.pathname.startsWith("/control/library")) {
       if (!CONTROL_TOKEN || request.headers["x-watchpair-control"] !== CONTROL_TOKEN) {
         sendJson(response, 403, { error: "Invalid companion control token." }, headers);
@@ -5021,7 +5192,11 @@ const server = createServer(async (request, response) => {
         sendJson(response, 409, { error: "Torrent telemetry is not active." }, headers);
         return;
       }
-      sendJson(response, 200, { torrent: job.torrentTelemetry.snapshot() }, headers);
+      sendJson(response, 200, { torrent: job.torrentTelemetry.snapshot(), peers: (job.torrent?.wires || []).slice(0, 1000).map(wire => ({
+        address: String(wire.peerAddress || wire.remoteAddress || "Connected peer").slice(0, 200),
+        client: String(wire.peerExtendedHandshake?.v || "Unknown").slice(0, 120),
+        downloadSpeed: wire.downloadSpeed?.() || 0, uploadSpeed: wire.uploadSpeed?.() || 0,
+      })) }, headers);
       return;
     }
 
@@ -5273,6 +5448,7 @@ const shutdown = async () => {
   persistJobs();
   await Promise.all([
     jobStore.flush(),
+    transferControlStore.flush(),
     persistAgentConfig(),
     serverClosed,
     new Promise((resolve) => {

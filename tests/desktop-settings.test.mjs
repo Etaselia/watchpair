@@ -144,7 +144,8 @@ test("desktop library gates partial previews and refreshes after settings restar
   assert.match(renderer, /External source files are always left untouched/);
   assert.match(renderer, /selectedTransferId !== requestedTransferId/);
   assert.match(renderer, /selectedLibraryCollectionId !== requestedCollectionId/);
-  assert.match(renderer, /setAttribute\("role", "progressbar"\)/);
+  const desk = await readFile(new URL("../desktop/renderer/transfer-desk.js", import.meta.url), "utf8");
+  assert.match(desk, /setAttribute\("role",\s*"progressbar"\)/);
   assert.match(main, /function assertMainRenderer\(event\)/);
   assert.match(main, /event\.sender !== mainWindow\.webContents/);
 });

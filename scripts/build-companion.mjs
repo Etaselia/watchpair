@@ -17,6 +17,8 @@ const inputs = [
   ["media-priority.mjs", resolve(root, "agent", "media-priority.mjs")],
   ["media-tool-paths.mjs", resolve(root, "agent", "media-tool-paths.mjs")],
   ["torrent-bandwidth-governor.mjs", resolve(root, "agent", "torrent-bandwidth-governor.mjs")],
+  ["transfer-controls.mjs", resolve(root, "agent", "transfer-controls.mjs")],
+  ["room-control.mjs", resolve(root, "agent", "room-control.mjs")],
   ["process-registry.mjs", resolve(root, "agent", "process-registry.mjs")],
   ["persistent-log.mjs", resolve(root, "agent", "persistent-log.mjs")],
   ["recovery-telemetry.mjs", resolve(root, "agent", "recovery-telemetry.mjs")],

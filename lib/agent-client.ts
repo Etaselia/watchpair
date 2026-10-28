@@ -15,6 +15,10 @@ function roomScopedAgentJob(job: AgentJob): AgentJob {
 export const AGENT_URL = "http://127.0.0.1:41735";
 export const AGENT_PROTOCOL_VERSION = 3;
 
+export async function connectAgentRoom(token: string, deviceId: string, name: string) {
+  return agentFetch<{ id: string }>("/room-context", { method: "POST", body: JSON.stringify({ token, deviceId, name }) });
+}
+
 export type AgentPermissionState = PermissionState | "unsupported";
 
 export async function getAgentPermissionState(): Promise<AgentPermissionState> {

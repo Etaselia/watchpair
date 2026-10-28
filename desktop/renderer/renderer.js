@@ -17,7 +17,6 @@ const elements = Object.fromEntries(
 );
 
 let busy = false;
-let transfers = [];
 let selectedTransferId = null;
 let transfersRefreshing = false;
 let detailsRefreshing = false;
@@ -90,84 +89,8 @@ function appendText(parent, tag, className, text) {
   return element;
 }
 
-function selectedFile(job) {
-  return job.files?.find((file) => file.selected) || job.files?.[0] || null;
-}
-
-function transferTitle(job) {
-  return selectedFile(job)?.name || job.label || `Transfer ${job.id.slice(0, 8)}`;
-}
-
-function torrentSummary(job) {
-  return job.torrent || job.torrentTelemetry || null;
-}
-
 function trackerSeedersLabel(value) {
   return Number.isFinite(value) ? String(value) : "Unknown";
-}
-
-function renderTransfers() {
-  elements["transfer-list"].replaceChildren();
-  const torrentJobs = transfers.filter((job) => job.kind === "magnet" || job.infoHash || torrentSummary(job));
-  elements["transfers-summary"].textContent = transfers.length
-    ? `${transfers.length} transfer${transfers.length === 1 ? "" : "s"} · ${torrentJobs.length} torrent${torrentJobs.length === 1 ? "" : "s"}`
-    : "No downloads or shared files";
-
-  if (!transfers.length) {
-    appendText(elements["transfer-list"], "p", "empty-state", "Transfers will appear here when media is downloaded or shared.");
-    return;
-  }
-
-  for (const job of transfers) {
-    const row = document.createElement("article");
-    row.className = "transfer-row";
-
-    const identity = document.createElement("div");
-    identity.className = "transfer-identity";
-    appendText(identity, "strong", "transfer-name", transferTitle(job));
-    const state = [humanize(job.seedState || job.status)];
-    if (job.pinned) state.push("Pinned");
-    if (job.seed) state.push("Sharing");
-    appendText(identity, "span", "transfer-state", state.join(" · "));
-    row.append(identity);
-
-    const metrics = document.createElement("div");
-    metrics.className = "transfer-metrics";
-    const telemetry = torrentSummary(job);
-    const peers = telemetry?.connectedPeers ?? job.peers;
-    appendText(metrics, "span", "", `${Number.isFinite(peers) ? peers : 0} connected`);
-    if (job.kind === "magnet" || job.infoHash || telemetry) {
-      appendText(
-        metrics,
-        "span",
-        "",
-        `${trackerSeedersLabel(telemetry?.trackerReportedSeeders)} tracker-reported seeds`
-      );
-    }
-    row.append(metrics);
-
-    const progress = document.createElement("div");
-    progress.className = "transfer-progress";
-    const progressValue = Math.max(0, Math.min(100, Number(job.progress) || 0));
-    progress.setAttribute("role", "progressbar");
-    progress.setAttribute("aria-label", `${transferTitle(job)} progress`);
-    progress.setAttribute("aria-valuemin", "0");
-    progress.setAttribute("aria-valuemax", "100");
-    progress.setAttribute("aria-valuenow", String(progressValue));
-    const progressBar = document.createElement("span");
-    progressBar.style.width = `${progressValue}%`;
-    progress.append(progressBar);
-    row.append(progress);
-
-    const details = document.createElement("button");
-    details.type = "button";
-    details.className = "secondary transfer-details-button";
-    details.textContent = "Torrent details";
-    details.disabled = !(job.kind === "magnet" || job.infoHash || telemetry);
-    details.addEventListener("click", () => openTorrentDetails(job));
-    row.append(details);
-    elements["transfer-list"].append(row);
-  }
 }
 
 async function refreshTransfers() {
@@ -175,15 +98,7 @@ async function refreshTransfers() {
   transfersRefreshing = true;
   elements["refresh-transfers"].disabled = true;
   try {
-    const result = await window.watchpair.getTransfers();
-    const seen = new Set();
-    transfers = (Array.isArray(result?.jobs) ? result.jobs : []).filter((job) => {
-      const key = job.sharedTransferId || job.id;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-    renderTransfers();
+    await window.companionDesk?.refresh();
   } catch (error) {
     elements["transfers-summary"].textContent = error instanceof Error
       ? error.message
@@ -327,17 +242,6 @@ function startDetailsPolling() {
   stopDetailsPolling();
   if (!elements["torrent-details"].open || document.visibilityState === "hidden") return;
   detailsPollTimer = setInterval(() => void refreshTorrentDetails(), DETAILS_POLL_MS);
-}
-
-function openTorrentDetails(job) {
-  selectedTransferId = job.id;
-  elements["torrent-details-title"].textContent = transferTitle(job);
-  elements["torrent-details-subtitle"].textContent = "Live swarm information · updates every 12 seconds while open";
-  elements["torrent-details-content"].replaceChildren();
-  appendText(elements["torrent-details-content"], "p", "empty-state", "Reading torrent details…");
-  if (!elements["torrent-details"].open) elements["torrent-details"].showModal();
-  void refreshTorrentDetails();
-  startDetailsPolling();
 }
 
 function startTransferPolling() {
@@ -871,6 +775,7 @@ function mediaPressureLabel(media) {
 }
 
 function render(next, { populateForm = false } = {}) {
+  window.companionDesk?.setState(next);
   elements.version.textContent = `Version ${next.version}`;
   elements["agent-status"].textContent = next.agent.status === "ready" ? "Running" : next.agent.status;
   elements["agent-status"].className = `status-pill ${next.agent.status === "ready" ? "ready" : next.agent.status === "error" ? "error" : ""}`;
