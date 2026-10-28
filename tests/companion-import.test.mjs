@@ -335,6 +335,7 @@ test("imports, seeds, restores, and cleans an expired companion file", { timeout
       updatedAt: resetTimestamp,
     };
     delete legacyManifest[0].retentionMetadataVersion;
+    delete legacyManifest[0].storageId;
     legacyManifest.push({
       ...legacyManifest[0],
       id: omittedLegacyId,

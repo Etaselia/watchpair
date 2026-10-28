@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { createServer } from "node:http";
 import { createReadStream, createWriteStream } from "node:fs";
-import { lstat, mkdir, readFile, realpath, rename, rm, stat, statfs, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, rename, rm, stat, statfs, utimes, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { BlockList } from "node:net";
 import { availableParallelism, homedir } from "node:os";
@@ -252,7 +252,7 @@ const libraryCatalog = createLibraryCatalog({
       label: job.label,
       pinned: job.pinned,
       identity: job.torrent?.infoHash || magnetInfoHash(job.value) || job.id,
-      root: path.join(DOWNLOAD_DIR, job.id),
+      root: managedJobDirectory(job.id),
       files: managedLibraryFiles(job),
     })),
   async onSetManagedPins(jobIds, pinned, collectionId) {
@@ -942,7 +942,7 @@ function jobFile(job, index) {
   if (job.kind === "magnet") {
     const file = job.torrent?.files[index];
     if (!file) throw new Error("Torrent file not found.");
-    const root = path.resolve(job.torrent.path || path.join(DOWNLOAD_DIR, job.id));
+    const root = path.resolve(job.torrent.path || managedJobDirectory(job.id));
     const filePath = path.resolve(root, file.path);
     if (filePath !== root && !filePath.startsWith(root + path.sep)) {
       throw new Error("Torrent file path escaped its download directory.");
@@ -1753,7 +1753,7 @@ function startTorrent(job, { restoreMetadata = false } = {}) {
   let torrent;
   try {
     torrent = client.add(job.value, {
-      path: path.join(DOWNLOAD_DIR, job.id),
+      path: managedJobDirectory(job.id),
       deselect: true,
     });
   } catch (error) {
@@ -1887,14 +1887,15 @@ async function startDirect(job) {
     if (job.paused || controller.signal.aborted) throw new DOMException("Download paused.", "AbortError");
     const fileName = safeName(job.file?.name || job.label ||
       decodeURIComponent(target.pathname.split("/").pop() || "video.mp4"));
-    const directory = path.join(DOWNLOAD_DIR, job.id);
     if (job.managed) {
       const claim = await claimManagedDirectory(job.id, {
         ownershipToken: job.ownershipToken,
         restoreMetadata: !job.ownershipToken,
       });
       job.ownershipToken = claim.ownershipToken;
+      job.storageId = claim.storageId;
     }
+    const directory = managedJobDirectory(job.id);
     await mkdir(directory, { recursive: true });
     const filePath = path.join(directory, fileName);
     const existing = await stat(filePath)
@@ -1991,6 +1992,7 @@ function createJob(source) {
   const now = Date.now();
   const job = {
     id: String(source.id),
+    storageId: validJobId(source.storageId || source.id),
     kind,
     value: String(source.value || "").trim(),
     label: String(source.label || "video").slice(0, 180),
@@ -2065,8 +2067,8 @@ function createJob(source) {
   return job;
 }
 
-function persistedJobs() {
-  const live = Array.from(jobs.values()).filter((job) => !job.transient).map((job) => ({
+function persistedJob(job) {
+  return {
     id: job.id,
     kind: job.kind,
     value: job.value,
@@ -2075,6 +2077,7 @@ function persistedJobs() {
     pinned: Boolean(job.pinned),
     libraryCollectionId: job.libraryCollectionId,
     ownershipToken: job.ownershipToken,
+    storageId: job.storageId,
     createdAt: job.createdAt,
     completedAt: job.completedAt,
     lastAccessedAt: job.lastAccessedAt,
@@ -2092,7 +2095,11 @@ function persistedJobs() {
     file: job.file
       ? { name: job.file.name, size: job.file.size, path: job.file.path, type: job.file.type }
       : null,
-  }));
+  };
+}
+
+function persistedJobs() {
+  const live = Array.from(jobs.values()).filter((job) => !job.transient).map(persistedJob);
   const liveIds = new Set(live.map((record) => record.id));
   return [
     ...live,
@@ -2154,7 +2161,27 @@ function markJobCompleted(job) {
   return true;
 }
 
-async function addDownload(source, { restoreMetadata = false, ownershipToken = null } = {}) {
+const pendingDownloads = new Map();
+
+async function addDownload(source, options = {}) {
+  const id = validJobId(source?.id);
+  const kind = source.kind === "magnet" ? "magnet" : "direct";
+  const identity = sourceIdentity(kind, source.value);
+  const pending = pendingDownloads.get(id);
+  if (pending) {
+    if (pending.identity !== identity) throw new Error("This source id is already bound to different media.");
+    return pending.promise;
+  }
+  const promise = addDownloadOnce(source, options);
+  pendingDownloads.set(id, { identity, promise });
+  try {
+    return await promise;
+  } finally {
+    if (pendingDownloads.get(id)?.promise === promise) pendingDownloads.delete(id);
+  }
+}
+
+async function addDownloadOnce(source, { restoreMetadata = false, ownershipToken = null } = {}) {
   const id = String(source?.id || "");
   if (!/^[a-zA-Z0-9-]{8,80}$/.test(id)) throw new Error("Invalid source id.");
   const kind = source.kind === "magnet" ? "magnet" : "direct";
@@ -2196,6 +2223,7 @@ async function addDownload(source, { restoreMetadata = false, ownershipToken = n
         torrentSilenced: Boolean(source.torrentSilenced),
         torrentVerifiedKeys: source.torrentVerifiedKeys,
         ownershipToken: source.ownershipToken,
+        storageId: source.storageId,
       }
     : {};
   const managed = restoredMetadata.managed === undefined ? true : Boolean(restoredMetadata.managed);
@@ -2203,6 +2231,11 @@ async function addDownload(source, { restoreMetadata = false, ownershipToken = n
     ? await claimManagedDirectory(id, {
         ownershipToken: restoreMetadata ? restoredMetadata.ownershipToken : ownershipToken,
         restoreMetadata,
+        storageId: restoredMetadata.storageId,
+        identity: sourceIdentity(kind, value),
+        // Old torrent folders carry ownership but no source digest. WebTorrent
+        // rechecks their pieces before treating any existing bytes as usable.
+        recoverLegacyTorrent: kind === "magnet",
       })
     : null;
   const job = createJob({
@@ -2214,6 +2247,7 @@ async function addDownload(source, { restoreMetadata = false, ownershipToken = n
     ...restoredMetadata,
     managed,
     ownershipToken: claim?.ownershipToken || null,
+    storageId: claim?.storageId || id,
     legacyUnowned: Boolean(claim?.legacyUnowned),
     restoredFromManifest: restoreMetadata,
   });
@@ -2230,7 +2264,7 @@ function validJobId(value) {
 }
 
 function managedJobDirectory(id) {
-  return path.join(DOWNLOAD_DIR, validJobId(id));
+  return path.join(DOWNLOAD_DIR, validJobId(jobs.get(id)?.storageId || id));
 }
 
 function ownershipMarkerPath(directory) {
@@ -2251,9 +2285,16 @@ async function readManagedDirectoryOwnership(directory) {
     if (
       Number(marker?.version) !== OWNERSHIP_MARKER_VERSION ||
       !/^[a-zA-Z0-9-]{8,80}$/.test(String(marker?.id || "")) ||
-      !OWNERSHIP_TOKEN_PATTERN.test(String(marker?.token || ""))
+      !OWNERSHIP_TOKEN_PATTERN.test(String(marker?.token || "")) ||
+      (marker.sourceIdentity != null && !/^[a-f0-9]{64}$/.test(String(marker.sourceIdentity)))
     ) return null;
-    return { id: String(marker.id), token: String(marker.token) };
+    return {
+      id: String(marker.id), token: String(marker.token),
+      identity: /^[a-f0-9]{64}$/.test(String(marker.sourceIdentity || ""))
+        ? marker.sourceIdentity : null,
+      atime: markerInfo.atime,
+      mtime: markerInfo.mtime,
+    };
   } catch (error) {
     if (error instanceof SyntaxError) return null;
     throw error;
@@ -2263,12 +2304,39 @@ async function readManagedDirectoryOwnership(directory) {
 async function claimManagedDirectory(id, {
   ownershipToken = null,
   restoreMetadata = false,
+  storageId = jobs.get(id)?.storageId || id,
+  identity = null,
+  recoverLegacyTorrent = false,
+  allowFallback = true,
 } = {}) {
   const validId = validJobId(id);
   const expectedToken = OWNERSHIP_TOKEN_PATTERN.test(String(ownershipToken || ""))
     ? String(ownershipToken)
     : null;
-  const directory = managedJobDirectory(validId);
+  const preferred = validJobId(storageId);
+  // Deterministic alternatives also recover a previous fallback after a lost
+  // manifest, without walking, renaming, or copying a potentially huge tree.
+  const suffix = createHash("sha256").update(`${validId}\0${identity || ""}`).digest("hex").slice(0, 24);
+  for (let attempt = 0; attempt < (allowFallback ? 16 : 1); attempt += 1) {
+    const candidate = attempt === 0 ? preferred : `wp-${validId.slice(0, 30)}-${suffix}-${attempt}`;
+    const claim = await tryClaimManagedDirectory(validId, candidate, {
+      expectedToken, restoreMetadata: restoreMetadata && attempt === 0,
+      identity, recoverLegacyTorrent,
+    });
+    if (claim) {
+      if (candidate !== validId) agentLogger.info("download_storage_recovered", {
+        jobId: validId, recovery: "alternate-folder",
+      });
+      return claim;
+    }
+  }
+  throw new Error("Could not allocate a managed download folder. Check the download directory.");
+}
+
+async function tryClaimManagedDirectory(validId, storageId, {
+  expectedToken, restoreMetadata, identity, recoverLegacyTorrent,
+}) {
+  const directory = path.join(DOWNLOAD_DIR, validJobId(storageId));
   let directoryInfo = await lstat(directory).catch((error) => {
     if (error?.code === "ENOENT") return null;
     throw error;
@@ -2282,29 +2350,41 @@ async function claimManagedDirectory(id, {
         version: OWNERSHIP_MARKER_VERSION,
         id: validId,
         token,
+        sourceIdentity: identity,
       }), { flag: "wx", mode: 0o600 });
-      return { directory, ownershipToken: token, legacyUnowned: false };
+      return { directory, storageId, ownershipToken: token, legacyUnowned: false };
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
       directoryInfo = await lstat(directory);
     }
   }
   if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) {
-    throw new Error("The download id collides with an existing filesystem entry.");
+    return null;
   }
   const marker = await readManagedDirectoryOwnership(directory);
-  if (marker?.id === validId && expectedToken && marker.token === expectedToken) {
-    return { directory, ownershipToken: marker.token, legacyUnowned: false };
-  }
-  if (restoreMetadata && marker?.id === validId && !expectedToken) {
-    return { directory, ownershipToken: marker.token, legacyUnowned: false };
+  if (marker?.id === validId &&
+    (!marker.identity || !identity || marker.identity === identity) &&
+    (expectedToken ? marker.token === expectedToken :
+      restoreMetadata || (identity && (marker.identity === identity || recoverLegacyTorrent)))) {
+    if (identity && !marker.identity) {
+      await writeFile(ownershipMarkerPath(directory), JSON.stringify({
+        version: OWNERSHIP_MARKER_VERSION, id: validId, token: marker.token, sourceIdentity: identity,
+      }), { mode: 0o600 });
+      // Binding an old marker is bookkeeping, not recent media activity. Keep
+      // filesystem-based legacy retention from treating the pack as newly used.
+      await utimes(ownershipMarkerPath(directory), marker.atime, marker.mtime);
+    }
+    if (!expectedToken && !restoreMetadata) agentLogger.info("download_storage_recovered", {
+      jobId: validId, recovery: "owned-folder-reused",
+    });
+    return { directory, storageId, ownershipToken: marker.token, legacyUnowned: false };
   }
   if (restoreMetadata && !marker && !expectedToken) {
     // Older manifests predate ownership markers. They may keep using their payload,
     // but remain intentionally ineligible for recursive deletion.
-    return { directory, ownershipToken: null, legacyUnowned: true };
+    return { directory, storageId, ownershipToken: null, legacyUnowned: true };
   }
-  throw new Error("The download id collides with an existing folder that WatchPair does not own.");
+  return null;
 }
 
 async function managedDirectoryIsOwned(job) {
@@ -2579,7 +2659,9 @@ async function seedLocalFile({
   const info = await stat(resolvedPath);
   if (!info.isFile()) throw new Error("The selected library entry is not a file.");
   const claim = managed
-    ? await claimManagedDirectory(id, { ownershipToken, restoreMetadata })
+    ? await claimManagedDirectory(id, {
+        ownershipToken, restoreMetadata, storageId: metadata.storageId, allowFallback: false,
+      })
     : null;
 
   const job = createJob({
@@ -2590,6 +2672,7 @@ async function seedLocalFile({
     managed,
     ownershipToken: claim?.ownershipToken || null,
     ...metadata,
+    storageId: claim?.storageId || id,
     legacyUnowned: Boolean(claim?.legacyUnowned),
     restoredFromManifest: restoreMetadata,
     seed: true,
@@ -2715,6 +2798,7 @@ async function finalizeImport(id, body) {
     label: name,
     managed: true,
     ownershipToken: claim.ownershipToken,
+    storageId: claim.storageId,
   });
 }
 
@@ -2804,7 +2888,7 @@ async function generatedArtifactBytes(jobId) {
 
 async function jobRemovalBytes(job) {
   const downloadBytes = job.managed
-    ? await pathSize(path.join(DOWNLOAD_DIR, job.id))
+    ? await pathSize(managedJobDirectory(job.id))
     : 0;
   return downloadBytes + await generatedArtifactBytes(job.id);
 }
@@ -2818,7 +2902,7 @@ async function legacyJobFilesystemExpired(job, settings, now) {
     job.pinned
   ) return false;
 
-  const latestMtimeMs = await pathLatestMtime(path.join(DOWNLOAD_DIR, job.id));
+  const latestMtimeMs = await pathLatestMtime(managedJobDirectory(job.id));
   return jobs.get(job.id) === job &&
     !retentionMetadataReliable(job) &&
     !job.pinned &&
@@ -2867,6 +2951,7 @@ async function restoreJobTransferAfterCleanup(job) {
         restoreMetadata: !job.ownershipToken,
       });
       job.ownershipToken = claim.ownershipToken;
+      job.storageId = claim.storageId;
     }
     startTorrent(job, { restoreMetadata: true });
   }
@@ -2973,6 +3058,7 @@ async function resumeJob(id) {
       retentionMetadataVersion: job.retentionMetadataVersion,
       updatedAt: job.updatedAt,
       ownershipToken: job.ownershipToken,
+      storageId: job.storageId,
       restoreMetadata: true,
       transient: job.transient,
     };
@@ -2996,6 +3082,7 @@ async function resumeJob(id) {
         restoreMetadata: !job.ownershipToken,
       });
       job.ownershipToken = claim.ownershipToken;
+      job.storageId = claim.storageId;
     }
     startTorrent(job, { restoreMetadata: true });
   } else {
@@ -3010,10 +3097,9 @@ async function retryJob(id) {
   const job = jobs.get(validJobId(id));
   if (!job) throw new Error("Download not found.");
   if (job.seed) throw new Error("A local seed does not need to be retried.");
-  const source = { id: job.id, kind: job.kind, value: job.value, label: job.label };
-  const ownershipToken = job.ownershipToken;
+  const source = persistedJob(job);
   await stopJob(id);
-  return addDownload(source, { ownershipToken });
+  return addDownload(source, { restoreMetadata: true });
 }
 
 async function restoreJobs() {
@@ -3036,10 +3122,14 @@ async function restoreJobs() {
             ? await claimManagedDirectory(record.id, {
                 ownershipToken: record.ownershipToken,
                 restoreMetadata: true,
+                storageId: record.storageId,
+                identity: sourceIdentity(record.kind, record.value),
+                allowFallback: !record.file?.path,
               })
             : null;
           const job = createJob({
             ...record,
+            storageId: claim?.storageId || record.storageId || record.id,
             paused: true,
             ownershipToken: claim?.ownershipToken || null,
             legacyUnowned: Boolean(claim?.legacyUnowned),
@@ -3069,6 +3159,7 @@ async function restoreJobs() {
             retentionMetadataVersion: RETENTION_METADATA_VERSION,
             updatedAt: record.updatedAt,
             ownershipToken: record.ownershipToken,
+            storageId: record.storageId,
             restoreMetadata: true,
           });
         } else if (record.kind === "magnet") {
@@ -3079,10 +3170,14 @@ async function restoreJobs() {
             ? await claimManagedDirectory(record.id, {
                 ownershipToken: record.ownershipToken,
                 restoreMetadata: true,
+                storageId: record.storageId,
+                identity: sourceIdentity(record.kind, record.value),
+                allowFallback: false,
               })
             : null;
           const job = createJob({
             ...record,
+            storageId: claim?.storageId || record.storageId || record.id,
             ownershipToken: claim?.ownershipToken || null,
             legacyUnowned: Boolean(claim?.legacyUnowned),
             restoredFromManifest: true,

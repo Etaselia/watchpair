@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -194,9 +194,47 @@ test("library APIs deduplicate, preview ranges, hide paths, and propagate collec
         value: "magnet:?xt=urn:btih:fedcba9876543210fedcba9876543210fedcba98",
       } }),
     });
-    assert.equal(collidingFolder.status, 400,
-      "a room id cannot claim a pre-existing unmarked user folder");
+    assert.equal(collidingFolder.status, 202,
+      "a folder collision automatically allocates a separate owned download directory");
+    assert.equal((await collidingFolder.json()).job.id, "TV-Shows-2024");
     assert.equal((await stat(path.join(unrelatedFolder, "keep.txt"))).isFile(), true);
+    assert.equal((await localFetch(`${base}/downloads/TV-Shows-2024?deleteFiles=1`, {
+      method: "DELETE",
+    })).status, 200);
+    assert.equal(await readFile(path.join(unrelatedFolder, "keep.txt"), "utf8"), "not agent-owned",
+      "deleting the recovered transfer never deletes the original user folder");
+
+    const boundFolderId = "identity-bound-folder";
+    const boundFolder = path.join(downloads, boundFolderId);
+    await mkdir(boundFolder);
+    const foreignMarker = JSON.stringify({ version: 1, id: boundFolderId, token: randomUUID(),
+      sourceIdentity: "0".repeat(64) });
+    await writeFile(path.join(boundFolder, ".watchpair-owned.json"), foreignMarker);
+    await writeFile(path.join(boundFolder, "keep.txt"), "different source");
+    const collidingFileId = "identity-file-collision";
+    await writeFile(path.join(downloads, collidingFileId), "unrelated file");
+    const collisionIds = [boundFolderId, collidingFileId];
+    const linkedFolderId = "identity-link-collision";
+    try {
+      await symlink(unrelatedFolder, path.join(downloads, linkedFolderId), process.platform === "win32" ? "junction" : "dir");
+      collisionIds.push(linkedFolderId);
+    } catch (error) {
+      if (!["EACCES", "ENOSYS", "ENOTSUP", "EPERM"].includes(error?.code)) throw error;
+    }
+    for (const [index, collisionId] of collisionIds.entries()) {
+      const recovered = await localFetch(`${base}/downloads`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ source: { id: collisionId, kind: "magnet",
+          value: `magnet:?xt=urn:btih:${String(index + 1).repeat(40)}`, downloadFileIndexes: [] } }),
+      });
+      assert.equal(recovered.status, 202, `automatically recover ${collisionId}`);
+      assert.deepEqual((await recovered.json()).job.downloadFileIndexes, []);
+      assert.equal((await localFetch(`${base}/downloads/${collisionId}?deleteFiles=1`, { method: "DELETE" })).status, 200);
+    }
+    assert.equal(await readFile(path.join(boundFolder, ".watchpair-owned.json"), "utf8"), foreignMarker);
+    assert.equal(await readFile(path.join(boundFolder, "keep.txt"), "utf8"), "different source");
+    assert.equal(await readFile(path.join(downloads, collidingFileId), "utf8"), "unrelated file");
+    assert.equal(await readFile(path.join(unrelatedFolder, "keep.txt"), "utf8"), "not agent-owned");
 
     const sourceId = "local-api-file";
     const attachedResponse = await localFetch(`${base}/library/${file.id}/attach`, {

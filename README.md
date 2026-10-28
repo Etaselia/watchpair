@@ -47,6 +47,11 @@ Selections are shared by the room while each device retains its Auto, Ask, or Ne
 Unchecked files are not requested, although BitTorrent pieces shared with an included file may
 contain a small amount of adjacent file data.
 
+The Companion recovers matching WatchPair-owned torrent folders automatically and verifies existing
+pieces before reuse. If a source ID collides with an unrelated folder, file, or directory link, it
+chooses a separate managed folder and loads the file list without altering that entry. Recovery
+does not copy the season pack; the managed location and file selection survive retries and restarts.
+
 The host records the distinct video intervals played in the shared player. After 90% has played,
 the episode moves to **Watched** without interrupting playback; seeking past footage and replaying
 the same scene do not increase coverage. Episodes and whole folders can also be marked watched or
