@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mediaToolPath } from "../agent/media-tool-paths.mjs";
 import ffmpegPath from "ffmpeg-static";
 import {
   CPU_ENCODER,
@@ -181,7 +182,7 @@ test("selects CUDA decode plus NVENC for a validated Windows NVIDIA source", asy
   ]);
   assert.equal(runtime.pipeline.filter.hardware, true);
   assert.equal(runtime.diagnostics.length, 0);
-  const sourceProbe = mock.calls.find((args) => args.includes("C:\\\\WatchPair\\\\episode.mkv"));
+  const sourceProbe = mock.calls.find((args) => args.includes(mediaToolPath("C:\\\\WatchPair\\\\episode.mkv")));
   assert.ok(sourceProbe);
   assert.ok(sourceProbe.includes("scale_cuda=format=yuv420p"));
   assert.equal(sourceProbe.includes("format=yuv420p"), false);

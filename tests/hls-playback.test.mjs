@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { readdirSync, rmSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -21,6 +21,33 @@ import {
 } from "../agent/hls-playback.mjs";
 
 const runFile = promisify(execFile);
+
+test("prepares HLS and probes duration from a long Windows source path", {
+  skip: process.platform !== "win32", timeout: 30_000,
+}, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "watchpair-long-hls-"));
+  const nested = path.join(directory, ("Show " + "long name ".repeat(15)).trim(), ("Season 02 " + "nested folder ".repeat(6)).trim());
+  const input = path.join(nested, "Episode 01.mkv");
+  const shortInput = path.join(directory, "input.mkv");
+  const manager = createHlsPlaybackManager({ ffmpegPath, ffprobePath: ffprobeStatic.path,
+    cacheRoot: path.join(directory, "cache"), segmentSeconds: 1, epochSeconds: 2, playableSeconds: 1 });
+  try {
+    assert.ok(input.length > 260);
+    await mkdir(nested, { recursive: true });
+    await createInput(shortInput, { duration: 2, audioTracks: 0 });
+    await copyFile(shortInput, input);
+    const result = await manager.prepare({ jobId: "long-source-path", fileIndex: 0,
+      fileSize: (await stat(input)).size, inputPath: input,
+      contentFingerprint: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", videoCodec: "h264",
+      videoPixelFormat: "yuv420p", videoProfile: "High", audioTracks: [] });
+    assert.equal(result.status, "ready");
+    assert.ok(result.sourceDuration > 1.9);
+    assert.ok(result.contiguousReadySeconds > 0);
+  } finally {
+    await manager.shutdown();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 async function readPlaylist(filePath) {
   for (let attempt = 0; attempt < 50; attempt += 1) {

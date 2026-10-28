@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import { createProcessRegistry } from "../agent/process-registry.mjs";
+import { mediaToolPath } from "../agent/media-tool-paths.mjs";
 
 test("process registry reports active work without exposing media paths", () => {
   const child = new EventEmitter();
@@ -12,7 +13,7 @@ test("process registry reports active work without exposing media paths", () => 
   });
   const tracker = registry.track(child, {
     jobId: "job", stage: "video", command: "C:\\tools\\ffmpeg.exe",
-    arguments: ["-i", "C:\\private\\episode.mkv", "C:\\private\\cache\\output.m3u8"],
+    arguments: ["-i", mediaToolPath("C:\\private\\episode.mkv", "win32"), mediaToolPath("C:\\private\\cache\\output.m3u8", "win32")],
     privatePaths: ["C:\\private\\episode.mkv"], hardware: true,
   });
   tracker.update({ frame: "120", speed: "2.4x", progress: "continue" });

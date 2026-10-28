@@ -22,6 +22,7 @@ import {
   createProcessRegistry,
 } from "./process-registry.mjs";
 import { mediaDurationFromProbe } from "./media-chapters.mjs";
+import { mediaToolArguments, mediaToolPath } from "./media-tool-paths.mjs";
 
 const CACHE_VERSION = "hls-v13";
 const CACHE_DIRECTORY_VERSION = "v13";
@@ -297,6 +298,8 @@ function redactPrivatePaths(value, privatePaths = []) {
     const exact = String(privatePath || "").trim();
     if (!isPrivatePathCandidate(exact)) continue;
     variants.add(exact);
+    variants.add(mediaToolPath(exact, "win32"));
+    variants.add(mediaToolPath(exact, "win32").replaceAll("\\", "/"));
     variants.add(exact.replaceAll("\\", "/"));
     variants.add(exact.replaceAll("/", "\\"));
   }
@@ -762,7 +765,7 @@ export function createHlsPlaybackManager({
     timeoutMs = FRAGMENT_VALIDATION_TIMEOUT_MS,
     privatePaths = [],
   } = {}) {
-    const child = spawn(executable, argumentsList, {
+    const child = spawn(executable, mediaToolArguments(argumentsList), {
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -1215,7 +1218,7 @@ export function createHlsPlaybackManager({
   }
 
   function launchEpochProcess(state, argumentsList, workingDirectory, taskContext, epochIndex) {
-    const processArguments = ["-progress", "pipe:1", "-nostats", ...argumentsList];
+    const processArguments = mediaToolArguments(["-progress", "pipe:1", "-nostats", ...argumentsList]);
     let stderr = "";
     const child = spawn(ffmpegPath, processArguments, {
       cwd: workingDirectory,

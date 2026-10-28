@@ -1,10 +1,13 @@
+import { mediaToolPath } from "./media-tool-paths.mjs";
+
 function publicArgument(value, privatePaths) {
   let argument = String(value);
-  for (const privatePath of privatePaths) {
+  const variants = privatePaths.filter(Boolean).flatMap((value) => [mediaToolPath(value, "win32"), value]);
+  for (const privatePath of variants) {
     if (!privatePath || !argument.includes(privatePath)) continue;
     argument = argument.split(privatePath).join("<media>");
   }
-  if (/^(?:[a-zA-Z]:[\\/]|\/)/.test(argument)) return "<path>";
+  if (/^(?:[a-zA-Z]:[\\/]|\/|\\\\)/.test(argument)) return "<path>";
   return argument.length > 240 ? argument.slice(0, 237) + "..." : argument;
 }
 function publicCommand(value) {

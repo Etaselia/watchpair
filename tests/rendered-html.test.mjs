@@ -743,6 +743,7 @@ test("packages the pairable magnet and subtitle companion", async () => {
     "WatchPair Companion/hls-epoch-playback.mjs",
     "WatchPair Companion/hardware-acceleration.mjs",
     "WatchPair Companion/media-governor.mjs",
+    "WatchPair Companion/media-tool-paths.mjs",
     "WatchPair Companion/process-registry.mjs",
     "WatchPair Companion/persistent-log.mjs",
     "WatchPair Companion/library-catalog.mjs",
