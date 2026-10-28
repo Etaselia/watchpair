@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -138,7 +138,90 @@ test("companion downloads chosen nested seasons, preserves an empty selection on
     assert.equal(JSON.parse(await readFile(markerPath, "utf8")).token, marker.token,
       "legacy recovery retains the original managed tree and ownership token");
     assert.match(JSON.parse(await readFile(markerPath, "utf8")).sourceIdentity, /^[a-f0-9]{64}$/);
+    const aliasIds = ["shared-season-pack", "shared-season-pack-two", "shared-season-pack-three"];
+    const aliased = await Promise.all(aliasIds.map((aliasId) => post("/downloads", {
+      source: { ...source, id: aliasId },
+    })));
+    for (const [index, result] of aliased.entries()) {
+      assert.equal(result.job.id, aliasIds[index]);
+      assert.equal(result.job.sharedTransferId, id);
+      assert.equal(result.job.files.length, inputs.length);
+      assert.deepEqual(result.job.downloadFileIndexes, []);
+      await assert.rejects(stat(path.join(downloads, aliasIds[index])), { code: "ENOENT" });
+    }
+    assert.deepEqual((await job()).downloadFileIndexes, [firstIndex], "metadata-only aliases preserve existing choices");
+    const aliasId = aliasIds[0];
+    await post(`/downloads/${aliasId}/selection`, { fileIndexes: [secondIndex] });
+    assert.deepEqual((await job()).downloadFileIndexes, [firstIndex], "each room keeps its own selection");
+    const aliasPriority = await post("/media-priority", {
+      selected: { jobId: aliasId, fileIndex: secondIndex },
+      targets: [{ jobId: aliasId, fileIndex: secondIndex }, { jobId: id, fileIndex: secondIndex }],
+      selections: [{ jobId: aliasId, fileIndexes: [secondIndex] }, { jobId: id, fileIndexes: [] }],
+    });
+    assert.equal(aliasPriority.targets.length, 1, "shared files occupy one priority slot");
+    assert.equal((await post(`/downloads/${aliasId}/retry`, {})).job.id, aliasId);
+    await until(async () => (await job())?.files?.length === inputs.length);
+    await until(async () => {
+      const saved = JSON.parse(await readFile(path.join(downloads, ".watchpair-jobs.json"), "utf8"));
+      const bindings = saved.find((record) => record.id === id)?.downloadBindings;
+      return bindings?.some((binding) => binding.id === aliasId && binding.fileIndexes?.includes(secondIndex)) &&
+        bindings.some((binding) => binding.id === id && binding.fileIndexes?.length === 0);
+    });
+    await terminateChildProcess(child);
+    const recordsBeforeRestart = JSON.parse(await readFile(path.join(downloads, ".watchpair-jobs.json"), "utf8"));
+    const legacyId = "legacy-duplicate-record";
+    const legacyDirectory = path.join(downloads, legacyId);
+    const legacyToken = randomUUID();
+    await mkdir(legacyDirectory);
+    await writeFile(path.join(legacyDirectory, ".watchpair-owned.json"), JSON.stringify({ version: 1, id: legacyId, token: legacyToken }));
+    await writeFile(path.join(legacyDirectory, "keep.txt"), "preserved old duplicate folder");
+    const legacyDuplicate = { ...recordsBeforeRestart[0], id: legacyId, storageId: legacyId,
+      ownershipToken: legacyToken, downloaded: 0, downloadFileIndexes: [],
+      torrentVerifiedKeys: null, torrentVerifiedKey: null, identityFingerprint: null };
+    delete legacyDuplicate.downloadBindings;
+    await writeFile(path.join(downloads, ".watchpair-jobs.json"), JSON.stringify([legacyDuplicate, ...recordsBeforeRestart]));
+    aliasIds.push(legacyId);
+    await start();
+    const aliasJob = async (key = aliasId) => (await fetch(`${base}/downloads/${key}`).then((response) => response.json())).job;
+    await until(async () => (await aliasJob())?.files[secondIndex]?.downloadReady);
+    assert.equal((await aliasJob(legacyId)).sharedTransferId, id, "old duplicate records recover onto the existing transfer");
+    assert.deepEqual((await aliasJob()).downloadFileIndexes, [secondIndex]);
+    assert.deepEqual((await job()).downloadFileIndexes, []);
     assert.equal((await fetch(`${base}/downloads/${id}?deleteFiles=1`, { method: "DELETE" })).status, 200);
+    assert.equal((await fetch(`${base}/downloads/${id}`)).status, 404);
+    assert.deepEqual(await readFile(reusedFile), bytes[0], "removing one room must preserve shared files");
+    const conflictingHiddenId = await fetch(`${base}/downloads`, { method: "POST",
+      headers: { "content-type": "application/json" }, body: JSON.stringify({ source: {
+        ...source, value: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+      } }),
+    });
+    assert.equal(conflictingHiddenId.status, 400, "a detached physical id cannot overwrite an active shared transfer");
+    await until(async () => {
+      const saved = JSON.parse(await readFile(path.join(downloads, ".watchpair-jobs.json"), "utf8"));
+      const bindings = saved.find((record) => record.id === id)?.downloadBindings;
+      return bindings?.length === aliasIds.length && !bindings.some((binding) => binding.id === id);
+    });
+    await terminateChildProcess(child);
+    await start();
+    await until(async () => (await aliasJob())?.files?.length === inputs.length);
+    assert.equal((await fetch(`${base}/downloads/${id}`)).status, 404, "detached source stays detached after restart");
+    assert.deepEqual(await readFile(reusedFile), bytes[0]);
+    for (const key of aliasIds.slice(1)) {
+      assert.equal((await fetch(`${base}/downloads/${key}?deleteFiles=1`, { method: "DELETE" })).status, 200);
+    }
+    assert.deepEqual(await readFile(reusedFile), bytes[0]);
+    assert.equal((await fetch(`${base}/downloads/${aliasId}?deleteFiles=1`, { method: "DELETE" })).status, 200);
+    await assert.rejects(stat(payloadDirectory), { code: "ENOENT" });
+    assert.equal(await readFile(path.join(legacyDirectory, "keep.txt"), "utf8"), "preserved old duplicate folder");
+    const simultaneousIds = ["simultaneous-add-one", "simultaneous-add-two", "simultaneous-add-three"];
+    const simultaneous = await Promise.all(simultaneousIds.map((key) => post("/downloads", { source: { ...source, id: key } })));
+    assert.equal(new Set(simultaneous.map((result) => result.job.sharedTransferId)).size, 1,
+      "concurrent different room IDs share one physical transfer");
+    await until(async () => (await Promise.all(simultaneousIds.map(aliasJob)))
+      .every((candidate) => candidate?.files?.length === inputs.length && !candidate.error));
+    for (const key of simultaneousIds) {
+      assert.equal((await fetch(`${base}/downloads/${key}?deleteFiles=1`, { method: "DELETE" })).status, 200);
+    }
     assert.equal(await readFile(path.join(downloads, id, "keep.txt"), "utf8"), "unrelated existing folder");
   } catch (error) {
     throw new Error(`${error.message}\n${output.slice(-6000)}`, { cause: error });

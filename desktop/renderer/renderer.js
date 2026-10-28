@@ -176,7 +176,13 @@ async function refreshTransfers() {
   elements["refresh-transfers"].disabled = true;
   try {
     const result = await window.watchpair.getTransfers();
-    transfers = Array.isArray(result?.jobs) ? result.jobs : [];
+    const seen = new Set();
+    transfers = (Array.isArray(result?.jobs) ? result.jobs : []).filter((job) => {
+      const key = job.sharedTransferId || job.id;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
     renderTransfers();
   } catch (error) {
     elements["transfers-summary"].textContent = error instanceof Error

@@ -1,7 +1,8 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
-export function createJsonStore(filePath, { delayMs = 150 } = {}) {
+export function createJsonStore(filePath, { delayMs = 150, renameFile = rename } = {}) {
   let timer = null;
   let pendingJson = null;
   let writePromise = Promise.resolve();
@@ -29,7 +30,17 @@ export function createJsonStore(filePath, { delayMs = 150 } = {}) {
       await mkdir(path.dirname(filePath), { recursive: true });
       const temporary = filePath + ".tmp";
       await writeFile(temporary, json, { mode: 0o600 });
-      await rename(temporary, filePath);
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          await renameFile(temporary, filePath);
+          break;
+        } catch (error) {
+          // Windows scanners can hold the destination briefly. Retrying the
+          // atomic replacement keeps the previous manifest intact throughout.
+          if (attempt >= 5 || !["EACCES", "EBUSY", "EPERM"].includes(error?.code)) throw error;
+          await delay(25 * 2 ** attempt);
+        }
+      }
     }).catch((error) => {
       console.warn(`Could not persist ${filePath}: ${error.message}`);
     });
