@@ -1,5 +1,16 @@
 import type { SharedSource } from "./session-types";
 import { fetchPreparedAgentAsset } from "./agent-subtitle-fetch.mjs";
+import { mediaItemId } from "./media-queue.mjs";
+
+function roomScopedAgentJob(job: AgentJob): AgentJob {
+  return {
+    ...job,
+    files: job.files.map((file) => ({
+      ...file,
+      itemId: mediaItemId(job.id, file.index),
+    })),
+  };
+}
 
 export const AGENT_URL = "http://127.0.0.1:41735";
 export const AGENT_PROTOCOL_VERSION = 3;
@@ -398,7 +409,7 @@ export async function addAgentDownload(source: SharedSource, fileIndexes?: numbe
     method: "POST",
     body: JSON.stringify({ source: { ...source, downloadFileIndexes: fileIndexes } }),
   });
-  return result.job;
+  return roomScopedAgentJob(result.job);
 }
 
 export async function getAgentDownload(sourceId: string) {
@@ -406,7 +417,7 @@ export async function getAgentDownload(sourceId: string) {
     `/downloads/${encodeURIComponent(sourceId)}`,
     { cache: "no-store" }
   );
-  return result.job;
+  return roomScopedAgentJob(result.job);
 }
 
 export async function selectAgentFile(sourceId: string, fileIndex: number) {
@@ -417,19 +428,19 @@ export async function selectAgentFile(sourceId: string, fileIndex: number) {
       body: JSON.stringify({ fileIndex }),
     }
   );
-  return result.job;
+  return roomScopedAgentJob(result.job);
 }
 
 export async function setAgentFileSelection(sourceId: string, fileIndexes: number[] | null) {
   const result = await agentFetch<{ job: AgentJob }>(`/downloads/${encodeURIComponent(sourceId)}/selection`, {
     method: "POST", body: JSON.stringify({ fileIndexes }),
   });
-  return result.job;
+  return roomScopedAgentJob(result.job);
 }
 
 export async function getAgentDownloads() {
   const result = await agentFetch<{ jobs: AgentJob[] }>("/downloads", { cache: "no-store" });
-  return result.jobs;
+  return result.jobs.map(roomScopedAgentJob);
 }
 
 export interface AgentPlaybackDiagnostic {
@@ -532,7 +543,7 @@ export async function pauseAgentDownload(sourceId: string) {
       `/downloads/${encodeURIComponent(sourceId)}/pause`,
       { method: "POST" }
     );
-    return result.job || null;
+    return result.job ? roomScopedAgentJob(result.job) : null;
   } catch (error) {
     if (!(error instanceof AgentRequestError) || (error.status !== 404 && error.status !== 405)) {
       throw error;
@@ -547,7 +558,7 @@ export async function resumeAgentDownload(sourceId: string) {
       `/downloads/${encodeURIComponent(sourceId)}/resume`,
       { method: "POST" }
     );
-    return result.job;
+    return roomScopedAgentJob(result.job);
   } catch (error) {
     if (!(error instanceof AgentRequestError) || (error.status !== 404 && error.status !== 405)) {
       throw error;
@@ -587,7 +598,7 @@ export async function setAgentDownloadPinned(sourceId: string, pinned: boolean) 
     "/downloads/" + encodeURIComponent(sourceId) + "/pin",
     { method: "POST", body: JSON.stringify({ pinned }) }
   );
-  return result.job;
+  return roomScopedAgentJob(result.job);
 }
 
 export async function getAgentStorage() {
@@ -631,7 +642,7 @@ export async function retryAgentDownload(sourceId: string) {
     `/downloads/${encodeURIComponent(sourceId)}/retry`,
     { method: "POST" }
   );
-  return result.job;
+  return roomScopedAgentJob(result.job);
 }
 
 export interface AgentLibraryScanResult {
@@ -734,7 +745,7 @@ export async function attachAgentLibraryFile(
       body: JSON.stringify({ sourceId, label }),
     }
   );
-  return result.job;
+  return roomScopedAgentJob(result.job);
 }
 
 export async function uploadAndSeedAgentFile(

@@ -146,6 +146,8 @@ test("companion downloads chosen nested seasons, preserves an empty selection on
       assert.equal(result.job.id, aliasIds[index]);
       assert.equal(result.job.sharedTransferId, id);
       assert.equal(result.job.files.length, inputs.length);
+      assert.ok(result.job.files.every((file) => file.itemId === `${aliasIds[index]}-f${file.index}`),
+        "shared transfer file identities belong to the requesting room source");
       assert.deepEqual(result.job.downloadFileIndexes, []);
       await assert.rejects(stat(path.join(downloads, aliasIds[index])), { code: "ENOENT" });
     }

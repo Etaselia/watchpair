@@ -133,6 +133,7 @@ import {
 } from "../lib/media-binding.mjs";
 import {
   mediaManifest,
+  mediaItemId,
   mediaQueue,
   orderedMediaQueue,
   torrentFileSelectionStatus,
@@ -1491,7 +1492,7 @@ export default function WatchApp() {
           await sendAction("select-media", {
             media: {
               sourceId,
-              itemId: target.itemId || `${sourceId}-f${target.index}`,
+              itemId: mediaItemId(sourceId, target.index),
               fileIndex: target.index,
               name: target.name,
               size: target.size,
@@ -2081,7 +2082,7 @@ export default function WatchApp() {
             const nextSession = await sendAction("select-media", {
               media: {
                 sourceId: source.id,
-                itemId: target.itemId || `${source.id}-f${target.index}`,
+                itemId: mediaItemId(source.id, target.index),
                 fileIndex: target.index,
                 name: target.name,
                 size: target.size,
@@ -2429,7 +2430,7 @@ export default function WatchApp() {
         await sendAction("select-media", {
           media: {
             sourceId,
-            itemId: file.itemId || `${sourceId}-f${file.index}`,
+            itemId: mediaItemId(sourceId, file.index),
             fileIndex: file.index,
             name: file.name,
             size: file.size,

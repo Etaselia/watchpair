@@ -50,9 +50,14 @@ app.whenReady().then(async()=>{
     await until(`!document.querySelector('dialog')`);
     await until(`window.pickerFixture.jobs[0].downloadFileIndexes.length===12`);
     assert.deepEqual(await js(`window.pickerFixture.jobs[0].downloadFileIndexes`),Array.from({length:12},(_,index)=>index+12));
+    await until(`window.pickerFixture.roomSelections.some(selection=>selection.status===200)`);
+    const selectedMedia = await js(`window.pickerFixture.roomSelections.find(selection=>selection.status===200).media`);
+    assert.equal(selectedMedia.fileIndex,12);
+    assert.equal(selectedMedia.itemId,await js(`window.pickerFixture.jobs[0].id+'-f12'`),
+      'A reused transfer must select the current room manifest item, including with older companions');
     await click('Manage files');
     await until(`document.querySelectorAll('.torrent-picker-file input:checked').length===12`);
-    const report={ok:true,checks:['file chooser visible before metadata','loading dialog opens','no apply or payload selection while metadata missing','room manifest errors visible','48 files arrive in an open dialog with initialized selection','one season applies exactly 12 indexes','saved selection survives reopening'],logs};
+    const report={ok:true,checks:['file chooser visible before metadata','loading dialog opens','no apply or payload selection while metadata missing','room manifest errors visible','48 files arrive in an open dialog with initialized selection','one season applies exactly 12 indexes','reused transfer selects the current room manifest identity','saved selection survives reopening'],logs};
     fs.writeFileSync(path.resolve('test-results/room-file-picker-report.json'),JSON.stringify(report,null,2));
     console.log(JSON.stringify(report));
     app.exit(0);
