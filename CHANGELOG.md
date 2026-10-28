@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/Etaselia/watchpair/compare/v0.12.8...v0.13.0) (2026-10-28)
+
+
+### Features
+
+* add folder selection and room watch history ([#137](https://github.com/Etaselia/watchpair/issues/137)) ([b9f0de6](https://github.com/Etaselia/watchpair/commit/b9f0de6a247f225c149f34a0f6dc30d5c7c90829))
+
 ## [0.12.8](https://github.com/Etaselia/watchpair/compare/v0.12.7...v0.12.8) (2026-10-22)
 
 
