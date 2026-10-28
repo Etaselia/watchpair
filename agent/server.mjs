@@ -110,7 +110,7 @@ import {
 } from "./torrent-state.mjs";
 
 const HOST = "127.0.0.1";
-const APP_VERSION = process.env.WATCHPAIR_APP_VERSION || "0.13.3"; // x-release-please-version
+const APP_VERSION = process.env.WATCHPAIR_APP_VERSION || "0.13.4"; // x-release-please-version
 const PROTOCOL_VERSION = 3;
 const CONTROL_TOKEN = String(process.env.WATCHPAIR_CONTROL_TOKEN || "");
 const PORT = Number(process.env.WATCHPAIR_AGENT_PORT || 41735);
@@ -3234,9 +3234,9 @@ async function restoreJobs() {
     // A failed duplicate may precede the useful copy in older manifests. Start
     // the most complete active payload first so later aliases reuse its bytes.
     const restoreOrder = [...records].sort((left, right) =>
-      Number(Boolean(left.paused)) - Number(Boolean(right.paused)) ||
-      (Number(right.downloaded) || 0) - (Number(left.downloaded) || 0) ||
-      Object.keys(right.torrentVerifiedKeys || {}).length - Object.keys(left.torrentVerifiedKeys || {}).length);
+      Number(Boolean(left?.paused)) - Number(Boolean(right?.paused)) ||
+      (Number(right?.downloaded) || 0) - (Number(left?.downloaded) || 0) ||
+      Object.keys(right?.torrentVerifiedKeys || {}).length - Object.keys(left?.torrentVerifiedKeys || {}).length);
     for (const record of restoreOrder) {
       try {
         if (record.transient || (record.managed === false && record.kind === "direct")) {
