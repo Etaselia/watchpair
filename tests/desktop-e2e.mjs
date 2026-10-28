@@ -89,7 +89,7 @@ try {
 }
 assert.equal(report.error, undefined, report.error || output.join(""));
 assert.equal(report.initial.agent.health.ok, true);
-assert.equal(report.initial.agent.health.protocolVersion, 2);
+assert.equal(report.initial.agent.health.protocolVersion, 3);
 assert.equal(report.initial.agent.health.version, report.initial.version);
 assert.equal(report.initial.version, packageVersion);
 assert.equal(report.initial.agent.health.logging.enabled, true);

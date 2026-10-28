@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { findLocalAgentMedia } from "../lib/media-binding.mjs";
+import { findLocalAgentMedia, selectedAgentMediaTarget } from "../lib/media-binding.mjs";
 
 function job(id, fingerprint, { selected = true, ready = true } = {}) {
   return {
@@ -84,4 +84,16 @@ test("does not bind a fingerprint to a differently sized local file", () => {
   };
 
   assert.equal(findLocalAgentMedia(jobs, selectedMedia), null);
+});
+
+test("the current file retains a playback target when absent from the pending queue", () => {
+  const selectedMedia = { sourceId: "room-torrent", fileIndex: 0, itemId: "room-torrent-f0",
+    name: "episode.mkv", size: 4096, fingerprint: "same-content" };
+  const current = { ...job("room-torrent", "same-content"), downloadFileIndexes: [] };
+  assert.deepEqual(selectedAgentMediaTarget(current, selectedMedia), {
+    jobId: "room-torrent", fileIndex: 0, itemId: "room-torrent-f0",
+  });
+  assert.equal(selectedAgentMediaTarget(current, { ...selectedMedia, fileIndex: 1 }), null);
+  assert.equal(selectedAgentMediaTarget(current, { ...selectedMedia, fingerprint: "other-content" }), null);
+  assert.equal(selectedAgentMediaTarget(current, { ...selectedMedia, sourceId: "another-torrent" }), null);
 });

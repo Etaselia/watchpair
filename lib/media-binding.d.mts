@@ -1,4 +1,4 @@
-import type { AgentFile, AgentJob } from "./agent-client";
+import type { AgentFile, AgentJob, AgentMediaTarget } from "./agent-client";
 import type { SelectedMedia } from "./session-types";
 
 export interface LocalAgentBinding {
@@ -15,6 +15,7 @@ export interface LocalAgentMedia {
 }
 
 export function agentFileFingerprint(job: AgentJob, file: AgentFile): string | null;
+export function selectedAgentMediaTarget(job: AgentJob | undefined, media: SelectedMedia | null | undefined, itemId?: string | null): AgentMediaTarget | null;
 
 export function findLocalAgentMedia(
   jobs: Record<string, AgentJob>,

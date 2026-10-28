@@ -77,6 +77,7 @@ import {
   selectAgentFile,
   setAgentDownloadPinned,
   setAgentMediaPriority,
+  setAgentFileSelection,
   stopAgentDownload,
   uploadAndSeedAgentFile,
   waitForAgentSeed,
@@ -127,6 +128,7 @@ import {
 import {
   agentFileFingerprint,
   findLocalAgentMedia,
+  selectedAgentMediaTarget,
   type LocalAgentBinding,
 } from "../lib/media-binding.mjs";
 import {
@@ -134,6 +136,8 @@ import {
   mediaQueue,
   orderedMediaQueue,
 } from "../lib/media-queue.mjs";
+import { createWatchCoverageTracker, downloadFileIndexes, isMediaWatched, mediaWatchKey, mergeWatchedRanges, relativeWatchTime, unreportedWatchedRanges } from "../lib/watch-history.mjs";
+import TorrentFilePicker from "./torrent-file-picker";
 import {
   hlsAudioPreference,
   resolveHlsAudioChannelCount,
@@ -549,6 +553,10 @@ export default function WatchApp() {
   const [approvedSourceIds, setApprovedSourceIds] = useState<string[]>([]);
   const [libraryFiles, setLibraryFiles] = useState<AgentLibraryFile[]>([]);
   const [libraryOpen, setLibraryOpen] = useState(false);
+  const [queueTab, setQueueTab] = useState<"queue" | "watched">("queue");
+  const [filesSourceId, setFilesSourceId] = useState("");
+  const offeredFilePickers = useRef(new Set<string>());
+  const [historyNow, setHistoryNow] = useState(Date.now);
   const [libraryBusy, setLibraryBusy] = useState(false);
   const [libraryCatalogStale, setLibraryCatalogStale] = useState(false);
   const [libraryScanWarning, setLibraryScanWarning] = useState("");
@@ -625,14 +633,20 @@ export default function WatchApp() {
   const agentJob = localAgentMedia?.job || (activeSource ? roomAgentJob(activeSource.id) || null : null);
   const selectedAgentFile = localAgentMedia?.file
     || (agentJob ? preferredAgentFile(agentJob, session?.selectedMedia) : null);
-  const synchronizedMedia = mediaQueue(sources);
+  const watchRecords = session?.watchRecords || {};
+  const watchedEntries = Object.values(watchRecords).filter((entry) => entry.watchedAt)
+    .sort((a, b) => b.watchedAt! - a.watchedAt!);
+  const pendingSourceCount = sources.filter((source) => source.selectionConfirmed === false ||
+    (source.mediaItems?.length ? source.mediaItems.some((item) => item.included && !isMediaWatched(watchRecords, source, item))
+      : !isMediaWatched(watchRecords, source))).length;
+  const synchronizedMedia = mediaQueue(sources, watchRecords);
   const selectedItemId = session?.selectedMedia?.itemId
     || synchronizedMedia.find((item) =>
       item.sourceId === session?.selectedMedia?.sourceId &&
       item.fileIndex === session?.selectedMedia?.fileIndex
     )?.id
     || null;
-  const orderedSynchronizedMedia = orderedMediaQueue(sources, selectedItemId);
+  const orderedSynchronizedMedia = orderedMediaQueue(sources, selectedItemId, watchRecords);
   const episodeTargets: AgentMediaTarget[] = orderedSynchronizedMedia.flatMap((item) => {
     const job = roomAgentJob(item.sourceId);
     const file = job?.files.find((candidate) =>
@@ -641,7 +655,11 @@ export default function WatchApp() {
     );
     return job && file ? [{ jobId: job.id, fileIndex: file.index, itemId: item.id }] : [];
   });
-  let selectedTarget = episodeTargets.find((target) => target.itemId === selectedItemId) || null;
+  let selectedTarget = episodeTargets.find((target) => target.itemId === selectedItemId)
+    || selectedAgentMediaTarget(
+      session?.selectedMedia?.sourceId ? roomAgentJob(session.selectedMedia.sourceId) : undefined,
+      session?.selectedMedia, selectedItemId
+    );
   if (localAgentMedia && session?.selectedMedia) {
     selectedTarget = {
       jobId: localAgentMedia.job.id,
@@ -656,7 +674,11 @@ export default function WatchApp() {
     if (existingIndex >= 0) episodeTargets.splice(existingIndex, 1);
     episodeTargets.unshift(selectedTarget);
   }
-  const priorityPlanKey = JSON.stringify({ selected: selectedTarget, targets: episodeTargets });
+  const priorityPlanKey = JSON.stringify({ selected: selectedTarget, targets: episodeTargets,
+    selections: sources.filter((source) => roomAgentJob(source.id) && source.kind === "magnet").map((source) => ({
+      jobId: source.id, fileIndexes: downloadFileIndexes(source, watchRecords),
+    })),
+  });
   const embeddedAudioTracks = selectedAgentFile?.audioTracks || agentJob?.audioTracks || EMPTY_AUDIO_TRACKS;
   const embeddedChapters = selectedAgentFile?.chapters || agentJob?.chapters || EMPTY_CHAPTERS;
   const embeddedSubtitles = selectedAgentFile?.subtitles || agentJob?.subtitles || EMPTY_SUBTITLE_TRACKS;
@@ -679,9 +701,26 @@ export default function WatchApp() {
     const plan = JSON.parse(priorityPlanKey) as {
       selected: AgentMediaTarget | null;
       targets: AgentMediaTarget[];
+      selections: { jobId: string; fileIndexes: number[] | null }[];
     };
-    void setAgentMediaPriority(plan.selected, plan.targets).catch(() => {});
+    void setAgentMediaPriority(plan.selected, plan.targets, plan.selections).catch((caught) => {
+      setError(caught instanceof Error ? caught.message : "Could not sync download selection.");
+    });
   }, [agentAvailable, priorityPlanKey]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setHistoryNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    const pending = session?.sources.find((source) => source.selectionConfirmed === false && source.mediaItems?.length &&
+      !offeredFilePickers.current.has(`${session.token}:${source.id}`));
+    if (pending && !filesSourceId) {
+      offeredFilePickers.current.add(`${session!.token}:${pending.id}`);
+      setFilesSourceId(pending.id);
+    }
+  }, [session, filesSourceId]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -1394,6 +1433,7 @@ export default function WatchApp() {
             id: sourceId,
             kind: "magnet",
             value: published.magnetURI,
+            selectionConfirmed: true,
             label: file.name,
           },
         });
@@ -1846,6 +1886,19 @@ export default function WatchApp() {
         preferredLocalMatch.sourceId !== sourceId &&
         selectedMediaForLibrary?.sourceId === sourceId
       );
+      for (const source of queueSources) {
+        const job = existingById.get(source.id);
+        if (!job || job.seed || source.kind !== "magnet") continue;
+        const indexes = downloadFileIndexes(source, currentSession?.watchRecords);
+        if (JSON.stringify(job.downloadFileIndexes ?? null) === JSON.stringify(indexes)) continue;
+        if (!refreshIsCurrent()) return;
+        try {
+          existingById.set(source.id, await setAgentFileSelection(source.id, indexes));
+        } catch (caught) {
+          if (refreshIsCurrent()) setError(caught instanceof Error ? caught.message : "Could not sync file selection.");
+          return;
+        }
+      }
       const resumed = await Promise.all(
         queueSources
           .filter((source) => {
@@ -1876,7 +1929,7 @@ export default function WatchApp() {
           .map(async (source) => {
             if (!refreshIsCurrent()) return null;
             try {
-              const job = await addAgentDownload(source);
+              const job = await addAgentDownload(source, downloadFileIndexes(source, currentSession?.watchRecords));
               if (!refreshIsCurrent()) return null;
               const expectedIdentity = expectedSourceIdentities.get(source.id);
               if (!agentJobMatchesSourceIdentity(job, expectedIdentity)) {
@@ -2003,7 +2056,10 @@ export default function WatchApp() {
           // auto-select, otherwise a fresh selection gets reverted ~1s later.
           if (sessionRef.current?.selectedMedia) return;
           const job = jobsById[source.id];
-          const target = job ? preferredAgentFile(job) : null;
+          const indexes = downloadFileIndexes(source, currentSession?.watchRecords);
+          if (source.selectionConfirmed === false || indexes?.length === 0 ||
+            (source.kind === "direct" && isMediaWatched(currentSession?.watchRecords, source))) continue;
+          const target = job ? (indexes ? job.files.find((file) => indexes.includes(file.index)) : preferredAgentFile(job)) : null;
           if (!job || !target) continue;
           const selectionKey = `${source.id}:${target.index}`;
           if (selectionSentRef.current === selectionKey) break;
@@ -2764,6 +2820,7 @@ export default function WatchApp() {
           id: sourceId,
           kind: "magnet",
           value: published.magnetURI,
+          selectionConfirmed: true,
           label: libraryFile.name,
         },
       });
@@ -2836,6 +2893,15 @@ export default function WatchApp() {
     session?.participants.every((participant) => participant.queue?.[itemId]?.ready)
   );
 
+  const reportWatchProgress = useCallback(async (values: Record<string, unknown>) => {
+    await sendAction("watch-progress", values);
+  }, [sendAction]);
+
+  const updateWatchState = async (state: "watched" | "unwatched" | "again", values: Record<string, unknown> = {}) => {
+    try { await sendAction("watch-state", { state, ...values }); return true; }
+    catch (caught) { setError(caught instanceof Error ? caught.message : "Could not update watch history."); return false; }
+  };
+
   const selectPlaylistMedia = async (itemId: string) => {
     if (itemId === selectedItemId) return;
     const mediaItem = synchronizedMedia.find((item) => item.id === itemId);
@@ -2850,15 +2916,15 @@ export default function WatchApp() {
     await chooseAgentMedia(sourceId, job, target);
   };
 
-  const playbackQueue: PlayerQueueItem[] = synchronizedMedia.length
-    ? synchronizedMedia.map((item) => ({
+  const playbackQueue: PlayerQueueItem[] = sources.flatMap((source) => source.mediaItems?.length
+    ? mediaQueue([source]).filter((item) => item.id === selectedItemId || !isMediaWatched(watchRecords, source, item)).map((item) => ({
         itemId: item.id,
         sourceId: item.sourceId,
         label: item.path,
         selected: item.id === selectedItemId,
         ready: item.id === selectedItemId || mediaReadyForEveryone(item.id),
       }))
-    : sources.map((source) => ({
+    : source.kind === "direct" && (source.id === session?.selectedMedia?.sourceId || !isMediaWatched(watchRecords, source)) ? [{
         itemId: source.id,
         sourceId: source.id,
         label: source.label,
@@ -2866,7 +2932,7 @@ export default function WatchApp() {
         ready:
           source.id === session?.selectedMedia?.sourceId ||
           mediaReadyForEveryone(source.id),
-      }));
+      }] : []);
 
   const advancePlaylist = async () => {
     if (!session || deviceId !== session.hostId || !session.selectedMedia) return;
@@ -2927,6 +2993,8 @@ export default function WatchApp() {
         onSelectVideo={selectPlaylistMedia}
         onBack={() => setView("lobby")}
         onEnded={deviceId === session.hostId ? () => void advancePlaylist() : undefined}
+        onWatchProgress={reportWatchProgress}
+        onWatchState={async (state) => { await updateWatchState(state); }}
         onSend={sendPlayerState}
       />
       <VoiceDock voice={voice} />
@@ -3048,7 +3116,7 @@ export default function WatchApp() {
               <h2 id="source-title">Download queue</h2>
             </div>
             {sources.length > 0 && (
-              <span className="source-badge">{sources.length} queued</span>
+              <span className="source-badge">{pendingSourceCount} queued</span>
             )}
           </div>
 
@@ -3133,7 +3201,7 @@ export default function WatchApp() {
                 <span>
                   <strong>{agentUpdateRequired ? "Companion update required" : "Companion needed"}</strong>
                   <small>{agentUpdateRequired
-                    ? "Install the latest Companion before reconnecting; this version cannot safely identify or share local media."
+                    ? "Install the latest Companion to synchronize file selections and local media safely."
                     : "Connect it for magnet pages, torrent downloads, and embedded MKV subtitles."}</small>
                 </span>
               </div>
@@ -3155,6 +3223,34 @@ export default function WatchApp() {
             </div>
           )}
 
+          <div className="room-media-tabs" role="tablist" aria-label="Room videos">
+            <button id="queue-tab" role="tab" aria-controls="room-queue" aria-selected={queueTab === "queue"}
+              type="button" onClick={() => setQueueTab("queue")}>Queue</button>
+            <button id="watched-tab" role="tab" aria-controls="room-watched" aria-selected={queueTab === "watched"}
+              type="button" onClick={() => setQueueTab("watched")}>Watched ({watchedEntries.length})</button>
+          </div>
+          {queueTab === "watched" && <div id="room-watched" role="tabpanel" aria-labelledby="watched-tab" className="watch-history">
+            {!watchedEntries.length && <p>Videos watched in this room will appear here.</p>}
+            {watchedEntries.map((entry) => <article className="watched-item" key={entry.key}>
+              <Check aria-hidden="true" />
+              <div><strong>{entry.media.name}</strong><small title={entry.media.path}>{entry.source?.label}{entry.media.path ? ` / ${entry.media.path}` : ""}</small>
+                <time dateTime={new Date(entry.watchedAt!).toISOString()} title={new Date(entry.watchedAt!).toLocaleString()}>
+                  Watched {relativeWatchTime(entry.watchedAt!, historyNow)}
+                </time>
+                {entry.completions.length > 1 && <small>Watched {entry.completions.length} times</small>}
+              </div>
+              <div className="queue-actions">
+                <button className="secondary-button compact-button" type="button"
+                  onClick={() => void updateWatchState("again", { key: entry.key }).then((saved) => { if (saved) setQueueTab("queue"); })}>Watch again</button>
+                <button className="secondary-button compact-button" type="button"
+                  onClick={() => void updateWatchState("unwatched", { key: entry.key })}>Mark unwatched</button>
+                {entry.source && sources.some((source) => source.id === entry.source!.id && source.mediaItems?.length) &&
+                  <button className="secondary-button compact-button" type="button"
+                    onClick={() => setFilesSourceId(entry.source!.id)}>Manage files</button>}
+              </div>
+            </article>)}
+          </div>}
+          <div id="room-queue" role="tabpanel" aria-labelledby="queue-tab" hidden={queueTab !== "queue"}>
           {sources.length ? (
             <div className="queue-list" aria-label="Synchronized download queue">
               {sources.map((source, queueIndex) => {
@@ -3162,12 +3258,16 @@ export default function WatchApp() {
                 const manifestItems = source.mediaItems?.length
                   ? source.mediaItems
                   : job ? mediaManifest(job.files, source.id) : [];
-                const mediaRows = manifestItems.map((item) => ({
+                const allRows = manifestItems.map((item) => ({
                   item,
                   file: job?.files.find((candidate) =>
                     candidate.index === item.fileIndex && candidate.size === item.size
                   ) || null,
                 }));
+                const mediaRows = allRows.filter(({ item }) => item.included && !isMediaWatched(watchRecords, source, item));
+                if (source.selectionConfirmed !== false && allRows.length &&
+                  allRows.every(({ item }) => isMediaWatched(watchRecords, source, item))) return null;
+                if (!allRows.length && isMediaWatched(watchRecords, source)) return null;
                 const selectedRow = mediaRows.find(({ item }) =>
                   item.id === selectedItemId ||
                   (
@@ -3175,12 +3275,12 @@ export default function WatchApp() {
                     item.fileIndex === session?.selectedMedia?.fileIndex
                   )
                 );
-                const target = selectedRow?.file || (job ? preferredAgentFile(job, session?.selectedMedia) : null);
+                const target = selectedRow?.file || mediaRows[0]?.file || (!allRows.length && job ? preferredAgentFile(job, session?.selectedMedia) : null);
                 const activeReadinessKey = selectedRow?.item.id || source.id;
                 const localState = readiness.queue[activeReadinessKey] || readiness.queue[source.id];
                 const selected = localAgentMedia
                   ? localAgentMedia.sourceId === source.id
-                  : activeSource?.id === source.id;
+                  : session?.selectedMedia?.sourceId === source.id;
                 const readyCount = session?.participants.filter(
                   (participant) => participant.queue?.[activeReadinessKey]?.ready
                 ).length || 0;
@@ -3197,7 +3297,9 @@ export default function WatchApp() {
                           <strong>{source.label}</strong>
                           <span className="source-badge subtle">{sourceKindLabel(source.kind)}</span>
                         </div>
-                        <span>{localState?.status || (agentAvailable ? "Starting companion job" : "Waiting for companion")}</span>
+                        <span>{source.selectionConfirmed === false ? "Choose files before downloading" :
+                          allRows.length && !mediaRows.length ? "No files selected" :
+                          localState?.status || (agentAvailable ? "Starting companion job" : "Waiting for companion")}</span>
                         <div className="progress-track" aria-label={`${Math.round(localState?.progress || 0)}% complete`}>
                           <span style={{ width: `${localState?.progress || 0}%` }} />
                         </div>
@@ -3209,7 +3311,7 @@ export default function WatchApp() {
                       <button
                         className={selected ? "secondary-button compact-button selected" : "secondary-button compact-button"}
                         type="button"
-                        disabled={!job || !target}
+                        disabled={!job || !target || source.selectionConfirmed === false}
                         onClick={() => { if (job && target) void chooseAgentMedia(source.id, job, target); }}
                         title={
                           selected ? "Currently selected"
@@ -3236,6 +3338,12 @@ export default function WatchApp() {
                     </div>
 
                     <div className="queue-actions">
+                      {source.kind === "magnet" && !!manifestItems.length && <button className="secondary-button compact-button" type="button"
+                        onClick={() => setFilesSourceId(source.id)}>
+                        {source.selectionConfirmed === false ? "Choose files" : "Manage files"}
+                      </button>}
+                      {source.kind === "direct" && <button className="secondary-button compact-button" type="button"
+                        onClick={() => void updateWatchState("watched", { sourceId: source.id })}>Mark watched</button>}
                       {(!job || agentJobIsPaused(job)) && acquisitionPolicy === "ask" && (
                         <button
                           className="secondary-button compact-button"
@@ -3363,7 +3471,7 @@ export default function WatchApp() {
                       </button>
                     </div>
 
-                    {mediaRows.length > 1 && (
+                    {source.kind === "magnet" && source.selectionConfirmed !== false && mediaRows.length > 0 && (
                       <div className="agent-files" aria-label={`Files in ${source.label}`}>
                         {mediaRows.map(({ item, file }) => {
                           const fileSelected = selected && (
@@ -3418,6 +3526,10 @@ export default function WatchApp() {
                                 {fileSelected && <Check />}
                               </button>
                               <button
+                                className="icon-button" type="button" title="Mark watched" aria-label={`Mark ${item.name} watched`}
+                                onClick={() => void updateWatchState("watched", { sourceId: source.id, itemIds: [item.id] })}
+                              ><Check /></button>
+                              <button
                                 className={item.priority ? "icon-button selected" : "icon-button"}
                                 type="button"
                                 disabled={!item.included || fileSelected}
@@ -3447,6 +3559,21 @@ export default function WatchApp() {
               <span><strong>Share a local video</strong> with this room</span>
             </button>
           )}
+          {sources.length > 0 && sources.every((source) => source.mediaItems?.length
+            ? source.mediaItems.every((item) => isMediaWatched(watchRecords, source, item))
+            : isMediaWatched(watchRecords, source)) && <p className="queue-empty">Everything in this room has been watched.</p>}
+          </div>
+
+          {sources.find((source) => source.id === filesSourceId && source.mediaItems?.length) && <TorrentFilePicker
+            key={filesSourceId}
+            source={sources.find((source) => source.id === filesSourceId)!}
+            records={watchRecords}
+            onClose={() => setFilesSourceId("")}
+            onApply={async (itemIds) => { await sendAction("select-files", { sourceId: filesSourceId, itemIds }); }}
+            onWatch={async (itemIds, watched) => { await sendAction("watch-state", {
+              sourceId: filesSourceId, itemIds, state: watched ? "watched" : "unwatched",
+            }); }}
+          />}
 
           {libraryOpen && (
             <div className="library-panel" role="dialog" aria-modal="false" aria-label="Companion library">
@@ -3835,6 +3962,8 @@ interface SyncedPlayerProps {
   onBack: () => void;
   onEnded?: () => void;
   onSend: (player: PlayerState) => Promise<void>;
+  onWatchProgress: (values: Record<string, unknown>) => Promise<void>;
+  onWatchState: (state: "watched" | "unwatched") => Promise<void>;
 }
 
 type HlsVideoRendition = "h264" | "vp9";
@@ -3905,8 +4034,69 @@ function SyncedPlayer({
   onBack,
   onEnded,
   onSend,
+  onWatchProgress,
+  onWatchState,
 }: SyncedPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const watchSource = session.sources.find((source) => source.id === session.selectedMedia?.sourceId);
+  const watchKey = mediaWatchKey(watchSource, session.selectedMedia || {});
+  const watchGeneration = session.watchRecords?.[watchKey]?.generation ?? 0;
+  const alreadyWatched = Boolean(session.watchRecords?.[watchKey]?.watchedAt);
+  const watchDurationRef = useRef(0);
+  useEffect(() => { watchDurationRef.current = Number(mediaPreparation?.sourceDuration) || 0; }, [mediaPreparation?.sourceDuration]);
+  useEffect(() => {
+    if (deviceId !== session.hostId || alreadyWatched) return;
+    const video = videoRef.current;
+    if (!video) return;
+    const coverage = createWatchCoverageTracker();
+    let reported: [number, number][] = [];
+    const sample = () => coverage.observe({
+      position: video.currentTime, time: performance.now(), rate: video.playbackRate,
+      playing: !video.paused && !video.ended && video.readyState >= 3, seeking: video.seeking,
+    });
+    const discontinuity = () => coverage.discontinuity();
+    let reporting = false;
+    const report = async () => {
+      if (reporting) return;
+      const total = Math.max(mediaDuration(video), watchDurationRef.current);
+      if (!Number.isFinite(total) || total <= 0) return;
+      const ranges = unreportedWatchedRanges(coverage.ranges(), reported, total);
+      if (!ranges.length) return;
+      reporting = true;
+      try {
+        for (const [start, end] of ranges) {
+          await onWatchProgress({ key: watchKey, generation: watchGeneration, start, end, duration: total });
+          reported = mergeWatchedRanges(reported, start, end, total);
+        }
+      } catch { /* Retry unacknowledged intervals on the next tick. */ }
+      finally { reporting = false; }
+    };
+    const flush = () => { sample(); void report(); };
+    video.addEventListener("timeupdate", sample);
+    video.addEventListener("playing", sample);
+    video.addEventListener("seeking", discontinuity);
+    video.addEventListener("seeked", sample);
+    video.addEventListener("loadstart", discontinuity);
+    video.addEventListener("waiting", flush);
+    video.addEventListener("pause", flush);
+    video.addEventListener("ended", flush);
+    sample();
+    const sampleTimer = window.setInterval(sample, 250);
+    const timer = window.setInterval(flush, 5_000);
+    return () => {
+      window.clearInterval(timer);
+      window.clearInterval(sampleTimer);
+      video.removeEventListener("timeupdate", sample);
+      video.removeEventListener("playing", sample);
+      video.removeEventListener("seeking", discontinuity);
+      video.removeEventListener("seeked", sample);
+      video.removeEventListener("loadstart", discontinuity);
+      video.removeEventListener("waiting", flush);
+      video.removeEventListener("pause", flush);
+      video.removeEventListener("ended", flush);
+      flush();
+    };
+  }, [alreadyWatched, deviceId, session.hostId, watchKey, watchGeneration, onWatchProgress]);
   const playerRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<Hls | null>(null);
   const assRendererRef = useRef<import("jassub").default | null>(null);
@@ -5047,6 +5237,10 @@ function SyncedPlayer({
           <span><span className="live-dot" /> Synced with {Math.max(0, session.participants.length - 1)} partner</span>
         </div>
         <div className="player-top-actions">
+          <button className="player-icon-button" type="button"
+            title={alreadyWatched ? "Mark unwatched" : "Mark watched"}
+            aria-label={alreadyWatched ? "Mark unwatched" : "Mark watched"}
+            onClick={() => void onWatchState(alreadyWatched ? "unwatched" : "watched")}><Check /></button>
           <label className="player-video-select" title="Playlist">
             <ListVideo />
             <select

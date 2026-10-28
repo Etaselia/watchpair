@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { mediaItemId, mediaManifest, sameMediaManifest } from "../lib/media-queue.mjs";
 import { magnetInfoHash } from "../lib/magnet-identity.mjs";
+import { isMediaWatched, mediaWatchKey, mergeWatchedRanges, watchedFraction } from "../lib/watch-history.mjs";
 import {
   initialPlayerState,
   type LocalReadiness,
@@ -16,6 +17,7 @@ import {
   type VoiceSignal,
   type VoiceSignalType,
   type WatchSession,
+  type WatchRecord,
 } from "../lib/session-types.ts";
 
 const TOKEN_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -54,6 +56,7 @@ interface SessionStore {
   setSources(token: string, sources: SharedSource[], now: number): Promise<void>;
   setSelectedMedia(token: string, media: SelectedMedia | null, now: number): Promise<void>;
   setPlayer(token: string, player: PlayerState, now: number): Promise<void>;
+  updateWatch(token: string, targets: WatchTarget[], action: WatchAction, now: number, progress?: WatchProgress): Promise<void>;
   addVoiceSignal(token: string, signal: VoiceSignal): Promise<void>;
 }
 
@@ -185,11 +188,16 @@ function stableParticipants(participants: ParticipantState[], hostId: string) {
   );
 }
 
+type WatchAction = "watched" | "unwatched" | "again" | "progress";
+interface WatchTarget { source?: SharedSource; media: SelectedMedia & { path?: string } }
+interface WatchProgress { start: number; end: number; duration: number; generation: number }
+
 interface MemorySession {
   token: string;
   hostId: string;
   sources: SharedSource[];
   selectedMedia: SelectedMedia | null;
+  watchRecords: Record<string, WatchRecord>;
   player: PlayerState;
   seq: number;
   createdAt: number;
@@ -225,6 +233,7 @@ class MemorySessionStore implements SessionStore {
       sources: record.sources,
       source: activeSource(record.sources, record.selectedMedia),
       selectedMedia: record.selectedMedia,
+      watchRecords: record.watchRecords,
       player: record.player,
       seq: record.seq,
       createdAt: record.createdAt,
@@ -253,6 +262,7 @@ class MemorySessionStore implements SessionStore {
       hostId,
       sources: [],
       selectedMedia: null,
+      watchRecords: {},
       player: initialPlayerState(now),
       seq: 0,
       createdAt: now,
@@ -342,6 +352,69 @@ class MemorySessionStore implements SessionStore {
       .concat(signal)
       .slice(-400);
   }
+
+  async updateWatch(token: string, targets: WatchTarget[], action: WatchAction, now: number, progress?: WatchProgress) {
+    const record = this.sessions.get(token);
+    if (!record) return;
+    for (const target of targets) {
+      const key = mediaWatchKey(target.source, target.media);
+      const previous = record.watchRecords[key];
+      if (action === "progress" && (previous?.watchedAt || (previous?.generation ?? 0) !== progress?.generation)) continue;
+      const source = target.source ? { ...target.source, mediaItems: undefined } : undefined;
+      const entry: WatchRecord = previous || {
+        key, source, media: { ...target.media }, ranges: [], duration: 0,
+        watchedAt: null, generation: 0, completions: [],
+      };
+      if (source) entry.source = source;
+      entry.media = { ...target.media };
+      if (action === "progress" && progress) {
+        // A duration change invalidates coverage rather than counting it against a shorter file.
+        if (entry.duration && Math.abs(entry.duration - progress.duration) > 1) entry.ranges = [];
+        entry.duration = progress.duration;
+        entry.ranges = mergeWatchedRanges(entry.ranges, progress.start, progress.end, entry.duration);
+        if (watchedFraction(entry.ranges, entry.duration) >= 0.9) {
+          entry.watchedAt = now;
+          entry.completions.push({ watchedAt: now, method: "automatic" });
+        }
+      } else if (action === "watched") {
+        if (!entry.watchedAt) {
+          entry.watchedAt = now;
+          entry.completions.push({ watchedAt: now, method: "manual" });
+        }
+      } else {
+        entry.watchedAt = null;
+        entry.ranges = [];
+        entry.generation += 1;
+        if (action === "again" && record.selectedMedia && mediaWatchKey(
+          record.sources.find((source) => source.id === record.selectedMedia!.sourceId), record.selectedMedia
+        ) === key) {
+          record.player = { ...record.player, paused: true, position: 0, changedAt: now, actorId: "system" };
+        }
+        if (action === "again" && entry.source) {
+          let queuedSource = record.sources.find((item) => item.id === entry.source!.id || mediaWatchKey(item, entry.media) === key);
+          if (!queuedSource && record.sources.length < 30) {
+            queuedSource = { ...entry.source, selectionConfirmed: true,
+              selectedFileIndexes: Number.isInteger(entry.media.fileIndex) ? [entry.media.fileIndex!] : undefined };
+            record.sources.push(queuedSource);
+          }
+          if (queuedSource) {
+            queuedSource.selectionConfirmed = true;
+            if (Number.isInteger(entry.media.fileIndex)) queuedSource.selectedFileIndexes = [...new Set([
+              ...(queuedSource.selectedFileIndexes || []), entry.media.fileIndex!,
+            ])];
+            queuedSource.mediaItems = queuedSource.mediaItems?.map((item) =>
+              item.fileIndex === entry.media.fileIndex ? { ...item, included: true } : item);
+            entry.source = { ...queuedSource, mediaItems: undefined };
+            entry.media.sourceId = queuedSource.id;
+            if (Number.isInteger(entry.media.fileIndex)) entry.media.itemId = mediaItemId(queuedSource.id, entry.media.fileIndex!);
+          }
+        }
+      }
+      record.watchRecords[key] = entry;
+    }
+    record.seq += 1;
+    record.updatedAt = now;
+  }
 }
 
 interface SessionPersistenceOptions {
@@ -362,6 +435,7 @@ interface PersistedSessionRecord {
   hostId?: unknown;
   sources?: unknown;
   selectedMedia?: unknown;
+  watchRecords?: unknown;
   player?: unknown;
   seq?: unknown;
   createdAt?: unknown;
@@ -470,6 +544,8 @@ export class FileSessionStore extends MemorySessionStore implements SessionStore
         hostId: typeof record.hostId === "string" ? record.hostId : "",
         sources: Array.isArray(record.sources) ? (record.sources as SharedSource[]) : [],
         selectedMedia: record.selectedMedia ? (record.selectedMedia as SelectedMedia) : null,
+        watchRecords: record.watchRecords && typeof record.watchRecords === "object" && !Array.isArray(record.watchRecords)
+          ? record.watchRecords as Record<string, WatchRecord> : {},
         player: record.player ? (record.player as PlayerState) : initialPlayerState(now),
         seq: typeof record.seq === "number" && Number.isFinite(record.seq) ? record.seq : 0,
         createdAt:
@@ -528,6 +604,11 @@ export class FileSessionStore extends MemorySessionStore implements SessionStore
     this.schedulePersist();
   }
 
+  async updateWatch(token: string, targets: WatchTarget[], action: WatchAction, now: number, progress?: WatchProgress) {
+    await super.updateWatch(token, targets, action, now, progress);
+    this.schedulePersist();
+  }
+
   /**
    * Persists any pending changes immediately and awaits the in-flight write.
    * Used by tests; a graceful-shutdown hook could call this too.
@@ -579,6 +660,7 @@ export class FileSessionStore extends MemorySessionStore implements SessionStore
           hostId: record.hostId,
           sources: record.sources,
           selectedMedia: record.selectedMedia,
+          watchRecords: record.watchRecords,
           player: record.player,
           seq: record.seq,
           createdAt: record.createdAt,
@@ -692,6 +774,7 @@ async function handlePost(request: Request, store: SessionStore) {
         label: String(candidate.label ?? "Shared media").slice(0, 180),
         addedBy: deviceId,
         addedAt: now,
+        selectionConfirmed: candidate.kind !== "magnet" || candidate.selectionConfirmed === true,
       },
       now
     );
@@ -797,7 +880,8 @@ async function handlePost(request: Request, store: SessionStore) {
       const item = incoming.get(current.id)!;
       return {
         ...item,
-        included: controls.get(item.id)?.included ?? item.included,
+        included: controls.get(item.id)?.included ?? (source.selectedFileIndexes
+          ? source.selectedFileIndexes.includes(item.fileIndex) : item.included),
         priority: controls.get(item.id)?.priority ?? item.priority,
       };
     });
@@ -808,6 +892,78 @@ async function handlePost(request: Request, store: SessionStore) {
         : item),
       now
     );
+  } else if (action === "select-files") {
+    const sourceId = String(body.sourceId || "");
+    const source = currentSession.sources.find((item) => item.id === sourceId);
+    const ids = Array.isArray(body.itemIds) ? body.itemIds.map(String) : null;
+    if (!source?.mediaItems?.length || !ids || new Set(ids).size !== ids.length ||
+      ids.some((id) => !source.mediaItems!.some((item) => item.id === id))) {
+      return Response.json({ error: "Choose files from this torrent's manifest." }, { status: 400 });
+    }
+    const selectedItem = source.mediaItems.find((item) => item.id === currentSession.selectedMedia?.itemId);
+    if (selectedItem && !ids.includes(selectedItem.id) && !currentSession.player.paused) {
+      return Response.json({ error: "Pause playback before excluding the current video." }, { status: 409 });
+    }
+    await store.setSources(token, currentSession.sources.map((item) => item.id === sourceId ? {
+      ...item, selectionConfirmed: true,
+      selectedFileIndexes: item.mediaItems!.filter((media) => ids.includes(media.id)).map((media) => media.fileIndex),
+      mediaItems: item.mediaItems!.map((media) => ({ ...media, included: ids.includes(media.id) })),
+    } : item), now);
+    if (selectedItem && !ids.includes(selectedItem.id)) await store.setSelectedMedia(token, null, now);
+  } else if (action === "watch-state" || action === "watch-progress") {
+    let targets: WatchTarget[] = [];
+    const watchAction = action === "watch-progress" ? "progress" : String(body.state) as WatchAction;
+    if (!["watched", "unwatched", "again", "progress"].includes(watchAction) ||
+      (action === "watch-state" && watchAction === "progress")) {
+      return Response.json({ error: "Unsupported watch action." }, { status: 400 });
+    }
+    if (action === "watch-progress") {
+      const media = currentSession.selectedMedia;
+      const source = currentSession.sources.find((item) => item.id === media?.sourceId);
+      if (deviceId !== currentSession.hostId || !media || body.key !== mediaWatchKey(source, media)) {
+        return Response.json({ error: "Only the host can report the current video's watched coverage." }, { status: 409 });
+      }
+      const { start, end, duration, generation } = body as unknown as WatchProgress;
+      if (![start, end, duration, generation].every(Number.isFinite) || start < 0 || end <= start ||
+        end > duration || end - start > 20 || duration <= 0 || duration > 604800 || !Number.isInteger(generation)) {
+        return Response.json({ error: "Invalid watched interval." }, { status: 400 });
+      }
+      const item = source?.mediaItems?.find((item) => item.fileIndex === media.fileIndex);
+      await store.updateWatch(token, [{ source, media: { ...media, path: item?.path || media.name } }], "progress", now,
+        { start, end, duration, generation });
+    } else {
+      const requestedKey = String(body.key || "");
+      const existing = Object.hasOwn(currentSession.watchRecords, requestedKey) ? currentSession.watchRecords[requestedKey] : undefined;
+      if (body.key && !existing) return Response.json({ error: "That watched video was not found." }, { status: 400 });
+      if (existing) targets = [{ source: existing.source, media: existing.media }];
+      else if (Array.isArray(body.itemIds) && body.itemIds.length <= 500) {
+        const itemIds = body.itemIds;
+        const source = currentSession.sources.find((item) => item.id === body.sourceId);
+        if (source?.kind === "direct" && itemIds.length === 1 && itemIds[0] === mediaItemId(source.id, 0)) {
+          const media = currentSession.selectedMedia?.sourceId === source.id ? currentSession.selectedMedia :
+            { sourceId: source.id, fileIndex: 0, itemId: itemIds[0], name: source.label, size: 0 };
+          targets = [{ source, media }];
+        } else {
+          targets = (source?.mediaItems || []).filter((item) => itemIds.includes(item.id))
+            .map((item) => ({ source, media: { ...item, itemId: item.id, sourceId: source!.id } }));
+        }
+        if (targets.length !== new Set(itemIds).size) targets = [];
+      } else if (body.sourceId) {
+        const source = currentSession.sources.find((item) => item.id === body.sourceId && item.kind === "direct");
+        if (source) targets = [{ source, media: currentSession.selectedMedia?.sourceId === source.id
+          ? currentSession.selectedMedia : { sourceId: source.id, name: source.label, size: 0 } }];
+      } else if (currentSession.selectedMedia) {
+        const media = currentSession.selectedMedia;
+        targets = [{ source: currentSession.sources.find((item) => item.id === media.sourceId), media }];
+      }
+      if (!targets.length) return Response.json({ error: "That room video was not found." }, { status: 400 });
+      if (watchAction === "again" && targets.some((target) => target.source &&
+        !currentSession.sources.some((item) => item.id === target.source!.id ||
+          mediaWatchKey(item, target.media) === mediaWatchKey(target.source, target.media))) && currentSession.sources.length >= 30) {
+        return Response.json({ error: "Remove a queued source before restoring this video." }, { status: 409 });
+      }
+      await store.updateWatch(token, targets, watchAction, now);
+    }
   } else if (action === "prioritize-media" || action === "include-media") {
     const itemId = String(body.itemId || "");
     const source = currentSession.sources.find((candidate) =>
@@ -817,6 +973,10 @@ async function handlePost(request: Request, store: SessionStore) {
       return Response.json({ error: "That synchronized video was not found." }, { status: 400 });
     }
     const property = action === "prioritize-media" ? "priority" : "included";
+    const excludingCurrent = property === "included" && !body.included && currentSession.selectedMedia?.itemId === itemId;
+    if (excludingCurrent && !currentSession.player.paused) {
+      return Response.json({ error: "Pause playback before excluding the current video." }, { status: 409 });
+    }
     await store.setSources(
       token,
       currentSession.sources.map((candidate) => candidate.id === source.id
@@ -829,6 +989,7 @@ async function handlePost(request: Request, store: SessionStore) {
         : candidate),
       now
     );
+    if (excludingCurrent) await store.setSelectedMedia(token, null, now);
   } else if (action === "reorder-media") {
     const sourceId = String(body.sourceId || "");
     const source = currentSession.sources.find((candidate) => candidate.id === sourceId);
@@ -870,6 +1031,12 @@ async function handlePost(request: Request, store: SessionStore) {
     }
     if (manifestItem && manifestItem.id !== mediaItemId(sourceId!, manifestItem.fileIndex)) {
       return Response.json({ error: "The synchronized video identity is invalid." }, { status: 400 });
+    }
+    const sameSelection = currentSession.selectedMedia?.sourceId === sourceId &&
+      currentSession.selectedMedia?.fileIndex === (manifestItem?.fileIndex ?? candidate.fileIndex);
+    if (!sameSelection && source && (source.selectionConfirmed === false || manifestItem?.included === false ||
+      isMediaWatched(currentSession.watchRecords, source, manifestItem || candidate))) {
+      return Response.json({ error: "Include an unwatched video or use Watch again before selecting it." }, { status: 409 });
     }
     if (candidate.fileIndex !== undefined && (!Number.isInteger(candidate.fileIndex) || Number(candidate.fileIndex) < 0)) {
       return Response.json({ error: "A valid media file index is required." }, { status: 400 });
