@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.3](https://github.com/Etaselia/watchpair/compare/v0.13.2...v0.13.3) (2026-10-28)
+
+
+### Bug Fixes
+
+* recover download folder collisions automatically ([#143](https://github.com/Etaselia/watchpair/issues/143)) ([b6e3e3e](https://github.com/Etaselia/watchpair/commit/b6e3e3e51765e29d48e7261af30ffdf6a2475fd1))
+
 ## [0.13.2](https://github.com/Etaselia/watchpair/compare/v0.13.1...v0.13.2) (2026-10-28)
 
 
