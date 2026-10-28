@@ -51,6 +51,12 @@ export function orderTransferTargets(targets, controls) {
         return true;
     });
 }
+export function filePlaybackReady(file, job = {}) {
+    const preparation = file.preparation?.status || job.preparation?.status || "waiting";
+    const fingerprint = file.fingerprint === undefined ? (file.selected ? job.identityFingerprint : null) : file.fingerprint;
+    return Boolean(file.ready && fingerprint && ["ready", "direct"].includes(preparation));
+}
+
 export function transferStage(job) {
     if (job.checking)
         return { key: "checking", label: "Verifying files", reason: "Checking torrent pieces already on disk" };
@@ -69,7 +75,9 @@ export function transferStage(job) {
         return job.kind === "magnet" && job.downloadRole === "waiting"
             ? { key: "queued", label: "Queued", reason: "Waiting for an active download slot or higher priority files" }
             : { key: "downloading", label: "Downloading", reason: "Downloading selected files" };
-    if (wanted.some(file => file.ready))
+    if (wanted.some(file => file.status === "verifying"))
+        return { key: "checking", label: "Verifying files", reason: "Confirming downloaded data and file identity" };
+    if (wanted.some(file => filePlaybackReady(file, job)))
         return { key: "ready", label: "Ready to play", reason: "At least one selected video is prepared for playback" };
     if (wanted.some(file => file.preparation?.status === "error"))
         return { key: "error", label: "Preparation failed", reason: wanted.find(file => file.preparation?.error)?.preparation.error || "Retry video preparation" };

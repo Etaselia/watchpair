@@ -9,6 +9,10 @@ test("manual queue limits distinct transfers, preserves file priorities, and exc
     assert.throws(() => validateBandwidthSettings({ downloadLimit: -1, uploadLimit: 0, maxActiveDownloads: 1, queueMode: "manual" }));
     assert.equal(transferStage({ paused: true, manualPaused: true }).label, "Paused manually");
     assert.equal(transferStage({ status: "ready", files: [{ included: true, progress: 100, downloadReady: true, ready: false }] }).key, "preparing");
+    const downloaded = { included: true, progress: 100, downloadReady: true, ready: true, fingerprint: "verified-fingerprint", preparation: { status: "queued" } };
+    assert.equal(transferStage({ files: [downloaded] }).key, "preparing", "Downloaded data is not a prepared browser copy");
+    assert.equal(transferStage({ files: [{ ...downloaded, preparation: { status: "ready" } }] }).key, "ready");
+    assert.equal(transferStage({ files: [{ ...downloaded, preparation: { status: "error", error: "Probe failed" } }] }).key, "error");
     assert.equal(transferStage({ files: [{ included: false }] }).key, "waiting");
 });
 test("room controls verify the current host, keep credentials private, and expire without browser renewal", async () => {

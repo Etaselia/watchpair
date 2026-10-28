@@ -1,4 +1,4 @@
-import { transferStage, groupTransferSnapshots } from "../../agent/transfer-controls.mjs";
+import { transferStage, groupTransferSnapshots, filePlaybackReady } from "../../agent/transfer-controls.mjs";
 import { mediaWatchKey } from "../../lib/watch-history.mjs";
 const $ = id => document.getElementById(id);
 const state = { jobs: [], groups: [], controls: { order: [], priorities: {} }, rooms: [], activity: {}, selected: null,
@@ -244,7 +244,7 @@ function redrawContent(job, draft, container) {
         row.append(priorityCell);
         const record = file ? watchRecord(file, job) : null;
         const selected = room()?.selectedMedia?.sourceId === job.id && room()?.selectedMedia?.fileIndex === file?.index;
-        const status = record?.watchedAt ? `Watched · ${age(record.watchedAt)}` : selected ? "Selected in room" : file?.ready ? "Ready to play" : file?.preparation?.status === "preparing" ? "Preparing video" : folder ? `${wanted} of ${files.length} selected` : file?.status || "Waiting";
+        const status = record?.watchedAt ? `Watched · ${age(record.watchedAt)}` : selected ? "Selected in room" : file && filePlaybackReady(file, job) ? "Ready to play" : ["preparing", "queued"].includes(file?.preparation?.status) ? "Preparing video" : folder ? `${wanted} of ${files.length} selected` : file?.downloadReady ? "Preparing video" : file?.status || "Waiting";
         const statusCell = el("td", status);
         if (record?.watchedAt)
             statusCell.title = new Date(record.watchedAt).toLocaleString();
@@ -318,7 +318,7 @@ function renderDetail(force = false) {
         if (!current.files?.length)
             container.append(el("p", stage.reason, "desk-note"));
         else if (current.seed || current.kind !== "magnet")
-            container.append(table(["File", "Size", "State"], current.files.map(file => [file.name, bytes(file.size), file.ready ? "Ready to play" : file.status])));
+            container.append(table(["File", "Size", "State"], current.files.map(file => [file.name, bytes(file.size), filePlaybackReady(file, current) ? "Ready to play" : file.downloadReady ? "Preparing video" : file.status])));
         else
             {
                 const videoJob = { ...current, files: current.files.filter(file => /\.(mp4|m4v|webm|ogv|mov|mkv|avi|ts)$/i.test(file.path || file.name)) };
