@@ -12,6 +12,7 @@ Run:
 npm run check
 npm test
 npm run test:desktop:e2e
+npm run test:room:e2e
 docker build -t watchpair:test .
 npm audit --omit=dev
 npx --yes pnpm@10.34.5 --dir companion audit --prod

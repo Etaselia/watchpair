@@ -6,7 +6,27 @@ import {
   mediaManifest,
   orderedMediaQueue,
   sameMediaManifest,
+  torrentFileSelectionStatus,
 } from "../lib/media-queue.mjs";
+
+test("file choice explains metadata loading, device policy, and errors before the room has files", () => {
+  const source = { id: "source-picker-pack", kind: "magnet", selectionConfirmed: false };
+  const connected = { agentAvailable: true };
+  assert.match(torrentFileSelectionStatus(source, null, connected), /Loading file list/);
+  assert.match(torrentFileSelectionStatus(source, null), /Connect the Companion/);
+  assert.match(torrentFileSelectionStatus(source, null, { agentUpdateRequired: true }), /Update the Companion/);
+  assert.match(torrentFileSelectionStatus(source, null, { ...connected, policy: "ask" }), /Choose files to start loading/);
+  assert.match(torrentFileSelectionStatus(source, null, { ...connected, policy: "ask", approved: true }), /Loading file list/);
+  assert.match(torrentFileSelectionStatus(source, null, { ...connected, policy: "never" }), /Set Download here/);
+  assert.match(torrentFileSelectionStatus(source, { status: "paused", paused: true }, connected), /start loading/);
+  assert.match(torrentFileSelectionStatus(source, { status: "error", error: "Tracker unavailable" }, connected), /Tracker unavailable/);
+  assert.match(torrentFileSelectionStatus(source, null, { ...connected, syncError: "Room unavailable" }), /Room unavailable.*Retrying/);
+  const files = [{ index: 0, path: "Season 1/Episode 1.mkv", size: 42 }];
+  assert.match(torrentFileSelectionStatus(source, { files }, connected), /Syncing file list/);
+  assert.match(torrentFileSelectionStatus(source, { files: [{ index: 0, path: "readme.txt", size: 1 }] }, connected), /no supported video files/);
+  assert.equal(torrentFileSelectionStatus({ ...source, mediaItems: mediaManifest(files, source.id) }, { files }, connected),
+    "Choose files before downloading");
+});
 
 test("naturally orders nested seasons and episode numbers", () => {
   const files = [

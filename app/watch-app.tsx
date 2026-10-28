@@ -135,6 +135,7 @@ import {
   mediaManifest,
   mediaQueue,
   orderedMediaQueue,
+  torrentFileSelectionStatus,
 } from "../lib/media-queue.mjs";
 import { createWatchCoverageTracker, downloadFileIndexes, isMediaWatched, mediaWatchKey, mergeWatchedRanges, relativeWatchTime, unreportedWatchedRanges } from "../lib/watch-history.mjs";
 import TorrentFilePicker from "./torrent-file-picker";
@@ -555,6 +556,7 @@ export default function WatchApp() {
   const [libraryOpen, setLibraryOpen] = useState(false);
   const [queueTab, setQueueTab] = useState<"queue" | "watched">("queue");
   const [filesSourceId, setFilesSourceId] = useState("");
+  const [fileListErrors, setFileListErrors] = useState<Record<string, string>>({});
   const offeredFilePickers = useRef(new Set<string>());
   const [historyNow, setHistoryNow] = useState(Date.now);
   const [libraryBusy, setLibraryBusy] = useState(false);
@@ -884,6 +886,7 @@ export default function WatchApp() {
     if (mediaUrlRef.current.startsWith("blob:")) URL.revokeObjectURL(mediaUrlRef.current);
     if (!updateState) return;
     setApprovedSourceIds([]);
+    setFileListErrors({});
     localAgentBindingRef.current = null;
     setLocalAgentBinding(null);
     setMediaUrl("");
@@ -1936,8 +1939,13 @@ export default function WatchApp() {
                 throw new Error("The companion returned a different source identity.");
               }
               sourceIdentityConflictIdsRef.current.delete(source.id);
+              setFileListErrors((current) => current[source.id] ? { ...current, [source.id]: "" } : current);
               return job;
             } catch (caught) {
+              if (refreshIsCurrent()) {
+                const message = caught instanceof Error ? caught.message : "The Companion could not start this torrent.";
+                setFileListErrors((current) => current[source.id] === message ? current : { ...current, [source.id]: message });
+              }
               if (
                 refreshIsCurrent() &&
                 caught instanceof Error &&
@@ -2007,8 +2015,13 @@ export default function WatchApp() {
             mediaItems: manifest,
           });
           if (!refreshIsCurrent()) return;
-        } catch {
+          setFileListErrors((current) => current[source.id] ? { ...current, [source.id]: "" } : current);
+        } catch (caught) {
           manifestSyncedRef.current.delete(manifestKey);
+          if (refreshIsCurrent()) {
+            const message = caught instanceof Error ? caught.message : "The room could not receive the file list.";
+            setFileListErrors((current) => current[source.id] === message ? current : { ...current, [source.id]: message });
+          }
         }
       }
 
@@ -2460,6 +2473,12 @@ export default function WatchApp() {
 
   const startQueuedSource = (sourceId: string) => {
     setApprovedSourceIds((current) => current.includes(sourceId) ? current : [...current, sourceId]);
+  };
+
+  const openFilePicker = (sourceId: string) => {
+    if (session) offeredFilePickers.current.add(`${session.token}:${sourceId}`);
+    setFilesSourceId(sourceId);
+    if (agentAvailable && acquisitionPolicy === "ask") startQueuedSource(sourceId);
   };
 
   const pauseQueuedSource = async (sourceId: string) => {
@@ -3297,7 +3316,10 @@ export default function WatchApp() {
                           <strong>{source.label}</strong>
                           <span className="source-badge subtle">{sourceKindLabel(source.kind)}</span>
                         </div>
-                        <span>{source.selectionConfirmed === false ? "Choose files before downloading" :
+                        <span>{source.selectionConfirmed === false ? torrentFileSelectionStatus(source, job, {
+                          agentAvailable, agentUpdateRequired, policy: acquisitionPolicy,
+                          approved: approvedSourceIds.includes(source.id), syncError: fileListErrors[source.id],
+                        }) :
                           allRows.length && !mediaRows.length ? "No files selected" :
                           localState?.status || (agentAvailable ? "Starting companion job" : "Waiting for companion")}</span>
                         <div className="progress-track" aria-label={`${Math.round(localState?.progress || 0)}% complete`}>
@@ -3338,8 +3360,8 @@ export default function WatchApp() {
                     </div>
 
                     <div className="queue-actions">
-                      {source.kind === "magnet" && !!manifestItems.length && <button className="secondary-button compact-button" type="button"
-                        onClick={() => setFilesSourceId(source.id)}>
+                      {source.kind === "magnet" && <button className="secondary-button compact-button" type="button"
+                        onClick={() => openFilePicker(source.id)}>
                         {source.selectionConfirmed === false ? "Choose files" : "Manage files"}
                       </button>}
                       {source.kind === "direct" && <button className="secondary-button compact-button" type="button"
@@ -3564,16 +3586,24 @@ export default function WatchApp() {
             : isMediaWatched(watchRecords, source)) && <p className="queue-empty">Everything in this room has been watched.</p>}
           </div>
 
-          {sources.find((source) => source.id === filesSourceId && source.mediaItems?.length) && <TorrentFilePicker
+          {sources.filter((source) => source.id === filesSourceId).map((source) => <TorrentFilePicker
             key={filesSourceId}
-            source={sources.find((source) => source.id === filesSourceId)!}
+            source={source}
             records={watchRecords}
+            status={torrentFileSelectionStatus(source, roomAgentJob(source.id), {
+              agentAvailable, agentUpdateRequired, policy: acquisitionPolicy,
+              approved: approvedSourceIds.includes(source.id), syncError: fileListErrors[source.id],
+            })}
+            onLoad={agentAvailable && acquisitionPolicy === "ask" && !approvedSourceIds.includes(source.id)
+              ? () => startQueuedSource(source.id) : undefined}
+            onRetry={agentAvailable && acquisitionPolicy !== "never" && roomAgentJob(source.id)?.status === "error"
+              ? () => retryQueuedSource(source.id) : undefined}
             onClose={() => setFilesSourceId("")}
             onApply={async (itemIds) => { await sendAction("select-files", { sourceId: filesSourceId, itemIds }); }}
             onWatch={async (itemIds, watched) => { await sendAction("watch-state", {
               sourceId: filesSourceId, itemIds, state: watched ? "watched" : "unwatched",
             }); }}
-          />}
+          />)}
 
           {libraryOpen && (
             <div className="library-panel" role="dialog" aria-modal="false" aria-label="Companion library">

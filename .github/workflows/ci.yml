@@ -131,6 +131,12 @@ jobs:
       - name: Exercise development client
         if: runner.os == 'Linux'
         run: xvfb-run --auto-servernum npm run test:desktop:e2e
+      - name: Exercise room file picker
+        if: runner.os == 'Windows'
+        run: npm run test:room:e2e
+      - name: Exercise room file picker
+        if: runner.os == 'Linux'
+        run: xvfb-run --auto-servernum npm run test:room:e2e
       - name: Package desktop client
         run: ${{ matrix.build }}
       - name: Exercise packaged client
