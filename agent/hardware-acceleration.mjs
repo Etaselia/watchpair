@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { mediaToolArguments } from "./media-tool-paths.mjs";
 import process from "node:process";
 import { promisify } from "node:util";
 
@@ -252,7 +253,7 @@ function outputText(result) {
 }
 
 async function commandOutput(path, args, run = runFile) {
-  const result = await run(path, args, {
+  const result = await run(path, mediaToolArguments(args), {
     maxBuffer: 8 * 1024 * 1024,
     timeout: PROBE_TIMEOUT_MS,
     windowsHide: true,

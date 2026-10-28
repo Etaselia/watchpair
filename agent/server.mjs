@@ -77,6 +77,7 @@ import {
   fontAttachmentMetadata,
 } from "./subtitle-assets.mjs";
 import { isSupportedMagnet } from "./torrent-input.mjs";
+import { mediaToolArguments } from "./media-tool-paths.mjs";
 import { installTorrentPieceRecovery, installWebTorrentSafetyGuards, verifiedTorrentFileProgress, verifyTorrentFilePieces } from "./webtorrent-safety.mjs";
 import {
   applyTorrentConnectionPlan,
@@ -1024,7 +1025,7 @@ async function probeSubtitleTracks(job, index = job.selectedIndex) {
   try {
     const result = await runFile(
       FFPROBE_PATH,
-      chapterProbeArguments(media.path),
+      mediaToolArguments(chapterProbeArguments(media.path)),
       { maxBuffer: 8 * 1024 * 1024 }
     );
     if (!isStillCurrent()) return;

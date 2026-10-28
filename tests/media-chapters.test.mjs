@@ -1,10 +1,22 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mediaToolArguments, mediaToolPath } from "../agent/media-tool-paths.mjs";
 import {
   chapterProbeArguments,
   mediaDurationFromProbe,
   normalizeMediaChapters,
 } from "../agent/media-chapters.mjs";
+
+test("native media tools receive extended Windows paths without changing URLs or filters", () => {
+  const drive = "C:\\Downloads\\Season 2\\Episode 1.mkv";
+  const network = "\\\\server\\media\\Episode 1.mkv";
+  assert.equal(mediaToolPath(drive, "win32"), "\\\\?\\" + drive);
+  assert.equal(mediaToolPath(network, "win32"), "\\\\?\\UNC\\server\\media\\Episode 1.mkv");
+  assert.equal(mediaToolPath(mediaToolPath(drive, "win32"), "win32"), mediaToolPath(drive, "win32"));
+  const unchanged = ["-i", "https://example.test/input.mkv", "pipe:1", "video/index.m3u8", "format=yuv420p", "/media/input.mkv"];
+  assert.deepEqual(mediaToolArguments(unchanged, "win32"), unchanged);
+  assert.deepEqual(mediaToolArguments([drive, network], "linux"), [drive, network]);
+});
 
 test("chapter probe asks ffprobe for streams and chapters", () => {
   assert.deepEqual(chapterProbeArguments("/videos/movie.mkv"), [

@@ -9,18 +9,23 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import ffmpegPath from "ffmpeg-static";
 import { terminateChildProcess } from "./process-helpers.mjs";
+import { mediaToolArguments } from "../agent/media-tool-paths.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 
 test("library APIs deduplicate, preview ranges, hide paths, and propagate collection pins", {
-  timeout: 30_000,
+  timeout: 60_000,
 }, async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), "watchpair-library-api-"));
   const downloads = path.join(temporary, "downloads");
   const libraryRoot = path.join(temporary, "library");
-  const showRoot = path.join(libraryRoot, "Example Show");
+  const showRoot = process.platform === "win32"
+    ? path.join(libraryRoot, ("Example Show " + "long title ".repeat(14)).trim(), ("Season 02 " + "nested folder ".repeat(6)).trim())
+    : path.join(libraryRoot, "Example Show");
   const videoPath = path.join(showRoot, "Episode 01.mp4");
   const hlsPreviewPath = path.join(showRoot, "Preview.mkv");
+  if (process.platform === "win32") assert.ok(hlsPreviewPath.length > 260);
+  const subtitlePath = path.join(temporary, "captions.srt");
   const bytes = Buffer.alloc(1_000, 0x5a);
   const unrelatedFolder = path.join(downloads, "TV-Shows-2024");
   const port = await freePort();
@@ -33,14 +38,16 @@ test("library APIs deduplicate, preview ranges, hide paths, and propagate collec
   await utimes(unrelatedFolder, old, old);
   await mkdir(showRoot, { recursive: true });
   await writeFile(videoPath, bytes);
-  await run(ffmpegPath, [
+  await writeFile(subtitlePath, "1\n00:00:00,000 --> 00:00:01,000\nLong path subtitles\n");
+  await run(ffmpegPath, mediaToolArguments([
     "-hide_banner", "-loglevel", "error", "-y",
     "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=12:duration=1.2",
     "-f", "lavfi", "-i", "sine=frequency=440:duration=1.2",
-    "-map", "0:v:0", "-map", "1:a:0",
-    "-c:v", "mpeg4", "-q:v", "8", "-c:a", "aac", "-shortest",
+    "-i", subtitlePath,
+    "-map", "0:v:0", "-map", "1:a:0", "-map", "2:s:0",
+    "-c:v", "mpeg4", "-q:v", "8", "-c:a", "aac", "-c:s", "srt",
     hlsPreviewPath,
-  ]);
+  ]));
   let child;
   let output = "";
 
@@ -234,6 +241,14 @@ test("library APIs deduplicate, preview ranges, hide paths, and propagate collec
     });
     assert.equal(videoPlaylistResponse.status, 200);
     assert.match(await videoPlaylistResponse.text(), /#EXT-X-MAP|#EXTINF/);
+    const preparedPreview = (await (await localFetch(`${base}/downloads/${previewSourceId}`)).json()).job;
+    assert.ok(preparedPreview.preparation.sourceDuration > 0, "the native probe reads the nested source duration");
+    assert.equal(preparedPreview.subtitles.length, 1);
+    const subtitleResponse = await localFetch(preparedPreview.subtitles[0].url, {
+      headers: { "x-watchpair-control": controlToken },
+    });
+    assert.equal(subtitleResponse.status, 200);
+    assert.match(await subtitleResponse.text(), /Long path subtitles/);
     assert.equal((await localFetch(`${base}/downloads/${previewSourceId}?deleteFiles=0`, {
       method: "DELETE",
       headers: { "x-watchpair-control": controlToken },

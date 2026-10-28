@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { applyMediaProcessPriority } from "./media-governor.mjs";
 import { attachFfmpegProgress } from "./process-registry.mjs";
+import { mediaToolArguments } from "./media-tool-paths.mjs";
 
 function pipelineError(stage, code, stderr) {
   const detail = stderr.trim().split(/\r?\n/).slice(-4).join(" ").slice(0, 700);
@@ -40,9 +41,9 @@ export function createScheduledFfmpegRunner({ ffmpegPath, scheduler, processRegi
         const mediaArguments = argumentsForProfile
           ? argumentsForProfile(profile)
           : fixedArguments;
-        const ffmpegArguments = captureProgress
+        const ffmpegArguments = mediaToolArguments(captureProgress
           ? ["-progress", "pipe:1", "-nostats", ...mediaArguments]
-          : mediaArguments;
+          : mediaArguments);
         const child = spawnProcess(ffmpegPath, ffmpegArguments, {
           windowsHide: true,
           stdio: ["ignore", "pipe", "pipe"],

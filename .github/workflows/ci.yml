@@ -137,6 +137,12 @@ jobs:
       - name: Exercise room file picker
         if: runner.os == 'Linux'
         run: xvfb-run --auto-servernum npm run test:room:e2e
+      - name: Exercise nested Windows media paths
+        if: runner.os == 'Windows'
+        run: |
+          node --test tests/agent-library-api.test.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --test --test-name-pattern="long Windows" tests/hls-playback.test.mjs
       - name: Package desktop client
         run: ${{ matrix.build }}
       - name: Exercise packaged client
