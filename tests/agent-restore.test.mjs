@@ -50,7 +50,7 @@ test("agent restores more than 100 jobs and preserves failed records", { timeout
     file: { name: "external.mp4", path: path.join(temporary, "external.mp4"), size: 1 },
   };
   await mkdir(downloads, { recursive: true });
-  await writeFile(manifestPath, JSON.stringify([...paused, failed, legacyTransientBinding], null, 2));
+  await writeFile(manifestPath, JSON.stringify([null, ...paused, failed, legacyTransientBinding], null, 2));
   let child;
   let output = "";
 
@@ -82,9 +82,10 @@ test("agent restores more than 100 jobs and preserves failed records", { timeout
     await terminateChildProcess(child, { graceMs: 4_000 });
     child = null;
     const persisted = JSON.parse(await readFile(manifestPath, "utf8"));
-    assert.equal(persisted.length, 106);
-    assert.ok(persisted.some((record) => record.id === failed.id && record.file.path === failed.file.path));
-    assert.equal(persisted.some((record) => record.id === legacyTransientBinding.id), false);
+    assert.equal(persisted.length, 107);
+    assert.ok(persisted.includes(null), "a malformed old record cannot prevent the other jobs from restoring");
+    assert.ok(persisted.some((record) => record?.id === failed.id && record.file.path === failed.file.path));
+    assert.equal(persisted.some((record) => record?.id === legacyTransientBinding.id), false);
   } catch (error) {
     throw new Error(`${error.message}\nAgent output:\n${output}`, { cause: error });
   } finally {
