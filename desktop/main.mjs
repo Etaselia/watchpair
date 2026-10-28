@@ -418,9 +418,9 @@ function createWindow() {
     return mainWindow;
   }
   mainWindow = new BrowserWindow({
-    width: 780,
-    height: 760,
-    minWidth: 650,
+    width: 1240,
+    height: 860,
+    minWidth: 760,
     minHeight: 620,
     backgroundColor: "#10130f",
     icon: windowIcon(),
@@ -618,6 +618,34 @@ async function runSelfTest() {
 
   await mainWindow.webContents.executeJavaScript("document.querySelector('#check-update').click()");
   await waitForRenderer("document.querySelector('#update-status')?.textContent === 'Updates are disabled in development'");
+  await waitForRenderer("window.companionDesk && document.querySelector('.transfer-table')");
+  await mainWindow.webContents.executeJavaScript(`(() => {
+    document.querySelector('#tab-speed').click();
+    const form = document.querySelector('#transfer-detail form');
+    form.elements.downloadLimit.value = '512';
+    form.elements.uploadLimit.value = '128';
+    form.elements.maxActiveDownloads.value = '2';
+    form.elements.queueMode.value = 'manual';
+    form.requestSubmit();
+  })()`);
+  await waitForRenderer("document.querySelector('#message')?.textContent === 'Saved'");
+  const transferControls = await mainWindow.webContents.executeJavaScript("window.watchpair.getTransferControls()");
+  const transferInteractions = await mainWindow.webContents.executeJavaScript(`(() => {
+    document.querySelector('#tab-content').click();
+    window.companionDesk.render([{ id: 'desktop-season-pack', label: 'Desktop test · 20-season collection', kind: 'magnet', status: 'downloading',
+      createdAt: Date.now(), files: Array.from({length: 2000}, (_,index) => ({index, name: 'Episode '+(index%100+1)+'.mkv',
+      path: 'Collection/Season '+Math.floor(index/100)+'/Episode '+(index%100+1)+'.mkv', size: 1048576, progress: 0, included: false, status: 'downloading'})) }]);
+    const detail = document.querySelector('#transfer-detail');
+    [...detail.querySelectorAll('button')].find(button => button.textContent === 'Select all').click();
+    const selectedAll = detail.textContent.includes('2000 files');
+    detail.querySelector('.folder-expand').click();
+    const collapsedRows = detail.querySelectorAll('tbody tr').length;
+    detail.querySelectorAll('.folder-expand')[1].click();
+    const expandedRows = detail.querySelectorAll('tbody tr').length;
+    const check = detail.querySelectorAll('.folder-row input[type=checkbox]')[1];
+    check.click();
+    return {selectedAll, collapsedRows, expandedRows, folderExcluded: detail.textContent.includes('1900 files')};
+  })()`);
   const dom = await mainWindow.webContents.executeJavaScript(`({
     title: document.title,
     status: document.querySelector("#agent-status")?.textContent,
@@ -628,7 +656,7 @@ async function runSelfTest() {
     downloadDirectory: document.querySelector("#download-directory")?.value,
     logs: document.querySelector("#log-summary")?.textContent,
     openLogs: Boolean(document.querySelector("#open-logs")),
-    sections: document.querySelectorAll("main section").length
+    transferDesk: Boolean(document.querySelector('.transfer-table') && document.querySelector('.sidebar') && document.querySelector('#tab-storage'))
   })`);
   const image = await mainWindow.webContents.capturePage();
   const screenshotPath = path.join(path.dirname(SELF_TEST_REPORT), "desktop-companion.png");
@@ -641,6 +669,8 @@ async function runSelfTest() {
     saved,
     cleaned,
     cleanupMessage,
+    transferControls,
+    transferInteractions,
     dom,
     screenshotPath,
     screenshotSize: image.getSize(),
@@ -786,6 +816,15 @@ async function stopLibraryPreview(event, sourceId) {
 }
 
 function registerIpc() {
+  ipcMain.handle("companion:get-transfer-controls", event => {
+    assertMainRenderer(event);
+    return agentFetch("/control/transfers", { headers: { "x-watchpair-control": CONTROL_TOKEN } });
+  });
+  ipcMain.handle("companion:transfer-command", (event, command) => {
+    assertMainRenderer(event);
+    return agentFetch("/control/transfers", { method: "POST", timeoutMs: 30_000,
+      headers: { "content-type": "application/json", "x-watchpair-control": CONTROL_TOKEN }, body: JSON.stringify(command) });
+  });
   ipcMain.handle("companion:get-state", async () => {
     await refreshAgentState();
     return publicState();

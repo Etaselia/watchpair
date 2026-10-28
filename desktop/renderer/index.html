@@ -6,30 +6,96 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; media-src watchpair-media:; connect-src watchpair-media:">
   <title>WatchPair Companion</title>
   <link rel="stylesheet" href="./styles.css">
+<link rel="stylesheet" href="./transfer-desk.css">
 </head>
 <body>
-  <header class="app-header">
-    <div class="brand-mark" aria-hidden="true"><span></span><span></span></div>
-    <div>
-      <h1>WatchPair Companion</h1>
-      <p id="version">Version</p>
-    </div>
-    <span id="agent-status" class="status-pill">Starting</span>
-  </header>
+<header class="app-header">
+<strong>WatchPair Companion</strong>
+<span id="version">Version</span>
+<span id="agent-status" class="status-pill">Starting</span>
+</header>
+<div class="transfer-toolbar" role="toolbar" aria-label="Torrent controls">
+<button type="button" data-command="add">＋ Add torrent</button>
+<button type="button" data-command="resume">▷ Resume</button>
+<button type="button" data-command="pause">Ⅱ Pause</button>
+<button type="button" data-command="recheck">↻ Recheck</button>
+<button type="button" data-command="up">↑ Up</button>
+<button type="button" data-command="down">↓ Down</button>
+<button type="button" data-command="remove">Remove</button>
+<button type="button" data-page="settings">Settings</button>
+<input id="transfer-search" type="search" placeholder="Filter torrents…" aria-label="Filter torrents">
+<button id="refresh-transfers" type="button">Refresh</button>
+</div>
 
-  <main>
-    <section aria-labelledby="transfers-title">
-      <div class="section-heading">
-        <div>
-          <h2 id="transfers-title">Transfers</h2>
-          <p id="transfers-summary">Reading active downloads and shares</p>
-        </div>
-        <button id="refresh-transfers" class="secondary" type="button">Refresh</button>
-      </div>
-      <div id="transfer-list" class="transfer-list" aria-live="polite"></div>
-    </section>
+<div class="room-strip">
+<label>Active room <select id="active-room">
+<option value="">This device only</option>
+</select>
+</label>
+<span id="room-permission">Open a room in the browser to connect its queue.</span>
+</div>
+<div class="companion-workspace">
+<aside class="sidebar" aria-label="Companion navigation">
+<h2>Status</h2>
+<div id="transfer-filters">
+<button type="button" data-filter="all">All<span data-count="all">0</span>
+</button>
+<button type="button" data-filter="queued">Queued<span data-count="queued">0</span></button>
+<button type="button" data-filter="downloading">Downloading<span data-count="downloading">0</span>
+</button>
+<button type="button" data-filter="preparing">Preparing video<span data-count="preparing">0</span>
+</button>
+<button type="button" data-filter="checking">Verifying<span data-count="checking">0</span>
+</button>
+<button type="button" data-filter="metadata">Getting metadata<span data-count="metadata">0</span>
+</button>
+<button type="button" data-filter="waiting">Waiting for selection<span data-count="waiting">0</span>
+</button>
+<button type="button" data-filter="ready">Ready to play<span data-count="ready">0</span>
+</button>
+<button type="button" data-filter="paused">Paused<span data-count="paused">0</span>
+</button>
+<button type="button" data-filter="sharing">Sharing<span data-count="sharing">0</span>
+</button>
+<button type="button" data-filter="error">Needs attention<span data-count="error">0</span>
+</button>
+</div>
+<h2>Library</h2>
+<button type="button" data-page="library">Local library</button>
+<button type="button" data-page="watched">Watched in room</button>
+<h2>Tools</h2>
+<button type="button" data-page="settings" data-anchor="storage-title">Storage</button>
+<button type="button" data-page="settings" data-anchor="performance-title">Performance</button>
+<button type="button" data-page="settings" data-anchor="updates-title">Updates</button>
+<button type="button" data-page="settings" data-anchor="diagnostics-title">Diagnostics</button>
+<button type="button" data-page="transfers">Transfers</button>
+</aside>
+<main>
+<section id="transfer-page" aria-labelledby="transfers-title">
+<h2 id="transfers-title" class="sr-only">Transfers</h2>
 
-    <section aria-labelledby="library-title">
+<div id="transfers-summary" class="transfer-summary">Reading transfers</div>
+<div id="transfer-list" class="transfer-list">
+</div>
+<div class="pane-divider">
+<label>Detail pane height <input id="detail-height" type="range" min="190" max="600" step="10" value="320">
+</label>
+</div>
+<div id="detail-title" class="detail-title">Select a transfer</div>
+<div id="transfer-detail" role="tabpanel" aria-labelledby="tab-content">
+</div>
+<nav class="detail-tabs" role="tablist" aria-label="Torrent details">
+<button type="button" role="tab" id="tab-general" aria-controls="transfer-detail" aria-selected="false" data-detail-tab="general">General</button>
+<button type="button" role="tab" id="tab-content" aria-controls="transfer-detail" aria-selected="true" data-detail-tab="content">Content</button>
+<button type="button" role="tab" id="tab-speed" aria-controls="transfer-detail" aria-selected="false" data-detail-tab="speed">Speed</button>
+<button type="button" role="tab" id="tab-storage" aria-controls="transfer-detail" aria-selected="false" data-detail-tab="storage">Storage</button>
+<button type="button" role="tab" id="tab-trackers" aria-controls="transfer-detail" aria-selected="false" data-detail-tab="trackers">Trackers</button>
+<button type="button" role="tab" id="tab-peers" aria-controls="transfer-detail" aria-selected="false" data-detail-tab="peers">Peers</button>
+<button type="button" role="tab" id="tab-activity" aria-controls="transfer-detail" aria-selected="false" data-detail-tab="activity">Activity</button>
+<button type="button" role="tab" id="tab-rooms" aria-controls="transfer-detail" aria-selected="false" data-detail-tab="rooms">Rooms</button>
+</nav>
+</section>
+<div id="library-page" hidden>    <section aria-labelledby="library-title">
       <div class="section-heading">
         <div>
           <h2 id="library-title">Library</h2>
@@ -40,20 +106,27 @@
           <button id="scan-library" class="secondary" type="button">Rescan</button>
         </div>
       </div>
-      <div id="library-folders" class="library-folders" aria-label="Library folders"></div>
+      <div id="library-folders" class="library-folders" aria-label="Library folders">
+</div>
       <label class="field wide library-search-field">
         <span>Find shows or episodes</span>
         <input id="library-search" type="search" maxlength="200" placeholder="Search the local library">
       </label>
-      <div id="library-list" class="library-list" aria-live="polite"></div>
+      <div id="library-list" class="library-list" aria-live="polite">
+</div>
       <div class="library-pagination">
         <button id="library-previous" class="secondary" type="button">Previous</button>
         <span id="library-page">Page 1</span>
         <button id="library-next" class="secondary" type="button">Next</button>
       </div>
     </section>
-
-    <section aria-labelledby="storage-title">
+</div>
+<div id="watched-page" hidden>
+<h2>Watched in active room</h2>
+<div id="watched-list">
+</div>
+</div>
+<div id="settings-page" hidden>    <section aria-labelledby="storage-title">
       <div class="section-heading">
         <div>
           <h2 id="storage-title">Storage</h2>
@@ -81,28 +154,41 @@
       <div class="field-grid cleanup-fields">
         <label class="field">
           <span>Downloads kept for</span>
-          <span class="number-control"><input id="download-days" type="number" min="1" max="3650"><span>days</span></span>
+          <span class="number-control">
+<input id="download-days" type="number" min="1" max="3650">
+<span>days</span>
+</span>
         </label>
         <label class="field">
           <span>Prepared video kept for</span>
-          <span class="number-control"><input id="cache-days" type="number" min="1" max="365"><span>days</span></span>
+          <span class="number-control">
+<input id="cache-days" type="number" min="1" max="365">
+<span>days</span>
+</span>
         </label>
         <label class="field">
           <span>Incomplete imports kept for</span>
-          <span class="number-control"><input id="partial-hours" type="number" min="1" max="720"><span>hours</span></span>
+          <span class="number-control">
+<input id="partial-hours" type="number" min="1" max="720">
+<span>hours</span>
+</span>
         </label>
         <label class="field">
           <span>Storage limit</span>
-          <span class="number-control"><input id="max-storage" type="number" min="0" max="100000"><span>GB</span></span>
+          <span class="number-control">
+<input id="max-storage" type="number" min="0" max="100000">
+<span>GB</span>
+</span>
         </label>
         <label class="field">
           <span>Free-space reserve</span>
-          <span class="number-control"><input id="min-free-space" type="number" min="0" max="100000"><span>GB</span></span>
+          <span class="number-control">
+<input id="min-free-space" type="number" min="0" max="100000">
+<span>GB</span>
+</span>
         </label>
       </div>
-    </section>
-
-    <section aria-labelledby="performance-title">
+    </section>    <section aria-labelledby="performance-title">
       <h2 id="performance-title">Performance</h2>
       <div class="field-grid">
         <label class="field">
@@ -142,9 +228,7 @@
         <input id="start-login" type="checkbox">
         <span>Start at login</span>
       </label>
-    </section>
-
-    <section aria-labelledby="diagnostics-title">
+    </section>    <section aria-labelledby="diagnostics-title">
       <div class="section-heading">
         <div>
           <h2 id="diagnostics-title">Diagnostics</h2>
@@ -152,9 +236,7 @@
         </div>
         <button id="open-logs" class="secondary" type="button">Open logs</button>
       </div>
-    </section>
-
-    <section aria-labelledby="updates-title">
+    </section>    <section aria-labelledby="updates-title">
       <div class="section-heading">
         <div>
           <h2 id="updates-title">Updates</h2>
@@ -176,9 +258,14 @@
           <span>Download automatically</span>
         </label>
       </div>
-      <div id="update-progress" class="progress hidden"><span></span></div>
+      <div id="update-progress" class="progress hidden">
+<span>
+</span>
+</div>
     </section>
-  </main>
+</div>
+</main>
+</div>
 
   <dialog id="torrent-details" aria-labelledby="torrent-details-title">
     <div class="dialog-heading">
@@ -188,7 +275,8 @@
       </div>
       <button id="close-torrent-details" class="secondary icon-button" type="button" aria-label="Close torrent details">Close</button>
     </div>
-    <div id="torrent-details-content" class="torrent-details-content"></div>
+    <div id="torrent-details-content" class="torrent-details-content">
+</div>
   </dialog>
 
   <dialog id="library-details" aria-labelledby="library-details-title">
@@ -199,13 +287,28 @@
       </div>
       <button id="close-library-details" class="secondary icon-button" type="button" aria-label="Close library details">Close</button>
     </div>
-    <div id="library-details-content" class="library-details-content"></div>
+    <div id="library-details-content" class="library-details-content">
+</div>
   </dialog>
 
   <footer>
-    <span id="message" role="status"></span>
+    <span id="message" role="status">
+</span>
     <button id="save-settings" class="primary" type="button">Save settings</button>
   </footer>
-  <script src="./renderer.js"></script>
+  <dialog id="transfer-dialog" aria-labelledby="transfer-dialog-title">
+<h2 id="transfer-dialog-title">
+</h2>
+<div id="transfer-dialog-body">
+</div>
+<div class="dialog-actions">
+<button type="button" id="cancel-transfer-dialog">Cancel</button>
+<button type="button" id="confirm-transfer-dialog" class="primary">Apply</button>
+</div>
+</dialog>
+<script type="module" src="./transfer-desk.js">
+</script>
+<script src="./renderer.js">
+</script>
 </body>
 </html>

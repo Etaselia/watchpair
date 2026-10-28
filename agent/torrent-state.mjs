@@ -100,7 +100,7 @@ export function applyRestoredTorrentState(job, source, ensureAsset) {
 // null preserves legacy jobs; [] is an explicit selection of no files.
 export function normalizeDownloadFileIndexes(value) {
   if (value === undefined || value === null) return null;
-  if (!Array.isArray(value) || value.length > 500 ||
+  if (!Array.isArray(value) || value.length > 10000 ||
     value.some((index) => !Number.isInteger(index) || index < 0) || new Set(value).size !== value.length) {
     throw new Error("A file selection must contain unique, non-negative torrent indexes.");
   }

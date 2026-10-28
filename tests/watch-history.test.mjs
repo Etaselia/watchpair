@@ -262,3 +262,34 @@ test("rewatching restores multiple removed episodes and reuses a re-added torren
   assert.equal(result.session.sources[0].id, readded.id);
   assert.equal(result.session.watchRecords[mediaWatchKey(source, items[0])].media.sourceId, readded.id);
 });
+
+test("Companion host selection immediately switches playback, rejects stale edits and guests, and stops an empty queue", async () => {
+  const request = await apiRoom();
+  await request("source", { source: { ...source, selectionConfirmed: true } });
+  await request("source-manifest", { sourceId: source.id, mediaItems: items });
+  await request("select-media", { media: { ...items[0], sourceId: source.id, itemId: items[0].id } });
+  let result = await request("player", { player: { paused: false, position: 42, playbackRate: 1.25 } });
+  const edit = { sourceId: source.id, itemIds: [items[1].id], expectedSeq: result.session.seq };
+  assert.equal((await request("companion-select-files", edit, "guest")).status, 403);
+  assert.equal((await request("companion-select-files", { ...edit, expectedSeq: -1 })).status, 409);
+  result = await request("companion-select-files", edit);
+  assert.equal(result.status, 200);
+  assert.equal(result.session.selectedMedia.itemId, items[1].id);
+  assert.equal(result.session.player.position, 0);
+  assert.equal(result.session.player.paused, false);
+  assert.equal(result.session.player.playbackRate, 1.25);
+  result = await request("companion-select-files", { sourceId: source.id, itemIds: [], expectedSeq: result.session.seq });
+  assert.equal(result.session.selectedMedia, null);
+  assert.equal(result.session.player.paused, true);
+});
+
+test("large torrent manifests accept a season selection beyond 500 files", async () => {
+  const request = await apiRoom();
+  await request("source", { source });
+  const manifest = mediaManifest(Array.from({length:1200}, (_,index)=>({index,path:`Season ${Math.floor(index/12)}/Episode ${index}.mkv`,size:100})),source.id);
+  let result = await request("source-manifest", {sourceId:source.id,mediaItems:manifest});
+  assert.equal(result.status,200);
+  result = await request("companion-select-files", {sourceId:source.id,itemIds:manifest.slice(0,1000).map(item=>item.id),expectedSeq:result.session.seq});
+  assert.equal(result.status,200);
+  assert.equal(result.session.sources[0].selectedFileIndexes.length,1000);
+});

@@ -116,8 +116,16 @@ assert.deepEqual(report.dom, {
   downloadDirectory: downloads,
   logs: "watchpair-main.log · watchpair-agent.log",
   openLogs: true,
-  sections: 6,
+  transferDesk: true,
 });
+assert.equal(report.transferControls.controls.downloadLimit, 512 * 1024);
+assert.equal(report.transferControls.controls.uploadLimit, 128 * 1024);
+assert.equal(report.transferControls.controls.maxActiveDownloads, 2);
+assert.equal(report.transferControls.controls.queueMode, "manual");
+assert.equal(report.transferInteractions.selectedAll, true);
+assert.equal(report.transferInteractions.folderExcluded, true);
+assert.equal(report.transferInteractions.collapsedRows, 21);
+assert.equal(report.transferInteractions.expandedRows, 121);
 assert.ok(report.screenshotSize.width >= 650);
 assert.ok(report.screenshotSize.height >= 620);
 assert.ok(report.screenshotBytes > 10_000);

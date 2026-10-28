@@ -56,6 +56,7 @@ import {
   acquireAgentSeedLease,
   addAgentDownload,
   attachAgentLibraryFile,
+  connectAgentRoom,
   detectAgent,
   getAgentActivityAge,
   getAgentDownloads,
@@ -1228,6 +1229,21 @@ export default function WatchApp() {
     },
     [applySession, deviceId, displayName, roomToken]
   );
+
+  useEffect(() => {
+    if (!joined || !agentAvailable || !roomToken || !deviceId) return;
+    let pending = false;
+    const connect = async () => {
+      if (pending) return;
+      pending = true;
+      try { await connectAgentRoom(roomToken, deviceId, displayName); }
+      catch { /* Older Companions continue to support browser controls. */ }
+      finally { pending = false; }
+    };
+    void connect();
+    const timer = window.setInterval(() => void connect(), 15_000);
+    return () => window.clearInterval(timer);
+  }, [joined, agentAvailable, roomToken, deviceId, displayName]);
 
   useEffect(() => {
     if (!joined || !roomToken) return;

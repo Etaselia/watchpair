@@ -9,6 +9,7 @@ import { createServer } from "node:http";
 import TrackerServer from "bittorrent-tracker/server";
 import WebTorrent from "webtorrent";
 import { terminateChildProcess } from "./process-helpers.mjs";
+import { handleSessionApi } from "../worker/session-api.ts";
 
 test("companion downloads chosen nested seasons, preserves an empty selection on restart, and skips extras", { timeout: 60_000 }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "watchpair-folder-selection-"));
@@ -16,8 +17,21 @@ test("companion downloads chosen nested seasons, preserves an empty selection on
   const seeder = new WebTorrent({ dht: false, lsd: false, natUpnp: false, natPmp: false, utp: false });
   let child;
   let output = "";
+  let roomBase = "";
+  const roomApi = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const result = await handleSessionApi(new Request(roomBase + request.url, {
+      method: request.method, headers: { "content-type": "application/json" },
+      ...(request.method === "POST" ? { body: Buffer.concat(chunks).toString() } : {}),
+    }));
+    response.writeHead(result.status, { "content-type": "application/json" });
+    response.end(await result.text());
+  });
   const id = "multifolder-selection";
   try {
+    await new Promise(resolve => roomApi.listen(0, "127.0.0.1", resolve));
+    roomBase = `http://127.0.0.1:${roomApi.address().port}`;
     const inputs = ["Season 1/Episode 1.mkv", "Season 2/Episode 1.mkv", "Bonus/Interview.mkv",
       ...Array.from({ length: 45 }, (_, index) => `Other Seasons/Season ${index + 3}/Episode 1.mkv`)];
     const seedDirectory = path.join(directory, "Show");
@@ -44,7 +58,7 @@ test("companion downloads chosen nested seasons, preserves an empty selection on
         cwd: new URL("../", import.meta.url), windowsHide: true,
         env: { ...process.env, WATCHPAIR_AGENT_PORT: String(port), WATCHPAIR_TORRENT_PORT: "0",
           WATCHPAIR_DOWNLOAD_DIR: path.join(directory, "downloads"), WATCHPAIR_CONFIG_PATH: path.join(directory, "companion.json"),
-          WATCHPAIR_CLEANUP_ENABLED: "0", WATCHPAIR_TRANSCODER: "cpu" },
+          WATCHPAIR_CLEANUP_ENABLED: "0", WATCHPAIR_TRANSCODER: "cpu", WATCHPAIR_CONTROL_TOKEN: "test-desktop-control", WATCHPAIR_ORIGINS: roomBase },
         stdio: ["ignore", "pipe", "pipe"],
       });
       child.stdout.on("data", (data) => { output += data; });
@@ -221,6 +235,50 @@ test("companion downloads chosen nested seasons, preserves an empty selection on
       "concurrent different room IDs share one physical transfer");
     await until(async () => (await Promise.all(simultaneousIds.map(aliasJob)))
       .every((candidate) => candidate?.files?.length === inputs.length && !candidate.error));
+    const control = async body => {
+      const response = await fetch(base + "/control/transfers", {method:"POST",headers:{"content-type":"application/json","x-watchpair-control":"test-desktop-control"},body:JSON.stringify(body)});
+      assert.equal(response.status,200,await response.clone().text());
+      return response.json();
+    };
+    assert.equal((await fetch(base + "/control/transfers")).status,403,"desktop commands require the native control token");
+    const desktopId=simultaneousIds[0];
+    await control({command:"selection",id:desktopId,fileIndexes:[firstIndex],priorities:{[firstIndex]:"high"}});
+    await post(`/downloads/${desktopId}/selection`,{fileIndexes:[]});
+    assert.deepEqual((await aliasJob(desktopId)).downloadFileIndexes,[firstIndex],"browser updates cannot overwrite a manual local selection");
+    await control({command:"limits",downloadLimit:1024*1024,uploadLimit:128*1024,maxActiveDownloads:2,queueMode:"manual"});
+    await control({command:"pause",id:desktopId});
+    assert.equal((await aliasJob(desktopId)).files.length,inputs.length,"paused transfers retain their file tree");
+    assert.equal((await post(`/downloads/${desktopId}/resume`,{})).job.paused,true,"browser cannot undo manual pause");
+    await terminateChildProcess(child);
+    await start();
+    assert.equal((await aliasJob(desktopId)).manualPaused,true);
+    assert.equal((await aliasJob(desktopId)).files.length,inputs.length);
+    await control({command:"resume",id:desktopId});
+    await until(async()=>(await aliasJob(desktopId)).files[firstIndex]?.downloadReady);
+    assert.deepEqual((await aliasJob(desktopId)).downloadFileIndexes,[firstIndex]);
+    const restoredControls=await fetch(base+"/control/transfers",{headers:{"x-watchpair-control":"test-desktop-control"}}).then(response=>response.json());
+    assert.equal(restoredControls.controls.downloadLimit,1024*1024);
+    await control({command:"follow-room",id:desktopId});
+    await post(`/downloads/${desktopId}/selection`,{fileIndexes:[]});
+    assert.deepEqual((await aliasJob(desktopId)).downloadFileIndexes,[]);
+    let roomToken;
+    const roomRequest = async (action, fields = {}) => {
+      const response = await fetch(roomBase + "/api/sessions", {method:"POST",headers:{"content-type":"application/json"},
+        body:JSON.stringify({action,token:roomToken,deviceId:"desktop-host",name:"Host",...fields})});
+      assert.ok(response.ok,await response.clone().text());
+      return response.json();
+    };
+    roomToken=(await roomRequest("create")).session.token;
+    const roomSourceId="room-existing-pack";
+    await roomRequest("source",{source:{...source,id:roomSourceId}});
+    const connected=await fetch(base+"/room-context",{method:"POST",headers:{"content-type":"application/json",origin:roomBase},
+      body:JSON.stringify({token:roomToken,deviceId:"desktop-host"})}).then(response=>response.json());
+    await control({command:"selection",id:desktopId,roomId:connected.id,fileIndexes:[secondIndex],priorities:{[secondIndex]:"high"}});
+    const synchronized=(await roomRequest("heartbeat")).session.sources[0];
+    assert.equal(synchronized.id,roomSourceId,"host choices reuse the room's torrent identity");
+    assert.deepEqual(synchronized.selectedFileIndexes,[secondIndex]);
+    assert.deepEqual((await aliasJob(roomSourceId)).downloadFileIndexes,[secondIndex]);
+    assert.equal((await fetch(`${base}/downloads/${roomSourceId}`,{method:"DELETE"})).status,200);
     for (const key of simultaneousIds) {
       assert.equal((await fetch(`${base}/downloads/${key}?deleteFiles=1`, { method: "DELETE" })).status, 200);
     }
@@ -231,6 +289,7 @@ test("companion downloads chosen nested seasons, preserves an empty selection on
     await terminateChildProcess(child);
     await new Promise((resolve) => seeder.destroy(resolve));
     await new Promise((resolve) => tracker.close(resolve));
+    if (roomApi.listening) await new Promise(resolve => roomApi.close(resolve));
     await rm(directory, { recursive: true, force: true });
   }
 });
