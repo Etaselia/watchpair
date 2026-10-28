@@ -1,12 +1,26 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  normalizeDownloadFileIndexes,
+  torrentFileAllowed,
   applyRestoredTorrentState,
   fileIdentityKey,
   persistedTorrentState,
   shouldSkipTorrentVerification,
   torrentVerifiedKeysOf,
 } from "../agent/torrent-state.mjs";
+
+test("explicit empty selections survive a restart without reverting to all files", () => {
+  for (const indexes of [null, [], [2, 8]]) {
+    const stored = persistedTorrentState({ downloadFileIndexes: indexes });
+    const job = { assets: new Map() };
+    applyRestoredTorrentState(job, stored, fakeMediaAsset);
+    assert.deepEqual(job.downloadFileIndexes, indexes);
+    assert.equal(torrentFileAllowed(job, 2), indexes === null || indexes.includes(2));
+  }
+  assert.deepEqual(normalizeDownloadFileIndexes([3, 1]), [1, 3]);
+  for (const invalid of [[-1], [1, 1], ["2"], [1.5], {}]) assert.throws(() => normalizeDownloadFileIndexes(invalid));
+});
 
 // Mirrors the server's `mediaAsset(job, index)` lazy-creation contract.
 function fakeMediaAsset(job, index) {

@@ -262,6 +262,16 @@ test("production session API supports join-in-progress state", async () => {
   assert.equal(queueSession.sources.length, 2);
   assert.deepEqual(queueSession.sources.map((source) => source.label), ["Episode 1", "Episode 2"]);
   assert.deepEqual(queueSession.sources.map((source) => source.id), ["source-episode-one", "source-episode-two"]);
+  for (const mutation of [
+    { action: "source-manifest", sourceId: "source-episode-two", mediaItems: [{ fileIndex: 0, path: "episode-2.mkv", size: 2048 }] },
+    { action: "select-files", sourceId: "source-episode-two", itemIds: ["source-episode-two-f0"] },
+  ]) {
+    const response = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: created.session.token, deviceId: "test-host", name: "Host", ...mutation }),
+    });
+    assert.equal(response.status, 200);
+  }
 
   const duplicateSourceResponse = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
     method: "POST",
@@ -556,8 +566,8 @@ test("ships the coordination and companion surfaces", async () => {
 
   assert.match(app, /Watch together/);
   assert.match(app, /action: "create",\s+token: requestedToken\.length === 9/);
-  assert.match(app, /setAgentMediaPriority\(plan\.selected, plan\.targets\)/);
-  assert.match(app, /orderedMediaQueue\(sources, selectedItemId\)/);
+  assert.match(app, /setAgentMediaPriority\(plan\.selected, plan\.targets, plan\.selections\)/);
+  assert.match(app, /orderedMediaQueue\(sources, selectedItemId, watchRecords\)/);
   assert.match(app, /source-manifest/);
   assert.match(app, /crossOrigin="anonymous"/);
   assert.match(app, /getAgentDownloads/);
@@ -579,7 +589,7 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(app, /stopAgentDownload\(previewJobId, false\)/);
   assert.match(app, /!isLibraryPreviewJobId\(job\.id\)/);
   assert.match(agentClient, /\/downloads\/\$\{encodeURIComponent\(sourceId\)\}\/publication/);
-  assert.match(agentClient, /AGENT_PROTOCOL_VERSION = 2/);
+  assert.match(agentClient, /AGENT_PROTOCOL_VERSION = 3/);
   assert.match(agentClient, /result\.protocolVersion !== AGENT_PROTOCOL_VERSION/);
   assert.match(app, /Companion update required/);
   assert.match(app, /opaqueSeedLeaseId/);
@@ -710,7 +720,7 @@ test("ships the coordination and companion surfaces", async () => {
   assert.match(agent, /queueSelectedPreparation/);
   assert.match(agent, /replaceTorrentSelections/);
   assert.match(agentClient, /loopback-network/);
-  assert.match(agentClient, /JSON\.stringify\(\{ selected, targets \}\)/);
+  assert.match(agentClient, /JSON\.stringify\(\{ selected, targets, selections \}\)/);
   assert.match(agentClient, /getAgentDownloads/);
   assert.match(agentClient, /reportAgentPlaybackEvent/);
   assert.match(agentClient, /getAgentPermissionState/);

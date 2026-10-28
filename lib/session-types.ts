@@ -19,6 +19,19 @@ export interface SharedSource {
   addedAt: number;
   infoHash?: string;
   mediaItems?: SharedMediaItem[];
+  selectionConfirmed?: boolean;
+  selectedFileIndexes?: number[];
+}
+
+export interface WatchRecord {
+  key: string;
+  source?: SharedSource;
+  media: SelectedMedia & { path?: string };
+  ranges: [number, number][];
+  duration: number;
+  watchedAt: number | null;
+  generation: number;
+  completions: { watchedAt: number; method: "automatic" | "manual" }[];
 }
 
 export interface SelectedMedia {
@@ -92,6 +105,7 @@ export interface WatchSession {
   sources: SharedSource[];
   source: SharedSource | null;
   selectedMedia: SelectedMedia | null;
+  watchRecords: Record<string, WatchRecord>;
   player: PlayerState;
   seq: number;
   createdAt: number;

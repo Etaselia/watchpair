@@ -63,6 +63,7 @@ export function torrentVerifiedKeysOf(job) {
  */
 export function persistedTorrentState(job) {
   return {
+    downloadFileIndexes: normalizeDownloadFileIndexes(job?.downloadFileIndexes),
     torrentSilenced: Boolean(job?.torrentSilenced),
     torrentVerifiedKeys: torrentVerifiedKeysOf(job),
   };
@@ -84,6 +85,7 @@ export function persistedTorrentState(job) {
  */
 export function applyRestoredTorrentState(job, source, ensureAsset) {
   if (!job || !source) return;
+  job.downloadFileIndexes = normalizeDownloadFileIndexes(source.downloadFileIndexes);
   job.torrentSilenced = Boolean(source.torrentSilenced);
   const keys = source.torrentVerifiedKeys;
   if (!keys || typeof keys !== "object" || typeof ensureAsset !== "function") return;
@@ -93,4 +95,18 @@ export function applyRestoredTorrentState(job, source, ensureAsset) {
     if (typeof key !== "string" || !key) continue;
     ensureAsset(job, index).torrentVerifiedKey = key;
   }
+}
+
+// null preserves legacy jobs; [] is an explicit selection of no files.
+export function normalizeDownloadFileIndexes(value) {
+  if (value === undefined || value === null) return null;
+  if (!Array.isArray(value) || value.length > 500 ||
+    value.some((index) => !Number.isInteger(index) || index < 0) || new Set(value).size !== value.length) {
+    throw new Error("A file selection must contain unique, non-negative torrent indexes.");
+  }
+  return [...value].sort((a, b) => a - b);
+}
+
+export function torrentFileAllowed(job, index) {
+  return job.downloadFileIndexes == null || job.downloadFileIndexes.includes(index);
 }

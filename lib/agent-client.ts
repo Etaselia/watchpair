@@ -2,7 +2,7 @@ import type { SharedSource } from "./session-types";
 import { fetchPreparedAgentAsset } from "./agent-subtitle-fetch.mjs";
 
 export const AGENT_URL = "http://127.0.0.1:41735";
-export const AGENT_PROTOCOL_VERSION = 2;
+export const AGENT_PROTOCOL_VERSION = 3;
 
 export type AgentPermissionState = PermissionState | "unsupported";
 
@@ -171,6 +171,7 @@ export interface AgentPreparation {
 }
 
 export interface AgentJob {
+  downloadFileIndexes?: number[] | null;
   id: string;
   kind: "magnet" | "direct";
   status: "queued" | "metadata" | "downloading" | "paused" | "ready" | "error";
@@ -392,10 +393,10 @@ export async function getAgentSubtitleBytes(url: string, signal?: AbortSignal) {
   return new Uint8Array(await (await getAgentSubtitleResponse(url, signal)).arrayBuffer());
 }
 
-export async function addAgentDownload(source: SharedSource) {
+export async function addAgentDownload(source: SharedSource, fileIndexes?: number[] | null) {
   const result = await agentFetch<{ job: AgentJob }>("/downloads", {
     method: "POST",
-    body: JSON.stringify({ source }),
+    body: JSON.stringify({ source: { ...source, downloadFileIndexes: fileIndexes } }),
   });
   return result.job;
 }
@@ -416,6 +417,13 @@ export async function selectAgentFile(sourceId: string, fileIndex: number) {
       body: JSON.stringify({ fileIndex }),
     }
   );
+  return result.job;
+}
+
+export async function setAgentFileSelection(sourceId: string, fileIndexes: number[] | null) {
+  const result = await agentFetch<{ job: AgentJob }>(`/downloads/${encodeURIComponent(sourceId)}/selection`, {
+    method: "POST", body: JSON.stringify({ fileIndexes }),
+  });
   return result.job;
 }
 
@@ -556,7 +564,8 @@ export interface AgentMediaTarget {
 
 export async function setAgentMediaPriority(
   selected: AgentMediaTarget | null,
-  targets: AgentMediaTarget[]
+  targets: AgentMediaTarget[],
+  selections?: { jobId: string; fileIndexes: number[] | null }[]
 ) {
   return agentFetch<{
     ok: boolean;
@@ -569,7 +578,7 @@ export async function setAgentMediaPriority(
     backgroundThreads: number;
   }>("/media-priority", {
     method: "POST",
-    body: JSON.stringify({ selected, targets }),
+    body: JSON.stringify({ selected, targets, selections }),
   });
 }
 

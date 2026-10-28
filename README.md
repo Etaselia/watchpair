@@ -20,6 +20,8 @@ subtitle timing synchronized.
 - Magnet-first page resolution through the local companion, including encoded links
 - Concurrent queued magnet, `.torrent`, and direct downloads through the local companion
 - Synchronized queue and torrent file selection with remove, rename, reorder, retry, and auto-advance
+- Folder-based torrent selection with per-season and per-video download choices, retained across companion restarts
+- Shared Queue and Watched tabs, relative watched timestamps, manual watched controls, and rewatching
 - Per-device automatic, manual, or external-client download policy
 - Resumable local-file imports that publish a room-only magnet and seed from the companion
 - Persistent companion jobs and configurable external download-library folders
@@ -38,6 +40,21 @@ subtitle timing synchronized.
 - Automatic age, cache, storage-limit, and free-space cleanup with per-download pins
 
 ## Architecture
+
+New torrents load their metadata before any video download starts. Use **Choose files** to select
+folders or individual episodes, then **Apply selection**; **Manage files** changes the selection later.
+Selections are shared by the room while each device retains its Auto, Ask, or Never download policy.
+Unchecked files are not requested, although BitTorrent pieces shared with an included file may
+contain a small amount of adjacent file data.
+
+The host records the distinct video intervals played in the shared player. After 90% has played,
+the episode moves to **Watched** without interrupting playback; seeking past footage and replaying
+the same scene do not increase coverage. Episodes and whole folders can also be marked watched or
+unwatched manually. **Watch again** returns an episode to the queue. Watched timestamps and history
+survive reconnects, coordinator restarts, and source removal, subject to the room's existing
+seven-day inactivity expiry. Marking watched does not delete local files.
+
+This version requires the matching Companion update for persistent file selections (protocol 3).
 
 ```text
 Browser A ---- polling/JIP + WebRTC signaling ---- Coordinator (state + snapshot file) ---- Browser B

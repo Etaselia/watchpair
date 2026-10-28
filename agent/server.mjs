@@ -42,6 +42,7 @@ import { createScheduledFfmpegRunner } from "./scheduled-ffmpeg.mjs";
 import {
   mediaTargetKey,
   normalizeMediaTargets,
+  preparationMediaTargets,
   replaceTorrentSelections,
 } from "./media-priority.mjs";
 import { createTorrentBandwidthGovernor } from "./torrent-bandwidth-governor.mjs";
@@ -103,11 +104,13 @@ import {
   fileIdentityKey,
   persistedTorrentState,
   shouldSkipTorrentVerification,
+  normalizeDownloadFileIndexes,
+  torrentFileAllowed,
 } from "./torrent-state.mjs";
 
 const HOST = "127.0.0.1";
 const APP_VERSION = process.env.WATCHPAIR_APP_VERSION || "0.12.8"; // x-release-please-version
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 3;
 const CONTROL_TOKEN = String(process.env.WATCHPAIR_CONTROL_TOKEN || "");
 const PORT = Number(process.env.WATCHPAIR_AGENT_PORT || 41735);
 const REQUESTED_TORRENT_PORT = Number(process.env.WATCHPAIR_TORRENT_PORT || PORT + 1);
@@ -1411,6 +1414,7 @@ function snapshot(job) {
     kind: job.kind,
     status: job.status,
     paused: Boolean(job.paused),
+    downloadFileIndexes: job.downloadFileIndexes,
     torrentSilenced: Boolean(job.torrentSilenced),
     progress: selected?.progress || 0,
     infoHash: job.torrent?.infoHash || null,
@@ -1491,7 +1495,7 @@ function pendingTorrentTargets() {
     for (const target of mediaPriorityTargets) {
       const job = jobs.get(target.jobId);
       const file = job?.torrent?.files?.[target.fileIndex];
-      if (job?.kind !== "magnet" || job.seed || !file || file.done) continue;
+      if (job?.kind !== "magnet" || job.seed || !file || file.done || !torrentFileAllowed(job, target.fileIndex)) continue;
       targets.push({ jobId: job.id, fileIndex: target.fileIndex });
       if (targets.length >= MAX_BANDWIDTH_TARGETS) break;
     }
@@ -1501,6 +1505,7 @@ function pendingTorrentTargets() {
   for (const job of jobs.values()) {
     if (job.kind !== "magnet" || job.seed || !job.torrent?.files?.length) continue;
     for (const fileIndex of orderedTorrentVideoIndexes(job.torrent)) {
+      if (!torrentFileAllowed(job, fileIndex)) continue;
       if (job.torrent.files[fileIndex].done) continue;
       targets.push({ jobId: job.id, fileIndex });
       if (targets.length >= MAX_BANDWIDTH_TARGETS) return targets;
@@ -1822,14 +1827,15 @@ function startTorrent(job, { restoreMetadata = false } = {}) {
       const asset = mediaAsset(job, index);
       asset.status = torrent.files[index].done ? "verifying" : "downloading";
     }
-    if (videos[0] !== undefined) {
-      selectTorrentFile(job, videos[0], { recordAccess: !restoreMetadata });
+    const firstIncluded = videos.find((index) => torrentFileAllowed(job, index));
+    if (firstIncluded !== undefined) {
+      selectTorrentFile(job, firstIncluded, { recordAccess: !restoreMetadata });
     }
     torrent.files.forEach((file, index) => {
       file.on("done", () => {
         agentLogger.info("torrent_file_downloaded", { jobId: job.id, fileIndex: index, size: file.length });
         refreshTorrentSelections("file-downloaded");
-        if (VIDEO_EXTENSIONS.test(file.path || file.name)) void completeSelectedFile(job, index);
+        if (VIDEO_EXTENSIONS.test(file.path || file.name) && torrentFileAllowed(job, index)) void completeSelectedFile(job, index);
         maybeSilenceCompletedTorrent(job);
       });
     });
@@ -1848,7 +1854,7 @@ function startTorrent(job, { restoreMetadata = false } = {}) {
     if (job.paused) return;
     agentLogger.info("torrent_download_complete", { jobId: job.id, infoHash: torrent.infoHash });
     for (const index of orderedTorrentVideoIndexes(torrent)) {
-      if (torrent.files[index].done) void completeSelectedFile(job, index);
+      if (torrent.files[index].done && torrentFileAllowed(job, index)) void completeSelectedFile(job, index);
     }
     refreshTorrentSelections("torrent-complete");
     maybeSilenceCompletedTorrent(job);
@@ -2108,11 +2114,26 @@ function touchJob(job) {
 }
 
 function requiredTorrentMediaIndexes(job) {
+  if (job.downloadFileIndexes !== null && job.downloadFileIndexes !== undefined) {
+    return job.downloadFileIndexes.filter((index) => job.torrent?.files?.[index]);
+  }
   const planned = mediaPriorityTargets
     .filter((target) => target.jobId === job.id)
     .map((target) => target.fileIndex)
     .filter((index) => job.torrent?.files?.[index]);
   return planned.length ? planned : orderedTorrentVideoIndexes(job.torrent);
+}
+
+function applyFileSelection(job, indexes) {
+  if (!job || job.seed) return;
+  if (JSON.stringify(job.downloadFileIndexes) === JSON.stringify(indexes)) return;
+  job.downloadFileIndexes = indexes;
+  const required = job.torrent?.files?.length ? requiredTorrentMediaIndexes(job) : [];
+  if (required.some((index) => !job.torrent.files[index].done)) job.completedAt = null;
+  for (const index of required) {
+    if (job.torrent.files[index].done && mediaAsset(job, index).status !== "ready") void completeSelectedFile(job, index);
+  }
+  touchJob(job);
 }
 
 function markJobCompleted(job) {
@@ -2188,6 +2209,7 @@ async function addDownload(source, { restoreMetadata = false, ownershipToken = n
     kind,
     value,
     label: source.label,
+    downloadFileIndexes: normalizeDownloadFileIndexes(source.downloadFileIndexes),
     ...restoredMetadata,
     managed,
     ownershipToken: claim?.ownershipToken || null,
@@ -3347,7 +3369,10 @@ function refreshPreparationScheduling() {
 }
 
 function setMediaPriority(selected, targets) {
-  mediaPriorityTargets = normalizeMediaTargets(targets || []);
+  mediaPriorityTargets = preparationMediaTargets(selected, targets, (target) => {
+    const job = jobs.get(target.jobId);
+    return !job || torrentFileAllowed(job, target.fileIndex);
+  });
   for (const target of mediaPriorityTargets) {
     const job = jobs.get(target.jobId);
     if (!job) continue;
@@ -4524,6 +4549,20 @@ const server = createServer(async (request, response) => {
 
     if (request.method === "POST" && url.pathname === "/media-priority") {
       const body = await readJson(request);
+      const selections = body.selections === undefined ? [] : body.selections;
+      if (!Array.isArray(selections) || selections.length > 30) throw new Error("Invalid download selections.");
+      const validated = selections.map((selection) => {
+        const job = jobs.get(String(selection.jobId));
+        const indexes = normalizeDownloadFileIndexes(selection.fileIndexes);
+        if (job?.torrent?.files?.length && indexes?.some((index) => !job.torrent.files[index] ||
+          !VIDEO_EXTENSIONS.test(torrentFilePath(job.torrent.files[index])))) {
+          throw new Error("Select video files from this torrent.");
+        }
+        return { job, indexes };
+      });
+      for (const { job, indexes } of validated) {
+        applyFileSelection(job, indexes);
+      }
       let targets = normalizeMediaTargets(body.targets || []);
       const selected = body.selected
         ? normalizeMediaTargets([body.selected], 1)[0]
@@ -4537,6 +4576,7 @@ const server = createServer(async (request, response) => {
         targets = [selected, ...targets];
       }
       setMediaPriority(selected, targets);
+      persistJobs();
       const foreground = mediaResourceProfile("foreground");
       const background = mediaResourceProfile("background");
       sendJson(response, 200, {
@@ -4817,6 +4857,21 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && retryMatch) {
       const job = await retryJob(retryMatch[1]);
       sendJson(response, 202, { job: snapshot(job) }, headers);
+      return;
+    }
+
+    const selectionMatch = /^\/downloads\/([a-zA-Z0-9-]{8,80})\/selection$/.exec(url.pathname);
+    if (request.method === "POST" && selectionMatch) {
+      const job = jobs.get(selectionMatch[1]);
+      if (!job || job.kind !== "magnet") throw new Error("Torrent download not found.");
+      const body = await readJson(request);
+      const indexes = normalizeDownloadFileIndexes(body.fileIndexes);
+      if (job.torrent?.files?.length && indexes?.some((index) => !job.torrent.files[index] ||
+        !VIDEO_EXTENSIONS.test(torrentFilePath(job.torrent.files[index])))) throw new Error("Select video files from this torrent.");
+      applyFileSelection(job, indexes);
+      refreshTorrentSelections("file-selection");
+      persistJobs();
+      sendJson(response, 200, { job: snapshot(job) }, headers);
       return;
     }
 

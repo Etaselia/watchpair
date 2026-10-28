@@ -34,6 +34,17 @@ export function firstPendingMediaTarget(targets, resolveFile) {
   return null;
 }
 
+export function preparationMediaTargets(selected, targets, downloadAllowed) {
+  const active = selected ? normalizeMediaTargets([selected], 1)[0] : null;
+  const activeKey = active ? mediaTargetKey(active.jobId, active.fileIndex) : null;
+  const normalized = normalizeMediaTargets(targets || []);
+  if (active && !normalized.some((target) => mediaTargetKey(target.jobId, target.fileIndex) === activeKey)) {
+    normalized.unshift(active);
+  }
+  return normalized.filter((target) =>
+    mediaTargetKey(target.jobId, target.fileIndex) === activeKey || downloadAllowed(target));
+}
+
 export function replaceTorrentSelections(torrent, selected = []) {
   if (!torrent?.files) return;
   for (const file of torrent.files) file.deselect();
