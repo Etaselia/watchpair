@@ -51,6 +51,8 @@ The Companion recovers matching WatchPair-owned torrent folders automatically an
 pieces before reuse. If a source ID collides with an unrelated folder, file, or directory link, it
 chooses a separate managed folder and loads the file list without altering that entry. Recovery
 does not copy the season pack; the managed location and file selection survive retries and restarts.
+Adding the same torrent in another room reuses the existing transfer and files. Each room retains
+its own download selection; removing one room's reference preserves files used by the others.
 
 The host records the distinct video intervals played in the shared player. After 90% has played,
 the episode moves to **Watched** without interrupting playback; seeking past footage and replaying

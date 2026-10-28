@@ -239,6 +239,7 @@ PRIVATE_NETWORKS.addSubnet("fc00::", 7, "ipv6");
 PRIVATE_NETWORKS.addSubnet("fe80::", 10, "ipv6");
 const pairingNonces = new Map();
 const jobs = new Map();
+const downloadAliases = new Map();
 const jobStore = createJsonStore(JOBS_PATH);
 let restoringJobs = false;
 let failedRestoreRecords = [];
@@ -1393,9 +1394,9 @@ function torrentFiles(job) {
   });
 }
 
-function snapshot(job) {
+function snapshot(job, sourceId = job.id) {
   syncSelectedAsset(job);
-  const files =
+  let files =
     job.kind === "magnet"
       ? torrentFiles(job)
       : job.file
@@ -1409,13 +1410,18 @@ function snapshot(job) {
           )]
         : [];
 
+  const indexes = job.downloadBindings?.get(sourceId);
+  if (job.downloadBindings) files = files.map((file) => ({ ...file,
+    included: indexes == null || indexes.includes(file.index),
+  }));
   const selected = files.find((file) => file.selected);
   return {
-    id: job.id,
+    id: sourceId,
+    sharedTransferId: job.downloadBindings ? job.id : null,
     kind: job.kind,
     status: job.status,
     paused: Boolean(job.paused),
-    downloadFileIndexes: job.downloadFileIndexes,
+    downloadFileIndexes: job.downloadBindings ? indexes : job.downloadFileIndexes,
     torrentSilenced: Boolean(job.torrentSilenced),
     progress: selected?.progress || 0,
     infoHash: job.torrent?.infoHash || null,
@@ -2062,9 +2068,68 @@ function createJob(source) {
     preparation: { status: "waiting", error: null, encoder: null, fallback: false },
     updatedAt: Number(source.updatedAt) || now,
   };
-  jobs.set(job.id, job);
   applyRestoredTorrentState(job, source, mediaAsset);
+  if (job.kind === "magnet" && !job.seed) {
+    const entries = Array.isArray(source.downloadBindings) ? source.downloadBindings
+      : [{ id: job.id, fileIndexes: job.downloadFileIndexes }];
+    job.downloadBindings = new Map(entries.map((entry) => [
+      validJobId(entry.id), normalizeDownloadFileIndexes(entry.fileIndexes),
+    ]));
+    if (!job.downloadBindings.size) throw new Error("A torrent needs at least one source binding.");
+    for (const id of job.downloadBindings.keys()) {
+      if (jobs.has(id) || downloadAliases.has(id)) throw new Error("This source id is already bound to different media.");
+    }
+    for (const id of job.downloadBindings.keys()) {
+      if (id !== job.id) downloadAliases.set(id, job);
+    }
+    job.downloadFileIndexes = effectiveDownloadSelection(job);
+  }
+  jobs.set(job.id, job);
   return job;
+}
+
+function downloadJob(id) {
+  const job = jobs.get(id) || downloadAliases.get(id);
+  return job && (!job.downloadBindings || job.downloadBindings.has(id)) ? job : null;
+}
+
+function effectiveDownloadSelection(job) {
+  const choices = Array.from(job.downloadBindings.values());
+  return choices.some((indexes) => indexes === null) ? null
+    : Array.from(new Set(choices.flat())).sort((left, right) => left - right);
+}
+
+function bindDownload(job, id, indexes) {
+  const existing = jobs.get(id) || downloadAliases.get(id);
+  if (existing && existing !== job) throw new Error("This source id is already bound to different media.");
+  job.downloadBindings.set(id, normalizeDownloadFileIndexes(indexes));
+  if (id !== job.id) downloadAliases.set(id, job);
+  job.downloadFileIndexes = effectiveDownloadSelection(job);
+  touchJob(job);
+  return job;
+}
+
+function matchingTorrentJob(kind, value, except = null) {
+  if (kind !== "magnet") return null;
+  return Array.from(jobs.values()).find((job) => job !== except && job.downloadBindings &&
+    job.status !== "error" && existingJobMatchesSource(job, kind, value)) || null;
+}
+
+function downloadSnapshots() {
+  return Array.from(jobs.values()).flatMap((job) => job.downloadBindings
+    ? Array.from(job.downloadBindings.keys(), (id) => snapshot(job, id)) : [snapshot(job)]);
+}
+
+function physicalMediaTargets(values, limit = 500) {
+  const seen = new Set();
+  return normalizeMediaTargets(values, limit).map((target) => ({ ...target,
+    jobId: downloadJob(target.jobId)?.id || target.jobId,
+  })).filter((target) => {
+    const key = mediaTargetKey(target.jobId, target.fileIndex);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function persistedJob(job) {
@@ -2078,6 +2143,8 @@ function persistedJob(job) {
     libraryCollectionId: job.libraryCollectionId,
     ownershipToken: job.ownershipToken,
     storageId: job.storageId,
+    downloadBindings: job.downloadBindings ? Array.from(job.downloadBindings,
+      ([id, fileIndexes]) => ({ id, fileIndexes })) : undefined,
     createdAt: job.createdAt,
     completedAt: job.completedAt,
     lastAccessedAt: job.lastAccessedAt,
@@ -2132,9 +2199,14 @@ function requiredTorrentMediaIndexes(job) {
   return planned.length ? planned : orderedTorrentVideoIndexes(job.torrent);
 }
 
-function applyFileSelection(job, indexes) {
+function applyFileSelection(job, indexes, sourceId = job?.id) {
   if (!job || job.seed) return;
-  if (JSON.stringify(job.downloadFileIndexes) === JSON.stringify(indexes)) return;
+  if (job.downloadBindings) {
+    if (JSON.stringify(job.downloadBindings.get(sourceId)) === JSON.stringify(indexes)) return;
+    job.downloadBindings.set(sourceId, indexes);
+    indexes = effectiveDownloadSelection(job);
+  }
+  else if (JSON.stringify(job.downloadFileIndexes) === JSON.stringify(indexes)) return;
   job.downloadFileIndexes = indexes;
   const required = job.torrent?.files?.length ? requiredTorrentMediaIndexes(job) : [];
   if (required.some((index) => !job.torrent.files[index].done)) job.completedAt = null;
@@ -2162,6 +2234,7 @@ function markJobCompleted(job) {
 }
 
 const pendingDownloads = new Map();
+const pendingDownloadSources = new Map();
 
 async function addDownload(source, options = {}) {
   const id = validJobId(source?.id);
@@ -2172,12 +2245,18 @@ async function addDownload(source, options = {}) {
     if (pending.identity !== identity) throw new Error("This source id is already bound to different media.");
     return pending.promise;
   }
-  const promise = addDownloadOnce(source, options);
+  const preceding = pendingDownloadSources.get(identity);
+  const promise = (async () => {
+    if (preceding) await preceding.catch(() => {});
+    return addDownloadOnce(source, options);
+  })();
   pendingDownloads.set(id, { identity, promise });
+  pendingDownloadSources.set(identity, promise);
   try {
     return await promise;
   } finally {
     if (pendingDownloads.get(id)?.promise === promise) pendingDownloads.delete(id);
+    if (pendingDownloadSources.get(identity) === promise) pendingDownloadSources.delete(identity);
   }
 }
 
@@ -2186,12 +2265,35 @@ async function addDownloadOnce(source, { restoreMetadata = false, ownershipToken
   if (!/^[a-zA-Z0-9-]{8,80}$/.test(id)) throw new Error("Invalid source id.");
   const kind = source.kind === "magnet" ? "magnet" : "direct";
   const value = String(source.value || "").trim();
-  const existing = jobs.get(id);
+  const reserved = jobs.get(id) || downloadAliases.get(id);
+  if (reserved && !existingJobMatchesSource(reserved, kind, value)) {
+    throw new Error("This source id is already bound to different media.");
+  }
+  const existing = downloadJob(id) || reserved;
   if (existing) {
     if (!existingJobMatchesSource(existing, kind, value)) {
       throw new Error("This source id is already bound to different media.");
     }
-    return existing;
+    if (existing.downloadBindings && !existing.downloadBindings.has(id)) {
+      bindDownload(existing, id, source.downloadFileIndexes);
+    }
+    const duplicate = existing.status === "error" ? matchingTorrentJob(kind, value, existing) : null;
+    if (!duplicate) return existing;
+    const bindings = Array.from(existing.downloadBindings || [[id, existing.downloadFileIndexes]]);
+    await stopJob(existing.id, { allBindings: true });
+    for (const [bindingId, indexes] of bindings) bindDownload(duplicate, bindingId, indexes);
+    persistJobs();
+    return duplicate;
+  }
+
+  const duplicate = matchingTorrentJob(kind, value);
+  if (duplicate) {
+    if (restoreMetadata && Array.isArray(source.downloadBindings)) {
+      for (const entry of source.downloadBindings) bindDownload(duplicate, validJobId(entry.id), entry.fileIndexes);
+    } else bindDownload(duplicate, id, source.downloadFileIndexes);
+    agentLogger.info("torrent_transfer_reused", { jobId: duplicate.id, sourceId: id });
+    persistJobs();
+    return duplicate;
   }
   if (kind === "magnet") {
     if (/^magnet:\?/i.test(value) && !isSupportedMagnet(value)) {
@@ -2224,6 +2326,7 @@ async function addDownloadOnce(source, { restoreMetadata = false, ownershipToken
         torrentVerifiedKeys: source.torrentVerifiedKeys,
         ownershipToken: source.ownershipToken,
         storageId: source.storageId,
+        downloadBindings: source.downloadBindings,
       }
     : {};
   const managed = restoredMetadata.managed === undefined ? true : Boolean(restoredMetadata.managed);
@@ -2962,9 +3065,19 @@ async function stopJob(id, {
   automatic = false,
   expectedJob = null,
   ignoreSeedLeases = false,
+  allBindings = false,
 } = {}) {
-  const job = jobs.get(validJobId(id));
+  const job = automatic || allBindings ? jobs.get(validJobId(id)) : downloadJob(validJobId(id));
   if (!job || (expectedJob && job !== expectedJob)) return false;
+  if (!automatic && !allBindings && job.downloadBindings?.size > 1) {
+    job.downloadBindings.delete(id);
+    downloadAliases.delete(id);
+    job.downloadFileIndexes = effectiveDownloadSelection(job);
+    touchJob(job);
+    refreshTorrentSelections("source-unbound");
+    return true;
+  }
+  id = job.id;
   if (job.seed && !ignoreSeedLeases && activeSeedLeaseCount(job) > 0) return false;
   if (deleteFiles && job.managed && !(await managedDirectoryIsOwned(job))) return false;
 
@@ -2998,6 +3111,7 @@ async function stopJob(id, {
     }
   }
   jobs.delete(id);
+  for (const alias of job.downloadBindings?.keys() || []) downloadAliases.delete(alias);
   for (let index = preparationQueue.length - 1; index >= 0; index -= 1) {
     if (preparationQueue[index].job === job) preparationQueue.splice(index, 1);
   }
@@ -3008,7 +3122,7 @@ async function stopJob(id, {
 }
 
 async function pauseJob(id, { ignoreSeedLeases = false } = {}) {
-  const job = jobs.get(validJobId(id));
+  const job = downloadJob(validJobId(id));
   if (!job) return null;
   if (job.seed && !ignoreSeedLeases && activeSeedLeaseCount(job) > 0) {
     throw new Error("This local seed is still shared by an active room.");
@@ -3038,9 +3152,16 @@ async function pauseJob(id, { ignoreSeedLeases = false } = {}) {
 }
 
 async function resumeJob(id) {
-  const job = jobs.get(validJobId(id));
+  const job = downloadJob(validJobId(id));
   if (!job) return null;
   if (!job.paused) return job;
+  const duplicate = matchingTorrentJob(job.kind, job.value, job);
+  if (duplicate) {
+    const bindings = Array.from(job.downloadBindings || [[id, job.downloadFileIndexes]]);
+    await stopJob(job.id, { allBindings: true });
+    for (const [bindingId, indexes] of bindings) bindDownload(duplicate, bindingId, indexes);
+    return duplicate.paused ? resumeJob(duplicate.downloadBindings.keys().next().value) : duplicate;
+  }
   job.paused = false;
   job.error = null;
   job.updatedAt = Date.now();
@@ -3094,11 +3215,11 @@ async function resumeJob(id) {
 }
 
 async function retryJob(id) {
-  const job = jobs.get(validJobId(id));
+  const job = downloadJob(validJobId(id));
   if (!job) throw new Error("Download not found.");
   if (job.seed) throw new Error("A local seed does not need to be retried.");
   const source = persistedJob(job);
-  await stopJob(id);
+  await stopJob(job.id, { allBindings: true });
   return addDownload(source, { restoreMetadata: true });
 }
 
@@ -3113,6 +3234,8 @@ async function restoreJobs() {
         if (record.transient || (record.managed === false && record.kind === "direct")) {
           continue;
         }
+        const bound = downloadJob(record.id);
+        if (bound && existingJobMatchesSource(bound, record.kind, record.value)) continue;
         if (record.paused) {
           const pausedInfo = record.file?.path ? await stat(record.file.path) : null;
           if (pausedInfo && !pausedInfo.isFile()) {
@@ -4648,20 +4771,20 @@ const server = createServer(async (request, response) => {
       const selections = body.selections === undefined ? [] : body.selections;
       if (!Array.isArray(selections) || selections.length > 30) throw new Error("Invalid download selections.");
       const validated = selections.map((selection) => {
-        const job = jobs.get(String(selection.jobId));
+        const job = downloadJob(String(selection.jobId));
         const indexes = normalizeDownloadFileIndexes(selection.fileIndexes);
         if (job?.torrent?.files?.length && indexes?.some((index) => !job.torrent.files[index] ||
           !VIDEO_EXTENSIONS.test(torrentFilePath(job.torrent.files[index])))) {
           throw new Error("Select video files from this torrent.");
         }
-        return { job, indexes };
+        return { job, indexes, sourceId: String(selection.jobId) };
       });
-      for (const { job, indexes } of validated) {
-        applyFileSelection(job, indexes);
+      for (const { job, indexes, sourceId } of validated) {
+        applyFileSelection(job, indexes, sourceId);
       }
-      let targets = normalizeMediaTargets(body.targets || []);
+      let targets = physicalMediaTargets(body.targets || []);
       const selected = body.selected
-        ? normalizeMediaTargets([body.selected], 1)[0]
+        ? physicalMediaTargets([body.selected], 1)[0]
         : null;
       if (
         selected &&
@@ -4708,7 +4831,8 @@ const server = createServer(async (request, response) => {
           throw new Error("Every preparation source id must be valid.");
         }
       }
-      setPreparationPriority(sourceId, sourceIds);
+      setPreparationPriority(downloadJob(sourceId)?.id || sourceId,
+        sourceIds ? Array.from(new Set(sourceIds.map((id) => downloadJob(id)?.id || id))) : undefined);
       sendJson(response, 200, {
         ok: true,
         sourceId: mediaPriorityTargets.find((target) =>
@@ -4825,14 +4949,14 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === "GET" && url.pathname === "/downloads") {
-      sendJson(response, 200, { jobs: Array.from(jobs.values(), snapshot) }, headers);
+      sendJson(response, 200, { jobs: downloadSnapshots() }, headers);
       return;
     }
 
     if (request.method === "POST" && url.pathname === "/downloads") {
       const body = await readJson(request);
       const job = await addDownload(body.source);
-      sendJson(response, 202, { job: snapshot(job) }, headers);
+      sendJson(response, 202, { job: snapshot(job, body.source.id) }, headers);
       return;
     }
 
@@ -4879,7 +5003,7 @@ const server = createServer(async (request, response) => {
         sendJson(response, 403, { error: "Invalid companion control token." }, headers);
         return;
       }
-      const job = jobs.get(torrentDetailsMatch[1]);
+      const job = downloadJob(torrentDetailsMatch[1]);
       if (!job) {
         sendJson(response, 404, { error: "Download not found." }, headers);
         return;
@@ -4894,17 +5018,17 @@ const server = createServer(async (request, response) => {
 
     const jobMatch = /^\/downloads\/([a-zA-Z0-9-]{8,80})$/.exec(url.pathname);
     if (request.method === "GET" && jobMatch) {
-      const job = jobs.get(jobMatch[1]);
+      const job = downloadJob(jobMatch[1]);
       if (!job) {
         sendJson(response, 404, { error: "Download not found." }, headers);
         return;
       }
-      sendJson(response, 200, { job: snapshot(job) }, headers);
+      sendJson(response, 200, { job: snapshot(job, jobMatch[1]) }, headers);
       return;
     }
 
     if (request.method === "DELETE" && jobMatch) {
-      const activeJob = jobs.get(jobMatch[1]);
+      const activeJob = downloadJob(jobMatch[1]);
       if (activeJob?.seed && activeSeedLeaseCount(activeJob) > 0) {
         sendJson(response, 409, { error: "This local seed is still shared by an active room." }, headers);
         return;
@@ -4918,7 +5042,7 @@ const server = createServer(async (request, response) => {
 
     const pinMatch = /^\/downloads\/([a-zA-Z0-9-]{8,80})\/pin$/.exec(url.pathname);
     if (request.method === "POST" && pinMatch) {
-      const job = jobs.get(pinMatch[1]);
+      const job = downloadJob(pinMatch[1]);
       if (!job) throw new Error("Download not found.");
       const body = await readJson(request);
       const pinned = Boolean(body.pinned);
@@ -4929,7 +5053,7 @@ const server = createServer(async (request, response) => {
       }
       persistJobs();
       await jobStore.flush();
-      sendJson(response, 200, { job: snapshot(job) }, headers);
+      sendJson(response, 200, { job: snapshot(job, pinMatch[1]) }, headers);
       return;
     }
 
@@ -4937,7 +5061,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && pauseMatch) {
       const job = await pauseJob(pauseMatch[1]);
       sendJson(response, job ? 200 : 404,
-        job ? { job: snapshot(job) } : { error: "Download not found." }, headers);
+        job ? { job: snapshot(job, pauseMatch[1]) } : { error: "Download not found." }, headers);
       return;
     }
 
@@ -4945,39 +5069,39 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && resumeMatch) {
       const job = await resumeJob(resumeMatch[1]);
       sendJson(response, job ? 202 : 404,
-        job ? { job: snapshot(job) } : { error: "Download not found." }, headers);
+        job ? { job: snapshot(job, resumeMatch[1]) } : { error: "Download not found." }, headers);
       return;
     }
 
     const retryMatch = /^\/downloads\/([a-zA-Z0-9-]{8,80})\/retry$/.exec(url.pathname);
     if (request.method === "POST" && retryMatch) {
       const job = await retryJob(retryMatch[1]);
-      sendJson(response, 202, { job: snapshot(job) }, headers);
+      sendJson(response, 202, { job: snapshot(job, retryMatch[1]) }, headers);
       return;
     }
 
     const selectionMatch = /^\/downloads\/([a-zA-Z0-9-]{8,80})\/selection$/.exec(url.pathname);
     if (request.method === "POST" && selectionMatch) {
-      const job = jobs.get(selectionMatch[1]);
+      const job = downloadJob(selectionMatch[1]);
       if (!job || job.kind !== "magnet") throw new Error("Torrent download not found.");
       const body = await readJson(request);
       const indexes = normalizeDownloadFileIndexes(body.fileIndexes);
       if (job.torrent?.files?.length && indexes?.some((index) => !job.torrent.files[index] ||
         !VIDEO_EXTENSIONS.test(torrentFilePath(job.torrent.files[index])))) throw new Error("Select video files from this torrent.");
-      applyFileSelection(job, indexes);
+      applyFileSelection(job, indexes, selectionMatch[1]);
       refreshTorrentSelections("file-selection");
       persistJobs();
-      sendJson(response, 200, { job: snapshot(job) }, headers);
+      sendJson(response, 200, { job: snapshot(job, selectionMatch[1]) }, headers);
       return;
     }
 
     const selectMatch = /^\/downloads\/([a-zA-Z0-9-]{8,80})\/select$/.exec(url.pathname);
     if (request.method === "POST" && selectMatch) {
-      const job = jobs.get(selectMatch[1]);
+      const job = downloadJob(selectMatch[1]);
       if (!job || job.kind !== "magnet") throw new Error("Torrent download not found.");
       const body = await readJson(request);
       selectTorrentFile(job, Number(body.fileIndex));
-      sendJson(response, 200, { job: snapshot(job) }, headers);
+      sendJson(response, 200, { job: snapshot(job, selectMatch[1]) }, headers);
       return;
     }
 
