@@ -12,6 +12,11 @@ export function mediaManifest(
   files: Array<Partial<SharedMediaItem> & { index?: number }>,
   sourceId: string
 ): SharedMediaItem[];
+export function torrentFileSelectionStatus(
+  source: SharedSource,
+  job: { files?: Array<{ index: number; path?: string; name: string; size: number }>; paused?: boolean; status: string; error?: string | null } | null | undefined,
+  options?: { agentAvailable?: boolean; agentUpdateRequired?: boolean; policy?: string; approved?: boolean; syncError?: string }
+): string;
 export function mediaQueue(sources: SharedSource[], watchRecords?: Record<string, WatchRecord>): QueuedMediaItem[];
 export function orderedMediaQueue(
   sources: SharedSource[],
