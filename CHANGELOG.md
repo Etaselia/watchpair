@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.4](https://github.com/Etaselia/watchpair/compare/v0.13.3...v0.13.4) (2026-10-28)
+
+
+### Bug Fixes
+
+* reuse existing torrent transfers across room sources ([#145](https://github.com/Etaselia/watchpair/issues/145)) ([c7578d2](https://github.com/Etaselia/watchpair/commit/c7578d2529272f9307a0d52b9cd0c5dbaf9971ff))
+
 ## [0.13.3](https://github.com/Etaselia/watchpair/compare/v0.13.2...v0.13.3) (2026-10-28)
 
 
