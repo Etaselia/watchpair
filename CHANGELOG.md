@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.5](https://github.com/Etaselia/watchpair/compare/v0.13.4...v0.13.5) (2026-10-28)
+
+
+### Bug Fixes
+
+* scope shared transfer file identities to each room ([76066e5](https://github.com/Etaselia/watchpair/commit/76066e58e24c285e4e4045e2734039213b68f4f7))
+
 ## [0.13.4](https://github.com/Etaselia/watchpair/compare/v0.13.3...v0.13.4) (2026-10-28)
 
 
