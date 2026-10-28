@@ -1,4 +1,5 @@
 import { transferStage, groupTransferSnapshots } from "../../agent/transfer-controls.mjs";
+import { mediaWatchKey } from "../../lib/watch-history.mjs";
 const $ = id => document.getElementById(id);
 const state = { jobs: [], groups: [], controls: { order: [], priorities: {} }, rooms: [], activity: {}, selected: null,
     roomId: localStorage.getItem("companion-active-room") || "", filter: "all", query: "", tab: "content", page: "transfers",
@@ -141,7 +142,12 @@ function draftFor(job) {
 function metricList(entries) { const list = el("dl"); for (const [key, value] of entries) {
     list.append(el("dt", key), el("dd", String(value ?? "—")));
 } return list; }
-function watchRecord(file, job) { return Object.values(room()?.watchRecords || {}).find(record => record.media?.sourceId === job.id && (record.media?.fileIndex === file.index || record.media?.itemId === file.itemId)); }
+function watchRecord(file, job) {
+    const connectedRoom = room();
+    if (!connectedRoom) return undefined;
+    const source = connectedRoom.sources.find(source => source.id === job.id) || { id: job.id, kind: job.kind, infoHash: job.infoHash };
+    return connectedRoom.watchRecords?.[mediaWatchKey(source, { fileIndex: file.index })];
+}
 function table(headers, rows) { const result = el("table", undefined, "file-table"), head = el("thead"), tr = el("tr"); headers.forEach(text => tr.append(el("th", text))); head.append(tr); result.append(head); const body = el("tbody"); for (const values of rows) {
     const row = el("tr");
     for (const value of values)
