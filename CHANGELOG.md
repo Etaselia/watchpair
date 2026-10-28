@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/Etaselia/watchpair/compare/v0.13.5...v0.14.0) (2026-10-28)
+
+
+### Features
+
+* rebuild Companion around a torrent transfer desk ([15b4dc9](https://github.com/Etaselia/watchpair/commit/15b4dc93250f8115a9d4bacb56bca02792c71d9a))
+
 ## [0.13.5](https://github.com/Etaselia/watchpair/compare/v0.13.4...v0.13.5) (2026-10-28)
 
 
