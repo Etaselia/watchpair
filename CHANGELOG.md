@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.1](https://github.com/Etaselia/watchpair/compare/v0.13.0...v0.13.1) (2026-10-28)
+
+
+### Bug Fixes
+
+* expose torrent file selection before metadata loads ([#139](https://github.com/Etaselia/watchpair/issues/139)) ([27bf049](https://github.com/Etaselia/watchpair/commit/27bf049afd79f77f3b8b878b65b589351fc97b69))
+
 ## [0.13.0](https://github.com/Etaselia/watchpair/compare/v0.12.8...v0.13.0) (2026-10-28)
 
 
