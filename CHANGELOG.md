@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.2](https://github.com/Etaselia/watchpair/compare/v0.13.1...v0.13.2) (2026-10-28)
+
+
+### Bug Fixes
+
+* support long Windows paths in media preparation ([#141](https://github.com/Etaselia/watchpair/issues/141)) ([0d4bd8d](https://github.com/Etaselia/watchpair/commit/0d4bd8de0636bee160f408ba3726b3449335e02b))
+
 ## [0.13.1](https://github.com/Etaselia/watchpair/compare/v0.13.0...v0.13.1) (2026-10-28)
 
 
