@@ -1412,6 +1412,7 @@ function snapshot(job, sourceId = job.id) {
 
   const indexes = job.downloadBindings?.get(sourceId);
   if (job.downloadBindings) files = files.map((file) => ({ ...file,
+    itemId: `${sourceId}-f${file.index}`,
     included: indexes == null || indexes.includes(file.index),
   }));
   const selected = files.find((file) => file.selected);

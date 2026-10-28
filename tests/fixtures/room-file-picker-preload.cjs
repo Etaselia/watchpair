@@ -1,4 +1,4 @@
-window.pickerFixture = { jobs: [], requests: [], metadataReady: false, failManifest: false };
+window.pickerFixture = { jobs: [], requests: [], roomSelections: [], metadataReady: false, failManifest: false };
 const originalFetch = window.fetch.bind(window);
 const preparation = { status: 'waiting', stage: 'waiting', progress: 0, label: 'Waiting', hardware: false };
 const reply = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: {'content-type':'application/json'} });
@@ -8,6 +8,11 @@ window.fetch = async (input, init = {}) => {
   const body = init.body ? JSON.parse(init.body) : {};
   if (url.pathname === '/api/sessions' && body.action === 'source-manifest' && fixture.failManifest) {
     return reply({error:'Simulated room file-list failure'}, 503);
+  }
+  if (url.pathname === '/api/sessions' && body.action === 'select-media') {
+    const response = await originalFetch(input, init);
+    fixture.roomSelections.push({media:body.media,status:response.status});
+    return response;
   }
   if (url.origin !== 'http://127.0.0.1:41735') return originalFetch(input, init);
   fixture.requests.push({path:url.pathname, body});
@@ -25,7 +30,9 @@ window.fetch = async (input, init = {}) => {
   for (const job of fixture.jobs) {
     if (fixture.metadataReady && !job.files.length) {
       job.status='downloading';
-      job.files = Array.from({length:48},(_,index)=>({index,itemId:`${job.id}-f${index}`,name:`Episode ${index%12+1}.mkv`,path:`Season ${Math.floor(index/12)+1}/Episode ${index%12+1}.mkv`,size:1048576,downloaded:0,progress:0,downloadReady:false,ready:false,selected:false,status:'downloading',preparation,subtitles:[],audioTracks:[],chapters:[],subtitleStatus:'waiting'}));
+      // Simulate v0.13.4's shared-transfer IDs. The browser must translate them
+      // into the current room source's manifest identities.
+      job.files = Array.from({length:48},(_,index)=>({index,itemId:`companion-existing-transfer-f${index}`,name:`Episode ${index%12+1}.mkv`,path:`Season ${Math.floor(index/12)+1}/Episode ${index%12+1}.mkv`,size:1048576,downloaded:0,progress:0,downloadReady:false,ready:false,selected:false,status:'downloading',preparation,subtitles:[],audioTracks:[],chapters:[],subtitleStatus:'waiting'}));
     }
   }
   if (url.pathname === '/downloads') return reply({jobs:fixture.jobs});
