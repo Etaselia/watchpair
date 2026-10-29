@@ -253,7 +253,11 @@ private slots:
     QVERIFY2(problems.isEmpty(), qPrintable(updates.status()));
     QVERIFY(updates.available());
     updates.download();
-    QTRY_VERIFY_WITH_TIMEOUT(!updates.busy(), 90000);
+    // Public mirrors and slower disks can exceed the loopback fixture budget.
+    // Keep the default strict; operators may explicitly allow a bounded WAN wait.
+    const auto downloadTimeout =
+        qBound(90000, qEnvironmentVariableIntValue("WATCHPAIR_UPDATE_TEST_TIMEOUT_MS"), 600000);
+    QTRY_VERIFY_WITH_TIMEOUT(!updates.busy(), downloadTimeout);
     QVERIFY2(problems.isEmpty(), qPrintable(updates.status()));
     QVERIFY(updates.staged());
     const auto staged = QJsonDocument::fromJson(read(root + QStringLiteral("/staged.json"))).object();

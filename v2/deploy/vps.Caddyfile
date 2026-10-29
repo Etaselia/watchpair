@@ -7,6 +7,10 @@
   }
 }
 
+http://38-180-216-137.sslip.io {
+  redir https://38-180-216-137.sslip.io:8443{uri} permanent
+}
+
 https://38-180-216-137.sslip.io:8443 {
   header {
     Strict-Transport-Security "max-age=31536000"
