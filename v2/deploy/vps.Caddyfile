@@ -1,0 +1,29 @@
+{
+  admin off
+  http_port 80
+  https_port 8443
+  servers {
+    protocols h1 h2
+  }
+}
+
+https://38-180-216-137.sslip.io:8443 {
+  header {
+    Strict-Transport-Security "max-age=31536000"
+    X-Content-Type-Options nosniff
+    Referrer-Policy no-referrer
+  }
+  redir / /downloads/ 302
+  handle_path /downloads/* {
+    root * /srv/downloads
+    file_server
+  }
+  handle /v2/relay/* {
+    reverse_proxy watchpair-v2-relay:8788
+  }
+  handle {
+    reverse_proxy watchpair-v2-coordinator:8787 {
+      header_up X-Forwarded-For {remote_host}
+    }
+  }
+}

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>WatchPair 2 — Desktop preview</title>
+<style>
+  *{box-sizing:border-box}body{margin:0;background:#0b111c;color:#e7edf7;font:16px/1.65 system-ui,sans-serif}
+  main{max-width:880px;margin:8vh auto;padding:28px}header{display:flex;align-items:center;gap:12px;color:#91a6c5;font-weight:600}
+  .mark{display:grid;place-items:center;width:36px;height:36px;background:#294e80;border-radius:12px;color:#a5ceff}
+  .badge{font-size:12px;border:1px solid #354054;border-radius:20px;padding:3px 10px;margin-left:auto}
+  h1{font-size:clamp(34px,6vw,58px);line-height:1.12;letter-spacing:-.04em;margin:36px 0 20px}h2{font-size:20px;margin-top:0}
+  p{color:#aabbd3}a{color:#99c6ff}.lead{max-width:630px;font-size:19px}.downloads{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:32px 0}
+  .card{background:#141f30;border:1px solid #29394e;border-radius:16px;padding:24px}.card p{font-size:14px;margin:8px 0 20px}
+  .button{display:inline-block;border-radius:9px;background:#75b3ff;color:#071628;padding:11px 18px;font-weight:650;text-decoration:none}
+  .muted{font-size:14px;color:#8fa2bd}code{display:block;overflow-wrap:anywhere;white-space:normal;background:#0c1523;border:1px solid #2b3c52;padding:12px 14px;border-radius:8px;color:#bed7fa;font-size:14px;user-select:all}
+  li{padding:6px 0;color:#bbc9dc}section{margin:30px 0}.note{border-left:3px solid #5e8fc9;padding-left:18px}footer{border-top:1px solid #25334a;padding-top:22px;font-size:14px;color:#8fa2bd}
+  @media(max-width:600px){main{margin:3vh auto;padding:20px}.downloads{grid-template-columns:1fr}.badge{margin-left:0}header{flex-wrap:wrap}}
+</style>
+<main>
+  <header><span class="mark">▶</span> WatchPair <span class="badge">2.0.0-alpha.2 · Desktop preview</span></header>
+  <h1>A better place<br>to watch together.</h1>
+  <p class="lead">Native playback, a shared episode queue, and clear download controls. Everyone watches their own copy, in sync.</p>
+  <div class="downloads">
+    <article class="card"><h2>Windows</h2><p>Windows 10 / 11 · x64 · 137 MB</p><a class="button" href="watchpair-windows-x64.zip">Download for Windows</a><p class="muted">Extract the whole ZIP, then start <strong>watchpair.exe</strong>.</p></article>
+    <article class="card"><h2>Linux</h2><p>Ubuntu 24.04 or newer · x64 · 165 MB</p><a class="button" href="watchpair-linux-x64.tar.gz">Download for Linux</a><p class="muted">Extract the archive, then run <strong>./AppRun</strong>.</p></article>
+  </div>
+  <section class="card"><h2>Start your first room</h2><ol><li>Open the app and choose <strong>Create room</strong>.</li><li>Enter this server address:<code>https://38-180-216-137.sslip.io:8443</code></li><li>Create your room, save the private recovery link, and share the normal invite with your friends.</li><li>Add media, select the episodes you want, and press <strong>Join watch</strong> when ready.</li></ol><p class="muted">You can install this copy for your user from Settings → Application and updates. Keep every extracted file together.</p></section>
+  <section class="note"><p>This is the first public v2 trial. The desktop app is required for watching. Create a new room: old browser rooms and history are not carried over. Your existing media files can still be added.</p><p class="muted">These preview packages use the validation signing key. Physical Windows 11 and Linux GPU/audio coverage is still being expanded.</p></section>
+  <section><h2>Updates and source</h2><p>For this preview's signed update feed, enter the following in Settings → Application and updates:</p><code>https://38-180-216-137.sslip.io:8443/downloads/release.json</code><p><a href="SHA256SUMS">Package checksums</a> · <a href="https://github.com/Etaselia/watchpair/releases/tag/v2.0.0-alpha.2">Complete corresponding source and build instructions</a></p><p class="muted">The exact source bundle is hosted with the release to conserve server disk space. Its two parts and reconstruction instructions are provided together.</p></section>
+  <footer>Private, invite-only rooms. Local media transfers use a direct connection when possible, with encrypted relay fallback.</footer>
+</main>
+</html>

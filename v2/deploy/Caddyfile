@@ -1,0 +1,18 @@
+{$WATCHPAIR_HOST} {
+  handle_path /downloads/* {
+    root * /srv/downloads
+    file_server
+    header Referrer-Policy no-referrer
+  }
+  handle {
+    reverse_proxy coordinator:8787 {
+      # Discard forwarded client identity supplied by an internet client.
+      header_up X-Forwarded-For {remote_host}
+    }
+  }
+}
+{$WATCHPAIR_RELAY_HOST} {
+  reverse_proxy relay:8788 {
+    header_up X-Forwarded-For {remote_host}
+  }
+}

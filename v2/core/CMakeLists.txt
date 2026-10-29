@@ -1,0 +1,6 @@
+add_library(watchpair_media media_source.h player.cpp player.h verified_stream.cpp verified_stream.h native_runtime.h)
+target_link_libraries(watchpair_media PUBLIC Qt6::Core Qt6::Network watchpair_mpv)
+target_include_directories(watchpair_media PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(watchpair_media PUBLIC QT_NO_CAST_FROM_ASCII QT_NO_CAST_TO_ASCII)
+add_library(watchpair_video video_widget.cpp video_widget.h)
+target_link_libraries(watchpair_video PUBLIC watchpair_media Qt6::Widgets Qt6::OpenGLWidgets)

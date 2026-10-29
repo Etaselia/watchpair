@@ -1,0 +1,71 @@
+services:
+  coordinator:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    init: true
+    restart: unless-stopped
+    command: ["node", "dist/src/main.js"]
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8787
+      WATCHPAIR_DATABASE: /data/watchpair-v2.sqlite
+      WATCHPAIR_TRUST_PROXY: 'true'
+      WATCHPAIR_RELAY_URL: https://${WATCHPAIR_RELAY_HOST:?Set the relay hostname}
+      WATCHPAIR_RELAY_SECRET: ${WATCHPAIR_RELAY_SECRET:?Generate a 32-byte base64 secret}
+    volumes:
+      - room-data:/data
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 1g
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:8787/health',{signal:AbortSignal.timeout(2000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+  relay:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    init: true
+    restart: unless-stopped
+    command: ["node", "dist/src/relay-main.js"]
+    environment:
+      WATCHPAIR_RELAY_HOST: 0.0.0.0
+      WATCHPAIR_RELAY_PORT: 8788
+      WATCHPAIR_RELAY_SECRET: ${WATCHPAIR_RELAY_SECRET:?Generate a 32-byte base64 secret}
+      WATCHPAIR_RELAY_INGRESS_BPS: ${WATCHPAIR_RELAY_INGRESS_BPS:-10485760}
+      WATCHPAIR_RELAY_EGRESS_BPS: ${WATCHPAIR_RELAY_EGRESS_BPS:-10485760}
+      WATCHPAIR_RELAY_CHANNEL_INGRESS_BPS: ${WATCHPAIR_RELAY_CHANNEL_INGRESS_BPS:-5242880}
+      WATCHPAIR_RELAY_CHANNEL_EGRESS_BPS: ${WATCHPAIR_RELAY_CHANNEL_EGRESS_BPS:-5242880}
+      WATCHPAIR_RELAY_BUFFER_BYTES: 67108864
+      WATCHPAIR_RELAY_MAX_CHANNELS: 1024
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:8788/health',{signal:AbortSignal.timeout(2000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+  edge:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      WATCHPAIR_HOST: ${WATCHPAIR_HOST:?Set the coordinator hostname}
+      WATCHPAIR_RELAY_HOST: ${WATCHPAIR_RELAY_HOST:?Set the relay hostname}
+    ports: ['80:80', '443:443', '443:443/udp']
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./downloads:/srv/downloads:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on: [coordinator, relay]
+volumes:
+  room-data:
+  caddy-data:
+  caddy-config:

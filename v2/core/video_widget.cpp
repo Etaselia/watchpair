@@ -1,0 +1,185 @@
+#include "video_widget.h"
+#include <QMetaObject>
+#include <QOpenGLContext>
+#include <QOpenGLExtraFunctions>
+#include <QOpenGLFunctions>
+#include <QShowEvent>
+#include <QWindow>
+
+namespace wp {
+VideoWidget::VideoWidget(Player &player, QWidget *parent) : QOpenGLWidget(parent), player_(player) {
+  setMinimumSize(480, 270);
+  setAutoFillBackground(false);
+  setAttribute(Qt::WA_OpaquePaintEvent);
+  // Qt can invalidate framebuffer contents during exposure or a framebuffer
+  // grab even when the native frame has not changed. Keep its surface, but
+  // redraw the cached native frame on every paintGL invocation.
+  setUpdateBehavior(QOpenGLWidget::PartialUpdate);
+  hiddenFrames_.setTimerType(Qt::PreciseTimer);
+  connect(&hiddenFrames_, &QTimer::timeout, this, [this] {
+    if (pendingFrame_.load())
+      frameAvailable();
+  });
+  hiddenFrames_.start(16);
+}
+VideoWidget::~VideoWidget() {
+  hiddenFrames_.stop();
+  if (render_) {
+    makeCurrent();
+    softwareSurface_.reset();
+    mpv_render_context_set_update_callback(render_, nullptr, nullptr);
+    mpv_render_context_free(render_);
+    render_ = nullptr;
+    doneCurrent();
+  }
+}
+void VideoWidget::initializeGL() {
+  const auto renderer =
+      QByteArray(reinterpret_cast<const char *>(context()->functions()->glGetString(GL_RENDERER))).toLower();
+  software_ = renderer.contains("softpipe") || renderer.contains("llvmpipe") ||
+              renderer.contains("software rasterizer");
+  context()->functions()->glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &textureUnits_);
+  prepareGL();
+  mpv_opengl_init_params gl{[](void *, const char *name) -> void * {
+                              return reinterpret_cast<void *>(
+                                  QOpenGLContext::currentContext()->getProcAddress(name));
+                            },
+                            nullptr};
+  mpv_render_param params[] = {{MPV_RENDER_PARAM_API_TYPE, const_cast<char *>(MPV_RENDER_API_TYPE_OPENGL)},
+                               {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &gl},
+                               {MPV_RENDER_PARAM_INVALID, nullptr}};
+  const auto result = mpv_render_context_create(&render_, player_.native(), params);
+  if (result < 0) {
+    player_.rendererFailed(QString::fromUtf8(mpv_error_string(result)));
+    emit failure(QString::fromUtf8(mpv_error_string(result)));
+    return;
+  }
+  mpv_render_context_set_update_callback(
+      render_,
+      [](void *data) {
+        auto *widget = static_cast<VideoWidget *>(data);
+        // Coalesce wakeups while a software-rendered frame is still pending.
+        // Otherwise decoder callbacks can flood the GUI event queue.
+        if (!widget->pendingFrame_.exchange(true))
+          QMetaObject::invokeMethod(widget, [widget] { widget->frameAvailable(); }, Qt::QueuedConnection);
+      },
+      this);
+  player_.rendererReady();
+}
+void VideoWidget::showEvent(QShowEvent *event) {
+  QOpenGLWidget::showEvent(event);
+  update();
+}
+void VideoWidget::frameAvailable() {
+  if (!render_)
+    return;
+  if (isVisible() && window()->windowHandle() && window()->windowHandle()->isExposed()) {
+    update();
+    return;
+  }
+  // A hidden transfer/library page must not stall the player's video queue.
+  // libmpv still needs a current GL context when consuming an undisplayed frame.
+  makeCurrent();
+  pendingFrame_.store(false);
+  if (mpv_render_context_update(render_) & MPV_RENDER_UPDATE_FRAME) {
+    prepareGL();
+    int skip = 1;
+    mpv_render_param params[] = {{MPV_RENDER_PARAM_SKIP_RENDERING, &skip},
+                                 {MPV_RENDER_PARAM_INVALID, nullptr}};
+    mpv_render_context_render(render_, params);
+  }
+  doneCurrent();
+}
+void VideoWidget::prepareGL() {
+  auto *gl = context()->functions();
+  auto *extra = context()->extraFunctions();
+  const bool debug = qEnvironmentVariableIsSet("WATCHPAIR_GL_DEBUG");
+  // Qt's compositor also uses this context. Attribute errors to the render
+  // operation that produced them, rather than inheriting its pending flags.
+  for (int n = 0; n < 16 && gl->glGetError() != GL_NO_ERROR; ++n) {
+  }
+  auto check = [gl, debug](const char *stage) {
+    if (debug) {
+      const auto code = gl->glGetError();
+      if (code)
+        qWarning("OpenGL boundary %s: %u", stage, code);
+    }
+  };
+  // Sampler objects and upload offsets left by Qt override texture parameters
+  // even when libmpv binds its own textures. Reset the documented API boundary.
+  for (int unit = 0; unit < textureUnits_; ++unit) {
+    gl->glActiveTexture(GL_TEXTURE0 + unit);
+    gl->glBindTexture(GL_TEXTURE_2D, 0);
+    extra->glBindSampler(unit, 0);
+  }
+  gl->glActiveTexture(GL_TEXTURE0);
+  check("samplers");
+  extra->glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+  gl->glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+  gl->glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+  gl->glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+  gl->glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, 0);
+  gl->glPixelStorei(GL_UNPACK_SKIP_IMAGES, 0);
+  gl->glPixelStorei(GL_UNPACK_SWAP_BYTES, GL_FALSE);
+  gl->glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+  check("pixel upload");
+  extra->glBindVertexArray(0);
+  gl->glUseProgram(0);
+  gl->glDisable(GL_SCISSOR_TEST);
+  gl->glDisable(GL_BLEND);
+  // Qt's compositor can leave clipping/depth state enabled. libmpv's render
+  // API requires standard defaults, including after framebuffer grabs.
+  gl->glDisable(GL_STENCIL_TEST);
+  gl->glDisable(GL_DEPTH_TEST);
+  gl->glDisable(GL_CULL_FACE);
+  gl->glDisable(GL_RASTERIZER_DISCARD);
+  gl->glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+  gl->glDisable(GL_SAMPLE_COVERAGE);
+  gl->glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+  check("draw defaults");
+}
+void VideoWidget::paintGL() {
+  if (!render_)
+    return;
+  pendingFrame_.store(false);
+  const auto updates = mpv_render_context_update(render_);
+  const QSize target(qRound(width() * devicePixelRatioF()), qRound(height() * devicePixelRatioF()));
+  prepareGL();
+  auto *gl = context()->functions();
+  const auto renderSize = software_ && (target.width() > 640 || target.height() > 360)
+                              ? target.scaled(QSize(640, 360), Qt::KeepAspectRatio)
+                              : target;
+  if (renderSize != target && (!softwareSurface_ || softwareSurface_->size() != renderSize)) {
+    softwareSurface_ = std::make_unique<QOpenGLFramebufferObject>(renderSize);
+    if (!softwareSurface_->isValid()) {
+      emit failure(QStringLiteral("Could not allocate the software graphics preview."));
+      return;
+    }
+    prepareGL();
+  }
+  const auto framebuffer = renderSize == target ? defaultFramebufferObject() : softwareSurface_->handle();
+  context()->extraFunctions()->glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+  const GLenum drawBuffer = GL_COLOR_ATTACHMENT0;
+  context()->extraFunctions()->glDrawBuffers(1, &drawBuffer);
+  if (updates & MPV_RENDER_UPDATE_FRAME)
+    ++frames_;
+  mpv_opengl_fbo fbo{static_cast<int>(framebuffer), renderSize.width(), renderSize.height(), 0};
+  int flip = 1;
+  mpv_render_param params[] = {{MPV_RENDER_PARAM_OPENGL_FBO, &fbo},
+                               {MPV_RENDER_PARAM_FLIP_Y, &flip},
+                               {MPV_RENDER_PARAM_INVALID, nullptr}};
+  const auto result = mpv_render_context_render(render_, params);
+  if (renderSize != target) {
+    auto *extra = context()->extraFunctions();
+    extra->glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+    extra->glBindFramebuffer(GL_DRAW_FRAMEBUFFER, defaultFramebufferObject());
+    extra->glBlitFramebuffer(0, 0, renderSize.width(), renderSize.height(), 0, 0, target.width(),
+                             target.height(), GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    extra->glBindFramebuffer(GL_FRAMEBUFFER, defaultFramebufferObject());
+  }
+  ++draws_;
+  glError_ = int(gl->glGetError());
+  if (result < 0)
+    emit failure(QString::fromUtf8(mpv_error_string(result)));
+}
+} // namespace wp

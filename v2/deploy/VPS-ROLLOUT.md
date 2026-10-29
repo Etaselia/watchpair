@@ -1,0 +1,18 @@
+# Existing VPS: v2 alpha trial
+
+This deployment keeps `https://38-180-216-137.sslip.io:8443` and the existing Caddy certificate volumes. Port 443 belongs to another service. The desktop preview uses the existing validation signing key; it is not a production-key release.
+
+`vps.Caddyfile` routes rooms and downloads to the coordinator and static files, and `/v2/relay/*` to the separate relay process. Both public origins are the same HTTPS address. Node ports remain private. The VPS has only 712 MiB RAM and a 5 GB disk, so `vps-start.sh` bounds coordinator/relay heaps, container memory, logs, relay buffers and bandwidth. The relay allows 2 MiB/s in each direction globally and 1 MiB/s per channel. Inspect actual memory before increasing these ceilings.
+
+Manual procedure, after checking the pinned SSH host key and authenticating as the operator:
+
+1. Inspect disk, running containers and mounts. Preserve unrelated services and downloaded media. Back up the small v1 Caddyfile, deployment receipt, container configuration and legacy deployment scripts locally. The old container may have no persisted room file; v2 intentionally starts an independent database.
+2. Export the tested v2 image locally, upload it, load it, tag it `watchpair-v2:2.0.0-alpha.2`, verify its image ID, and delete the temporary image archive from the VPS.
+3. Upload the exact tested desktop archives, checksum list, signed `release.json` and `vps-downloads.html` into `/opt/watchpair-v2/downloads`. Publish the complete corresponding source in the GitHub prerelease, split into two parts to fit asset limits. Do not publish private signing keys or room profiles.
+4. Install `vps.Caddyfile` as `/opt/watchpair-v2/Caddyfile`. Stop the old coordinator to reclaim RAM, then run `vps-start.sh` as root. The script generates a fresh private relay secret and uses a private persistent SQLite directory. Both new containers must become healthy before switching the edge.
+5. Recreate only `watchpair-proxy`, keeping `watchpair-net`, the `watchpair-caddy-data` and `watchpair-caddy-config` volumes and port mappings `80:80`, `8443:8443`. Bind the new Caddyfile and the downloads directory read-only. Preserve the old proxy configuration until public verification passes.
+6. Verify certificate-validated HTTPS, invite landing, authenticated WebSockets, two-member queue/history, relay bytes, checksums, signed feed and restart persistence. Remove test rooms afterwards. The existing deployment smoke can use the same-origin relay routes.
+7. Replace the legacy v1 root deployment executable with a refusal stub so scheduled CI cannot restore v1. Disable its GitHub workflow as well. Keep its old source/configuration backup locally.
+8. Remove the stopped old WatchPair container, `watchpair:0.14.0`, `watchpair:rollback`, obsolete WatchPair downloads/configuration and staging archives. Use exact inspected names and paths; do not globally prune Docker or remove the Caddy certificate volumes. Record the deployed image ID, package checksums, endpoint and disk usage.
+
+Persistent v2 room state is `/opt/watchpair-v2/data/watchpair-v2.sqlite`. Use the online backup tool described in `README.md`; preserve the WAL with the original database when recovering stopped state. `service.env` contains the relay secret and must stay root-only. This hard swap intentionally does not migrate v1 rooms or history.

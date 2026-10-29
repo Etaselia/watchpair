@@ -1,0 +1,27 @@
+{
+  "name": "@watchpair/coordinator",
+  "version": "2.0.0-dev.1",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/tests/*.test.js",
+    "start": "node dist/src/main.js",
+    "relay": "node dist/src/relay-main.js"
+  },
+  "dependencies": {
+    "@fastify/rate-limit": "11.2.1",
+    "@fastify/websocket": "11.3.4",
+    "fastify": "5.12.7",
+    "ws": "8.22.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "@types/ws": "8.18.2",
+    "typescript": "7.0.2"
+  }
+}
