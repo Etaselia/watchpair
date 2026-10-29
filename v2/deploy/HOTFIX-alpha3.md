@@ -17,6 +17,8 @@ This application-only hotfix uses the same Qt, libmpv, libtorrent, FFmpeg and ot
 - The Windows full native CTest run passes all 11 suites. Platform reports and packaged acceptance logs are retained under `outputs/v2-hotfix-*` and `outputs/v2/linux-startup-qa`.
 - Updater coverage includes HTTP 404 reporting, signature/key/version checks and a real signed package transport/staging test followed by a current-version check.
 
+The first Linux full run passed 11/12 suites but failed the automatic watched-history assertion: native playback reached EOF while recorded coverage stopped at 16.75/24.02 seconds, with eight additional readiness invalidations. Both an isolated traced run and a complete traced playback-suite rerun subsequently passed unchanged, with continuous coverage through 90% and reports no more than 204 ms apart. The eight-player check retained 41.7 ms p95/max spread. The original triggering transition was not captured, so concurrent load is a hypothesis, not a proven cause. Keep the original failed report and treat history under heavy load as a remaining acceptance risk; no assertion or coverage rule was relaxed.
+
 Physical Linux graphics/audio devices and Windows 11 remain the hardware coverage limits recorded in [IMPLEMENTATION.md](../IMPLEMENTATION.md). WSL/X11/Wayland checks do not establish physical device qualification.
 
 ## Release artifacts
