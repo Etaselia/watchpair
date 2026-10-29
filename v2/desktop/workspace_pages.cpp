@@ -228,7 +228,7 @@ SettingsPage::SettingsPage(AppServices &app, QWidget *parent) : QWidget(parent),
   form->addRow(installation);
   auto *feed = new QLineEdit(app_.store.setting(QStringLiteral("updateFeed")).toString());
   feed->setObjectName(QStringLiteral("UpdateFeed"));
-  feed->setPlaceholderText(tr("https://your-server/downloads/stable.json"));
+  feed->setPlaceholderText(tr("https://your-server/downloads/release.json"));
   form->addRow(tr("Signed release feed"), feed);
   auto *deliveryButtons = new QWidget;
   auto *deliveryLayout = new QHBoxLayout(deliveryButtons);
@@ -283,7 +283,7 @@ SettingsPage::SettingsPage(AppServices &app, QWidget *parent) : QWidget(parent),
         url = server_->text().trimmed();
         if (url.endsWith(QLatin1Char('/')))
           url.chop(1);
-        url += QStringLiteral("/downloads/stable.json");
+        url += QStringLiteral("/downloads/release.json");
         feed->setText(url);
       }
       app_.store.setSetting(QStringLiteral("updateFeed"), url);

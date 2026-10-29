@@ -131,6 +131,7 @@ private:
     bool physicalPause = false, pendingResume = false, removing = false;
     int playbackFile = -1;
     QSet<int> pendingHashes;
+    QSet<int> pendingRenames;
     QSet<QString> holds;
     QList<qint64> progress;
     QJsonArray trackerRows, peerRows;

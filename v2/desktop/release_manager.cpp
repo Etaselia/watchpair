@@ -189,7 +189,8 @@ int compareVersions(const QString &left, const QString &right) {
   const auto a = parts(left), b = parts(right);
   return a < b ? -1 : a > b ? 1 : 0;
 }
-Release verifyFeed(const QByteArray &data, const QByteArray &publicKey, const QString &currentVersion) {
+Release verifyFeed(const QByteArray &data, const QByteArray &publicKey, const QString &currentVersion,
+                   bool requireNewer) {
   if (data.size() > 128 * 1024 || publicKey.size() != 32)
     fail(QStringLiteral("This build has no valid trusted update key, or the feed is too large."));
   const auto envelope = QJsonDocument::fromJson(data).object();
@@ -216,7 +217,8 @@ Release verifyFeed(const QByteArray &data, const QByteArray &publicKey, const QS
     fail(QStringLiteral("This release requires an incompatible update or room protocol."));
   Release result;
   result.version = document.value(QStringLiteral("version")).toString();
-  if (compareVersions(result.version, currentVersion) <= 0)
+  const auto comparison = compareVersions(result.version, currentVersion);
+  if (requireNewer && comparison <= 0)
     fail(QStringLiteral(
         "You already have this version or a newer version. Downgrades use Restore previous version."));
   result.protocol = 2;
@@ -651,21 +653,29 @@ void ReleaseManager::check(const QUrl &feed) {
   options.maximumBytes = 128 * 1024;
   auto release = std::make_shared<delivery::Release>();
   const auto current = QCoreApplication::applicationVersion();
+  release_ = {};
   status_ = QStringLiteral("Checking the signed release feed…");
   task(
       [options, release, current] {
         const auto result = fetchHttp(options);
         if (result.cancelled)
           return QStringLiteral("Update check cancelled.");
-        if (!result.error.isEmpty() || result.status != 200)
-          return QStringLiteral("The update feed could not be downloaded.");
-        *release =
-            delivery::verifyFeed(result.body, QByteArray::fromHex(WATCHPAIR_UPDATE_PUBLIC_KEY), current);
+        if (result.status != 200 && result.status > 0)
+          return QStringLiteral("The update feed returned HTTP %1. Check the update feed address.")
+              .arg(result.status);
+        if (!result.error.isEmpty())
+          return QStringLiteral("The update feed could not be downloaded. %1").arg(result.error);
+        *release = delivery::verifyFeed(result.body, QByteArray::fromHex(WATCHPAIR_UPDATE_PUBLIC_KEY),
+                                        current, false);
         return QString();
       },
-      [this, release] {
-        release_ = *release;
-        status_ = QStringLiteral("Version %1 is available. %2").arg(release_.version, release_.notes);
+      [this, release, current] {
+        if (delivery::compareVersions(release->version, current) > 0) {
+          release_ = *release;
+          status_ = QStringLiteral("Version %1 is available. %2").arg(release_.version, release_.notes);
+        } else {
+          status_ = QStringLiteral("You're up to date. Installed version: %1.").arg(current);
+        }
       });
 }
 void ReleaseManager::download() {

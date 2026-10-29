@@ -19,7 +19,8 @@ QString runningRoot();
 QString launcher(const QString &root);
 QString defaultRoot();
 int compareVersions(const QString &left, const QString &right);
-Release verifyFeed(const QByteArray &envelope, const QByteArray &publicKey, const QString &currentVersion);
+Release verifyFeed(const QByteArray &envelope, const QByteArray &publicKey, const QString &currentVersion,
+                   bool requireNewer = true);
 QJsonObject verifyBundle(const QString &directory, const QString &expectedVersion = {});
 void extractArchive(const QString &archive, const QString &freshDirectory);
 QJsonObject installBundle(const QString &bundle, const QString &root, const QString &profile);

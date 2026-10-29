@@ -459,6 +459,11 @@ void TransferEngine::manifest(Record &r) {
   // rename_file is posted to libtorrent's thread. Never retain a reference
   // into its mutable mapped storage while enqueueing disk-name changes.
   const lt::file_storage fs = ti->orig_files();
+#if LIBTORRENT_VERSION_NUM >= 20100
+  const auto mapped = r.handle.get_renamed_files();
+#else
+  const lt::file_storage mapped = ti->files();
+#endif
   if (fs.num_files() > 10000) {
     r.error = QStringLiteral("This pack contains more than 10,000 files. Split it into smaller sources.");
     r.handle.pause();
@@ -519,7 +524,12 @@ void TransferEngine::manifest(Record &r) {
     diskPaths.insert(key(int(i)), disk);
     // Original index and label remain the protocol identity; only disk names
     // are normalized for Windows/Linux compatibility.
-    if (disk != path)
+#if LIBTORRENT_VERSION_NUM >= 20100
+    const auto current = QDir::fromNativeSeparators(QString::fromStdString(mapped.file_path(fs, i)));
+#else
+    const auto current = QDir::fromNativeSeparators(QString::fromStdString(mapped.file_path(i)));
+#endif
+    if (disk != current && !r.pendingRenames.contains(int(i)))
       renames.append({int(i), disk});
   }
   r.files = files;
@@ -528,11 +538,19 @@ void TransferEngine::manifest(Record &r) {
   next.insert(QStringLiteral("name"), QString::fromStdString(ti->name()));
   next.insert(QStringLiteral("identity"), hashIdentity(ti->info_hashes()));
   persist(r, next);
-  for (const auto &rename : renames)
+  if (!renames.isEmpty()) {
+    r.handle.pause();
+    r.physicalPause = true;
+  }
+  for (const auto &rename : renames) {
+    r.pendingRenames.insert(rename.first);
     r.handle.rename_file(lt::file_index_t(rename.first), rename.second.toStdString());
+  }
   applySelection(r);
-  r.handle.save_resume_data(lt::torrent_handle::save_info_dict);
-  r.pendingResume = true;
+  if (r.pendingRenames.isEmpty()) {
+    r.handle.save_resume_data(lt::torrent_handle::save_info_dict);
+    r.pendingResume = true;
+  }
   emit r.source->manifestChanged();
   emit manifestReady(r.source->id());
 }
@@ -797,7 +815,7 @@ QSet<QString> TransferEngine::downloadSlots() const {
     return {};
   for (const auto &[id, r] : records_) {
     if (r->removing || !r->handle.is_valid() || r->intent.value(QStringLiteral("manualPaused")).toBool() ||
-        !r->error.isEmpty() || r->priorities.isEmpty() ||
+        !r->error.isEmpty() || !r->pendingRenames.isEmpty() || r->priorities.isEmpty() ||
         !store_.get(QStringLiteral("storage-job"), id).isEmpty() ||
         (r->status.total_wanted > 0 && r->status.total_wanted_done >= r->status.total_wanted))
       continue;
@@ -1167,6 +1185,8 @@ void TransferEngine::schedule() {
       reason = QStringLiteral("Device bandwidth allocated to another transfer");
     else if (!r->error.isEmpty())
       reason = r->error;
+    else if (!r->pendingRenames.isEmpty())
+      reason = QStringLiteral("Preparing portable filenames");
     else if (!store_.get(QStringLiteral("storage-job"), id).isEmpty())
       reason = QStringLiteral("Moving storage");
     else if (selected && !completed) {
@@ -1295,7 +1315,17 @@ void TransferEngine::poll() {
           else
             emit identificationUnavailable(id, index);
         }
+      } else if (auto *renamed = lt::alert_cast<lt::file_renamed_alert>(a)) {
+        if (r->pendingRenames.remove(int(renamed->index)) && r->pendingRenames.isEmpty()) {
+          r->handle.save_resume_data(lt::torrent_handle::save_info_dict);
+          r->pendingResume = true;
+          schedule();
+        }
       } else if (auto *saved = lt::alert_cast<lt::save_resume_data_alert>(a)) {
+        if (!r->pendingRenames.isEmpty()) {
+          r->pendingResume = false;
+          continue;
+        }
         auto bytes = lt::write_resume_data_buf(saved->params);
         auto next = r->intent;
         next.insert(QStringLiteral("resume"),
@@ -1335,6 +1365,7 @@ void TransferEngine::poll() {
         log(id, QStringLiteral("MOVE_FAILED"), r->error);
         changed = true;
       } else if (auto *failed = lt::alert_cast<lt::file_rename_failed_alert>(a)) {
+        r->pendingRenames.remove(int(failed->index));
         r->error = QStringLiteral("A portable disk filename could not be created: ") +
                    QString::fromStdString(failed->error.message());
         r->handle.pause();
@@ -1412,7 +1443,7 @@ void TransferEngine::poll() {
 }
 void TransferEngine::checkpoint() {
   for (auto &[id, r] : records_)
-    if (!r->pendingResume && !r->removing && r->handle.is_valid()) {
+    if (!r->pendingResume && r->pendingRenames.isEmpty() && !r->removing && r->handle.is_valid()) {
       r->pendingResume = true;
       r->handle.save_resume_data(lt::torrent_handle::save_info_dict);
     }
@@ -1420,7 +1451,7 @@ void TransferEngine::checkpoint() {
 int TransferEngine::pendingCheckpoints() const {
   int n = 0;
   for (const auto &[id, r] : records_)
-    if (r->pendingResume)
+    if (r->pendingResume || !r->pendingRenames.isEmpty())
       ++n;
   return n;
 }

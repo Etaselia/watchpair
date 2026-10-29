@@ -43,6 +43,31 @@ int changedPixels(const QImage &a, const QImage &b) {
 class MediaMatrix final : public QObject {
   Q_OBJECT
 private slots:
+  void systemAudioDriverOpensAtZeroVolume() {
+    if (!qEnvironmentVariableIsSet("WATCHPAIR_TEST_REAL_AUDIO"))
+      QSKIP("Set WATCHPAIR_TEST_REAL_AUDIO to verify an actual system audio backend");
+    const auto fixtures = qEnvironmentVariable("WATCHPAIR_MEDIA_FIXTURES");
+    QVERIFY(!fixtures.isEmpty());
+    wp::Player player(nullptr, false, false);
+    player.setVolume(0);
+    wp::VideoWidget video(player);
+    video.resize(640, 360);
+    video.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&video));
+    player.open(QUrl::fromLocalFile(QDir(fixtures).filePath(QStringLiteral("tracks.mkv"))));
+    QTRY_VERIFY_WITH_TIMEOUT(player.loaded(), 10000);
+    auto output = [&] {
+      auto *value = mpv_get_property_string(player.native(), "current-ao");
+      const auto result = value ? QString::fromUtf8(value) : QString();
+      mpv_free(value);
+      return result;
+    };
+    QTRY_VERIFY2_WITH_TIMEOUT(!output().isEmpty() && output() != QStringLiteral("null"),
+                              "No real system audio driver opened", 10000);
+    qInfo().noquote() << "Real audio backend:" << output();
+    QTRY_VERIFY_WITH_TIMEOUT(player.sampledPosition() > .2, 5000);
+    player.stop();
+  }
   void nativeDecodeAndRendering_data() {
     QTest::addColumn<QString>("name");
     for (const auto *name : {"h264.mp4", "hevc10.mkv", "av1.mkv", "hdr-pq.mkv", "tracks.mkv"})

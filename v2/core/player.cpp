@@ -57,7 +57,10 @@ Player::Player(QObject *parent, bool headless, bool silent) : QObject(parent), m
   option("terminal", "no");
   option("input-default-bindings", "no");
   option("vo", headless ? "null" : "libmpv");
-  option("ao", headless || silent ? "null" : "auto");
+  // An omitted driver list enables mpv's system-output autodetection. "auto"
+  // is an audio-device value, not the name of an audio output driver.
+  if (headless || silent)
+    option("ao", "null");
   // Validate original-media playback first. Native hardware interop is a
   // separate platform gate; do not silently select an unvalidated decoder.
   option("hwdec", "no");

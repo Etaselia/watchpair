@@ -9,6 +9,8 @@
 #include <QProcessEnvironment>
 #include <QScopeGuard>
 #include <QSqlQuery>
+#include <QTcpServer>
+#include <QTcpSocket>
 #include <QTemporaryDir>
 #include <QtTest>
 #include <archive.h>
@@ -117,6 +119,31 @@ void writeArchive(const QString &path, const QStringList &names, bool symlink = 
 class DeliveryTests final : public QObject {
   Q_OBJECT
 private slots:
+  void missingUpdateFeedReportsHttpStatus() {
+    QTemporaryDir tmp;
+    wp::LocalStore store(tmp.filePath(QStringLiteral("profile")));
+    wp::TransferEngine transfers(store, nullptr, true);
+    wp::ReleaseManager updates(store, transfers);
+    if (!updates.canUpdate())
+      QSKIP("Build with the pinned update key to exercise the update request");
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost));
+    connect(&server, &QTcpServer::newConnection, this, [&] {
+      auto *socket = server.nextPendingConnection();
+      connect(socket, &QTcpSocket::readyRead, socket, [socket] {
+        socket->readAll();
+        socket->write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        socket->disconnectFromHost();
+      });
+      connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+    });
+    QSignalSpy problems(&updates, &wp::ReleaseManager::problem);
+    updates.check(QUrl(QStringLiteral("http://127.0.0.1:%1/missing.json").arg(server.serverPort())));
+    QTRY_VERIFY_WITH_TIMEOUT(!updates.busy(), 10000);
+    QCOMPARE(problems.size(), 1);
+    QVERIFY(updates.status().contains(QStringLiteral("HTTP 404")));
+    QVERIFY(!updates.available());
+  }
   void packagedInstallationLaunchAndAutomaticCrashRollback() {
     const auto candidate = QString::fromLocal8Bit(qgetenv("WATCHPAIR_PACKAGE"));
     const auto previous = QString::fromLocal8Bit(qgetenv("WATCHPAIR_PREVIOUS_PACKAGE"));
@@ -208,6 +235,12 @@ private slots:
     const auto signedFeed = trusted.sign(document);
     QCOMPARE(wp::delivery::verifyFeed(signedFeed, trusted.publicKey, QStringLiteral("2.0.0-beta.99")).size,
              1234);
+    QCOMPARE(
+        wp::delivery::verifyFeed(signedFeed, trusted.publicKey, QStringLiteral("2.0.0-rc.2"), false).version,
+        QStringLiteral("2.0.0-rc.2"));
+    QVERIFY_EXCEPTION_THROWN(
+        wp::delivery::verifyFeed(signedFeed, wrong.publicKey, QStringLiteral("2.0.0-rc.2"), false),
+        wp::AppError);
     QVERIFY_EXCEPTION_THROWN(
         wp::delivery::verifyFeed(signedFeed, wrong.publicKey, QStringLiteral("2.0.0-beta.99")), wp::AppError);
     QVERIFY_EXCEPTION_THROWN(wp::delivery::verifyFeed(signedFeed, trusted.publicKey, QStringLiteral("2.0.0")),
@@ -266,6 +299,12 @@ private slots:
     QCOMPARE(wp::delivery::compareVersions(manifest.value(QStringLiteral("version")).toString(),
                                            baseline.value(QStringLiteral("version")).toString()),
              1);
+    QCoreApplication::setApplicationVersion(manifest.value(QStringLiteral("version")).toString());
+    updates.check(QUrl(feed));
+    QTRY_VERIFY_WITH_TIMEOUT(!updates.busy(), 15000);
+    QVERIFY2(problems.isEmpty(), qPrintable(updates.status()));
+    QVERIFY(!updates.available());
+    QVERIFY(updates.status().contains(QStringLiteral("You're up to date")));
   }
   void archiveRejectsTraversalLinksDuplicateNamesAndDevicePaths() {
     QTemporaryDir tmp;

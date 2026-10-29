@@ -24,8 +24,10 @@
 #include <libtorrent/bencode.hpp>
 #include <libtorrent/create_torrent.hpp>
 #include <libtorrent/hasher.hpp>
+#include <libtorrent/read_resume_data.hpp>
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/torrent_info.hpp>
+#include <libtorrent/write_resume_data.hpp>
 
 namespace lt = libtorrent;
 namespace {
@@ -66,6 +68,76 @@ public:
 class LocalServices final : public QObject {
   Q_OBJECT
 private slots:
+  void populatedPortableTorrentResumesWithoutRenamingExistingFiles_data() {
+    QTest::addColumn<bool>("staleMapping");
+    QTest::newRow("saved-mapping") << false;
+    QTest::newRow("interrupted-checkpoint") << true;
+  }
+  void populatedPortableTorrentResumesWithoutRenamingExistingFiles() {
+    QFETCH(bool, staleMapping);
+    QTemporaryDir tmp;
+    QVERIFY(tmp.isValid());
+    const QByteArray payload(65536, 'R');
+    lt::file_storage storage;
+    storage.add_file(
+        (QStringLiteral("Pack/") + QString(200, QLatin1Char('a')) + QStringLiteral(".mkv")).toStdString(),
+        payload.size());
+    lt::create_torrent create(storage, 65536, lt::create_torrent::v1_only);
+    create.set_hash(lt::piece_index_t(0), lt::hasher(payload.constData(), payload.size()).final());
+    std::vector<char> encoded;
+    lt::bencode(std::back_inserter(encoded), create.generate());
+    const auto metadata = tmp.filePath(QStringLiteral("portable-data.torrent"));
+    write(metadata, QByteArray(encoded.data(), encoded.size()));
+    const auto profile = tmp.filePath(QStringLiteral("profile"));
+    QString id, disk;
+    {
+      wp::LocalStore store(profile);
+      wp::TransferEngine engine(store, nullptr, true);
+      engine.configure({{QStringLiteral("reserveMiB"), 0}});
+      id = engine.add(metadata);
+      engine.checkpoint();
+      QTRY_COMPARE_WITH_TIMEOUT(engine.pendingCheckpoints(), 0, 10000);
+      disk = QDir(engine.view(id).path)
+                 .filePath(engine.intent(id)
+                               .value(QStringLiteral("diskPaths"))
+                               .toObject()
+                               .value(QStringLiteral("0"))
+                               .toString());
+      write(disk, payload);
+      engine.select(id, {{0, 4}});
+      engine.recheck(id);
+      QTRY_VERIFY_WITH_TIMEOUT(engine.source(id)->hasPiece(0), 10000);
+      engine.checkpoint();
+      QTRY_COMPARE_WITH_TIMEOUT(engine.pendingCheckpoints(), 0, 10000);
+    }
+    if (staleMapping) {
+      // Simulate termination after the portable file was created, before its
+      // native rename mapping reached the durable resume checkpoint.
+      wp::LocalStore store(profile);
+      auto row = store.get(QStringLiteral("transfer"), id);
+      const auto bytes = QByteArray::fromBase64(row.value(QStringLiteral("resume")).toString().toLatin1());
+      auto params = lt::read_resume_data(lt::span<const char>(bytes.constData(), bytes.size()));
+      params.renamed_files.clear();
+      params.ti = std::make_shared<lt::torrent_info>(metadata.toStdString());
+      const auto encodedResume = lt::write_resume_data_buf(params);
+      row.insert(QStringLiteral("resume"),
+                 QString::fromLatin1(QByteArray(encodedResume.data(), encodedResume.size()).toBase64()));
+      store.put(QStringLiteral("transfer"), id, row);
+    }
+    for (int restart = 0; restart < 2; ++restart) {
+      wp::LocalStore store(profile);
+      wp::TransferEngine engine(store, nullptr, true);
+      engine.restore();
+      QTRY_VERIFY_WITH_TIMEOUT(engine.source(id)->hasPiece(0), 10000);
+      engine.checkpoint();
+      QTRY_COMPARE_WITH_TIMEOUT(engine.pendingCheckpoints(), 0, 10000);
+      QTest::qWait(1500); // Drain asynchronous native rename failures, not just initial state.
+      QVERIFY2(engine.view(id).error.isEmpty(), qPrintable(engine.view(id).error));
+      QFile file(disk);
+      QVERIFY(file.open(QIODevice::ReadOnly));
+      QCOMPARE(file.readAll(), payload);
+    }
+  }
   void portableTorrentNamesKeepOriginalManifestIndexesAcrossRestart() {
     try {
       QTemporaryDir tmp;

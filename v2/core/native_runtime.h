@@ -4,10 +4,15 @@
 #include <QFile>
 #include <QTcpServer>
 #include <QUdpSocket>
+#include <clocale>
 #include <stdexcept>
 
 namespace wp {
 inline void configureNativeRuntime() {
+  // QApplication adopts the user's C locale during construction. libmpv
+  // requires C numeric parsing before mpv_create(), including on desktops
+  // whose numbers use a decimal comma. Qt's QLocale retains user formatting.
+  std::setlocale(LC_NUMERIC, "C");
 #ifdef Q_OS_WIN
   // Providers are dynamically loaded and absent from DLL import tables.
   const auto modules = QCoreApplication::applicationDirPath() + QStringLiteral("/ossl-modules");
