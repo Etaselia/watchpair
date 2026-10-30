@@ -140,6 +140,7 @@ void Player::open(const QUrl &url, bool startPaused) {
   activePlaylist_ = -1;
   loaded_ = false;
   tracksKnown_ = false;
+  pendingTracksRequest_ = 0;
   position_ = 0;
   duration_ = 0;
   cachedSeconds_ = 0;
@@ -191,6 +192,7 @@ void Player::stop() {
   command({"stop"});
   loaded_ = false;
   tracksKnown_ = false;
+  pendingTracksRequest_ = 0;
   position_ = 0;
   duration_ = 0;
   atEnd_ = false;
@@ -240,21 +242,22 @@ void Player::updatePlaylist() {
       playlistEpochs_.value(activePlaylist_) == epoch_) {
     pendingLoaded_ = -1;
     loaded_ = true;
-    // FILE_LOADED and observed track-list notifications need not be delivered
-    // together. Query only after this playlist entry is validated as current,
-    // so an empty inventory means no tracks rather than metadata still loading.
-    mpv_node currentTracks{};
-    if (mpv_get_property(mpv_, "track-list", MPV_FORMAT_NODE, &currentTracks) >= 0) {
-      readTracks(node(currentTracks).toArray());
-      mpv_free_node_contents(&currentTracks);
-    }
     error_.clear();
+    // Do not block the GUI/render thread while mpv finishes native setup. A
+    // distinct request ID ties the complete inventory to this validated open.
+    pendingTracksRequest_ = (quint64(1) << 63) | epoch_;
+    const auto code = mpv_get_property_async(mpv_, pendingTracksRequest_, "track-list", MPV_FORMAT_NODE);
+    if (code < 0) {
+      pendingTracksRequest_ = 0;
+      error_ = QStringLiteral("Cannot read media tracks: ") + QString::fromUtf8(mpv_error_string(code));
+      emit activity(error_);
+    }
     emit activity(QStringLiteral("Native decoder opened media"));
   }
   if (pendingEndErrors_.size() > 32)
     pendingEndErrors_.clear();
 }
-void Player::readTracks(const QJsonArray &native) {
+void Player::readTracks(const QJsonArray &native, bool validated) {
   QJsonArray result;
   QHash<QString, int> ordinal;
   for (auto item : native) {
@@ -286,7 +289,8 @@ void Player::readTracks(const QJsonArray &native) {
       break;
   }
   tracks_ = result;
-  tracksKnown_ = loaded_;
+  if (validated)
+    tracksKnown_ = loaded_;
 }
 bool Player::setTracks(const QString &audio, const QString &subtitle, double delay) {
   QString aid, sid = QStringLiteral("no");
@@ -381,6 +385,26 @@ void Player::poll() {
                e->error < 0 && e->reply_userdata == epoch_) {
       error_ = QString::fromUtf8(mpv_error_string(e->error));
       emit activity(error_);
+    } else if (e->event_id == MPV_EVENT_GET_PROPERTY_REPLY && pendingTracksRequest_ &&
+               e->reply_userdata == pendingTracksRequest_) {
+      const auto *property = static_cast<mpv_event_property *>(e->data);
+      const bool current = pendingTracksRequest_ == ((quint64(1) << 63) | epoch_) && loaded_ &&
+                           playlistEpochs_.value(activePlaylist_) == epoch_;
+      pendingTracksRequest_ = 0;
+      if (!current)
+        continue;
+      if (e->error >= 0 && property && property->name &&
+          QString::fromUtf8(property->name) == QStringLiteral("track-list") &&
+          property->format == MPV_FORMAT_NODE && property->data &&
+          static_cast<mpv_node *>(property->data)->format == MPV_FORMAT_NODE_ARRAY) {
+        readTracks(node(*static_cast<mpv_node *>(property->data)).toArray(), true);
+      } else {
+        error_ = QStringLiteral("Cannot read media tracks: ") +
+                 (e->error < 0 ? QString::fromUtf8(mpv_error_string(e->error))
+                               : QStringLiteral("invalid native inventory"));
+        emit activity(error_);
+      }
+      dirty = true;
     } else if (e->event_id == MPV_EVENT_PROPERTY_CHANGE) {
       auto *p = static_cast<mpv_event_property *>(e->data);
       if (!p->data)

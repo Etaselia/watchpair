@@ -1,5 +1,6 @@
 #include "player_surface.h"
 #include <QApplication>
+#include <QComboBox>
 #include <QCursor>
 #include <QEvent>
 #include <QGridLayout>
@@ -100,9 +101,34 @@ bool PlayerSurface::eventFilter(QObject *object, QEvent *event) {
     // Combo boxes can create their native popup before this surface moves.
     // Reparenting the controls does not update that popup's transient owner.
     if (event->type() == QEvent::Show) {
-      if (auto *handle = popup->windowHandle())
+      if (auto *handle = popup->windowHandle()) {
         if (auto *owner = window()->windowHandle(); owner && handle->transientParent() != owner)
           handle->setTransientParent(owner);
+        if (QApplication::platformName().startsWith(QStringLiteral("wayland"))) {
+          if (auto *combo = qobject_cast<QComboBox *>(popup->parentWidget())) {
+            const QRect control(combo->mapTo(window(), QPoint()), combo->size());
+            const bool above = window()->isFullScreen() &&
+                popup->height() > window()->height() - control.bottom() - 1 &&
+                popup->height() <= control.top();
+            // Qt 6.12's Wayland positioner overrides QWidget popup placement.
+            // Its platform properties (qwaylandxdgshell.cpp) let us place an
+            // owned combo above bottom controls before mapping, even when the
+            // compositor fails to flip/slide a fullscreen popup. No private
+            // headers are used; recheck this compatibility path on Qt upgrades.
+            if (above) {
+              const bool rtl = combo->layoutDirection() == Qt::RightToLeft;
+              handle->setProperty("_q_waylandPopupAnchorRect", control);
+              handle->setProperty("_q_waylandPopupAnchor", QVariant::fromValue(
+                  Qt::Edges(Qt::TopEdge | (rtl ? Qt::RightEdge : Qt::LeftEdge))));
+              handle->setProperty("_q_waylandPopupGravity", QVariant::fromValue(
+                  Qt::Edges(Qt::TopEdge | (rtl ? Qt::LeftEdge : Qt::RightEdge))));
+            } else {
+              for (const auto *property : {"_q_waylandPopupAnchorRect", "_q_waylandPopupAnchor", "_q_waylandPopupGravity"})
+                handle->setProperty(property, QVariant());
+            }
+          }
+        }
+      }
       idle_.stop();
     } else if (event->type() == QEvent::Hide && playing_ && !blocking_ && isVisible())
       idle_.start();

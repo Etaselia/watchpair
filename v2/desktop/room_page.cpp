@@ -1052,6 +1052,10 @@ void RoomPage::reorder(int direction) {
   });
 }
 void RoomPage::trackChoice() {
+  if (!trackInventoryReady()) {
+    updateTracks();
+    return;
+  }
   if (audio_->currentIndex() < 0 || subtitles_->currentIndex() < 0)
     return;
   app_.perform([this] {
@@ -1070,12 +1074,50 @@ void RoomPage::trackChoice() {
                          {}, {{QStringLiteral("generation"), tracksGeneration_}});
   });
 }
+bool RoomPage::trackInventoryReady() const {
+  const bool local = app_.playback.local();
+  if (local)
+    return app_.player.tracksKnown();
+  if (room_.isEmpty() || !app_.rooms.connected(room_))
+    return false;
+  const auto snapshot = room_.isEmpty() ? QJsonObject() : app_.rooms.room(room_);
+  const auto p = snapshot.value(QStringLiteral("playback")).toObject();
+  const auto entry = p.value(QStringLiteral("entryId")).toString();
+  if (entry.isEmpty() || p.value(QStringLiteral("subtitleTransition")).toBool())
+    return false;
+  if (app_.player.tracksKnown() && app_.playback.room() == room_ && app_.playback.entryId() == entry)
+    return true;
+  const auto identity = app_.rooms.entry(room_, entry).value(QStringLiteral("mediaId"));
+  for (auto value : snapshot.value(QStringLiteral("members")).toArray()) {
+    const auto member = value.toObject(), status = member.value(QStringLiteral("status")).toObject();
+    const auto watch = member.value(QStringLiteral("watch")).toString();
+    if (member.value(QStringLiteral("connected")).toBool() &&
+        (watch == QStringLiteral("active") || watch == QStringLiteral("staging")) &&
+        status.value(QStringLiteral("tracksKnown")).toBool() &&
+        status.value(QStringLiteral("entryId")) == p.value(QStringLiteral("entryId")) &&
+        status.value(QStringLiteral("generation")) == p.value(QStringLiteral("generation")) &&
+        status.value(QStringLiteral("identity")) == identity)
+      return true;
+  }
+  return false;
+}
 void RoomPage::updateTracks() {
+  const bool local = app_.playback.local();
+  const auto snapshot = room_.isEmpty() ? QJsonObject() : app_.rooms.room(room_);
+  const auto p = snapshot.value(QStringLiteral("playback")).toObject();
+  const auto entry = local ? app_.playback.entryId() : p.value(QStringLiteral("entryId")).toString();
+  if (!trackInventoryReady() || tracksEntry_ != entry ||
+      (!local && tracksGeneration_ != p.value(QStringLiteral("generation")).toInt())) {
+    const QSignalBlocker resetDelay(subtitleDelay_);
+    audio_->hidePopup();
+    subtitles_->hidePopup();
+    subtitleDelay_->clearFocus();
+  }
   if (audio_->view()->isVisible() || subtitles_->view()->isVisible() || chapters_->view()->isVisible() ||
       subtitleDelay_->hasFocus())
     return;
-  const auto snapshot = room_.isEmpty() ? QJsonObject() : app_.rooms.room(room_);
-  const auto p = snapshot.value(QStringLiteral("playback")).toObject();
+  const auto identity = local || room_.isEmpty() ? QJsonValue() :
+      app_.rooms.entry(room_, p.value(QStringLiteral("entryId")).toString()).value(QStringLiteral("mediaId"));
   QJsonArray statusTracks;
   for (auto value : snapshot.value(QStringLiteral("members")).toArray()) {
     const auto m = value.toObject(), status = m.value(QStringLiteral("status")).toObject();
@@ -1083,6 +1125,9 @@ void RoomPage::updateTracks() {
                                     {QStringLiteral("audio"), status.value(QStringLiteral("audio"))},
                                     {QStringLiteral("subtitles"), status.value(QStringLiteral("subtitles"))},
                                     {QStringLiteral("entryId"), status.value(QStringLiteral("entryId"))},
+                                    {QStringLiteral("generation"), status.value(QStringLiteral("generation"))},
+                                    {QStringLiteral("identity"), status.value(QStringLiteral("identity"))},
+                                    {QStringLiteral("connected"), m.value(QStringLiteral("connected"))},
                                     {QStringLiteral("known"), status.value(QStringLiteral("tracksKnown"))}});
   }
   const auto signature =
@@ -1092,6 +1137,9 @@ void RoomPage::updateTracks() {
                       {QStringLiteral("tracks"), app_.player.tracks()},
                       {QStringLiteral("chapters"), app_.player.chapters()},
                       {QStringLiteral("loaded"), app_.player.loaded()},
+                      {QStringLiteral("known"), app_.player.tracksKnown()},
+                      {QStringLiteral("roomEntry"), p.value(QStringLiteral("entryId"))},
+                      {QStringLiteral("subtitleTransition"), p.value(QStringLiteral("subtitleTransition"))},
                       {QStringLiteral("entryId"), app_.playback.entryId()},
                       {QStringLiteral("audio"), app_.playback.audioChoice()},
                       {QStringLiteral("subtitle"), app_.playback.subtitleChoice()},
@@ -1103,14 +1151,14 @@ void RoomPage::updateTracks() {
     return;
   trackSignature_ = signature;
   tracksGeneration_ = p.value(QStringLiteral("generation")).toInt();
-  tracksEntry_ = app_.playback.entryId();
+  tracksEntry_ = entry;
   const QSignalBlocker a(audio_), s(subtitles_), d(subtitleDelay_), c(chapters_);
   audio_->clear();
   subtitles_->clear();
   audio_->addItem(tr("Default audio"), QStringLiteral("auto"));
   subtitles_->addItem(tr("Subtitles off"), QStringLiteral("off"));
   QHash<QString, QString> labels;
-  if (app_.player.loaded())
+  if (app_.player.tracksKnown() && (local || (app_.playback.room() == room_ && app_.playback.entryId() == entry)))
     for (auto value : app_.player.tracks()) {
       const auto t = value.toObject();
       labels.insert(t.value(QStringLiteral("key")).toString(), trackLabel(t));
@@ -1131,9 +1179,13 @@ void RoomPage::updateTracks() {
     if (watch != QStringLiteral("active") && watch != QStringLiteral("staging"))
       continue;
     const auto status = m.value(QStringLiteral("status")).toObject();
-    if (status.value(QStringLiteral("tracksKnown")).toBool() &&
-        status.value(QStringLiteral("entryId")) == p.value(QStringLiteral("entryId")))
-      watchers.append(m);
+    if (!m.value(QStringLiteral("connected")).toBool() ||
+        !status.value(QStringLiteral("tracksKnown")).toBool() ||
+        status.value(QStringLiteral("entryId")) != p.value(QStringLiteral("entryId")) ||
+        status.value(QStringLiteral("generation")) != p.value(QStringLiteral("generation")) ||
+        status.value(QStringLiteral("identity")) != identity)
+      continue;
+    watchers.append(m);
     for (auto key : status.value(QStringLiteral("audio")).toArray())
       audio.insert(key.toString());
     for (auto key : status.value(QStringLiteral("subtitles")).toArray())
@@ -1186,7 +1238,11 @@ void RoomPage::updateTracks() {
   }
   fill(audio_, audio);
   fill(subtitles_, subtitles);
-  const auto currentAudio = app_.playback.audioChoice(), currentSub = app_.playback.subtitleChoice();
+  const bool checking = !local && p.value(QStringLiteral("subtitleTransition")).toBool();
+  const auto currentAudio = app_.playback.audioChoice();
+  const auto currentSub = checking ? QStringLiteral("off") : app_.playback.subtitleChoice();
+  if (checking)
+    subtitles_->setItemText(0, tr("Checking subtitles…"));
   if (audio_->findData(currentAudio) < 0 && !currentAudio.isEmpty())
     audio_->addItem(tr("Unavailable · %1").arg(currentAudio), currentAudio);
   if (subtitles_->findData(currentSub) < 0 && !currentSub.isEmpty())
@@ -1368,9 +1424,10 @@ void RoomPage::refresh() {
           item->setData(Qt::UserRole, member.value(QStringLiteral("id")).toString());
       }
     }
-    audio_->setEnabled(local || connected);
-    subtitles_->setEnabled(local || connected);
-    subtitleDelay_->setEnabled(local || connected);
+    const bool tracksReady = (local || connected) && trackInventoryReady();
+    audio_->setEnabled(tracksReady);
+    subtitles_->setEnabled(tracksReady);
+    subtitleDelay_->setEnabled(tracksReady);
     updateTracks();
   });
 }

@@ -51,7 +51,7 @@ signals:
 private:
   void poll();
   void command(const QList<QByteArray> &args);
-  void readTracks(const QJsonArray &tracks);
+  void readTracks(const QJsonArray &tracks, bool validated = false);
   void updatePlaylist();
   mpv_handle *mpv_ = nullptr;
   QTimer timer_;
@@ -64,6 +64,7 @@ private:
   bool renderReady_ = false, pendingOpen_ = false;
   bool paused_ = false, seeking_ = false, atEnd_ = false;
   quint64 epoch_ = 100;
+  quint64 pendingTracksRequest_ = 0;
   qint64 activePlaylist_ = -1;
   QHash<qint64, quint64> playlistEpochs_;
   QHash<qint64, QString> pendingEndErrors_;

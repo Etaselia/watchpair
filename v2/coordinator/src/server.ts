@@ -11,7 +11,7 @@ import { Engine } from './engine.js';
 import { PROTOCOL, DomainError, socketMessageSchema, type Change } from './protocol.js';
 
 const name = z.string().trim().min(1).max(100).refine(v => !/[\x00-\x1f\x7f]/.test(v));
-const VERSION = '2.0.0-alpha.4';
+const VERSION = '2.0.0-alpha.5';
 const capability = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const createBody = z.object({ name, memberName: name, retryKey: capability }).strict();
 const joinBody = z.object({ invite: capability, name, retryKey: capability }).strict();

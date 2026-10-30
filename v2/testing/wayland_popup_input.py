@@ -53,18 +53,39 @@ origin_x, origin_y, child = c.c_int(), c.c_int(), window_type()
 x.XTranslateCoordinates(display, compositors[0][0], root, 0, 0, c.byref(origin_x), c.byref(origin_y), c.byref(child))
 
 if sys.argv[1] == 'click':
-    pid, kind, local_x, local_y = sys.argv[2:]
-    graph = subprocess.run(['weston-debug', 'scene-graph'], capture_output=True, text=True, check=True, timeout=3).stdout
+    pid, kind, local_x, local_y = sys.argv[2:6]
+    pattern = rf'View \d+ \(role xdg_{re.escape(kind)}, PID {int(pid)},[^\n]+\n\s+position: \((-?\d+), (-?\d+)\) -> \((-?\d+), (-?\d+)\)'
+    deadline = time.monotonic() + 3
+    while True:
+        graph = subprocess.run(['weston-debug', 'scene-graph'], capture_output=True, text=True, check=True, timeout=3).stdout
+        matches = re.findall(pattern, graph)
+        if len(matches) == 1:
+            left, top, right, bottom = map(int, matches[0])
+            if kind != 'toplevel' or len(sys.argv) <= 7 or (right-left, bottom-top) == tuple(map(int, sys.argv[6:8])):
+                break
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f'Committed {kind} surface did not match requested geometry: {matches}\n{graph}')
+        time.sleep(.02)
     if os.environ.get('WATCHPAIR_UI_OUTPUT'):
         stamp = str(time.time_ns())
         with open(os.path.join(os.environ['WATCHPAIR_UI_OUTPUT'], f'scene-{kind}-{stamp}.txt'), 'w') as output:
             output.write(graph)
         subprocess.run([sys.executable, __file__, 'capture', os.path.join(os.environ['WATCHPAIR_UI_OUTPUT'], f'before-{kind}-{stamp}.png')], check=True)
-    pattern = rf'View \d+ \(role xdg_{re.escape(kind)}, PID {int(pid)},[^\n]+\n\s+position: \((-?\d+), (-?\d+)\) -> \((-?\d+), (-?\d+)\)'
-    matches = re.findall(pattern, graph)
     if len(matches) != 1:
         raise RuntimeError(f'Expected one {kind} for PID {pid}, found {matches}\n{graph}')
     px, py, right, bottom = map(int, matches[0])
+    if kind == 'popup':
+        outputs = re.findall(r'Output \d+[^\n]*\n\s+position: \((-?\d+), (-?\d+)\) -> \((-?\d+), (-?\d+)\)', graph)
+        if len(outputs) != 1:
+            raise RuntimeError(f'Expected one isolated compositor output: {outputs}')
+        left_edge, top_edge, right_edge, bottom_edge = map(int, outputs[0])
+        if not (left_edge <= px < right <= right_edge and top_edge <= py < bottom <= bottom_edge):
+            raise RuntimeError(f'Popup {matches[0]} is clipped by compositor output {outputs[0]}')
+        if len(sys.argv) > 6:
+            owners = re.findall(rf'View \d+ \(role xdg_toplevel, PID {int(pid)},[^\n]+\n\s+position: \((-?\d+), (-?\d+)\) ->', graph)
+            if len(owners) != 1 or bottom > int(owners[0][1]) + int(sys.argv[6]):
+                raise RuntimeError(f'Fullscreen popup {matches[0]} is not above its control')
+        print(f'Popup {matches[0]} fully within output {outputs[0]}', flush=True)
     if not (0 <= int(local_x) < right - px and 0 <= int(local_y) < bottom - py):
         raise RuntimeError(f'Click point {local_x},{local_y} is outside committed {kind} surface {matches[0]}')
     px += origin_x.value + int(local_x)

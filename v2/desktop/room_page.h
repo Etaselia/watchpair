@@ -87,6 +87,7 @@ private:
   void seekPlayer(double seconds);
   void skipChapter(int direction);
   bool chapterMetadataReady() const;
+  bool trackInventoryReady() const;
   QString selectedEntry() const;
   QStringList selectedEntries() const;
   AppServices &app_;

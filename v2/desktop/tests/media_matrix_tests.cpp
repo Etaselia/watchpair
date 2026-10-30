@@ -8,6 +8,7 @@
 #include <QDir>
 #include <QFile>
 #include <QJsonDocument>
+#include <QRectF>
 #include <QScopeGuard>
 #include <QSurfaceFormat>
 #include <QtTest>
@@ -47,6 +48,54 @@ int videoColors(const QImage &image) {
     for (int x = 0; x < image.width(); x += 12)
       distinct.insert(image.pixel(x, y));
   return distinct.size();
+}
+class NativeProperties {
+public:
+  explicit NativeProperties(wp::Player &player)
+      : client_(mpv_create_client(player.native(), "media-test"), mpv_destroy) {
+    if (!client_)
+      throw std::runtime_error("Cannot create the media test observer");
+    quint64 id = 0;
+    for (const auto *name : {"sid", "sub-text", "sub-visibility", "sub-delay", "sub-start", "sub-end"})
+      if (mpv_observe_property(client_.get(), ++id, name, MPV_FORMAT_STRING) < 0)
+        throw std::runtime_error("Cannot observe native subtitle state");
+  }
+  QString value(const char *name) {
+    // A separate client keeps fresh property events independent of Player's
+    // event consumer. Never block the GUI/render thread with a property getter.
+    for (auto *event = mpv_wait_event(client_.get(), 0); event->event_id != MPV_EVENT_NONE;
+         event = mpv_wait_event(client_.get(), 0)) {
+      if (event->event_id != MPV_EVENT_PROPERTY_CHANGE)
+        continue;
+      const auto *property = static_cast<mpv_event_property *>(event->data);
+      if (!property || !property->name)
+        continue;
+      const auto text = property->format == MPV_FORMAT_STRING && property->data
+                            ? QString::fromUtf8(*static_cast<char **>(property->data))
+                            : QStringLiteral("<unavailable>");
+      values_.insert(QString::fromUtf8(property->name), text);
+    }
+    return values_.value(QString::fromLatin1(name), QStringLiteral("<unavailable>"));
+  }
+
+private:
+  std::unique_ptr<mpv_handle, decltype(&mpv_destroy)> client_;
+  QHash<QString, QString> values_;
+};
+int fixtureSubtitlePixels(const QImage &image, bool bitmap) {
+  // generate-media-fixtures.py creates yellow ASS text near bottom center and
+  // a white PGS rectangle at (24,140), size 96x16, in a 320x180 canvas. These
+  // interior regions exclude the video's yellow bar and gray moving block.
+  const QRectF region = bitmap ? QRectF(.10, .79, .25, .06) : QRectF(.55, .80, .40, .14);
+  int result = 0;
+  for (int y = int(region.top() * image.height()); y < int(region.bottom() * image.height()); ++y)
+    for (int x = int(region.left() * image.width()); x < int(region.right() * image.width()); ++x) {
+      const auto color = image.pixelColor(x, y);
+      if (color.red() > (bitmap ? 220 : 200) && color.green() > (bitmap ? 220 : 200) &&
+          (bitmap ? color.blue() > 220 : color.blue() < 70))
+        ++result;
+    }
+  return result;
 }
 } // namespace
 class MediaMatrix final : public QObject {
@@ -88,6 +137,7 @@ private slots:
     QVERIFY2(!fixtures.isEmpty(), "Set WATCHPAIR_MEDIA_FIXTURES to the generated fixture directory");
     const auto output = QString::fromLocal8Bit(qgetenv("WATCHPAIR_MEDIA_OUTPUT"));
     wp::Player player(nullptr, false, true);
+    NativeProperties observed(player);
     if (qEnvironmentVariableIsSet("WATCHPAIR_MEDIA_DISABLE_SHADER_CACHE"))
       QCOMPARE(mpv_set_property_string(player.native(), "gpu-shader-cache", "no"), 0);
     if (qEnvironmentVariableIsSet("WATCHPAIR_MEDIA_GPU_DUMB"))
@@ -178,14 +228,35 @@ private slots:
         }
       }
       QVERIFY(!ass.isEmpty() && !pgs.isEmpty() && !surround.isEmpty() && !stereo.isEmpty());
+      const auto subtitleDiagnostic = [&](const QString &name) {
+        if (!qEnvironmentVariableIsSet("WATCHPAIR_MEDIA_SUBTITLE_DIAGNOSTICS"))
+          return;
+        const auto inspect = [&](const QString &phase) {
+          QJsonObject state;
+          for (const auto *property :
+               {"sid", "sub-text", "sub-visibility", "sub-delay", "sub-start", "sub-end"}) {
+            state.insert(QString::fromLatin1(property), observed.value(property));
+          }
+          state.insert(QStringLiteral("position"), player.sampledPosition());
+          state.insert(QStringLiteral("frames"), qint64(video.frames()));
+          state.insert(QStringLiteral("draws"), qint64(video.draws()));
+          qInfo().noquote() << name << phase << QJsonDocument(state).toJson(QJsonDocument::Compact);
+          if (!output.isEmpty())
+            video.grabFramebuffer().save(
+                QDir(output).filePath(name + QLatin1Char('-') + phase + QStringLiteral(".png")));
+        };
+        inspect(QStringLiteral("immediate"));
+        QTest::qWait(750);
+        inspect(QStringLiteral("settled"));
+      };
       player.setPaused(true);
       QTRY_VERIFY_WITH_TIMEOUT(player.paused(), 3000);
       player.seek(1.5);
-      QTRY_VERIFY_WITH_TIMEOUT(!player.seeking() && std::abs(player.sampledPosition() - 1.5) < .1, 5000);
+      QTRY_VERIFY_WITH_TIMEOUT(!player.seeking() && std::abs(player.sampledPosition() - 1.5) < .001, 5000);
       const auto beforeOff = video.frames();
       const bool alreadyOff = player.mediaInfo().value(QStringLiteral("subtitleId")).isBool();
       QVERIFY(player.setTracks(surround, QStringLiteral("off"), 0));
-      QTRY_VERIFY_WITH_TIMEOUT(player.mediaInfo().value(QStringLiteral("subtitleId")).isBool(), 3000);
+      QTRY_COMPARE_WITH_TIMEOUT(observed.value("sid"), QStringLiteral("no"), 3000);
       QTRY_VERIFY_WITH_TIMEOUT(alreadyOff || video.frames() > beforeOff, 3000);
       QTRY_COMPARE_WITH_TIMEOUT(player.mediaInfo()
                                     .value(QStringLiteral("audio"))
@@ -193,27 +264,52 @@ private slots:
                                     .value(QStringLiteral("channel-count"))
                                     .toInt(),
                                 6, 3000);
-      QTest::qWait(150);
+      // Audio selection can still be completing its asynchronous refresh. Take
+      // the off baseline only after a new rendered frame at the exact seek PTS.
+      const auto beforeClean = video.frames();
+      player.seek(1.5);
+      QTRY_VERIFY_WITH_TIMEOUT(player.paused() && !player.seeking() &&
+                                   std::abs(player.sampledPosition() - 1.5) < .001 &&
+                                   video.frames() > beforeClean,
+                               5000);
       const auto clean = video.grabFramebuffer();
+      QCOMPARE(fixtureSubtitlePixels(clean, false), 0);
+      QCOMPARE(fixtureSubtitlePixels(clean, true), 0);
       if (!output.isEmpty())
         clean.save(QDir(output).filePath(QStringLiteral("subtitles-off.png")));
+      subtitleDiagnostic(QStringLiteral("subtitles-off"));
+      QImage subtitleImage;
+      const auto renderedCaption = [&](bool bitmap) {
+        subtitleImage = video.grabFramebuffer();
+        const int minimumPixels = subtitleImage.width() * subtitleImage.height() / (bitmap ? 100 : 1000);
+        return player.paused() && !player.seeking() && std::abs(player.sampledPosition() - 1.5) < .001 &&
+               fixtureSubtitlePixels(subtitleImage, bitmap) > minimumPixels &&
+               changedPixels(clean, subtitleImage) > 100;
+      };
       QVERIFY(player.setTracks(surround, ass, 0));
-      QTRY_COMPARE_WITH_TIMEOUT(player.mediaInfo().value(QStringLiteral("subtitleId")).toInt(), assId, 3000);
+      QTRY_COMPARE_WITH_TIMEOUT(observed.value("sid"), QString::number(assId), 3000);
+      QTRY_COMPARE_WITH_TIMEOUT(observed.value("sub-text"), QStringLiteral("WatchPair ASS fixture"), 3000);
       QTRY_VERIFY2_WITH_TIMEOUT(
-          changedPixels(clean, video.grabFramebuffer()) > 100,
+          renderedCaption(false),
           qPrintable(QStringLiteral("ASS redraw: frames=%1 draws=%2 position=%3 error=%4")
                          .arg(video.frames())
                          .arg(video.draws())
                          .arg(player.sampledPosition())
                          .arg(player.error())),
           3000);
+      qInfo() << "ASS rendered pixels:" << fixtureSubtitlePixels(subtitleImage, false)
+              << "paused PTS:" << player.sampledPosition();
+      subtitleDiagnostic(QStringLiteral("ass"));
       if (!output.isEmpty())
-        video.grabFramebuffer().save(QDir(output).filePath(QStringLiteral("ass.png")));
+        subtitleImage.save(QDir(output).filePath(QStringLiteral("ass.png")));
       QVERIFY(player.setTracks(stereo, pgs, .1));
-      QTRY_COMPARE_WITH_TIMEOUT(player.mediaInfo().value(QStringLiteral("subtitleId")).toInt(), pgsId, 3000);
-      QTRY_VERIFY_WITH_TIMEOUT(changedPixels(clean, video.grabFramebuffer()) > 100, 3000);
+      QTRY_COMPARE_WITH_TIMEOUT(observed.value("sid"), QString::number(pgsId), 3000);
+      QTRY_VERIFY_WITH_TIMEOUT(renderedCaption(true), 3000);
+      qInfo() << "PGS rendered pixels:" << fixtureSubtitlePixels(subtitleImage, true)
+              << "paused PTS:" << player.sampledPosition();
+      subtitleDiagnostic(QStringLiteral("pgs"));
       if (!output.isEmpty())
-        video.grabFramebuffer().save(QDir(output).filePath(QStringLiteral("pgs.png")));
+        subtitleImage.save(QDir(output).filePath(QStringLiteral("pgs.png")));
     }
     player.seek(4);
     player.setPaused(false);

@@ -17,6 +17,7 @@ export QT_QPA_PLATFORM=wayland QT_WAYLAND_DISABLE_WINDOWDECORATION=1
 export LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=softpipe
 export WATCHPAIR_UI_OUTPUT="$task_output"
 export WATCHPAIR_WAYLAND_POPUP_INPUT="$task_testing/wayland_popup_input.py"
+if [[ ${WATCHPAIR_POPUP_WAYLAND_DEBUG:-0} == 1 ]]; then export WAYLAND_DEBUG=client; fi
 cat >"$task_runtime/weston.ini" <<'CONFIG'
 [shell]
 animation=none
@@ -32,4 +33,4 @@ for task_attempt in {1..50}; do
   if ! kill -0 "$task_weston" 2>/dev/null; then cat "$task_output/weston.log"; exit 1; fi
   sleep 0.1
 done
-timeout -k 5s 150s "$task_binary" "${@:3}" -v2 -o "$task_output/results.txt,txt"
+timeout -k 5s 150s "$task_binary" "${@:3}" -v2 -o "$task_output/results.txt,txt" 2>"$task_output/native-stderr.txt"
