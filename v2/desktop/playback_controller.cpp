@@ -348,7 +348,7 @@ void PlaybackController::tick() {
         localPaused_ = true;
       player_.setPaused(localPaused_);
       player_.setRate(localRate_);
-      if (player_.loaded())
+      if (player_.tracksKnown())
         player_.setTracks(localAudio_, localSubtitle_, localSubtitleDelay_);
       reason_ = !player_.error().isEmpty() ? player_.error()
                 : !player_.loaded()        ? QStringLiteral("Opening local media…")
@@ -408,15 +408,18 @@ void PlaybackController::tick() {
         seekIssued_ = true;
       }
       const auto subtitle = p.value(QStringLiteral("subtitle")).toString();
-      if (player_.loaded() && subtitle.startsWith(QStringLiteral("ext:")) && subtitleProvider_) {
+      const bool subtitleTransition = p.value(QStringLiteral("subtitleTransition")).toBool();
+      if (player_.loaded() && !subtitleTransition && subtitle.startsWith(QStringLiteral("ext:")) &&
+          subtitleProvider_) {
         const auto path = subtitleProvider_(room_, subtitle);
         if (!path.isEmpty())
           player_.addSubtitle(QUrl::fromLocalFile(path), subtitle);
       }
       const bool tracks =
-          player_.loaded() && player_.setTracks(p.value(QStringLiteral("audio")).toString(),
-                                                p.value(QStringLiteral("subtitle")).toString(),
-                                                p.value(QStringLiteral("subtitleDelay")).toDouble());
+          player_.tracksKnown() &&
+          player_.setTracks(p.value(QStringLiteral("audio")).toString(),
+                            subtitleTransition ? QStringLiteral("off") : subtitle,
+                            subtitleTransition ? 0 : p.value(QStringLiteral("subtitleDelay")).toDouble());
       drift_ = player_.position() - timeline;
       const bool starting = !p.value(QStringLiteral("paused")).toBool(true) &&
                             rooms_.serverNow(room_) < p.value(QStringLiteral("startsAt")).toDouble();
@@ -445,12 +448,14 @@ void PlaybackController::tick() {
       player_.setRate(playing && std::abs(drift_) > 0.07 && std::abs(drift_) < 0.55
                           ? baseRate * (drift_ > 0 ? 0.98 : 1.02)
                           : baseRate);
-      player_.setPaused(!playing || !tracks || !buffered || player_.atEnd());
+      player_.setPaused(!playing || !tracks || subtitleTransition || !buffered || player_.atEnd());
       reason_ = !player_.error().isEmpty() ? player_.error()
                 : !player_.loaded()
                     ? (binding.reason.isEmpty()
                            ? QStringLiteral("Opening verified media; downloading required container data…")
                            : binding.reason)
+                : !player_.tracksKnown() ? QStringLiteral("Reading audio and subtitle tracks…")
+                : subtitleTransition     ? QStringLiteral("Checking subtitles for this episode…")
                 : !tracks
                     ? QStringLiteral("The selected audio or subtitle track is unavailable on this device.")
                 : player_.buffering() || !buffered
@@ -484,7 +489,7 @@ void PlaybackController::tick() {
                        {QStringLiteral("identity"), binding.source ? binding.identity : QString()},
                        {QStringLiteral("audio"), audio},
                        {QStringLiteral("subtitles"), subtitles},
-                       {QStringLiteral("tracksKnown"), player_.loaded()}});
+                       {QStringLiteral("tracksKnown"), player_.tracksKnown()}});
     if (ready && player_.atEnd() && !p.value(QStringLiteral("paused")).toBool(true) &&
         snapshot.value(QStringLiteral("reporterId")) == self().value(QStringLiteral("id")) &&
         timeline >= player_.duration() - 0.8 && endedGeneration_ != generation) {

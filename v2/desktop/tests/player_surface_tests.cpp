@@ -5,6 +5,7 @@
 #include "theme.h"
 #endif
 #include <QApplication>
+#include <QAbstractItemView>
 #include <QComboBox>
 #include <QDir>
 #include <QFile>
@@ -12,8 +13,11 @@
 #include <QProcess>
 #include <QPushButton>
 #include <QSignalSpy>
+#include <QScreen>
 #include <QSurfaceFormat>
 #include <QTemporaryDir>
+#include <QVBoxLayout>
+#include <QWindow>
 #include <QtTest>
 #include <cmath>
 namespace {
@@ -30,6 +34,79 @@ void capture(QWidget &widget, const QString &name) {
     widget.grab().save(QDir(output).filePath(name + QStringLiteral(".png")));
   }
 }
+bool compositorInput(const QStringList &arguments) {
+  QProcess input;
+  input.start(QStringLiteral("python3"),
+              QStringList{qEnvironmentVariable("WATCHPAIR_WAYLAND_POPUP_INPUT")} + arguments);
+  if (!input.waitForFinished(5000))
+    return false;
+  qInfo().noquote() << input.readAllStandardOutput();
+  if (input.exitCode() != 0)
+    qWarning().noquote() << input.readAllStandardError();
+  return input.exitStatus() == QProcess::NormalExit && input.exitCode() == 0;
+}
+bool clickPopupWidget(QWidget &widget, const QPoint &point) {
+  if (!qEnvironmentVariableIsEmpty("WATCHPAIR_WAYLAND_POPUP_INPUT")) {
+    const auto local = widget.mapTo(widget.window(), point);
+    return compositorInput({QStringLiteral("click"), QString::number(QCoreApplication::applicationPid()),
+        widget.window()->windowType() == Qt::Popup ? QStringLiteral("popup") : QStringLiteral("toplevel"),
+        QString::number(local.x()), QString::number(local.y())});
+  }
+  QTest::mouseClick(&widget, Qt::LeftButton, Qt::NoModifier, point);
+  return true;
+}
+bool choosePopup(wp::ui::PlayerSurface &surface, QComboBox &combo, QWidget &host, int row,
+                 const QString &name, bool waitIdle = false) {
+  if (host.isFullScreen() && !QTest::qWaitFor([&] { return host.size() == host.screen()->geometry().size(); }, 3000))
+    return false;
+  surface.revealControls();
+  if (!clickPopupWidget(combo, QPoint(combo.width() - 10, combo.height() / 2)))
+    return false;
+  if (!QTest::qWaitFor([&] { return combo.view()->isVisible(); }, 3000))
+    return false;
+  if (!QTest::qWaitForWindowExposed(combo.view()->window()))
+    return false;
+  QTest::qWait(QApplication::doubleClickInterval() + 50);
+  if (waitIdle)
+    QTest::qWait(2700);
+  auto *popup = combo.view()->window();
+  if (!surface.controlsVisible() || !combo.view()->isVisible() ||
+      !popup->windowHandle() || !popup->windowHandle()->isExposed())
+    return false;
+  const auto index = combo.model()->index(row, 0);
+  const auto point = combo.view()->visualRect(index).center();
+  if (!combo.view()->viewport()->rect().contains(point))
+    return false;
+  const auto global = combo.view()->viewport()->mapToGlobal(point);
+  // Moving from the arrow into the list releases Qt's opening-click guard.
+  QTest::mouseMove(combo.view()->viewport(), point);
+  QTest::qWait(150);
+  auto *hit = QApplication::widgetAt(global);
+  if (!hit || (hit != combo.view()->viewport() && !combo.view()->isAncestorOf(hit)))
+    return false;
+  capture(*popup, name + QStringLiteral("-popup"));
+  const auto output = qEnvironmentVariable("WATCHPAIR_UI_OUTPUT");
+  if (!output.isEmpty()) {
+    const auto bounds = QRect(host.mapToGlobal(QPoint()), host.size()).united(popup->frameGeometry());
+    const auto screen = host.screen()->grabWindow(0, bounds.x(), bounds.y(), bounds.width(), bounds.height());
+    if (!screen.isNull())
+      screen.save(QDir(output).filePath(name + QStringLiteral("-screen.png")));
+    else if (!qEnvironmentVariableIsEmpty("WATCHPAIR_WAYLAND_POPUP_INPUT") &&
+             !compositorInput({QStringLiteral("capture"), QDir(output).filePath(name + QStringLiteral("-screen.png"))}))
+      return false;
+  }
+  qInfo() << name << "popup exposed" << popup->windowHandle()->isExposed()
+          << "transient parent matches" << (popup->windowHandle()->transientParent() == host.windowHandle());
+  if (popup->windowHandle()->transientParent() != host.windowHandle())
+    return false;
+  if (!clickPopupWidget(*combo.view()->viewport(), point))
+    return false;
+  const bool selected = QTest::qWaitFor([&] { return combo.currentIndex() == row && !combo.view()->isVisible(); });
+  qInfo() << name << "selected" << combo.currentIndex() << "expected" << row
+          << "view current" << combo.view()->currentIndex().row() << "popup visible" << combo.view()->isVisible();
+  return selected;
+}
+
 }
 class PlayerSurfaceTests final : public QObject {
   Q_OBJECT
@@ -92,6 +169,42 @@ private slots:
     movePointer(*video, QPoint(25, 20));
     QTRY_VERIFY_WITH_TIMEOUT(!surface.controlsVisible(), 4000);
   }
+  void clickedPopupFollowsDetachedFullscreenAndReturnedSurface() {
+    QWidget room, detached;
+    auto *roomLayout = new QVBoxLayout(&room);
+    auto *detachedLayout = new QVBoxLayout(&detached);
+    auto *surface = new wp::ui::PlayerSurface(new QWidget);
+    auto *combo = new QComboBox;
+    combo->setObjectName(QStringLiteral("PopupRegressionSubtitles"));
+    combo->addItems({QStringLiteral("Subtitles off"), QStringLiteral("English subtitles"),
+                     QStringLiteral("German subtitles")});
+    surface->addControls(combo);
+    roomLayout->addWidget(surface);
+    room.resize(900, 600);
+    detached.resize(800, 500);
+    room.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&room));
+    // RoomPage inspects view visibility before the presentation host moves.
+    QVERIFY(!combo->view()->isVisible());
+    surface->setPlaybackState(true, false);
+    QVERIFY2(choosePopup(*surface, *combo, room, 1, QStringLiteral("room-subtitle-choice"), false), "Room dropdown is visible and hit-testable");
+    detachedLayout->addWidget(surface);
+    room.hide();
+    detached.show();
+    surface->show();
+    QVERIFY(QTest::qWaitForWindowExposed(&detached));
+    QVERIFY2(choosePopup(*surface, *combo, detached, 2, QStringLiteral("popout-subtitle-choice"), true), "Detached dropdown is visible above the player and accepts a clicked option");
+    detached.showFullScreen();
+    QVERIFY(QTest::qWaitForWindowExposed(&detached));
+    QVERIFY2(choosePopup(*surface, *combo, detached, 1, QStringLiteral("fullscreen-subtitle-choice"), false), "Fullscreen dropdown remains visible and interactive");
+    detached.showNormal();
+    roomLayout->addWidget(surface);
+    detached.hide();
+    room.show();
+    surface->show();
+    QVERIFY(QTest::qWaitForWindowExposed(&room));
+    QVERIFY2(choosePopup(*surface, *combo, room, 2, QStringLiteral("returned-subtitle-choice"), false), "Returned dropdown retains its native popup interaction");
+  }
 #ifdef WATCHPAIR_PLAYER_NATIVE_FIXTURE
   void nativeRendererSurvivesFullscreenPopoutAndReturnWithWorkingSeeks() {
     try {
@@ -102,6 +215,11 @@ private slots:
     metadata.write(";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=8000\ntitle=Opening\n"
                    "[CHAPTER]\nTIMEBASE=1/1000\nSTART=8000\nEND=30000\ntitle=Second chapter\n");
     metadata.close();
+    const auto subtitlePath = tmp.filePath(QStringLiteral("subtitles.srt"));
+    QFile subtitleFile(subtitlePath);
+    QVERIFY(subtitleFile.open(QIODevice::WriteOnly));
+    subtitleFile.write("1\n00:00:00,000 --> 00:00:29,000\nPopup visibility regression subtitle\n");
+    subtitleFile.close();
     const auto path = tmp.filePath(QStringLiteral("player.mkv"));
     QProcess fixture;
     fixture.start(QStringLiteral("ffmpeg"),
@@ -109,8 +227,12 @@ private slots:
                    QStringLiteral("-f"), QStringLiteral("lavfi"), QStringLiteral("-i"),
                    QStringLiteral("testsrc2=size=320x180:rate=24:duration=30"), QStringLiteral("-f"),
                    QStringLiteral("ffmetadata"), QStringLiteral("-i"), chapters,
+                   QStringLiteral("-f"), QStringLiteral("srt"), QStringLiteral("-i"), subtitlePath,
+                   QStringLiteral("-map"), QStringLiteral("0:v"), QStringLiteral("-map"), QStringLiteral("2:s"),
                    QStringLiteral("-map_chapters"), QStringLiteral("1"), QStringLiteral("-c:v"),
-                   QStringLiteral("libx264"), QStringLiteral("-preset"), QStringLiteral("ultrafast"), path});
+                   QStringLiteral("libx264"), QStringLiteral("-preset"), QStringLiteral("ultrafast"),
+                   QStringLiteral("-c:s"), QStringLiteral("ass"), QStringLiteral("-metadata:s:s:0"),
+                   QStringLiteral("title=English popup subtitles"), path});
     QVERIFY(fixture.waitForFinished(30000));
     QCOMPARE(fixture.exitCode(), 0);
     wp::AppServices services(tmp.filePath(QStringLiteral("profile")), nullptr, true, false);
@@ -169,10 +291,23 @@ private slots:
     window.hide();
     QVERIFY(detached->isVisible());
     capture(*detached, QStringLiteral("player-popout"));
+    auto *surface = window.roomPage()->playerSurface();
+    auto *subtitleChoice = surface->findChild<QComboBox *>(QStringLiteral("SharedSubtitles"));
+    QVERIFY(subtitleChoice);
+    QTRY_VERIFY(subtitleChoice->count() > 1);
+    const auto subtitleId = subtitleChoice->itemData(1).toString();
+    QVERIFY2(choosePopup(*surface, *subtitleChoice, *detached, 1,
+                         QStringLiteral("native-popout-subtitles"), true),
+             "Real renderer pop-out dropdown paints above video and accepts a clicked subtitle");
+    QTRY_COMPARE(services.playback.subtitleChoice(), subtitleId);
     QTest::mouseDClick(video, Qt::LeftButton);
     QTest::mouseRelease(video, Qt::LeftButton);
     QTRY_VERIFY(detached->isFullScreen());
     QTRY_COMPARE(video->size(), detached->size());
+    QVERIFY2(choosePopup(*surface, *subtitleChoice, *detached, 0,
+                         QStringLiteral("native-fullscreen-subtitles")),
+             "Real renderer fullscreen dropdown remains visible and hit-testable");
+    QTRY_COMPARE(services.playback.subtitleChoice(), QStringLiteral("off"));
     window.restoreWindow();
     QVERIFY(!window.isFullScreen());
     QVERIFY(detached->isFullScreen());
@@ -187,6 +322,10 @@ private slots:
     const auto resumed = video->frames();
     QTRY_VERIFY_WITH_TIMEOUT(video->frames() > resumed + 3, 5000);
     QCOMPARE(video->glError(), 0);
+    QVERIFY2(choosePopup(*surface, *subtitleChoice, window, 1,
+                         QStringLiteral("native-returned-subtitles")),
+             "Returned renderer dropdown keeps its current native owner and clicked selection");
+    QTRY_COMPARE(services.playback.subtitleChoice(), subtitleId);
     auto *chapterChoice = window.roomPage()->findChild<QComboBox *>(QStringLiteral("Chapters"));
     QVERIFY(chapterChoice);
     QVERIFY(chapterChoice->isEnabled());

@@ -591,6 +591,11 @@ QJsonObject RoomMedia::acquisition(const QString &room, const QString &source) c
   row.insert(QStringLiteral("effectivePolicy"), row.value(QStringLiteral("override")).toString(policy(room)));
   return row;
 }
+bool RoomMedia::localCopyAvailable(const QJsonObject &entry) const {
+  const auto existing = bySha_.value(entry.value(QStringLiteral("sha256")).toString());
+  return existing.value(QStringLiteral("size")) == entry.value(QStringLiteral("size")) &&
+         LibraryService::unchanged(existing);
+}
 void RoomMedia::ensureSource(const QString &room, const QJsonObject &source) {
   const auto sourceId = source.value(QStringLiteral("id")).toString(), key = bindingKey(room, sourceId);
   const auto kind = source.value(QStringLiteral("kind")).toString();

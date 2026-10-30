@@ -32,6 +32,7 @@ public:
   void approve(const QString &room, const QString &sourceId, const QStringList &mediaIds);
   void refuse(const QString &room, const QString &sourceId);
   QJsonObject acquisition(const QString &room, const QString &sourceId) const;
+  bool localCopyAvailable(const QJsonObject &entry) const;
   MediaBinding binding(const QString &room, const QString &entryId);
   void reconcile(const QString &room);
   void forgetRoom(const QString &room);

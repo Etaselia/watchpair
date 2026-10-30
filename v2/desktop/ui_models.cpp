@@ -1,4 +1,5 @@
 #include "ui_models.h"
+#include <QAbstractItemView>
 #include <QApplication>
 #include <QBrush>
 #include <QCollator>
@@ -8,8 +9,11 @@
 #include <QFileInfo>
 #include <QFont>
 #include <QLocale>
+#include <QKeyEvent>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QStyle>
+#include <QStyleOptionButton>
 #include <algorithm>
 #include <cmath>
 namespace wp::ui {
@@ -49,7 +53,7 @@ QStringList headers(JsonKind kind) {
   switch (kind) {
   case JsonKind::Queue:
     return {QStringLiteral("Episode"), QStringLiteral("Queue"), QStringLiteral("Length"),
-            QStringLiteral("Folder")};
+            QStringLiteral("Folder"), QStringLiteral("Download")};
   case JsonKind::History:
     return {QStringLiteral("Episode"), QStringLiteral("Watched"), QStringLiteral("Coverage"),
             QStringLiteral("Recorded")};
@@ -621,6 +625,8 @@ QVariant JsonTable::data(const QModelIndex &i, int role) const {
     return id(r);
   if (role == ObjectRole)
     return QVariant::fromValue(r);
+  if (role == ApprovalRole)
+    return kind_ == JsonKind::Queue && r.value(QStringLiteral("_approvalNeeded")).toBool();
   if (role == SearchRole)
     return r.value(QStringLiteral("label")).toString() + QLatin1Char(' ') +
            r.value(QStringLiteral("path")).toString() + QLatin1Char(' ') +
@@ -645,6 +651,10 @@ QVariant JsonTable::data(const QModelIndex &i, int role) const {
                                             QLocale::LongFormat)
                         : QStringLiteral("Recorded time unavailable"));
     }
+    if (kind_ == JsonKind::Queue && i.column() == 4)
+      return r.value(QStringLiteral("_approvalNeeded")).toBool()
+          ? tr("Download this episode on this device. Other episodes and room members are unaffected.")
+          : QString();
     if (kind_ == JsonKind::Queue)
       return r.value(QStringLiteral("sourceLabel")).toString() + QLatin1Char('\n') +
              r.value(QStringLiteral("sourceId")).toString() + QLatin1Char('\n') +
@@ -666,6 +676,8 @@ QVariant JsonTable::data(const QModelIndex &i, int role) const {
   const auto context = r.value(QStringLiteral("_sourceCaption")).toString();
   switch (kind_) {
   case JsonKind::Queue:
+    if (col == 4)
+      return r.value(QStringLiteral("_approvalNeeded")).toBool() ? tr("Download") : QString();
     if (col == 0) {
       const auto folder = QFileInfo(r.value(QStringLiteral("path")).toString()).path();
       return label + (folder.isEmpty() || folder == QStringLiteral(".") ? QString()
@@ -788,6 +800,84 @@ void ProgressDelegate::paint(QPainter *painter, const QStyleOptionViewItem &opti
   filled.setWidth(int(bar.width() * value));
   painter->drawRoundedRect(filled, 1.5, 1.5);
   painter->restore();
+}
+EpisodeDownloadDelegate::EpisodeDownloadDelegate(QObject *parent) : QStyledItemDelegate(parent) {
+  if (auto *view = qobject_cast<QAbstractItemView *>(parent))
+    view->viewport()->installEventFilter(this);
+}
+bool EpisodeDownloadDelegate::eventFilter(QObject *object, QEvent *event) {
+  const auto *view = qobject_cast<QAbstractItemView *>(parent());
+  if (!view || object != view->viewport())
+    return QStyledItemDelegate::eventFilter(object, event);
+  // Other columns have their own delegates. Observe the complete gesture so a
+  // cancelled button press cannot be completed by a later title/drag gesture.
+  if (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::Hide ||
+      event->type() == QEvent::Leave || event->type() == QEvent::UngrabMouse)
+    pressed_ = QPersistentModelIndex();
+  else if (event->type() == QEvent::MouseButtonRelease && pressed_.isValid()) {
+    const auto *mouse = static_cast<QMouseEvent *>(event);
+    if (mouse->button() != Qt::LeftButton ||
+        view->indexAt(mouse->position().toPoint()) != pressed_ ||
+        !view->visualRect(pressed_).adjusted(4, 4, -4, -4).contains(mouse->position().toPoint()))
+      pressed_ = QPersistentModelIndex();
+  }
+  return false;
+}
+void EpisodeDownloadDelegate::paint(QPainter *painter, const QStyleOptionViewItem &option,
+                                    const QModelIndex &index) const {
+  auto background = option;
+  initStyleOption(&background, index);
+  background.text.clear();
+  const auto *style = option.widget ? option.widget->style() : QApplication::style();
+  style->drawControl(QStyle::CE_ItemViewItem, &background, painter, option.widget);
+  if (!index.data(ApprovalRole).toBool())
+    return;
+  QStyleOptionButton button;
+  button.rect = option.rect.adjusted(4, 4, -4, -4);
+  button.text = tr("Download");
+  button.palette = option.palette;
+  button.palette.setColor(QPalette::Button, QColor(QStringLiteral("#315f96")));
+  button.palette.setColor(QPalette::ButtonText, QColor(QStringLiteral("#f1f5ff")));
+  button.state = QStyle::State_Enabled | QStyle::State_Raised;
+  if (option.state & QStyle::State_MouseOver)
+    button.state |= QStyle::State_MouseOver;
+  if (option.state & QStyle::State_HasFocus)
+    button.state |= QStyle::State_HasFocus;
+  if (pressed_ == index)
+    button.state = (button.state & ~QStyle::State_Raised) | QStyle::State_Sunken;
+  style->drawControl(QStyle::CE_PushButton, &button, painter, option.widget);
+}
+bool EpisodeDownloadDelegate::editorEvent(QEvent *event, QAbstractItemModel *,
+                                          const QStyleOptionViewItem &option,
+                                          const QModelIndex &index) {
+  const bool needed = index.data(ApprovalRole).toBool();
+  if (event->type() == QEvent::MouseButtonPress) {
+    const auto *mouse = static_cast<QMouseEvent *>(event);
+    pressed_ = QPersistentModelIndex();
+    if (!needed || mouse->button() != Qt::LeftButton ||
+        !option.rect.adjusted(4, 4, -4, -4).contains(mouse->position().toPoint()))
+      return false;
+    pressed_ = index;
+    return true;
+  }
+  if (event->type() == QEvent::MouseButtonRelease) {
+    const auto *mouse = static_cast<QMouseEvent *>(event);
+    const bool activate = needed && pressed_ == index && mouse->button() == Qt::LeftButton &&
+        option.rect.adjusted(4, 4, -4, -4).contains(mouse->position().toPoint());
+    const bool handled = pressed_.isValid();
+    pressed_ = QPersistentModelIndex();
+    if (activate)
+      emit downloadRequested(index.data(ObjectRole).value<QJsonObject>());
+    return handled;
+  }
+  if (needed && event->type() == QEvent::KeyPress) {
+    const auto *key = static_cast<QKeyEvent *>(event);
+    if (!key->isAutoRepeat() && key->key() == Qt::Key_Space) {
+      emit downloadRequested(index.data(ObjectRole).value<QJsonObject>());
+      return true;
+    }
+  }
+  return false;
 }
 QWidget *PriorityDelegate::createEditor(QWidget *parent, const QStyleOptionViewItem &,
                                         const QModelIndex &) const {

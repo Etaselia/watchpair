@@ -139,6 +139,7 @@ void Player::open(const QUrl &url, bool startPaused) {
   pendingEndErrors_.clear();
   activePlaylist_ = -1;
   loaded_ = false;
+  tracksKnown_ = false;
   position_ = 0;
   duration_ = 0;
   cachedSeconds_ = 0;
@@ -154,6 +155,10 @@ void Player::open(const QUrl &url, bool startPaused) {
   appliedSubtitle_.clear();
   appliedDelay_ = 1e20;
   setPaused(startPaused);
+  // Native numeric track IDs are local to a file. Start every new entry off;
+  // the controller reapplies only that entry's resolved shared selection.
+  command({"set", "sid", "no"});
+  command({"set", "sub-delay", "0"});
   pendingOpen_ = !renderReady_;
   if (renderReady_)
     command({"loadfile", requested_.toEncoded(), "replace"});
@@ -185,6 +190,7 @@ void Player::stop() {
   pendingOpen_ = false;
   command({"stop"});
   loaded_ = false;
+  tracksKnown_ = false;
   position_ = 0;
   duration_ = 0;
   atEnd_ = false;
@@ -234,6 +240,14 @@ void Player::updatePlaylist() {
       playlistEpochs_.value(activePlaylist_) == epoch_) {
     pendingLoaded_ = -1;
     loaded_ = true;
+    // FILE_LOADED and observed track-list notifications need not be delivered
+    // together. Query only after this playlist entry is validated as current,
+    // so an empty inventory means no tracks rather than metadata still loading.
+    mpv_node currentTracks{};
+    if (mpv_get_property(mpv_, "track-list", MPV_FORMAT_NODE, &currentTracks) >= 0) {
+      readTracks(node(currentTracks).toArray());
+      mpv_free_node_contents(&currentTracks);
+    }
     error_.clear();
     emit activity(QStringLiteral("Native decoder opened media"));
   }
@@ -272,6 +286,7 @@ void Player::readTracks(const QJsonArray &native) {
       break;
   }
   tracks_ = result;
+  tracksKnown_ = loaded_;
 }
 bool Player::setTracks(const QString &audio, const QString &subtitle, double delay) {
   QString aid, sid = QStringLiteral("no");

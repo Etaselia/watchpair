@@ -7,6 +7,7 @@
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QVBoxLayout>
+#include <QWindow>
 namespace wp::ui {
 PlayerSurface::PlayerSurface(QWidget *video, QWidget *parent) : QWidget(parent), video_(video) {
   setObjectName(QStringLiteral("PlayerSurface"));
@@ -44,7 +45,11 @@ void PlayerSurface::addControls(QWidget *controls) {
   controls_->raise();
 }
 bool PlayerSurface::contains(QWidget *widget) const {
-  return widget && (widget == this || isAncestorOf(widget));
+  // QWidget::isAncestorOf stops at window boundaries, including combo popups.
+  for (auto *ancestor = widget; ancestor; ancestor = ancestor->parentWidget())
+    if (ancestor == this)
+      return true;
+  return false;
 }
 bool PlayerSurface::controlsVisible() const { return !controls_->isHidden(); }
 void PlayerSurface::revealControls() {
@@ -90,6 +95,21 @@ bool PlayerSurface::eventFilter(QObject *object, QEvent *event) {
   auto *widget = qobject_cast<QWidget *>(object);
   if (!contains(widget))
     return QWidget::eventFilter(object, event);
+  auto *popup = widget->window();
+  if (popup != window() && popup->windowType() == Qt::Popup) {
+    // Combo boxes can create their native popup before this surface moves.
+    // Reparenting the controls does not update that popup's transient owner.
+    if (event->type() == QEvent::Show) {
+      if (auto *handle = popup->windowHandle())
+        if (auto *owner = window()->windowHandle(); owner && handle->transientParent() != owner)
+          handle->setTransientParent(owner);
+      idle_.stop();
+    } else if (event->type() == QEvent::Hide && playing_ && !blocking_ && isVisible())
+      idle_.start();
+    // Raising the underlying controls while a popup handles input can disturb
+    // its native stacking. The popup keeps its own keyboard/mouse handling.
+    return QWidget::eventFilter(object, event);
+  }
   switch (event->type()) {
   case QEvent::MouseMove:
   case QEvent::MouseButtonPress:

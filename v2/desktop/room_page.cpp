@@ -75,8 +75,11 @@ bool QueueProxy::filterAcceptsRow(int row, const QModelIndex &) const {
           value.value(QStringLiteral("path")).toString().contains(query_, Qt::CaseInsensitive));
 }
 Qt::ItemFlags QueueProxy::flags(const QModelIndex &index) const {
-  return QSortFilterProxyModel::flags(index) | Qt::ItemIsDropEnabled |
-         (index.isValid() ? Qt::ItemIsDragEnabled : Qt::NoItemFlags);
+  auto result = QSortFilterProxyModel::flags(index);
+  // Rows are insertion targets, never parents that can contain other rows.
+  result.setFlag(Qt::ItemIsDropEnabled, !index.isValid());
+  result.setFlag(Qt::ItemIsDragEnabled, index.isValid());
+  return result;
 }
 QStringList QueueProxy::mimeTypes() const {
   return {QStringLiteral("application/x-watchpair-queue-entries")};
@@ -85,7 +88,7 @@ QMimeData *QueueProxy::mimeData(const QModelIndexList &indexes) const {
   auto *data = new QMimeData;
   QSet<int> selected;
   for (const auto &index : indexes)
-    if (index.isValid())
+    if (index.isValid() && index.model() == this)
       selected.insert(index.row());
   QList<int> rows(selected.begin(), selected.end());
   std::sort(rows.begin(), rows.end());
@@ -101,44 +104,87 @@ bool QueueProxy::dropMimeData(const QMimeData *data, Qt::DropAction action, int 
                               const QModelIndex &parent) {
   if (action == Qt::IgnoreAction)
     return true;
-  if (action != Qt::MoveAction || column > 0 || room_.isEmpty() || revision_ < 0 ||
+  QStringList changed;
+  if (!dropOrder(data, action, row, column, parent, &changed))
+    return false;
+  if (!changed.isEmpty())
+    emit reorderRequested(changed, revision_);
+  return true;
+}
+bool QueueProxy::canDropMimeData(const QMimeData *data, Qt::DropAction action, int row, int column,
+                                const QModelIndex &parent) const {
+  // QAbstractProxyModel forwards this check to JsonTable, which does not own
+  // the queue's custom MIME format or its server-authoritative move operation.
+  return dropOrder(data, action, row, column, parent, nullptr);
+}
+bool QueueProxy::dropOrder(const QMimeData *data, Qt::DropAction action, int row, int column,
+                           const QModelIndex &parent, QStringList *changedOrder) const {
+  const auto *model = qobject_cast<JsonTable *>(sourceModel());
+  if (!model || !data || action != Qt::MoveAction || row < -1 || column < -1 ||
+      column >= columnCount() || (parent.isValid() && parent.model() != this) ||
+      room_.isEmpty() || revision_ < 0 ||
       !data->hasFormat(mimeTypes().first()))
     return false;
   const auto drag = QJsonDocument::fromJson(data->data(mimeTypes().first())).object();
   if (drag.value(QStringLiteral("room")).toString() != room_ ||
       drag.value(QStringLiteral("revision")).toInteger(-1) != revision_)
     return false;
-  const auto *model = qobject_cast<JsonTable *>(sourceModel());
-  QStringList order, moved;
+  QStringList order;
+  QSet<QString> orderIds, moved;
   for (int i = 0; i < model->rowCount(); ++i)
-    if (upcoming(model->row(i)))
-      order.append(model->index(i, 0).data(IdRole).toString());
+    if (upcoming(model->row(i))) {
+      const auto id = model->index(i, 0).data(IdRole).toString();
+      order.append(id);
+      orderIds.insert(id);
+    }
   for (const auto value : drag.value(QStringLiteral("ids")).toArray()) {
     const auto id = value.toString();
-    if (!order.contains(id) || moved.contains(id))
+    if (!orderIds.contains(id) || moved.contains(id))
       return false;
-    moved.append(id);
+    moved.insert(id);
   }
   if (moved.isEmpty())
     return false;
-  // Preserve the room's order of a multi-selection, including hidden rows.
-  QStringList moving, remaining;
-  for (const auto &id : order)
-    (moved.contains(id) ? moving : remaining).append(id);
   const int target = row >= 0 ? row : parent.isValid() ? parent.row() : rowCount();
   if (target < 0 || target > rowCount())
     return false;
-  QString anchor = target < rowCount() ? index(target, 0).data(IdRole).toString() : QString();
-  int original = order.indexOf(anchor);
-  while (!anchor.isEmpty() && moving.contains(anchor))
-    anchor = ++original < order.size() ? order[original] : QString();
+  int original = order.size();
+  if (target < rowCount())
+    original = order.indexOf(index(target, 0).data(IdRole).toString());
+  else if (rowCount() > 0) {
+    // After the last visible episode means before its hidden following season,
+    // rather than appending to the end of the entire unfiltered room queue.
+    original = order.indexOf(index(rowCount() - 1, 0).data(IdRole).toString());
+    if (original < 0)
+      return false;
+    ++original;
+  }
+  if (original < 0)
+    return false;
+  while (original < order.size() && moved.contains(order[original]))
+    ++original;
+  const auto anchor = original < order.size() ? order[original] : QString();
+  // Drag negotiation validates the request without allocating a reordered list.
+  if (!changedOrder)
+    return true;
+  // Preserve the room's order of a multi-selection, including hidden rows.
+  QStringList moving, remaining;
+  moving.reserve(moved.size());
+  remaining.reserve(order.size());
+  for (const auto &id : order)
+    (moved.contains(id) ? moving : remaining).append(id);
   const int insertAt = anchor.isEmpty() ? remaining.size() : remaining.indexOf(anchor);
   if (insertAt < 0)
     return false;
-  for (int i = 0; i < moving.size(); ++i)
-    remaining.insert(insertAt + i, moving[i]);
-  if (remaining != order)
-    emit reorderRequested(remaining, revision_);
+  QStringList result;
+  result.reserve(order.size());
+  for (int i = 0; i < insertAt; ++i)
+    result.append(remaining[i]);
+  result.append(moving);
+  for (int i = insertAt; i < remaining.size(); ++i)
+    result.append(remaining[i]);
+  if (result != order)
+    *changedOrder = std::move(result);
   return true;
 }
 RoomPage::RoomPage(AppServices &app, QWidget *parent)
@@ -228,6 +274,11 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   queue_->setColumnWidth(2, 70);
   queue_->hideColumn(1);
   queue_->hideColumn(3);
+  queue_->setColumnWidth(4, std::max(100, queue_->fontMetrics().horizontalAdvance(tr("Download")) + 28));
+  queue_->verticalHeader()->setDefaultSectionSize(std::max(34, queue_->fontMetrics().height() + 14));
+  auto *download = new EpisodeDownloadDelegate(queue_);
+  queue_->setItemDelegateForColumn(4, download);
+  connect(download, &EpisodeDownloadDelegate::downloadRequested, this, &RoomPage::approveEntry);
   queueStack_->addWidget(queue_);
   historyProxy_.setSourceModel(&historyModel_);
   historyProxy_.setFilterCaseSensitivity(Qt::CaseInsensitive);
@@ -263,12 +314,7 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   queueTools->addWidget(queueMark_, 1);
   queueTools->addWidget(queueMore);
   queueLayout->addLayout(queueTools);
-  queueApprove_ = button(tr("Approve selected downloads"), QStringLiteral("download"));
-  queueApprove_->setObjectName(QStringLiteral("QueueApproveDownloads"));
-  queueApprove_->setProperty("role", QStringLiteral("primary"));
-  queueApprove_->setToolTip(tr("Download only the selected episodes on this device. The room queue is unchanged."));
-  queueLayout->addWidget(queueApprove_);
-  queueHint_ = text(tr("Select episodes to download here. Drag rows to reorder for everyone."), QStringLiteral("Muted"));
+  queueHint_ = text(tr("Download individual episodes here. Drag rows to reorder for everyone."), QStringLiteral("Muted"));
   queueHint_->setWordWrap(true);
   queueLayout->addWidget(queueHint_);
   loadHistory_ = button(tr("Load earlier history"), QStringLiteral("clock"));
@@ -496,8 +542,14 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
         [this] { app_.rooms.command(room_, {{QStringLiteral("type"), QStringLiteral("playback.next")}}); });
   });
   connect(queue_, &QTableView::doubleClicked, this, [this](const QModelIndex &index) {
+    if (index.column() == 4)
+      return;
     const auto id = queueProxy_.mapToSource(index).data(IdRole).toString();
     app_.perform([&] { app_.playback.choose(id); });
+  });
+  connect(queue_, &QTableView::activated, this, [this](const QModelIndex &index) {
+    if (index.column() == 4)
+      approveEntry(index.data(ObjectRole).value<QJsonObject>());
   });
   connect(history_, &QTableView::doubleClicked, this, [this] { rewatch(); });
   connect(queueTabs_, &QTabBar::currentChanged, this, [this](int index) {
@@ -524,13 +576,10 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   connect(queueMark_, &QPushButton::clicked, this, [this] {
     if (queueTabs_->currentIndex() == 0) mark(true); else rewatch();
   });
-  connect(queueApprove_, &QPushButton::clicked, this, [this] { approveSelected(); });
   queueUnwatched_ = queueMenu->addAction(tr("Mark unwatched · keep history"));
   connect(queueUnwatched_, &QAction::triggered, this, [this] { mark(false); });
   queueWatchAgain_ = queueMenu->addAction(tr("Watch again"));
   connect(queueWatchAgain_, &QAction::triggered, this, &RoomPage::rewatch);
-  queueApproveSources_ = queueMenu->addAction(tr("Approve selected sources…"));
-  connect(queueApproveSources_, &QAction::triggered, this, [this] { approveSelected(true); });
   queueRename_ = queueMenu->addAction(tr("Rename episode…"));
   connect(queueRename_, &QAction::triggered, this, [this] {
     const auto id = selectedEntry();
@@ -685,6 +734,10 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
     if (room == room_)
       updateQueue();
   });
+  connect(&app_.media, &RoomMedia::changed, this, [this](const QString &room) {
+    if (room == room_)
+      updateQueue();
+  });
   connect(&app_.rooms, &RoomClient::changed, this, [this](const QString &room) {
     if (room == room_ && !refresh_.isActive())
       refresh_.start(100);
@@ -742,20 +795,46 @@ void RoomPage::updateQueue() {
   const auto currentQueue = queue_->currentIndex().data(IdRole).toString();
   const auto currentHistory = history_->currentIndex().data(IdRole).toString();
   queueProxy_.setContext(room_, snapshot.value(QStringLiteral("queueRevision")).toInteger());
-  QHash<QString, QString> sourceLabels;
+  QHash<QString, QString> sourceLabels, sourceKinds;
+  QHash<QString, QString> policies;
+  QHash<QString, QSet<QString>> approvals;
+  QSet<QString> ownedSources;
+  const auto self = app_.rooms.credential(room_).value(QStringLiteral("memberId")).toString();
   for (const auto value : snapshot.value(QStringLiteral("sources")).toArray()) {
     const auto source = value.toObject();
-    sourceLabels.insert(source.value(QStringLiteral("id")).toString(), source.value(QStringLiteral("label")).toString());
+    const auto id = source.value(QStringLiteral("id")).toString();
+    sourceLabels.insert(id, source.value(QStringLiteral("label")).toString());
+    sourceKinds.insert(id, source.value(QStringLiteral("kind")).toString());
+    const auto acquisition = app_.media.acquisition(room_, id);
+    policies.insert(id, acquisition.value(QStringLiteral("effectivePolicy")).toString());
+    for (const auto media : acquisition.value(QStringLiteral("approved")).toArray())
+      approvals[id].insert(media.toString());
+    if (source.value(QStringLiteral("kind")).toString() == QStringLiteral("share") &&
+        !self.isEmpty() && source.value(QStringLiteral("publisherId")).toString() == self)
+      ownedSources.insert(id);
   }
   QJsonArray entries;
   QHash<QString, QJsonObject> entriesById;
+  bool anyApproval = false;
   for (const auto value : snapshot.value(QStringLiteral("entries")).toArray()) {
     auto entry = value.toObject();
-    entry.insert(QStringLiteral("sourceLabel"), sourceLabels.value(entry.value(QStringLiteral("sourceId")).toString()));
+    const auto source = entry.value(QStringLiteral("sourceId")).toString();
+    const auto policy = policies.value(source);
+    const auto kind = sourceKinds.value(source);
+    const bool approved = policy == QStringLiteral("Auto") ||
+        (policy == QStringLiteral("Ask") && approvals.value(source).contains(entry.value(QStringLiteral("mediaId")).toString()));
+    const bool needsApproval = upcoming(entry) && !approved && !ownedSources.contains(source) &&
+        QStringList{QStringLiteral("torrent"), QStringLiteral("direct"), QStringLiteral("share")}.contains(kind) &&
+        !app_.media.localCopyAvailable(entry);
+    entry.insert(QStringLiteral("sourceLabel"), sourceLabels.value(source));
+    entry.insert(QStringLiteral("_approvalNeeded"), needsApproval);
+    entry.insert(QStringLiteral("_approvalRoom"), room_);
+    anyApproval |= needsApproval;
     entries.append(entry);
     entriesById.insert(entry.value(QStringLiteral("id")).toString(), entry);
   }
   queueModel_.setRows(entries);
+  queue_->setColumnHidden(4, !anyApproval);
   queueProxy_.invalidate(); // Watched/status updates must re-run the membership filter now.
   for (const auto &id : selected) {
     const auto index = queueProxy_.mapFromSource(queueModel_.index(queueModel_.indexOf(id), 0));
@@ -843,10 +922,6 @@ void RoomPage::updateQueueActions() {
       : tr("Mark the selected episodes watched for everyone. They leave Upcoming when the shared update arrives."));
   queueMark_->setAccessibleName(watched ? tr("Watch selected episode again") : tr("Mark selected episodes watched"));
   queueMark_->setEnabled(connected && !selected.isEmpty() && (!watched || one));
-  queueApprove_->setVisible(!watched);
-  queueApprove_->setEnabled(connected && !selected.isEmpty());
-  queueApprove_->setText(selected.isEmpty() ? tr("Approve selected downloads")
-      : tr("Approve %n selected download(s)", nullptr, selected.size()));
   queueUnwatched_->setVisible(watched);
   queueWatchAgain_->setVisible(watched);
   queueUnwatched_->setEnabled(connected && !selected.isEmpty());
@@ -855,75 +930,29 @@ void RoomPage::updateQueueActions() {
   queueRename_->setEnabled(connected && one);
   queueRemove_->setVisible(!watched);
   queueRemove_->setEnabled(connected && !selected.isEmpty());
-  queueApproveSources_->setVisible(!watched);
-  queueApproveSources_->setEnabled(connected && !selected.isEmpty());
   queueClear_->setText(watched ? tr("Clear Watched for everyone…") : tr("Clear Upcoming for everyone…"));
   queueClear_->setEnabled(connected);
   queueHint_->setText(watched
       ? tr("Shared watch history · Clear Watched removes it for everyone. Downloaded files stay.")
-      : tr("Select episodes to download on this device. Drag rows to reorder for everyone."));
+      : tr("Click Download on an episode to download it here. Drag rows to reorder for everyone."));
 }
-void RoomPage::approveSelected(bool wholeSources) {
-  if (room_.isEmpty() || queueTabs_->currentIndex() != 0)
-    return;
-  const auto room = room_;
-  const auto selected = selectedEntries();
-  if (selected.isEmpty())
-    return;
-  const auto snapshot = app_.rooms.room(room);
-  QSet<QString> sourceIds;
-  for (const auto &id : selected)
-    sourceIds.insert(app_.rooms.entry(room, id).value(QStringLiteral("sourceId")).toString());
-  QHash<QString, QJsonObject> entries;
-  QHash<QString, QString> labels;
-  for (const auto value : snapshot.value(QStringLiteral("sources")).toArray()) {
-    const auto source = value.toObject();
-    labels.insert(source.value(QStringLiteral("id")).toString(), source.value(QStringLiteral("label")).toString());
-  }
-  QStringList details;
-  qint64 size = 0;
-  for (const auto value : snapshot.value(QStringLiteral("entries")).toArray()) {
-    const auto entry = value.toObject();
-    const auto id = entry.value(QStringLiteral("id")).toString();
-    const auto source = entry.value(QStringLiteral("sourceId")).toString();
-    if (upcoming(entry) && (wholeSources ? sourceIds.contains(source) : selected.contains(id))) {
-      entries.insert(id, entry);
-      size += entry.value(QStringLiteral("size")).toInteger();
-      details.append(labels.value(source) + QStringLiteral(" · ") + entry.value(QStringLiteral("path")).toString() +
-          QStringLiteral("\n") + tr("Source: %1").arg(source));
-    }
-  }
-  if (entries.isEmpty())
-    return;
-  auto *dialog = new QMessageBox(QMessageBox::Question, tr("Approve downloads on this device"),
-      tr("Download %n episode(s) on this device?", nullptr, entries.size()) + QStringLiteral("\n\n") +
-      (wholeSources ? tr("This approves every upcoming episode from the selected sources, including rows hidden by search.")
-                    : tr("Only the selected episodes are approved.")) + QStringLiteral("\n") +
-      tr("Total selected size: %1. This does not change the shared room queue or anyone else's download choices.").arg(bytes(size)),
-      QMessageBox::Cancel, this);
-  dialog->setAttribute(Qt::WA_DeleteOnClose);
-  dialog->setObjectName(QStringLiteral("QueueDownloadApproval"));
-  dialog->setTextFormat(Qt::PlainText);
-  dialog->setDetailedText(details.join(QLatin1Char('\n')));
-  auto *approve = dialog->addButton(tr("Approve download"), QMessageBox::AcceptRole);
-  dialog->setDefaultButton(QMessageBox::Cancel);
-  connect(dialog, &QMessageBox::finished, this, [this, dialog, approve, room, entries](int) {
-    if (dialog->clickedButton() != approve)
+void RoomPage::approveEntry(const QJsonObject &shown) {
+  app_.perform([&] {
+    if (room_.isEmpty() || queueTabs_->currentIndex() != 0 ||
+        shown.value(QStringLiteral("_approvalRoom")).toString() != room_)
       return;
-    app_.perform([&] {
-      QHash<QString, QStringList> bySource;
-      for (auto it = entries.begin(); it != entries.end(); ++it) {
-        const auto current = app_.rooms.entry(room, it.key());
-        if (!upcoming(current) || current.value(QStringLiteral("sourceId")) != it->value(QStringLiteral("sourceId")) ||
-            current.value(QStringLiteral("mediaId")) != it->value(QStringLiteral("mediaId")))
-          throw AppError(QStringLiteral("QUEUE_CHANGED"), tr("The selected episodes changed. Review the list and approve again."));
-        bySource[current.value(QStringLiteral("sourceId")).toString()].append(current.value(QStringLiteral("mediaId")).toString());
-      }
-      for (auto it = bySource.begin(); it != bySource.end(); ++it)
-        app_.media.approve(room, it.key(), it.value());
-    });
+    const auto id = shown.value(QStringLiteral("id")).toString();
+    const auto entry = app_.rooms.entry(room_, id);
+    if (!upcoming(entry) || entry.value(QStringLiteral("sourceId")) != shown.value(QStringLiteral("sourceId")) ||
+        entry.value(QStringLiteral("mediaId")) != shown.value(QStringLiteral("mediaId")))
+      throw AppError(QStringLiteral("QUEUE_CHANGED"), tr("The episode changed. Review its Download button again."));
+    const auto current = queueModel_.row(queueModel_.indexOf(id));
+    if (!current.value(QStringLiteral("_approvalNeeded")).toBool())
+      return;
+    app_.media.approve(room_, entry.value(QStringLiteral("sourceId")).toString(),
+                       {entry.value(QStringLiteral("mediaId")).toString()});
+    updateQueue();
   });
-  dialog->open();
 }
 void RoomPage::clearList() {
   if (room_.isEmpty())

@@ -28,7 +28,7 @@ function fixture(database = ':memory:') {
     const entry = room().entries.find(e => e.id === p.entryId);
     engine.status(host.roomId, who.memberId, connection, { type: 'status', generation: p.generation,
       entryId: p.entryId, ready: true, reason: '', position: timelinePosition(p, time), duration: entry?.duration ?? null,
-      identity: entry?.mediaId ?? '', audio: ['audio:0', 'audio:1'], subtitles: ['sub:0'], ...overrides });
+      identity: entry?.mediaId ?? '', audio: ['audio:0', 'audio:1'], subtitles: ['sub:0'], tracksKnown: true, ...overrides });
   };
   const start = () => { add(); command({ type: 'watch.join' }); command({ type: 'playback.play' }); status(); };
   const advance = (milliseconds: number) => { time += milliseconds; };
@@ -265,6 +265,99 @@ test('shared track mismatches block the barrier and a common track clears it', t
   assert.equal(f.room().revision, pausedRevision, 'an unchanged readiness barrier must not churn event revisions');
   f.command({ type: 'tracks.select', audio: 'audio:0', subtitle: 'sub:0', subtitleDelay: 0 }); f.status(); f.status(f.guest, f.guestConnection);
   assert.equal(f.room().playback.paused, false);
+});
+
+test('episode transitions preserve a shared subtitle only after fresh inventories from every active watcher', t => {
+  const f = fixture(); t.after(() => f.store.close()); f.start();
+  f.command({ type: 'watch.join' }, f.guest.memberId); f.status(f.guest, f.guestConnection);
+  f.command({ type: 'tracks.select', audio: 'auto', subtitle: 'sub:0', subtitleDelay: 0.75 });
+  f.status(); f.status(f.guest, f.guestConnection);
+  const previous = { ...f.room().playback };
+  f.command({ type: 'playback.next' });
+  const transitionGeneration = f.room().playback.generation;
+  assert.equal(f.room().playback.subtitleTransition, true);
+  f.status(f.host, f.hostConnection, { ready: false, tracksKnown: false, subtitles: [] });
+  assert.equal(f.room().playback.subtitle, 'sub:0', 'loading is not proof that a track is absent');
+  f.status(f.guest, f.guestConnection, { generation: previous.generation, entryId: previous.entryId, subtitles: [] });
+  f.status(f.guest, f.guestConnection, { identity: 'different-media', subtitles: [] });
+  assert.equal(f.room().playback.subtitle, 'sub:0', 'stale and wrong-media inventories cannot choose fallback');
+  f.status();
+  assert.equal(f.room().playback.subtitleTransition, true);
+  assert.equal(f.room().playback.paused, true);
+  f.status(f.guest, f.guestConnection);
+  assert.equal(f.room().playback.subtitleTransition, false);
+  assert.equal(f.room().playback.subtitle, 'sub:0');
+  assert.equal(f.room().playback.subtitleDelay, 0.75);
+  assert.ok(f.room().playback.generation > transitionGeneration);
+  assert.equal(f.room().playback.paused, true, 'provisional inventories are not applied-track readiness');
+  f.status(f.host, f.hostConnection, { generation: transitionGeneration });
+  f.status(f.guest, f.guestConnection, { generation: transitionGeneration });
+  assert.equal(f.room().playback.paused, true, 'pre-resolution ready reports cannot start playback');
+  f.status();
+  assert.equal(f.room().playback.paused, true);
+  f.status(f.guest, f.guestConnection);
+  assert.equal(f.room().playback.paused, false);
+});
+
+test('one active watcher missing an inherited subtitle switches the whole room off and resumes normally', t => {
+  const f = fixture(); t.after(() => f.store.close()); f.start();
+  f.command({ type: 'watch.join' }, f.guest.memberId); f.status(f.guest, f.guestConnection);
+  f.command({ type: 'tracks.select', audio: 'auto', subtitle: 'sub:0', subtitleDelay: 1.25 });
+  f.status(); f.status(f.guest, f.guestConnection);
+  f.command({ type: 'playback.next' });
+  const generation = f.room().playback.generation;
+  f.status();
+  f.status(f.guest, f.guestConnection, { ready: false, subtitles: [] });
+  assert.equal(f.room().playback.subtitle, 'off');
+  assert.equal(f.room().playback.subtitleDelay, 0);
+  assert.equal(f.room().playback.subtitleTransition, false);
+  assert.ok(f.room().playback.generation > generation);
+  assert.equal(f.room().playback.requested, true);
+  f.status(); f.status(f.guest, f.guestConnection, { subtitles: [] });
+  assert.equal(f.room().playback.paused, false);
+});
+
+test('manual episode choice resolves inherited subtitles while paused and ignores idle members', t => {
+  const f = fixture(); t.after(() => f.store.close()); f.start();
+  f.command({ type: 'tracks.select', audio: 'auto', subtitle: 'sub:0', subtitleDelay: -0.5 }); f.status();
+  f.command({ type: 'playback.choose', entryId: f.room().entries[1]!.id });
+  f.status(f.guest, f.guestConnection, { subtitles: [] });
+  assert.equal(f.room().playback.subtitle, 'sub:0');
+  f.status(f.host, f.hostConnection, { subtitles: [], ready: false });
+  assert.equal(f.room().playback.subtitle, 'off');
+  assert.equal(f.room().playback.subtitleDelay, 0);
+  assert.equal(f.room().playback.requested, false);
+  assert.equal(f.room().playback.paused, true);
+});
+
+test('an explicit selection supersedes inherited resolution and retains the same-episode mismatch barrier', t => {
+  const f = fixture(); t.after(() => f.store.close()); f.start();
+  f.command({ type: 'tracks.select', audio: 'auto', subtitle: 'sub:0', subtitleDelay: 0 }); f.status();
+  f.command({ type: 'playback.next' });
+  f.command({ type: 'tracks.select', audio: 'auto', subtitle: 'sub:explicit', subtitleDelay: 0.5 });
+  f.status(f.host, f.hostConnection, { subtitles: [], ready: false });
+  assert.equal(f.room().playback.subtitle, 'sub:explicit');
+  assert.equal(f.room().playback.subtitleDelay, 0.5);
+  assert.equal(f.room().playback.subtitleTransition, false);
+  assert.equal(f.room().playback.paused, true);
+  assert.match(f.room().playback.reason, /subtitle track/);
+  f.command({ type: 'playback.choose', entryId: f.room().playback.entryId! });
+  f.command({ type: 'playback.play' }); f.status(f.host, f.hostConnection, { subtitles: [], ready: false });
+  assert.equal(f.room().playback.subtitle, 'sub:explicit', 'choosing the same episode is not a transition');
+});
+
+test('external subtitles and their delays never carry to another entry or beyond the end of the queue', t => {
+  for (const transition of ['next', 'choose', 'remove', 'clear'] as const) {
+    const f = fixture(); t.after(() => f.store.close()); f.start();
+    f.command({ type: 'tracks.select', audio: 'auto', subtitle: `ext:${'a'.repeat(64)}`, subtitleDelay: 2 });
+    if (transition === 'next') f.command({ type: 'playback.next' });
+    else if (transition === 'choose') f.command({ type: 'playback.choose', entryId: f.room().entries[1]!.id });
+    else if (transition === 'remove') f.command({ type: 'queue.remove', ids: [f.room().playback.entryId!] });
+    else f.command({ type: 'queue.clear', scope: 'upcoming' });
+    assert.equal(f.room().playback.subtitle, 'off', transition);
+    assert.equal(f.room().playback.subtitleDelay, 0, transition);
+    assert.equal(f.room().playback.subtitleTransition, false, transition);
+  }
 });
 
 test('loss detection checkpoints the paused generation rather than an obsolete playing snapshot', t => {

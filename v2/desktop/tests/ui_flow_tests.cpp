@@ -73,7 +73,7 @@ private slots:
       const auto room = entered.first()[1].toString();
       QTRY_VERIFY_WITH_TIMEOUT(services.rooms.connected(room), 5000);
       const auto root = tmp.filePath(QStringLiteral("pack"));
-      const auto transfer = services.transfers.add(pack(root), root);
+      const auto transfer = services.transfers.add(pack(root), tmp.filePath(QStringLiteral("downloads")));
       QTRY_VERIFY_WITH_TIMEOUT(services.transfers.source(transfer) &&
           services.transfers.source(transfer)->files().size() == 13, 5000);
       QList<int> files;
@@ -183,25 +183,75 @@ private slots:
       QCOMPARE(history->model()->index(0, 1).data().toString(), QStringLiteral("just now"));
       QTest::mouseClick(queue->viewport(), Qt::LeftButton, Qt::NoModifier,
                         queue->visualRect(queue->model()->index(0, 0)).center());
-      auto *approveButton = page.findChild<QPushButton *>(QStringLiteral("QueueApproveDownloads"));
-      QVERIFY(approveButton->isEnabled());
-      QTest::mouseClick(approveButton, Qt::LeftButton);
-      auto *approval = page.findChild<QMessageBox *>(QStringLiteral("QueueDownloadApproval"));
-      QVERIFY(approval && approval->isVisible());
-      QVERIFY(approval->detailedText().contains(QStringLiteral("Season 1/Episode 01")));
-      QVERIFY(!approval->detailedText().contains(QStringLiteral("Season 2/Episode 01")));
-      QVERIFY(QTest::qWaitForWindowExposed(approval));
-      screenshot(page, QStringLiteral("queue-download-approval-selection"));
-      screenshot(*approval, QStringLiteral("queue-download-approval"));
-      for (auto *choice : approval->buttons())
-        if (approval->buttonRole(choice) == QMessageBox::AcceptRole)
-          QTest::mouseClick(choice, Qt::LeftButton);
+      QVERIFY(!page.findChild<QPushButton *>(QStringLiteral("QueueApproveDownloads")));
+      const auto action = queue->model()->index(0, 4);
+      QVERIFY(action.data(wp::ui::ApprovalRole).toBool());
+      QCOMPARE(action.data().toString(), QStringLiteral("Download"));
+      queue->scrollTo(action);
+      QCoreApplication::processEvents();
+      screenshot(page, QStringLiteral("queue-inline-download"));
+      const auto queueRevision = services.rooms.room(room).value(QStringLiteral("queueRevision"));
+      const auto actionPoint = queue->visualRect(action).center();
+      const auto titlePoint = queue->visualRect(queue->model()->index(0, 0)).center();
+      QTest::mousePress(queue->viewport(), Qt::LeftButton, Qt::NoModifier, actionPoint);
+      QTest::mouseRelease(queue->viewport(), Qt::LeftButton, Qt::NoModifier, titlePoint);
+      QTest::mousePress(queue->viewport(), Qt::LeftButton, Qt::NoModifier, titlePoint);
+      QTest::mouseRelease(queue->viewport(), Qt::LeftButton, Qt::NoModifier, actionPoint);
+      const auto unapproved = services.rooms.entry(room, firstId);
+      QVERIFY(!services.media.acquisition(room, unapproved.value(QStringLiteral("sourceId")).toString())
+          .value(QStringLiteral("approved")).toArray().contains(unapproved.value(QStringLiteral("mediaId"))));
+      QVERIFY(queue->model()->index(0, 4).data(wp::ui::ApprovalRole).toBool());
+      // A single row click approves exactly this episode, with no modal step.
+      QTest::mouseClick(queue->viewport(), Qt::LeftButton, Qt::NoModifier,
+                        queue->visualRect(action).center());
       const auto first = services.rooms.entry(room, firstId), second = services.rooms.entry(room, secondId);
-      const auto acquisition = services.media.acquisition(room, first.value(QStringLiteral("sourceId")).toString());
+      const auto source = first.value(QStringLiteral("sourceId")).toString();
+      const auto acquisition = services.media.acquisition(room, source);
       QVERIFY(acquisition.value(QStringLiteral("approved")).toArray().contains(first.value(QStringLiteral("mediaId"))));
       QVERIFY(!acquisition.value(QStringLiteral("approved")).toArray().contains(second.value(QStringLiteral("mediaId"))));
+      QCOMPARE(services.rooms.room(room).value(QStringLiteral("queueRevision")), queueRevision);
+      QTRY_VERIFY(services.transfers.source(transfer)->selected(first.value(QStringLiteral("fileIndex")).toInt()));
+      QVERIFY(!services.transfers.source(transfer)->selected(second.value(QStringLiteral("fileIndex")).toInt()));
+      QVERIFY(!page.findChild<QMessageBox *>(QStringLiteral("QueueDownloadApproval")));
+      QTRY_VERIFY(!queue->model()->index(0, 4).data(wp::ui::ApprovalRole).toBool());
+      QVERIFY(queue->model()->index(0, 4).data().toString().isEmpty());
+      QTest::mouseClick(queue->viewport(), Qt::LeftButton, Qt::NoModifier,
+                        queue->visualRect(queue->model()->index(0, 4)).center());
+      QCOMPARE(services.media.acquisition(room, source).value(QStringLiteral("decisionRevision")),
+               acquisition.value(QStringLiteral("decisionRevision")));
+      // Keyboard activation also targets its own stable row without approval elsewhere.
+      const auto filter = search->text();
+      search->clear();
+      QModelIndex keyboard;
+      for (int row = 0; row < queue->model()->rowCount(); ++row)
+        if (queue->model()->index(row, 4).data(wp::ui::ApprovalRole).toBool()) {
+          keyboard = queue->model()->index(row, 4);
+          break;
+        }
+      QVERIFY(keyboard.isValid());
+      const auto keyboardEntry = keyboard.data(wp::ui::ObjectRole).value<QJsonObject>();
+      queue->setCurrentIndex(keyboard);
+      queue->setFocus();
+      QTest::keyClick(queue, Qt::Key_Space);
+      QTRY_VERIFY(services.media.acquisition(room, source).value(QStringLiteral("approved")).toArray()
+          .contains(keyboardEntry.value(QStringLiteral("mediaId"))));
+      QModelIndex enter;
+      for (int row = 0; row < queue->model()->rowCount(); ++row)
+        if (queue->model()->index(row, 4).data(wp::ui::ApprovalRole).toBool()) {
+          enter = queue->model()->index(row, 4);
+          break;
+        }
+      QVERIFY(enter.isValid());
+      const auto enterEntry = enter.data(wp::ui::ObjectRole).value<QJsonObject>();
+      queue->setCurrentIndex(enter);
+      QTest::keyClick(queue, Qt::Key_Return);
+      QTRY_VERIFY(services.media.acquisition(room, source).value(QStringLiteral("approved")).toArray()
+          .contains(enterEntry.value(QStringLiteral("mediaId"))));
+      search->setText(filter);
+      page.refresh();
+      QVERIFY(!queue->model()->index(0, 4).data(wp::ui::ApprovalRole).toBool());
+      screenshot(page, QStringLiteral("queue-inline-download-approved"));
       tabs->setCurrentIndex(1);
-      QTRY_VERIFY(!approveButton->isVisible());
       QAction *clear = page.findChild<QAction *>(QStringLiteral("QueueClear"));
       QVERIFY(clear && clear->text().contains(QStringLiteral("Watched")));
       for (auto *action : more->menu()->actions())

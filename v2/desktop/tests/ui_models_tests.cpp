@@ -2,12 +2,179 @@
 #include "room_page.h"
 #include <QApplication>
 #include <QAbstractItemModelTester>
+#include <QDrag>
+#include <QDragEnterEvent>
+#include <QDragMoveEvent>
+#include <QDropEvent>
 #include <QFontMetrics>
+#include <QHeaderView>
 #include <QMimeData>
+#include <QScopeGuard>
 #include <QtTest>
+#ifdef Q_OS_WIN
+#include <windows.h>
+#include <thread>
+#endif
+namespace {
+class QueueDragView final : public QTableView {
+public:
+  int starts = 0, enters = 0, moves = 0;
+  bool enterAccepted = false, dropAccepted = false, finished = false;
+protected:
+  void startDrag(Qt::DropActions actions) override {
+    ++starts;
+    QTableView::startDrag(actions);
+    finished = true;
+  }
+  void dragEnterEvent(QDragEnterEvent *event) override {
+    ++enters;
+    QTableView::dragEnterEvent(event);
+    enterAccepted = event->isAccepted();
+  }
+  void dragMoveEvent(QDragMoveEvent *event) override {
+    ++moves;
+    QTableView::dragMoveEvent(event);
+  }
+  void dropEvent(QDropEvent *event) override {
+    QTableView::dropEvent(event);
+    dropAccepted = event->isAccepted();
+  }
+};
+}
 class UiModels final : public QObject {
   Q_OBJECT
 private slots:
+  void pointerDragNegotiatesAndDropsFilteredQueueRows_data() {
+    QTest::addColumn<int>("sourceRow");
+    QTest::addColumn<int>("targetRow");
+    QTest::addColumn<int>("targetColumn");
+    QTest::addColumn<int>("verticalOffset");
+    QTest::newRow("title-top-edge") << 1 << 0 << 0 << -14;
+    QTest::newRow("title-upper-half") << 1 << 0 << 0 << -4;
+    QTest::newRow("length-upper-half") << 1 << 0 << 2 << -4;
+    QTest::newRow("title-lower-half") << 0 << 1 << 0 << 4;
+    QTest::newRow("length-bottom-edge") << 0 << 1 << 2 << 14;
+    QTest::newRow("approval-bottom-edge") << 0 << 1 << 4 << 14;
+  }
+  void pointerDragNegotiatesAndDropsFilteredQueueRows() {
+#ifndef Q_OS_WIN
+    QSKIP("This pointer regression uses the native Windows drag backend");
+#else
+    if (QGuiApplication::platformName() != QStringLiteral("windows"))
+      QSKIP("Run this pointer regression with QT_QPA_PLATFORM=windows");
+    if (GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+      QSKIP("Release the physical pointer before running the native drag regression");
+    QFETCH(int, sourceRow);
+    QFETCH(int, targetRow);
+    QFETCH(int, targetColumn);
+    QFETCH(int, verticalOffset);
+    wp::ui::JsonTable model(wp::ui::JsonKind::Queue);
+    wp::ui::QueueProxy proxy;
+    proxy.setSourceModel(&model);
+    proxy.setContext(QStringLiteral("room"), 7);
+    QJsonArray rows;
+    for (const auto &id : {QStringLiteral("a"), QStringLiteral("b"), QStringLiteral("c"), QStringLiteral("d")})
+      rows.append(QJsonObject{{QStringLiteral("id"), id}, {QStringLiteral("enabled"), true},
+        {QStringLiteral("watchedAt"), QJsonValue::Null}, {QStringLiteral("label"), QStringLiteral("Episode 1")},
+        {QStringLiteral("path"), (id == QStringLiteral("b") || id == QStringLiteral("c"))
+            ? QStringLiteral("Season 2/Episode 1.mkv") : QStringLiteral("Season 1/Episode 1.mkv")}});
+    model.setRows(rows);
+    proxy.search(QStringLiteral("Season 2"));
+    QueueDragView view;
+    view.setModel(&proxy);
+    view.setSelectionBehavior(QAbstractItemView::SelectRows);
+    view.setSelectionMode(QAbstractItemView::ExtendedSelection);
+    view.setDragEnabled(true);
+    view.setAcceptDrops(true);
+    view.setDropIndicatorShown(true);
+    view.setDragDropMode(QAbstractItemView::InternalMove);
+    view.setDragDropOverwriteMode(false);
+    view.setDefaultDropAction(Qt::MoveAction);
+    view.setEditTriggers(QAbstractItemView::NoEditTriggers);
+    view.verticalHeader()->setDefaultSectionSize(34);
+    view.horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    view.hideColumn(1);
+    view.hideColumn(3);
+    view.setColumnWidth(2, 70);
+    view.resize(500, 240);
+    view.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&view));
+    const auto handle = reinterpret_cast<HWND>(view.winId());
+    ShowWindow(handle, SW_SHOWNORMAL);
+    SetWindowPos(handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    SetForegroundWindow(handle);
+    view.doItemsLayout();
+    const auto source = view.visualRect(proxy.index(sourceRow, 0)).center();
+    const auto targetRect = view.visualRect(proxy.index(targetRow, targetColumn));
+    const auto target = targetRect.center() + QPoint(0, verticalOffset);
+    QVERIFY(view.viewport()->rect().contains(source));
+    QVERIFY(view.viewport()->rect().contains(target));
+    QSignalSpy reordered(&proxy, &wp::ui::QueueProxy::reorderRequested);
+    auto nativePoint = [&](const QPoint &point) {
+      const auto local = view.viewport()->mapTo(&view, point);
+      POINT native{qRound(local.x() * view.devicePixelRatioF()),
+                   qRound(local.y() * view.devicePixelRatioF())};
+      ClientToScreen(handle, &native);
+      return QPoint(native.x, native.y);
+    };
+    const auto from = nativePoint(source), to = nativePoint(target);
+    POINT original{};
+    GetCursorPos(&original);
+    bool pressed = false, released = false, ownWindowHit = false;
+    // Feed OS pointer events while the GUI thread is inside the real OLE drag
+    // loop. Synthetic dropMimeData calls never exercise drag negotiation.
+    std::thread pointer([&] {
+      SetCursorPos(from.x(), from.y());
+      const auto hit = WindowFromPoint(POINT{from.x(), from.y()});
+      ownWindowHit = hit == handle || IsChild(handle, hit);
+      INPUT input{};
+      input.type = INPUT_MOUSE;
+      input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+      pressed = SendInput(1, &input, sizeof(input)) == 1;
+      Sleep(80);
+      for (int step = 1; step <= 12; ++step) {
+        const auto point = from + (to - from) * step / 12;
+        SetCursorPos(point.x(), point.y());
+        Sleep(20);
+      }
+      Sleep(80);
+      input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+      released = SendInput(1, &input, sizeof(input)) == 1;
+      // Always leave the native drag loop bounded, even if Windows rejected
+      // an input event or another desktop window took focus during the test.
+      Sleep(500);
+      INPUT escape{};
+      escape.type = INPUT_KEYBOARD;
+      escape.ki.wVk = VK_ESCAPE;
+      SendInput(1, &escape, sizeof(escape));
+      escape.ki.dwFlags = KEYEVENTF_KEYUP;
+      SendInput(1, &escape, sizeof(escape));
+    });
+    const auto restorePointer = qScopeGuard([&] {
+      if (pointer.joinable())
+        pointer.join();
+      SetCursorPos(original.x, original.y);
+    });
+    QTest::qWait(1100);
+    pointer.join();
+    qInfo() << "Queue drag events" << view.starts << view.enters << view.moves
+            << "accepted" << view.enterAccepted << view.dropAccepted
+            << "input" << pressed << released << ownWindowHit
+            << "visible" << bool(IsWindowVisible(handle));
+    QVERIFY(pressed);
+    QVERIFY(released);
+    QVERIFY(ownWindowHit);
+    QCOMPARE(view.starts, 1);
+    QVERIFY(view.enters > 0);
+    QVERIFY(view.enterAccepted);
+    QVERIFY(view.dropAccepted);
+    QCOMPARE(reordered.size(), 1);
+    QCOMPARE(reordered.first()[0].toStringList(),
+             (QStringList{QStringLiteral("a"), QStringLiteral("c"), QStringLiteral("b"), QStringLiteral("d")}));
+    QCOMPARE(reordered.first()[1].toLongLong(), 7);
+    QCOMPARE(model.index(1, 0).data(wp::ui::IdRole).toString(), QStringLiteral("b"));
+#endif
+  }
   void identicalPathsFromDifferentSourcesHaveDistinctCaptionsWithoutChangingIdentity() {
     for (const auto kind : {wp::ui::JsonKind::Queue, wp::ui::JsonKind::History}) {
       wp::ui::JsonTable model(kind);
@@ -92,16 +259,65 @@ private slots:
     proxy.search(QStringLiteral("Season 2"));
     QSignalSpy reordered(&proxy, &wp::ui::QueueProxy::reorderRequested);
     std::unique_ptr<QMimeData> drag(proxy.mimeData({proxy.index(1, 0)}));
+    QVERIFY(proxy.canDropMimeData(drag.get(), Qt::MoveAction, 0, 0, {}));
     QVERIFY(proxy.dropMimeData(drag.get(), Qt::MoveAction, 0, 0, {}));
     QCOMPARE(reordered.size(), 1);
     QCOMPARE(reordered.first()[0].toStringList(), (QStringList{QStringLiteral("a"), QStringLiteral("c"), QStringLiteral("b"), QStringLiteral("d")}));
     QCOMPARE(reordered.first()[1].toLongLong(), 7);
     QCOMPARE(model.index(1, 0).data(wp::ui::IdRole).toString(), QStringLiteral("b")); // Wait for the server's accepted order.
+    QVERIFY(proxy.canDropMimeData(drag.get(), Qt::MoveAction, 0, 2, {}));
+    std::unique_ptr<QMimeData> first(proxy.mimeData({proxy.index(0, 0)}));
+    QVERIFY(proxy.canDropMimeData(first.get(), Qt::MoveAction, proxy.rowCount(), 4, {}));
+    QVERIFY(proxy.dropMimeData(first.get(), Qt::MoveAction, proxy.rowCount(), 4, {}));
+    QCOMPARE(reordered.last()[0].toStringList(),
+             (QStringList{QStringLiteral("a"), QStringLiteral("c"), QStringLiteral("b"), QStringLiteral("d")}));
+    QCOMPARE(reordered.size(), 2);
+    QVERIFY(!proxy.canDropMimeData(first.get(), Qt::CopyAction, 0, 0, {}));
     proxy.setContext(QStringLiteral("room"), 8);
+    QVERIFY(!proxy.canDropMimeData(drag.get(), Qt::MoveAction, 0, 0, {}));
     QVERIFY(!proxy.dropMimeData(drag.get(), Qt::MoveAction, 0, 0, {}));
-    QCOMPARE(reordered.size(), 1);
+    QCOMPARE(reordered.size(), 2);
     proxy.setContext(QStringLiteral("other-room"), 7);
+    QVERIFY(!proxy.canDropMimeData(drag.get(), Qt::MoveAction, 0, 0, {}));
     QVERIFY(!proxy.dropMimeData(drag.get(), Qt::MoveAction, 0, 0, {}));
+  }
+  void queueDropKeepsMultiSelectionOrderAndRejectsInvalidEntryIds() {
+    wp::ui::JsonTable model(wp::ui::JsonKind::Queue);
+    wp::ui::QueueProxy proxy;
+    proxy.setSourceModel(&model);
+    proxy.setContext(QStringLiteral("room"), 9);
+    QJsonArray rows;
+    for (const auto &id : {QStringLiteral("a"), QStringLiteral("b"), QStringLiteral("c"),
+                           QStringLiteral("d"), QStringLiteral("e")})
+      rows.append(QJsonObject{{QStringLiteral("id"), id}, {QStringLiteral("enabled"), true},
+        {QStringLiteral("watchedAt"), QJsonValue::Null},
+        {QStringLiteral("label"), (id == QStringLiteral("b") || id == QStringLiteral("d"))
+            ? QStringLiteral("visible duplicate") : QStringLiteral("hidden duplicate")}});
+    model.setRows(rows);
+    proxy.search(QStringLiteral("visible"));
+    QSignalSpy reordered(&proxy, &wp::ui::QueueProxy::reorderRequested);
+    std::unique_ptr<QMimeData> drag(proxy.mimeData({proxy.index(1, 0), proxy.index(0, 2), proxy.index(1, 2)}));
+    QVERIFY(proxy.canDropMimeData(drag.get(), Qt::MoveAction, 2, 2, {}));
+    QVERIFY(proxy.dropMimeData(drag.get(), Qt::MoveAction, 2, 2, {}));
+    QCOMPARE(reordered.size(), 1);
+    QCOMPARE(reordered.first()[0].toStringList(),
+             (QStringList{QStringLiteral("a"), QStringLiteral("c"), QStringLiteral("b"),
+                           QStringLiteral("d"), QStringLiteral("e")}));
+    QCOMPARE(reordered.first()[1].toLongLong(), 9);
+    std::unique_ptr<QMimeData> first(proxy.mimeData({proxy.index(0, 0)}));
+    QVERIFY(proxy.dropMimeData(first.get(), Qt::MoveAction, 0, 0, {}));
+    QCOMPARE(reordered.size(), 1); // An accepted no-op sends no room command.
+    for (const auto &ids : {QJsonArray{QStringLiteral("missing")},
+                            QJsonArray{QStringLiteral("b"), QStringLiteral("b")}}) {
+      auto envelope = QJsonDocument::fromJson(drag->data(proxy.mimeTypes().first())).object();
+      envelope.insert(QStringLiteral("ids"), ids);
+      QMimeData invalid;
+      invalid.setData(proxy.mimeTypes().first(), QJsonDocument(envelope).toJson());
+      QVERIFY(!proxy.canDropMimeData(&invalid, Qt::MoveAction, 0, 0, {}));
+      QVERIFY(!proxy.dropMimeData(&invalid, Qt::MoveAction, 0, 0, {}));
+    }
+    QVERIFY(!proxy.canDropMimeData(drag.get(), Qt::MoveAction, 3, 0, {}));
+    QCOMPARE(reordered.size(), 1);
   }
   void nestedSelectionRetainsOriginalIndexesAndPriorities() {
     wp::ui::FileTree model;

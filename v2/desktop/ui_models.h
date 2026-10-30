@@ -3,13 +3,14 @@
 #include <QAbstractItemModel>
 #include <QAbstractTableModel>
 #include <QJsonObject>
+#include <QPersistentModelIndex>
 #include <QStyledItemDelegate>
 #include <QTimer>
 #include <memory>
 #include <optional>
 #include <vector>
 namespace wp::ui {
-enum Roles { SortRole = Qt::UserRole + 1, ProgressRole, IdRole, ObjectRole, SearchRole };
+enum Roles { SortRole = Qt::UserRole + 1, ProgressRole, IdRole, ObjectRole, SearchRole, ApprovalRole };
 QString bytes(qint64 value);
 QString elapsed(double seconds);
 QString age(qint64 timestamp, qint64 now = 0);
@@ -103,6 +104,21 @@ class ProgressDelegate final : public QStyledItemDelegate {
 public:
   using QStyledItemDelegate::QStyledItemDelegate;
   void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override;
+};
+// Paint only visible rows rather than allocating a widget for every episode.
+class EpisodeDownloadDelegate final : public QStyledItemDelegate {
+  Q_OBJECT
+public:
+  explicit EpisodeDownloadDelegate(QObject *parent = nullptr);
+  void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override;
+  bool editorEvent(QEvent *event, QAbstractItemModel *model, const QStyleOptionViewItem &option,
+                   const QModelIndex &index) override;
+signals:
+  void downloadRequested(QJsonObject entry);
+protected:
+  bool eventFilter(QObject *object, QEvent *event) override;
+private:
+  QPersistentModelIndex pressed_;
 };
 class PriorityDelegate final : public QStyledItemDelegate {
 public:

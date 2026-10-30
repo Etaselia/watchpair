@@ -25,6 +25,8 @@ public:
   Qt::ItemFlags flags(const QModelIndex &index) const override;
   QStringList mimeTypes() const override;
   QMimeData *mimeData(const QModelIndexList &indexes) const override;
+  bool canDropMimeData(const QMimeData *data, Qt::DropAction action, int row, int column,
+                       const QModelIndex &parent) const override;
   bool dropMimeData(const QMimeData *data, Qt::DropAction action, int row, int column,
                     const QModelIndex &parent) override;
   Qt::DropActions supportedDropActions() const override { return Qt::MoveAction; }
@@ -47,6 +49,8 @@ protected:
   bool filterAcceptsRow(int row, const QModelIndex &parent) const override;
 
 private:
+  bool dropOrder(const QMimeData *data, Qt::DropAction action, int row, int column,
+                 const QModelIndex &parent, QStringList *changedOrder) const;
   QString query_, room_;
   qint64 revision_ = -1;
 };
@@ -76,7 +80,7 @@ private:
   void mark(bool watched);
   void reorder(int direction);
   void rewatch();
-  void approveSelected(bool wholeSources = false);
+  void approveEntry(const QJsonObject &entry);
   void clearList();
   void updateQueueActions();
   void trackChoice();
@@ -102,8 +106,8 @@ private:
   QStackedWidget *queueStack_;
   QLabel *roomTitle_, *roomSubtitle_, *episodeTitle_, *state_, *time_, *overlayText_;
   QPushButton *join_, *leave_, *play_, *next_, *overlayAction_, *loadHistory_;
-  QPushButton *queueUp_, *queueDown_, *queueMark_, *queueApprove_;
-  QAction *queueUnwatched_, *queueWatchAgain_, *queueRename_, *queueRemove_, *queueClear_, *queueApproveSources_;
+  QPushButton *queueUp_, *queueDown_, *queueMark_;
+  QAction *queueUnwatched_, *queueWatchAgain_, *queueRename_, *queueRemove_, *queueClear_;
   QLabel *queueHint_;
   QPushButton *previousChapter_, *nextChapter_, *skipBack_, *skipForward_, *popout_, *reattach_;
   QSlider *seek_, *volume_;

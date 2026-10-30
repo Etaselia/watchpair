@@ -3,6 +3,7 @@
 #include "native_runtime.h"
 #include <QCryptographicHash>
 #include <QFile>
+#include <QFileInfo>
 #include <QProcess>
 #include <QTemporaryDir>
 #include <QtTest>
@@ -27,10 +28,159 @@ QString watch(wp::AppServices &app, const QString &room, const QString &member) 
       return value.toObject().value(QStringLiteral("watch")).toString();
   return {};
 }
+QString nativeSubtitle(wp::Player &player) {
+  auto *value = mpv_get_property_string(player.native(), "sid");
+  const auto result = QString::fromUtf8(value ? value : "<unavailable>");
+  mpv_free(value);
+  return result;
+}
 } // namespace
 class PlaybackTests final : public QObject {
   Q_OBJECT
 private slots:
+  void episodeSubtitleFallbackIsSharedAndExplicitMissingSelectionStillBlocks() {
+    QTemporaryDir tmp;
+    QVERIFY(tmp.isValid());
+    const auto captions = tmp.filePath(QStringLiteral("captions.srt"));
+    QFile subtitle(captions);
+    QVERIFY(subtitle.open(QIODevice::WriteOnly));
+    subtitle.write("1\n00:00:00,000 --> 00:00:12,000\nEpisode one captions\n");
+    subtitle.close();
+    const QStringList paths{tmp.filePath(QStringLiteral("with-captions.mkv")),
+                            tmp.filePath(QStringLiteral("without-captions.mkv"))};
+    for (int i = 0; i < paths.size(); ++i) {
+      QStringList arguments{QStringLiteral("-hide_banner"),
+                            QStringLiteral("-loglevel"),
+                            QStringLiteral("error"),
+                            QStringLiteral("-f"),
+                            QStringLiteral("lavfi"),
+                            QStringLiteral("-i"),
+                            QStringLiteral("testsrc2=size=160x90:rate=12:duration=12")};
+      if (i == 0)
+        arguments << QStringLiteral("-i") << captions << QStringLiteral("-c:s") << QStringLiteral("srt");
+      arguments << QStringLiteral("-c:v") << QStringLiteral("libx264") << QStringLiteral("-preset")
+                << QStringLiteral("ultrafast") << paths[i];
+      QProcess ffmpeg;
+      ffmpeg.start(QStringLiteral("ffmpeg"), arguments);
+      QVERIFY(ffmpeg.waitForFinished(30000));
+      QVERIFY2(ffmpeg.exitCode() == 0, ffmpeg.readAllStandardError().constData());
+    }
+    wp::test::Coordinator server;
+    server.start(tmp.filePath(QStringLiteral("coordinator.sqlite")));
+    wp::AppServices host(tmp.filePath(QStringLiteral("host")), nullptr, true, true);
+    wp::AppServices guest(tmp.filePath(QStringLiteral("guest")), nullptr, true, true);
+    QList<QJsonObject> files;
+    for (const auto &path : paths) {
+      files.append(sourceFile(host, path));
+      sourceFile(guest, path);
+    }
+    QSignalSpy created(&host.rooms, &wp::RoomClient::entered);
+    host.rooms.create(server.url(), QStringLiteral("Episode subtitles"), QStringLiteral("Host"));
+    QTRY_COMPARE_WITH_TIMEOUT(created.size(), 1, 5000);
+    const auto room = created.first()[1].toString();
+    QTRY_VERIFY_WITH_TIMEOUT(host.rooms.connected(room), 5000);
+    QSignalSpy entered(&guest.rooms, &wp::RoomClient::entered);
+    guest.rooms.join(host.rooms.inviteLink(room), QStringLiteral("Guest"));
+    QTRY_COMPARE_WITH_TIMEOUT(entered.size(), 1, 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(guest.rooms.connected(room), 5000);
+    for (int i = 0; i < files.size(); ++i) {
+      const auto file = files[i];
+      const auto sha = file.value(QStringLiteral("sha256")).toString();
+      const auto identity = QStringLiteral("sha256:") + sha;
+      const QJsonObject source{{QStringLiteral("id"), identity},
+                               {QStringLiteral("kind"), QStringLiteral("direct")},
+                               {QStringLiteral("identity"), identity},
+                               {QStringLiteral("uri"), QStringLiteral("https://example.invalid/episode.mkv")},
+                               {QStringLiteral("label"), QStringLiteral("Own copy")}};
+      const QJsonObject video{{QStringLiteral("mediaId"), wp::RoomMedia::mediaId(identity, 0)},
+                              {QStringLiteral("path"), QFileInfo(paths[i]).fileName()},
+                              {QStringLiteral("label"), QStringLiteral("Episode %1").arg(i + 1)},
+                              {QStringLiteral("fileIndex"), 0},
+                              {QStringLiteral("size"), file.value(QStringLiteral("size"))},
+                              {QStringLiteral("duration"), 12},
+                              {QStringLiteral("selected"), true},
+                              {QStringLiteral("sha256"), sha}};
+      host.rooms.command(room, {{QStringLiteral("type"), QStringLiteral("queue.add")},
+                                {QStringLiteral("source"), source},
+                                {QStringLiteral("files"), QJsonArray{video}}});
+      QTRY_COMPARE_WITH_TIMEOUT(host.rooms.room(room).value(QStringLiteral("entries")).toArray().size(),
+                                i + 1, 5000);
+    }
+    const auto entries = host.rooms.room(room).value(QStringLiteral("entries")).toArray();
+    const auto first = entries[0].toObject().value(QStringLiteral("id")).toString();
+    const auto second = entries[1].toObject().value(QStringLiteral("id")).toString();
+    host.playback.setRoom(room);
+    guest.playback.setRoom(room);
+    host.playback.joinWatch();
+    QTRY_COMPARE_WITH_TIMEOUT(playback(guest, room).value(QStringLiteral("entryId")).toString(), first, 5000);
+    guest.playback.joinWatch();
+    QTRY_VERIFY_WITH_TIMEOUT(host.player.tracksKnown() && guest.player.tracksKnown(), 10000);
+    QString embedded;
+    for (auto value : host.player.tracks())
+      if (value.toObject().value(QStringLiteral("type")).toString() == QStringLiteral("sub"))
+        embedded = value.toObject().value(QStringLiteral("key")).toString();
+    QVERIFY(!embedded.isEmpty());
+    host.playback.setTracks(QStringLiteral("auto"), embedded, 0.75);
+    QTRY_VERIFY_WITH_TIMEOUT(host.player.mediaInfo().value(QStringLiteral("subtitleId")).toInt(-1) > 0 &&
+                                 guest.player.mediaInfo().value(QStringLiteral("subtitleId")).toInt(-1) > 0,
+                             5000);
+    host.playback.togglePause();
+    QTRY_VERIFY_WITH_TIMEOUT(!playback(host, room).value(QStringLiteral("paused")).toBool(), 5000);
+    QSignalSpy hostErrors(&host.playback, &wp::PlaybackController::error);
+    QSignalSpy guestErrors(&guest.playback, &wp::PlaybackController::error);
+    host.playback.choose(second);
+    QTRY_VERIFY_WITH_TIMEOUT(host.player.loaded() && guest.player.loaded() &&
+                                 host.playback.entryId() == second && guest.playback.entryId() == second,
+                             10000);
+    QTRY_COMPARE_WITH_TIMEOUT(host.playback.subtitleChoice(), QStringLiteral("off"), 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(guest.playback.subtitleChoice(), QStringLiteral("off"), 5000);
+    QCOMPARE(host.playback.subtitleDelay(), 0);
+    QCOMPARE(guest.playback.subtitleDelay(), 0);
+    QTRY_COMPARE_WITH_TIMEOUT(nativeSubtitle(host.player), QStringLiteral("no"), 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(nativeSubtitle(guest.player), QStringLiteral("no"), 5000);
+    QVERIFY(host.player.error().isEmpty());
+    QVERIFY(guest.player.error().isEmpty());
+    QCOMPARE(hostErrors.size(), 0);
+    QCOMPARE(guestErrors.size(), 0);
+    // A new explicit request during this episode must still explain a missing
+    // shared track; episode-transition fallback must not erase that choice.
+    host.playback.setTracks(QStringLiteral("auto"), embedded, 0.5);
+    QTRY_COMPARE_WITH_TIMEOUT(guest.playback.subtitleChoice(), embedded, 5000);
+    host.playback.togglePause();
+    QTRY_VERIFY_WITH_TIMEOUT(playback(host, room)
+                                 .value(QStringLiteral("reason"))
+                                 .toString()
+                                 .contains(QStringLiteral("subtitle track")),
+                             5000);
+    QTest::qWait(500);
+    QCOMPARE(host.playback.subtitleChoice(), embedded);
+    QVERIFY(playback(host, room).value(QStringLiteral("paused")).toBool());
+    host.playback.setTracks(QStringLiteral("auto"), QStringLiteral("off"), 0);
+    QTRY_VERIFY_WITH_TIMEOUT(!playback(host, room).value(QStringLiteral("paused")).toBool(), 5000);
+    // Reopening the subtitle-bearing file must not restore its previous native
+    // numeric ID while the room's current selection is off.
+    host.playback.choose(first);
+    QTRY_VERIFY_WITH_TIMEOUT(host.player.loaded() && guest.player.loaded() &&
+                                 host.playback.entryId() == first && guest.playback.entryId() == first,
+                             10000);
+    // Unchanged native properties are not necessarily re-observed after open
+    // clears mediaInfo, so inspect the actual current file's selection.
+    QTRY_COMPARE_WITH_TIMEOUT(nativeSubtitle(host.player), QStringLiteral("no"), 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(nativeSubtitle(guest.player), QStringLiteral("no"), 5000);
+    host.playback.setTracks(QStringLiteral("auto"), embedded, 0.25);
+    QTRY_VERIFY_WITH_TIMEOUT(guest.player.mediaInfo().value(QStringLiteral("subtitleId")).toInt(-1) > 0,
+                             5000);
+    host.playback.togglePause();
+    QTRY_VERIFY_WITH_TIMEOUT(!playback(host, room).value(QStringLiteral("paused")).toBool(), 5000);
+    host.rooms.command(room, {{QStringLiteral("type"), QStringLiteral("playback.next")}});
+    QTRY_VERIFY_WITH_TIMEOUT(host.playback.entryId() == second && guest.playback.entryId() == second &&
+                                 host.playback.subtitleChoice() == QStringLiteral("off") &&
+                                 guest.playback.subtitleChoice() == QStringLiteral("off") &&
+                                 !playback(host, room).value(QStringLiteral("paused")).toBool(),
+                             10000);
+    QCOMPARE(hostErrors.size(), 0);
+    QCOMPARE(guestErrors.size(), 0);
+  }
   void restartingMembershipRequiresAnotherExplicitJoinButReconnectingDoesNot() {
     QTemporaryDir tmp;
     wp::test::Coordinator server;

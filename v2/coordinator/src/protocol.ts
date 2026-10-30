@@ -86,6 +86,8 @@ export type Playback = {
   entryId: string | null; generation: number; position: number; anchor: number;
   paused: boolean; requested: boolean; startsAt: number | null; rate: number;
   reason: string; audio: string; subtitle: string; subtitleDelay: number;
+  // A carried embedded key is provisional until the new episode's track inventories arrive.
+  subtitleTransition?: boolean;
 };
 export type Live = { connectionId: string; lastSeen: number; status: Status | null; statusAt: number; coveragePosition: number | null; coverageAt: number };
 export type Member = {

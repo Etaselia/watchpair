@@ -28,6 +28,7 @@ public:
   void addSubtitle(const QUrl &url, const QString &portableKey);
   bool setTracks(const QString &audio, const QString &subtitle, double delay);
   QJsonArray tracks() const { return tracks_; }
+  bool tracksKnown() const { return loaded_ && tracksKnown_; }
   QJsonArray chapters() const { return chapters_; }
   QJsonObject mediaInfo() const { return mediaInfo_; }
   QJsonArray audioDevices() const;
@@ -59,7 +60,7 @@ private:
   double observedRate_ = 1;
   double position_ = 0, duration_ = 0;
   double volume_ = 80, cachedSeconds_ = 0;
-  bool loaded_ = false, buffering_ = false;
+  bool loaded_ = false, tracksKnown_ = false, buffering_ = false;
   bool renderReady_ = false, pendingOpen_ = false;
   bool paused_ = false, seeking_ = false, atEnd_ = false;
   quint64 epoch_ = 100;

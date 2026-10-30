@@ -16,7 +16,7 @@ const queueCommand = (type: string) => (type.startsWith('queue.') && type !== 'q
 const playbackCommand = (type: string) => type.startsWith('playback.') || type === 'tracks.select';
 const freshPlayback = (now: number): Room['playback'] => ({
   entryId: null, generation: 0, position: 0, anchor: now, paused: true, requested: false,
-  startsAt: null, rate: 1, reason: 'Choose an episode', audio: 'auto', subtitle: 'off', subtitleDelay: 0,
+  startsAt: null, rate: 1, reason: 'Choose an episode', audio: 'auto', subtitle: 'off', subtitleDelay: 0, subtitleTransition: false,
 });
 type Ack = { operationId: string; revision: number; queueRevision: number; replayed: boolean; secret?: string; secretCurrent?: boolean };
 
@@ -185,10 +185,45 @@ export class Engine extends EventEmitter {
       if (next) { const live = this.member(room, next).live!; live.coveragePosition = null; live.coverageAt = this.now(); }
     }
   }
+  private setEntry(room: Room, entryId: string | null) {
+    const p = room.playback;
+    if (p.entryId === entryId) return;
+    // External subtitles belong to their episode. Embedded keys may carry only
+    // after the new media has proved they exist for the required watchers.
+    p.subtitleTransition = !!entryId && p.subtitle !== 'off' && !p.subtitle.startsWith('ext:');
+    if (!entryId || p.subtitle.startsWith('ext:')) { p.subtitle = 'off'; p.subtitleDelay = 0; }
+    p.entryId = entryId;
+  }
+  private resolveSubtitleTransition(room: Room) {
+    const p = room.playback;
+    if (!p.subtitleTransition) return;
+    const entry = room.entries.find(e => e.id === p.entryId);
+    if (!entry) return;
+    const active = room.members.filter(m => m.watch === 'active');
+    // A late staging member does not block an established watch. When nobody
+    // is active yet, resolve for the members explicitly joining this watch.
+    const required = active.length ? active : room.members.filter(m => m.watch === 'staging');
+    let known = 0;
+    for (const member of required) {
+      const live = member.live, status = live?.status;
+      if (!live || !status || status.entryId !== entry.id || status.identity !== entry.mediaId ||
+          status.generation !== p.generation || status.tracksKnown !== true || this.now() - live.statusAt > 1250) continue;
+      if (!status.subtitles.includes(p.subtitle)) {
+        p.subtitle = 'off'; p.subtitleDelay = 0; p.subtitleTransition = false;
+        this.invalidate(room, this.position(room), 'Subtitles off for this episode');
+        return;
+      }
+      ++known;
+    }
+    if (required.length && known === required.length) {
+      p.subtitleTransition = false;
+      this.invalidate(room, this.position(room), 'Applying subtitles for this episode');
+    }
+  }
   private ready(room: Room, member: Member) {
     const status = member.live?.status, p = room.playback;
     const entry = room.entries.find(e => e.id === p.entryId);
-    return !!(entry && status && status.entryId === entry.id && status.generation === p.generation &&
+    return !!(entry && !p.subtitleTransition && status && status.entryId === entry.id && status.generation === p.generation &&
       status.ready && status.identity === entry.mediaId &&
       this.now() - member.live!.statusAt <= 1250 &&
       Math.abs(status.position - timelinePosition(p, p.paused ? this.now() : member.live!.statusAt, entry.duration)) <= 0.75 &&
@@ -196,8 +231,9 @@ export class Engine extends EventEmitter {
       (p.audio === 'auto' || status.audio.includes(p.audio)) && (p.subtitle === 'off' || status.subtitles.includes(p.subtitle)));
   }
   private reconcile(room: Room) {
-    if (!room.playback.entryId || !room.playback.requested) return false;
     const previous = JSON.stringify(room.playback);
+    this.resolveSubtitleTransition(room);
+    if (!room.playback.entryId || !room.playback.requested) return previous !== JSON.stringify(room.playback);
     if (!this.member(room, room.hostId).live) this.freeze(room, 'Host disconnected');
     else {
       const required = room.members.filter(m => m.watch === 'active');
@@ -205,7 +241,8 @@ export class Engine extends EventEmitter {
       if (!required.length) this.freeze(room, 'Join watch to start playback');
       else if (waiting) {
         const status = waiting.live?.status;
-        const reason = status?.generation === room.playback.generation && status.tracksKnown !== false && room.playback.audio !== 'auto' && !status.audio.includes(room.playback.audio)
+        const reason = room.playback.subtitleTransition ? 'Checking subtitles for this episode'
+          : status?.generation === room.playback.generation && status.tracksKnown !== false && room.playback.audio !== 'auto' && !status.audio.includes(room.playback.audio)
           ? `${waiting.name} does not have the selected audio track`
           : status?.generation === room.playback.generation && status.tracksKnown !== false && room.playback.subtitle !== 'off' && !status.subtitles.includes(room.playback.subtitle)
             ? `${waiting.name} does not have the selected subtitle track`
@@ -222,8 +259,7 @@ export class Engine extends EventEmitter {
   private next(room: Room) {
     const current = room.entries.findIndex(e => e.id === room.playback.entryId);
     const entry = room.entries.slice(current + 1).find(e => e.enabled && e.watchedAt === null);
-    if(room.playback.entryId!==entry?.id&&room.playback.subtitle.startsWith('ext:')){room.playback.subtitle='off';room.playback.subtitleDelay=0;}
-    room.playback.entryId = entry?.id ?? null;
+    this.setEntry(room, entry?.id ?? null);
     room.playback.requested = !!entry && room.playback.requested;
     this.invalidate(room, 0, entry ? 'Preparing the next episode' : 'No more selected episodes');
   }
@@ -273,7 +309,7 @@ export class Engine extends EventEmitter {
         for (const entry of room.entries) if (removed.has(entry.id)) entry.enabled = false;
         if (p.entryId && removed.has(p.entryId)) this.next(room);
         else if (source.assets?.some(a => p.subtitle === `ext:${a.sha256}`)) {
-          const position = this.position(room); p.subtitle = 'off'; p.subtitleDelay = 0;
+          const position = this.position(room); p.subtitle = 'off'; p.subtitleDelay = 0; p.subtitleTransition = false;
           this.invalidate(room, position, 'Shared subtitle removed');
         }
         room.entries = room.entries.filter(e => !removed.has(e.id));
@@ -343,12 +379,11 @@ export class Engine extends EventEmitter {
       }
       case 'playback.choose': {
         const entry = this.entry(room, c.entryId); requireThat(entry.enabled, 'NOT_SELECTED', 'Select this episode before playing it.');
-        if(p.entryId!==entry.id&&p.subtitle.startsWith('ext:')){p.subtitle='off';p.subtitleDelay=0;}
-        p.entryId = entry.id; p.requested = false; this.invalidate(room, 0, 'Ready to watch'); break;
+        this.setEntry(room, entry.id); p.requested = false; this.invalidate(room, 0, 'Ready to watch'); break;
       }
       case 'playback.play': {
         requireThat(this.member(room, room.hostId).live, 'HOST_OFFLINE', 'The host must reconnect or the designated successor must take over.');
-        if (!p.entryId) { const entry = room.entries.find(e => e.enabled && e.watchedAt === null); requireThat(entry, 'EMPTY_QUEUE', 'Add and select an episode first.'); p.entryId = entry.id; this.invalidate(room, 0, 'Preparing playback'); }
+        if (!p.entryId) { const entry = room.entries.find(e => e.enabled && e.watchedAt === null); requireThat(entry, 'EMPTY_QUEUE', 'Add and select an episode first.'); this.setEntry(room, entry.id); this.invalidate(room, 0, 'Preparing playback'); }
         p.requested = true; break;
       }
       case 'playback.pause': this.invalidate(room, this.position(room), 'Paused by a room member'); p.requested = false; break;
@@ -367,7 +402,7 @@ export class Engine extends EventEmitter {
         requireThat(entry.duration && this.position(room) >= entry.duration - 1, 'NOT_ENDED', 'This episode has not reached its end.'); this.next(room); break;
       }
       case 'tracks.select': {
-        p.audio = c.audio; p.subtitle = c.subtitle; p.subtitleDelay = c.subtitleDelay;
+        p.audio = c.audio; p.subtitle = c.subtitle; p.subtitleDelay = c.subtitleDelay; p.subtitleTransition = false;
         this.invalidate(room, this.position(original), 'Applying shared audio and subtitles'); break;
       }
       case 'watch.join':
