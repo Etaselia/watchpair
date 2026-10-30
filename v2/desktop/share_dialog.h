@@ -17,6 +17,7 @@ private:
   FileSelector *files_;
   QLabel *error_;
   QPushButton *apply_, *reload_;
+  QComboBox *connectionMode_;
   QString operation_;
   qint64 revision_ = -1;
 };

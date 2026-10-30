@@ -40,6 +40,20 @@ public:
     throw std::runtime_error(process_.readAllStandardError().constData());
   }
   QString url() const { return QStringLiteral("http://127.0.0.1:%1").arg(port_); }
+  bool directFault(const QString &fault) {
+    process_.write(QJsonDocument(QJsonObject{{QStringLiteral("directFault"), fault}}).toJson(QJsonDocument::Compact) + '\n');
+    process_.waitForBytesWritten(1000);
+    QElapsedTimer clock;
+    clock.start();
+    while (clock.elapsed() < 3000) {
+      process_.waitForReadyRead(100);
+      while (process_.canReadLine())
+        if (QJsonDocument::fromJson(process_.readLine()).object().value(QStringLiteral("directFault")).toString() == fault)
+          return true;
+    }
+    return false;
+  }
+  bool blockDirect() { return directFault(QStringLiteral("blocked")); }
   QJsonObject inspect(const QString &room) {
     process_.write(
         QJsonDocument(QJsonObject{{QStringLiteral("inspectRoom"), room}}).toJson(QJsonDocument::Compact) +

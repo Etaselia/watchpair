@@ -368,6 +368,16 @@ QJsonObject installBundle(const QString &bundle, const QString &directory, const
   if (!QDir().mkpath(root + QStringLiteral("/versions")) || !QDir().mkpath(root + QStringLiteral("/backups")))
     fail(QStringLiteral("Cannot create the version and backup directories."));
   const auto version = manifest.value(QStringLiteral("version")).toString();
+  if (QFileInfo::exists(root + QStringLiteral("/current.txt"))) {
+    const auto installed =
+        json(root + QStringLiteral("/versions/") + current(root) + QStringLiteral("/runtime-manifest.json"))
+            .value(QStringLiteral("version"))
+            .toString();
+    if (compareVersions(version, installed) < 0)
+      fail(QStringLiteral("This copy (%1) is older than the installed version (%2). Open the installed "
+                          "copy instead. Use Restore previous version for an intentional rollback.")
+               .arg(version, installed));
+  }
   auto name = version + QLatin1Char('-') +
               QString::fromLatin1(digest(bundle + QStringLiteral("/runtime-manifest.json")).left(12));
   auto destination = root + QStringLiteral("/versions/") + name;
@@ -425,6 +435,75 @@ QJsonObject installBundle(const QString &bundle, const QString &directory, const
   return {
       {QStringLiteral("root"), root}, {QStringLiteral("version"), version}, {QStringLiteral("key"), name}};
 }
+QJsonObject installationState(const QString &directory) {
+  const auto root = normalized(directory);
+  profile(root); // Validate the installer ownership marker before reading pointers.
+  const auto installed = current(root);
+  auto versionFor = [&](const QString &name) {
+    if (!key(name))
+      fail(QStringLiteral("The installed version pointer is damaged."));
+    const auto version =
+        json(root + QStringLiteral("/versions/") + name + QStringLiteral("/runtime-manifest.json"))
+            .value(QStringLiteral("version"))
+            .toString();
+    compareVersions(version, version);
+    if (!name.startsWith(version + QLatin1Char('-')))
+      fail(QStringLiteral("The installation version does not match its manifest."));
+    return version;
+  };
+  QJsonObject result{{QStringLiteral("version"), versionFor(installed)}, {QStringLiteral("key"), installed}};
+  if (QFileInfo::exists(root + QStringLiteral("/staged.json"))) {
+    const auto staged = json(root + QStringLiteral("/staged.json"));
+    const auto nonce = staged.value(QStringLiteral("nonce")).toString();
+    if (staged.value(QStringLiteral("format")).toInt() != 1 ||
+        staged.value(QStringLiteral("from")).toString() != installed || !key(nonce) ||
+        staged.value(QStringLiteral("to")).toString() == installed ||
+        staged.value(QStringLiteral("backup")).toString() !=
+            QStringLiteral("backups/") + nonce + QStringLiteral(".sqlite"))
+      fail(QStringLiteral("The staged update no longer matches this installation. Download it again."));
+    const auto target = staged.value(QStringLiteral("to")).toString();
+    const auto targetVersion = versionFor(target);
+    result.insert(QStringLiteral("stagedVersion"), targetVersion);
+    result.insert(QStringLiteral("stagedKey"), target);
+    result.insert(QStringLiteral("stagedObsolete"),
+                  compareVersions(targetVersion, result.value(QStringLiteral("version")).toString()) < 0);
+  }
+  return result;
+}
+QString prepareRestart(const QString &runningBundle, const QString &directory, const QString &profilePath) {
+  const auto root = normalized(directory);
+  if (profile(root) != normalized(profilePath))
+    fail(QStringLiteral("This installation belongs to a different profile."));
+  const auto running = verifyBundle(runningBundle).value(QStringLiteral("version")).toString();
+  auto state = installationState(root);
+  const auto installed = state.value(QStringLiteral("version")).toString();
+  const auto staged = state.value(QStringLiteral("stagedVersion")).toString();
+  // A newer portable copy must not restart into an older installed copy. Stage
+  // the verified running bundle unless an equally new or newer update is ready.
+  if (compareVersions(running, installed) > 0 && (staged.isEmpty() || compareVersions(running, staged) > 0)) {
+    installBundle(runningBundle, root, profilePath);
+    state = installationState(root);
+  } else if (!staged.isEmpty() && compareVersions(staged, installed) < 0) {
+    // Older clients could stage their portable copy over a newer installation.
+    // Discard only that obsolete activation marker, retaining all runtime files.
+    QLockFile lock(root + QStringLiteral("/install.lock"));
+    if (!lock.tryLock())
+      fail(QStringLiteral("Another installation task is using this application folder."));
+    if (installationState(root) != state || !QFile::remove(root + QStringLiteral("/staged.json")))
+      fail(QStringLiteral("The staged update changed. Check for updates and try again."));
+    state = installationState(root);
+  }
+  const bool activateUpdate = state.contains(QStringLiteral("stagedKey"));
+  const auto selected =
+      state.value(activateUpdate ? QStringLiteral("stagedKey") : QStringLiteral("key")).toString();
+  const auto selectedVersion = verifyBundle(root + QStringLiteral("/versions/") + selected)
+                                   .value(QStringLiteral("version"))
+                                   .toString();
+  if (compareVersions(selectedVersion, running) < 0)
+    fail(QStringLiteral(
+        "The installed version is older than this copy. Install this copy before restarting."));
+  return activateUpdate ? QStringLiteral("activate") : QStringLiteral("installed");
+}
 void activate(const QString &directory) {
   const auto root = normalized(directory), profileName = profile(root);
   QLockFile installationLock(root + QStringLiteral("/install.lock"));
@@ -465,6 +544,34 @@ void activate(const QString &directory) {
   save(root + QStringLiteral("/current.txt"), to.toLatin1() + '\n');
   QFile::remove(root + QStringLiteral("/staged.json"));
 }
+namespace {
+QJsonObject recoveryState(const QString &root) {
+  const auto activation = json(root + QStringLiteral("/last-activation.json"));
+  const auto from = activation.value(QStringLiteral("from")).toString(),
+             to = activation.value(QStringLiteral("to")).toString(),
+             nonce = activation.value(QStringLiteral("nonce")).toString();
+  const auto backupName = QStringLiteral("backups/") + nonce + QStringLiteral(".sqlite");
+  if (activation.value(QStringLiteral("format")).toInt() != 1 || !key(from) || !key(to) ||
+      from == to || !key(nonce) || current(root) != to ||
+      activation.value(QStringLiteral("backup")).toString() != backupName)
+    fail(QStringLiteral("The recovery record does not match the current installation."));
+  const auto backup = root + QLatin1Char('/') + backupName;
+  if (digest(backup) != activation.value(QStringLiteral("backupSha256")).toString().toLatin1())
+    fail(QStringLiteral("The recovery backup checksum does not match. No profile files were changed."));
+  checkDatabase(backup);
+  verifyBundle(root + QStringLiteral("/versions/") + from);
+  return activation;
+}
+} // namespace
+void prepareRollback(const QString &directory, const QString &profilePath) {
+  const auto root = normalized(directory);
+  if (profile(root) != normalized(profilePath))
+    fail(QStringLiteral("This installation belongs to a different profile."));
+  QLockFile lock(root + QStringLiteral("/install.lock"));
+  if (!lock.tryLock())
+    fail(QStringLiteral("Another installation task is using this application folder."));
+  recoveryState(root);
+}
 void rollback(const QString &directory) {
   const auto root = normalized(directory), profileName = profile(root);
   QLockFile installationLock(root + QStringLiteral("/install.lock"));
@@ -473,19 +580,18 @@ void rollback(const QString &directory) {
   QLockFile lock(profileName + QStringLiteral("/instance.lock"));
   if (!lock.tryLock())
     fail(QStringLiteral("Another WatchPair process still uses this profile. Close it before recovery."));
-  const auto activation = json(root + QStringLiteral("/last-activation.json"));
+  // Revalidate after shutdown and under both locks, even when the live client
+  // already checked that recovery is possible before leaving its session.
+  const auto activation = recoveryState(root);
   const auto from = activation.value(QStringLiteral("from")).toString(),
              to = activation.value(QStringLiteral("to")).toString(),
              nonce = activation.value(QStringLiteral("nonce")).toString();
-  const auto backupName = QStringLiteral("backups/") + nonce + QStringLiteral(".sqlite");
-  if (!key(from) || !key(to) || !key(nonce) || current(root) != to ||
-      activation.value(QStringLiteral("backup")).toString() != backupName)
-    fail(QStringLiteral("The recovery record does not match the current installation."));
-  const auto backup = root + QLatin1Char('/') + backupName;
-  if (digest(backup) != activation.value(QStringLiteral("backupSha256")).toString().toLatin1())
-    fail(QStringLiteral("The recovery backup checksum does not match. No profile files were changed."));
-  checkDatabase(backup);
-  verifyBundle(root + QStringLiteral("/versions/") + from);
+  const auto backup = root + QLatin1Char('/') + activation.value(QStringLiteral("backup")).toString();
+  // A staged update refers to the version being restored away from. Retain its
+  // runtime files, but discard that obsolete activation before changing current.
+  const auto staged = root + QStringLiteral("/staged.json");
+  if (QFileInfo::exists(staged) && !QFile::remove(staged))
+    fail(QStringLiteral("Cannot discard the staged update before restoring the previous version."));
   const auto database = profileName + QStringLiteral("/watchpair-v2.sqlite");
   for (const auto &suffix : {QString(), QStringLiteral("-wal"), QStringLiteral("-shm")})
     if (QFileInfo::exists(database + suffix) &&
@@ -504,6 +610,14 @@ void rollback(const QString &directory) {
   QFile::remove(root + QStringLiteral("/previous.txt"));
   QFile::rename(root + QStringLiteral("/last-activation.json"),
                 root + QStringLiteral("/backups/rolled-back-") + nonce + QStringLiteral(".json"));
+  try {
+    save(
+        root + QStringLiteral("/recovery-notice.json"),
+        QJsonDocument(QJsonObject{{QStringLiteral("restoredKey"), from}, {QStringLiteral("replacedKey"), to}})
+            .toJson());
+  } catch (const AppError &) {
+    qWarning("The previous version was restored, but its recovery notice could not be saved.");
+  }
 }
 void markHealthy() {
   const auto root = runningRoot();
@@ -531,6 +645,17 @@ void waitForProcess(qint64 pid) {
   for (int n = 0; n < 600; ++n) {
     if (kill(pid_t(pid), 0) < 0 && errno == ESRCH)
       return;
+#ifdef Q_OS_LINUX
+    // An exited process can remain unreaped by its parent. Its files and
+    // locks are already closed, even though kill(pid, 0) still succeeds.
+    QFile process(QStringLiteral("/proc/%1/stat").arg(pid));
+    if (process.open(QIODevice::ReadOnly)) {
+      const auto state = process.read(4096);
+      const auto end = state.lastIndexOf(')');
+      if (end >= 0 && end + 2 < state.size() && state[end + 2] == 'Z')
+        return;
+    }
+#endif
     QThread::msleep(100);
   }
   fail(QStringLiteral("WatchPair did not stop within a minute. Close it and retry."));
@@ -551,6 +676,20 @@ ReleaseManager::ReleaseManager(LocalStore &store, TransferEngine &transfers, QOb
     route_ = next;
   });
   status_ = QStringLiteral("Version %1").arg(QCoreApplication::applicationVersion());
+  try {
+    const auto directory = root();
+    if (!directory.isEmpty() && QFileInfo::exists(directory + QStringLiteral("/recovery-notice.json"))) {
+      const auto notice = delivery::json(directory + QStringLiteral("/recovery-notice.json"));
+      const auto state = delivery::installationState(directory);
+      if (notice.value(QStringLiteral("restoredKey")) == state.value(QStringLiteral("key")))
+        status_ = QStringLiteral("The installed copy returned to version %1 and restored its previous "
+                                 "local profile backup. Running version: %2.")
+                      .arg(state.value(QStringLiteral("version")).toString(),
+                           QCoreApplication::applicationVersion());
+    }
+  } catch (const AppError &) {
+    // A diagnostic notice must never prevent ordinary application startup.
+  }
 }
 ReleaseManager::~ReleaseManager() {
   cancel();
@@ -558,7 +697,19 @@ ReleaseManager::~ReleaseManager() {
   transfers_.setExternalTrafficFor(QStringLiteral("updates"), 0);
 }
 QString ReleaseManager::root() const {
+  const auto running = delivery::runningRoot();
+  if (!running.isEmpty())
+    return running;
   return store_.setting(QStringLiteral("installationRoot")).toString();
+}
+QJsonObject ReleaseManager::installation() const {
+  if (root().isEmpty())
+    return {};
+  try {
+    return delivery::installationState(root());
+  } catch (const AppError &) {
+    return {{QStringLiteral("error"), true}};
+  }
 }
 bool ReleaseManager::canUpdate() const {
   return QByteArray::fromHex(WATCHPAIR_UPDATE_PUBLIC_KEY).size() == 32;
@@ -727,8 +878,23 @@ void ReleaseManager::restart(bool restore) {
   if (restore && !canRollback())
     throw AppError(QStringLiteral("UPDATE_BACKUP"),
                    QStringLiteral("No previous version and profile backup are available."));
-  emit restartRequested(root(), restore    ? QStringLiteral("rollback")
-                                : staged() ? QStringLiteral("activate")
-                                           : QStringLiteral("installed"));
+  control_.reset();
+  const auto directory = root(), profile = store_.profile(), bundle = delivery::bundleRoot();
+  auto action = std::make_shared<QString>();
+  status_ = restore
+                ? QStringLiteral("Verifying the previous version and profile backup. Your current session "
+                                 "stays open until recovery is ready…")
+                : QStringLiteral("Verifying the version to restart. Your current session stays open until "
+                                 "it is ready…");
+  task(
+      [directory, profile, bundle, action, restore] {
+        if (restore) {
+          delivery::prepareRollback(directory, profile);
+          *action = QStringLiteral("rollback");
+        } else
+          *action = delivery::prepareRestart(bundle, directory, profile);
+        return QString();
+      },
+      [this, directory, action] { emit restartRequested(directory, *action); });
 }
 } // namespace wp

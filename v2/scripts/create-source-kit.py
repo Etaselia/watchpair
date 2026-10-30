@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import tarfile
 import urllib.request
+from native_source_overrides import validate_windows_overrides
 
 
 def sha(path):
@@ -49,8 +50,11 @@ def main():
     expected_linux = {tuple(row.split('\t')) for row in (args.linux_bundle / 'runtime-sources.tsv').read_text().splitlines()}
     if expected_linux != {(row['source'], row['version']) for row in ubuntu['sources']}:
         parser.error('The verified Ubuntu source set does not match this runtime')
-    output.mkdir(parents=True)
     project = Path(__file__).resolve().parents[1]
+    override_inputs = validate_windows_overrides(
+        windows, args.windows_bundle, project,
+        [{'name': row['archive'], 'sha256': row['sha256']} for row in msys['sources']])
+    output.mkdir(parents=True)
     code = output / 'watchpair' / 'v2'
     code.mkdir(parents=True)
     for file in project.rglob('*'):
@@ -117,6 +121,8 @@ def main():
         for name in ('runtime-manifest.json', 'build-info.json', 'runtime-packages.tsv', 'runtime-sources.tsv', 'runtime-sdk.tsv'):
             if (bundle / name).is_file():
                 shutil.copyfile(bundle / name, build / f'{label}-{name}')
+    for file in override_inputs:
+        shutil.copyfile(file, build / f'windows-{file.name}')
     (output / 'windows-source-receipt.json').write_text(json.dumps(msys, indent=2))
     (output / 'linux-source-receipt.json').write_text(json.dumps(ubuntu, indent=2))
     (output / 'README.txt').write_text(

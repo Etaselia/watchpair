@@ -24,6 +24,9 @@ Release verifyFeed(const QByteArray &envelope, const QByteArray &publicKey, cons
 QJsonObject verifyBundle(const QString &directory, const QString &expectedVersion = {});
 void extractArchive(const QString &archive, const QString &freshDirectory);
 QJsonObject installBundle(const QString &bundle, const QString &root, const QString &profile);
+QJsonObject installationState(const QString &root);
+QString prepareRestart(const QString &runningBundle, const QString &root, const QString &profile);
+void prepareRollback(const QString &root, const QString &profile);
 void activate(const QString &root);
 void rollback(const QString &root);
 void markHealthy();
@@ -37,6 +40,7 @@ public:
   bool busy() const { return busy_; }
   QString status() const { return status_; }
   QString root() const;
+  QJsonObject installation() const;
   bool canUpdate() const;
   bool canRollback() const;
   bool available() const { return !release_.version.isEmpty(); }

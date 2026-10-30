@@ -68,6 +68,98 @@ public:
 class LocalServices final : public QObject {
   Q_OBJECT
 private slots:
+  void torrentFileUploadsRequireOptInWhileDownloadingAndAfterCompletion() {
+    try {
+      QTemporaryDir tmp;
+      const auto seedRoot = tmp.filePath(QStringLiteral("original"));
+      const auto metadata = torrent(seedRoot, QStringLiteral("Upload policy"));
+      wp::LocalStore store(tmp.filePath(QStringLiteral("profile")));
+      wp::TransferEngine engine(store, nullptr, true);
+      QCOMPARE(engine.configuration().value(QStringLiteral("seedPolicy")).toString(), QStringLiteral("off"));
+      QCOMPARE(engine.configuration().value(QStringLiteral("sharingMode")).toString(), QStringLiteral("p2p-relay"));
+      engine.configure({{QStringLiteral("reserveMiB"), 0}, {QStringLiteral("upLimit"), 16 * 1024}});
+      const auto id = engine.add(metadata);
+      auto *source = engine.source(id);
+      QVERIFY(source);
+      QHash<int, int> choices;
+      wp::TorrentFile available{};
+      for (const auto &file : source->files()) {
+        choices.insert(file.index, 4);
+        if (file.size >= 64 * 1024 && available.size == 0)
+          available = file;
+      }
+      QVERIFY(available.size > 0);
+      QFile original(QDir(seedRoot).filePath(available.path));
+      QVERIFY(original.open(QIODevice::ReadOnly));
+      const auto disk = QDir(engine.view(id).path).filePath(
+          engine.intent(id).value(QStringLiteral("diskPaths")).toObject()
+              .value(QString::number(available.index)).toString());
+      write(disk, original.readAll());
+      engine.select(id, choices);
+      engine.recheck(id);
+      const int piece = int((available.offset + source->pieceLength() - 1) / source->pieceLength());
+      QTRY_VERIFY_WITH_TIMEOUT(source->hasPiece(piece), 10000);
+      QTRY_VERIFY_WITH_TIMEOUT(engine.view(id).verified > 0 && engine.view(id).verified < engine.view(id).wanted, 10000);
+      QVERIFY(!engine.view(id).uploadsEnabled);
+      QTRY_VERIFY_WITH_TIMEOUT(engine.port() > 0, 5000);
+
+      lt::settings_pack settings;
+      settings.set_str(lt::settings_pack::listen_interfaces, wp::torrentListenInterface(true));
+      settings.set_bool(lt::settings_pack::enable_dht, false);
+      settings.set_bool(lt::settings_pack::enable_lsd, false);
+      settings.set_bool(lt::settings_pack::enable_upnp, false);
+      settings.set_bool(lt::settings_pack::enable_natpmp, false);
+      lt::session leecher(settings);
+      lt::add_torrent_params params;
+      params.ti = std::make_shared<lt::torrent_info>(metadata.toStdString());
+      params.save_path = tmp.filePath(QStringLiteral("leecher")).toStdString();
+      params.flags &= ~(lt::torrent_flags::auto_managed | lt::torrent_flags::paused);
+      params.file_priorities.assign(params.ti->num_files(), lt::dont_download);
+      params.file_priorities[available.index] = lt::default_priority;
+      auto peer = leecher.add_torrent(params);
+      peer.connect_peer({lt::make_address("127.0.0.1"), engine.port()});
+      QTRY_VERIFY_WITH_TIMEOUT(peer.status().num_peers > 0, 10000);
+      QTest::qWait(2500);
+      QCOMPARE(peer.status().total_payload_download, qint64(0));
+      QCOMPARE(engine.view(id).uploaded, qint64(0));
+
+      auto configuration = engine.configuration();
+      configuration.insert(QStringLiteral("seedPolicy"), QStringLiteral("unlimited"));
+      engine.configure(configuration);
+      QCOMPARE(engine.seedingPolicy(id), QStringLiteral("unlimited"));
+      QTest::qWait(300);
+      peer.connect_peer({lt::make_address("127.0.0.1"), engine.port()});
+      QTRY_VERIFY_WITH_TIMEOUT(peer.status().total_payload_download > 0, 15000);
+      QVERIFY(peer.status().total_wanted_done < peer.status().total_wanted);
+      engine.setLimits(id, 0, 0, 0, 0, QStringLiteral("off"));
+      QVERIFY(!engine.view(id).uploadsEnabled);
+      QTest::qWait(1500);
+      const auto stopped = peer.status().total_payload_download;
+      QTest::qWait(1500);
+      QCOMPARE(peer.status().total_payload_download, stopped);
+      QCOMPARE(store.get(QStringLiteral("transfer"), id).value(QStringLiteral("seedPolicy")).toString(), QStringLiteral("off"));
+
+      for (const auto &file : source->files()) {
+        QFile input(QDir(seedRoot).filePath(file.path));
+        QVERIFY(input.open(QIODevice::ReadOnly));
+        write(QDir(engine.view(id).path).filePath(engine.intent(id).value(QStringLiteral("diskPaths")).toObject()
+                  .value(QString::number(file.index)).toString()), input.readAll());
+      }
+      engine.recheck(id);
+      QTRY_COMPARE_WITH_TIMEOUT(engine.view(id).state, QStringLiteral("Complete"), 10000);
+      QVERIFY(!engine.view(id).uploadsEnabled);
+      for (const auto &policy : {QStringLiteral("ratio1"), QStringLiteral("ratio2"), QStringLiteral("unlimited")}) {
+        engine.setLimits(id, 0, 0, 0, 0, policy);
+        QCOMPARE(engine.seedingPolicy(id), policy);
+      }
+      engine.setLimits(id, 0, 0, 1.5, 20, QStringLiteral("custom"));
+      QCOMPARE(engine.intent(id).value(QStringLiteral("seedRatio")).toDouble(), 1.5);
+      QCOMPARE(engine.intent(id).value(QStringLiteral("seedMinutes")).toInt(), 20);
+      QVERIFY_EXCEPTION_THROWN(engine.setLimits(id, 0, 0, 0, 0, QStringLiteral("invalid")), wp::AppError);
+    } catch (const std::exception &error) {
+      QFAIL(error.what());
+    }
+  }
   void populatedPortableTorrentResumesWithoutRenamingExistingFiles_data() {
     QTest::addColumn<bool>("staleMapping");
     QTest::newRow("saved-mapping") << false;

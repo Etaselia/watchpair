@@ -15,6 +15,26 @@ New-Item -ItemType Directory -Path $Destination | Out-Null
 $Destination = (Resolve-Path -LiteralPath $Destination).Path
 Copy-Item -LiteralPath $taskExe -Destination $Destination
 Copy-Item -LiteralPath (Join-Path $BuildDirectory 'desktop\watchpair-launcher.exe') -Destination $Destination
+$taskTorrentReceiptPath = Join-Path $BuildDirectory 'desktop\watchpair-libtorrent-build.json'
+$taskTorrentDllPath = Join-Path $BuildDirectory 'desktop\libtorrent-rasterbar.dll'
+if (-not (Test-Path -LiteralPath $taskTorrentReceiptPath) -or -not (Test-Path -LiteralPath $taskTorrentDllPath)) {
+  throw 'Build against the matched libtorrent runtime first; its tested DLL and build receipt must accompany watchpair.exe.'
+}
+$taskTorrentReceipt = Get-Content -LiteralPath $taskTorrentReceiptPath -Raw | ConvertFrom-Json
+$taskRuntimeSelection = Join-Path $BuildDirectory 'torrent-runtime-selection.txt'
+if (-not (Test-Path -LiteralPath $taskRuntimeSelection)) { throw 'Reconfigure the matched native runtime before packaging.' }
+$taskSelectedPaths = @(Get-Content -LiteralPath $taskRuntimeSelection)
+if ($taskSelectedPaths.Count -ne 2 -or
+    (Get-FileHash -LiteralPath $taskSelectedPaths[0] -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $taskTorrentDllPath -Algorithm SHA256).Hash -or
+    (Get-FileHash -LiteralPath $taskSelectedPaths[1] -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $taskTorrentReceiptPath -Algorithm SHA256).Hash) {
+  throw 'The adjacent runtime is stale. Build again to stage the currently selected DLL and receipt.'
+}
+if ($taskTorrentReceipt.format -ne 1 -or $taskTorrentReceipt.asioThreadBackend -ne 'pthread' -or
+    $taskTorrentReceipt.dll.file -ne 'libtorrent-rasterbar.dll' -or
+    (Get-FileHash -LiteralPath $taskTorrentDllPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $taskTorrentReceipt.dll.sha256) {
+  throw 'The tested libtorrent runtime does not match its consistent-backend build receipt.'
+}
+Copy-Item -LiteralPath $taskTorrentReceiptPath,$taskTorrentDllPath -Destination $Destination
 $taskBuildInfo = Get-Content -LiteralPath (Join-Path $BuildDirectory 'build-info.json') -Raw | ConvertFrom-Json
 Copy-Item -LiteralPath (Join-Path $BuildDirectory 'build-info.json') -Destination $Destination
 $env:Path = (Join-Path $taskPrefix 'bin') + ';' + $env:Path
@@ -54,6 +74,9 @@ if (Test-Path -LiteralPath $taskCommon) {Copy-Item -LiteralPath $taskCommon -Des
 Copy-Item -LiteralPath (Join-Path $taskSource 'assets\watchpair.svg') -Destination $Destination
 Copy-Item -LiteralPath (Join-Path $taskSource '..\LICENSE') -Destination (Join-Path $Destination 'WatchPair-LICENSE.txt')
 Copy-Item -LiteralPath (Join-Path $taskSource 'DISTRIBUTION.md') -Destination $Destination
+if ((Get-FileHash -LiteralPath (Join-Path $Destination 'libtorrent-rasterbar.dll') -Algorithm SHA256).Hash.ToLowerInvariant() -ne $taskTorrentReceipt.dll.sha256) {
+  throw 'Dependency deployment replaced the tested libtorrent runtime.'
+}
 Set-Content -LiteralPath (Join-Path $Destination 'PACKAGE-STATUS.txt') -Encoding utf8 -Value 'Internal validation bundle. Public distribution requires exact corresponding source, build recipes, complete license notices, signed release metadata and published checksums. See v2/DISTRIBUTION.md.'
 $taskOwners = @{}
 $taskPackages = foreach ($taskFolder in Get-ChildItem -LiteralPath (Join-Path $MsysRoot 'var\lib\pacman\local') -Directory) {
@@ -88,5 +111,5 @@ $taskRows = foreach ($taskFile in Get-ChildItem -LiteralPath $Destination -Recur
   [ordered]@{path=[IO.Path]::GetRelativePath($Destination,$taskFile.FullName).Replace('\','/');size=$taskFile.Length;sha256=(Get-FileHash -LiteralPath $taskFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant();originPackage=$taskOrigin}
 }
 $taskRuntimePackages = @($taskPackages | Where-Object {$taskRuntimeNames.Contains($_.name)})
-[ordered]@{format=1;version=$taskBuildInfo.version;protocol=2;platform='windows-x64';files=@($taskRows);runtimePackages=$taskRuntimePackages;sdkPackages=@($taskPackages)} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Destination 'runtime-manifest.json') -Encoding utf8
+[ordered]@{format=1;version=$taskBuildInfo.version;protocol=2;platform='windows-x64';files=@($taskRows);runtimePackages=$taskRuntimePackages;sdkPackages=@($taskPackages);runtimeOverrides=@([ordered]@{file='libtorrent-rasterbar.dll';receipt='watchpair-libtorrent-build.json';sha256=$taskTorrentReceipt.dll.sha256;recipe=$taskTorrentReceipt.recipe;asioThreadBackend='pthread'})} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Destination 'runtime-manifest.json') -Encoding utf8
 Write-Output (Join-Path $Destination 'watchpair.exe')

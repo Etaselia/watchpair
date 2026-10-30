@@ -17,6 +17,8 @@
 #include <libtorrent/alert_types.hpp>
 #include <libtorrent/announce_entry.hpp>
 #include <libtorrent/ip_filter.hpp>
+#include <libtorrent/extensions.hpp>
+#include <libtorrent/peer_connection_handle.hpp>
 #include <libtorrent/magnet_uri.hpp>
 #include <libtorrent/peer_info.hpp>
 #include <libtorrent/read_resume_data.hpp>
@@ -35,6 +37,30 @@ QString uuid() {
 QString key(int index) {
   return QString::number(index);
 }
+bool validSeedPolicy(const QString &value, bool perTransfer = false) {
+  return value == QStringLiteral("off") || value == QStringLiteral("ratio1") ||
+         value == QStringLiteral("ratio2") || value == QStringLiteral("unlimited") ||
+         (perTransfer && (value == QStringLiteral("inherit") || value == QStringLiteral("custom")));
+}
+// A zero libtorrent upload rate or slot limit means unlimited. Intercept file
+// piece requests instead, before libtorrent can queue their payload. Protocol
+// handshakes, metadata and tracker traffic remain available for downloading.
+class UploadPeer final : public lt::peer_plugin {
+public:
+  explicit UploadPeer(std::shared_ptr<std::atomic_bool> allowed) : allowed_(std::move(allowed)) {}
+  bool on_request(const lt::peer_request &) override { return !allowed_->load(); }
+private:
+  std::shared_ptr<std::atomic_bool> allowed_;
+};
+class UploadPolicy final : public lt::torrent_plugin {
+public:
+  explicit UploadPolicy(std::shared_ptr<std::atomic_bool> allowed) : allowed_(std::move(allowed)) {}
+  std::shared_ptr<lt::peer_plugin> new_connection(const lt::peer_connection_handle &) override {
+    return std::make_shared<UploadPeer>(allowed_);
+  }
+private:
+  std::shared_ptr<std::atomic_bool> allowed_;
+};
 QString safeComponent(QString name) {
   name.replace(QRegularExpression(QStringLiteral("[<>:\"/\\\\|?*\\x00-\\x1f]")), QStringLiteral("_"));
   while (name.endsWith(QLatin1Char('.')) || name.endsWith(QLatin1Char(' ')))
@@ -389,6 +415,11 @@ void TransferEngine::install(QJsonObject value, bool restoring) {
   auto r = std::make_unique<Record>();
   r->intent = value;
   r->source = std::make_unique<TorrentTransfer>(*this, id);
+  // The gate starts closed even for resume data from an older release. The
+  // current durable device/per-transfer policy is applied before resume.
+  p.extensions.push_back([allowed = r->uploadAllowed](const lt::torrent_handle &, lt::client_data_t) {
+    return std::make_shared<UploadPolicy>(allowed);
+  });
   r->handle = session_->add_torrent(p);
   auto *ptr = r.get();
   ensureOrder(QStringLiteral("torrent:") + id);
@@ -702,16 +733,21 @@ void TransferEngine::setPinned(const QString &id, bool pinned) {
   persist(r, next);
   emit changed();
 }
-void TransferEngine::setLimits(const QString &id, int down, int up, double ratio, int minutes) {
+void TransferEngine::setLimits(const QString &id, int down, int up, double ratio, int minutes,
+                               const QString &seedPolicy) {
   if (down < 0 || up < 0 || ratio < 0 || ratio > 1000 || minutes < 0)
     throw AppError(QStringLiteral("LIMIT_INVALID"),
                    QStringLiteral("Limits must be positive; zero means unlimited."));
+  if (!seedPolicy.isEmpty() && !validSeedPolicy(seedPolicy, true))
+    throw AppError(QStringLiteral("LIMIT_INVALID"), QStringLiteral("Choose a supported seeding policy."));
   auto &r = record(id);
   auto next = r.intent;
   next.insert(QStringLiteral("downLimit"), down);
   next.insert(QStringLiteral("upLimit"), up);
   next.insert(QStringLiteral("seedRatio"), ratio);
   next.insert(QStringLiteral("seedMinutes"), minutes);
+  if (!seedPolicy.isEmpty())
+    next.insert(QStringLiteral("seedPolicy"), seedPolicy);
   persist(r, next);
   applySelection(r);
   schedule();
@@ -1029,6 +1065,15 @@ void TransferEngine::finishRemoval(Record &r) {
 }
 void TransferEngine::configure(const QJsonObject &value) {
   auto next = value;
+  if (!next.contains(QStringLiteral("seedPolicy")))
+    next.insert(QStringLiteral("seedPolicy"), QStringLiteral("off"));
+  if (!validSeedPolicy(next.value(QStringLiteral("seedPolicy")).toString()))
+    throw AppError(QStringLiteral("NETWORK_SETTINGS"), QStringLiteral("Choose a supported default seeding policy."));
+  if (!next.contains(QStringLiteral("sharingMode")))
+    next.insert(QStringLiteral("sharingMode"), QStringLiteral("p2p-relay"));
+  if (next.value(QStringLiteral("sharingMode")).toString() != QStringLiteral("p2p-relay") &&
+      next.value(QStringLiteral("sharingMode")).toString() != QStringLiteral("p2p-only"))
+    throw AppError(QStringLiteral("NETWORK_SETTINGS"), QStringLiteral("Choose peer-to-peer only or relay fallback."));
   for (const auto &name :
        {QStringLiteral("downLimit"), QStringLiteral("upLimit"), QStringLiteral("reserveMiB"),
         QStringLiteral("concurrency"), QStringLiteral("connections"), QStringLiteral("port"),
@@ -1149,6 +1194,28 @@ void TransferEngine::setExternalTrafficFor(const QString &transport, int down, i
   upBudget_->bytesPerSecond.store(externalUpLimit());
   schedule();
 }
+QString TransferEngine::seedingPolicy(const QString &id) const {
+  const auto policy = record(id).intent.value(QStringLiteral("seedPolicy")).toString();
+  if (policy.isEmpty() || policy == QStringLiteral("inherit"))
+    return config_.value(QStringLiteral("seedPolicy")).toString(QStringLiteral("off"));
+  return validSeedPolicy(policy, true) ? policy : QStringLiteral("off");
+}
+bool TransferEngine::allowUpload(const Record &r) const {
+  const auto policy = seedingPolicy(r.source->id());
+  if (policy == QStringLiteral("off") || r.priorities.isEmpty())
+    return false;
+  const auto ratio = policy == QStringLiteral("ratio1") ? 1.0
+                     : policy == QStringLiteral("ratio2") ? 2.0
+                     : policy == QStringLiteral("custom") ? r.intent.value(QStringLiteral("seedRatio")).toDouble()
+                                                           : 0.0;
+  const auto minutes = policy == QStringLiteral("custom") ? r.intent.value(QStringLiteral("seedMinutes")).toInt() : 0;
+  // An existing local copy has no downloaded counter. Its selected size is
+  // the useful denominator for an explicit 1x/2x contribution in that case.
+  const auto base = r.status.all_time_download > 0 ? r.status.all_time_download
+                                                  : std::max<qint64>(1, r.status.total_wanted);
+  return !(ratio > 0 && r.status.all_time_upload >= ratio * base) &&
+         !(minutes > 0 && r.status.seeding_duration.count() >= qint64(minutes) * 60);
+}
 void TransferEngine::schedule() {
   std::vector<Record *> ordered;
   for (auto &[id, r] : records_)
@@ -1197,15 +1264,21 @@ void TransferEngine::schedule() {
       else if (!grantedSlots.contains(QStringLiteral("torrent:") + id))
         reason = QStringLiteral("Waiting for a download slot");
     } else if (completed) {
-      const auto ratio = r->intent.value(QStringLiteral("seedRatio")).toDouble();
-      const auto minutes = r->intent.value(QStringLiteral("seedMinutes")).toInt();
-      if (ratio > 0 && r->status.all_time_upload >= ratio * std::max<qint64>(1, r->status.all_time_download))
-        reason = QStringLiteral("Seeding ratio reached");
-      else if (minutes > 0 && r->status.seeding_duration.count() >= qint64(minutes) * 60)
-        reason = QStringLiteral("Seeding time reached");
+      if (seedingPolicy(id) == QStringLiteral("off"))
+        reason = QStringLiteral("Complete; torrent uploads are off");
+      else if (!allowUpload(*r))
+        reason = QStringLiteral("Seeding limit reached");
     }
     const bool paused = !reason.isEmpty();
-    if (r->physicalPause != paused || bool(r->handle.flags() & lt::torrent_flags::paused) != paused) {
+    const bool allowed = !paused && allowUpload(*r);
+    const bool policyChanged = r->uploadAllowed->exchange(allowed) != allowed;
+    if (policyChanged) {
+      // Drop previously queued uploads and reconnect cleanly when a policy
+      // changes. The request gate already reflects the new durable decision.
+      r->handle.pause();
+      if (!paused)
+        r->handle.resume();
+    } else if (r->physicalPause != paused || bool(r->handle.flags() & lt::torrent_flags::paused) != paused) {
       if (paused) {
         r->handle.clear_piece_deadlines();
         r->handle.pause();
@@ -1531,6 +1604,8 @@ TransferView TransferEngine::view(const QString &id) const {
   v.pinned = r.intent.value(QStringLiteral("pinned")).toBool();
   v.moving = !store_.get(QStringLiteral("storage-job"), id).isEmpty();
   v.inUse = r.playbackFile >= 0 || !r.holds.isEmpty() || !r.pendingHashes.isEmpty();
+  v.seedPolicy = seedingPolicy(id);
+  v.uploadsEnabled = r.uploadAllowed->load();
   // Native telemetry arrives asynchronously after file choices. Show the
   // committed selection immediately, rather than an old zero-byte/seeding row.
   for (const auto &file : r.files)
@@ -1549,6 +1624,10 @@ TransferView TransferEngine::view(const QString &id) const {
                                                       r.intent.value(QStringLiteral("order")).toInt())));
   if (!r.error.isEmpty())
     v.state = QStringLiteral("Error");
+  else if (r.physicalPause && s.total_wanted > 0 && s.total_wanted_done >= s.total_wanted &&
+           (r.reason == QStringLiteral("Complete; torrent uploads are off") ||
+            r.reason == QStringLiteral("Seeding limit reached")))
+    v.state = QStringLiteral("Complete");
   else if (r.physicalPause)
     v.state = v.manualPaused ? QStringLiteral("Paused") : QStringLiteral("Waiting");
   else if (!v.metadata)

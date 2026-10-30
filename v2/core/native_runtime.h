@@ -2,7 +2,9 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include <QRandomGenerator>
 #include <QTcpServer>
+#include <QTcpSocket>
 #include <QUdpSocket>
 #include <clocale>
 #include <stdexcept>
@@ -24,16 +26,28 @@ inline std::string torrentListenInterface(bool localOnly) {
 #ifdef Q_OS_WIN
   // libtorrent binds TCP first, then UDP to the same port. Windows can assign
   // a TCP ephemeral port that is reserved for UDP (notably with Hyper-V/WSL).
-  // Choose a port available to both protocols without changing OS exclusions.
+  // UDP's allocator can also return hundreds of consecutive TCP exclusions.
+  // Spread probes across high ports instead of relying on either allocator.
   const QHostAddress address(localOnly ? QHostAddress::LocalHost : QHostAddress::AnyIPv4);
-  for (int attempt = 0; attempt < 32; ++attempt) {
-    QUdpSocket udp;
-    if (!udp.bind(address, 0, QAbstractSocket::DontShareAddress))
-      continue;
-    QTcpServer tcp;
-    if (tcp.listen(address, udp.localPort()))
-      return (address.toString() + QLatin1Char(':') + QString::number(udp.localPort())).toStdString();
-  }
+  auto available = [&](quint16 first, quint32 count, quint32 stride) -> quint16 {
+    const auto start = QRandomGenerator::system()->bounded(count);
+    for (quint32 attempt = 0; attempt < 128; ++attempt) {
+      const auto port = quint16(first + (start + attempt * stride) % count);
+      QTcpSocket tcp;
+      if (!tcp.bind(address, port, QAbstractSocket::DontShareAddress))
+        continue;
+      QUdpSocket udp;
+      if (udp.bind(address, port, QAbstractSocket::DontShareAddress))
+        return port;
+    }
+    return 0;
+  };
+  // Odd strides visit distinct ports in these power-of-two ranges.
+  auto port = available(49152, 16384, 10127);
+  if (!port)
+    port = available(16384, 32768, 20249);
+  if (port)
+    return (address.toString() + QLatin1Char(':') + QString::number(port)).toStdString();
   throw std::runtime_error("Cannot allocate a torrent port available to both TCP and UDP.");
 #else
   return localOnly ? "127.0.0.1:0" : "0.0.0.0:0";

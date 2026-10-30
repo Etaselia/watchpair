@@ -39,6 +39,15 @@ int changedPixels(const QImage &a, const QImage &b) {
     }
   return result;
 }
+int videoColors(const QImage &image) {
+  QSet<QRgb> distinct;
+  // Subtitle antialiasing can contain many colors over otherwise black
+  // video. Check the fixture's upper video area independently of text.
+  for (int y = 0; y < image.height() / 2; y += 12)
+    for (int x = 0; x < image.width(); x += 12)
+      distinct.insert(image.pixel(x, y));
+  return distinct.size();
+}
 } // namespace
 class MediaMatrix final : public QObject {
   Q_OBJECT
@@ -79,6 +88,13 @@ private slots:
     QVERIFY2(!fixtures.isEmpty(), "Set WATCHPAIR_MEDIA_FIXTURES to the generated fixture directory");
     const auto output = QString::fromLocal8Bit(qgetenv("WATCHPAIR_MEDIA_OUTPUT"));
     wp::Player player(nullptr, false, true);
+    if (qEnvironmentVariableIsSet("WATCHPAIR_MEDIA_DISABLE_SHADER_CACHE"))
+      QCOMPARE(mpv_set_property_string(player.native(), "gpu-shader-cache", "no"), 0);
+    if (qEnvironmentVariableIsSet("WATCHPAIR_MEDIA_GPU_DUMB"))
+      QCOMPARE(mpv_set_property_string(player.native(), "gpu-dumb-mode", "yes"), 0);
+    const bool decodeControl = qEnvironmentVariableIsSet("WATCHPAIR_MEDIA_DECODE_CONTROL");
+    if (decodeControl)
+      QCOMPARE(mpv_set_property_string(player.native(), "screenshot-sw", "yes"), 0);
     // Readers must close before the renderer is destroyed: a native stop can
     // otherwise wait for an HTTP read while render-context teardown blocks.
     wp::VideoWidget video(player);
@@ -102,6 +118,12 @@ private slots:
     video.resize(640, 360);
     video.show();
     QVERIFY(QTest::qWaitForWindowExposed(&video));
+    if (video.softwareGraphics()) {
+      auto *nativeMode = mpv_get_property_string(player.native(), "gpu-dumb-mode");
+      const auto mode = QString::fromUtf8(nativeMode ? nativeMode : "");
+      mpv_free(nativeMode);
+      QCOMPARE(mode, QStringLiteral("yes"));
+    }
     wp::LocalFileSource local(descriptor(QDir(fixtures).filePath(name)));
     auto stream = std::make_unique<wp::VerifiedStream>(local);
     player.open(stream->url(0), false);
@@ -110,14 +132,22 @@ private slots:
     QTRY_VERIFY_WITH_TIMEOUT(video.frames() >= 3, 5000);
     QTRY_VERIFY_WITH_TIMEOUT(player.mediaInfo().value(QStringLiteral("video")).isObject(), 3000);
     QCOMPARE(video.glError(), 0);
+    if (decodeControl) {
+      QVERIFY(!output.isEmpty());
+      const auto path = QDir(output).filePath(name + QStringLiteral(".decoded.png"));
+      const auto encoded = path.toUtf8();
+      const char *args[] = {"screenshot-to-file", encoded.constData(), "video", nullptr};
+      QCOMPARE(mpv_command_async(player.native(), 0, args), 0);
+      QImage decoded;
+      QTRY_VERIFY_WITH_TIMEOUT(decoded.load(path), 5000);
+      qInfo().nospace() << "Decoded screenshot size=" << decoded.size()
+                        << " upperColors=" << videoColors(decoded)
+                        << " position=" << player.sampledPosition();
+    }
     auto image = video.grabFramebuffer();
     auto colors = [&] {
       image = video.grabFramebuffer();
-      QSet<QRgb> distinct;
-      for (int y = 0; y < image.height(); y += 12)
-        for (int x = 0; x < image.width(); x += 12)
-          distinct.insert(image.pixel(x, y));
-      return distinct.size();
+      return videoColors(image);
     };
     QTRY_VERIFY_WITH_TIMEOUT(colors() > 20, 6000);
     QVERIFY2(player.error().isEmpty(), qPrintable(player.error()));

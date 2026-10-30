@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 project(WatchPair VERSION 2.0.0 LANGUAGES CXX)
-set(WATCHPAIR_APP_VERSION "2.0.0-alpha.1" CACHE STRING "Application release version")
+set(WATCHPAIR_APP_VERSION "2.0.0-alpha.4" CACHE STRING "Application release version")
 if(NOT WATCHPAIR_APP_VERSION MATCHES "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\\.(0|[1-9][0-9]*))?$")
   message(FATAL_ERROR "WATCHPAIR_APP_VERSION must be a semantic version, for example 2.0.0-alpha.1. Quote the complete -D argument in PowerShell.")
 endif()

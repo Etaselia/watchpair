@@ -1,5 +1,6 @@
 #pragma once
 #include "app_services.h"
+#include "player_surface.h"
 #include "ui_models.h"
 #include "video_widget.h"
 #include <QComboBox>
@@ -17,8 +18,20 @@
 #include <QWidget>
 namespace wp::ui {
 class QueueProxy final : public QSortFilterProxyModel {
+  Q_OBJECT
 public:
-  using QSortFilterProxyModel::QSortFilterProxyModel;
+  explicit QueueProxy(QObject *parent = nullptr);
+  void setContext(const QString &room, qint64 revision) { room_ = room; revision_ = revision; }
+  Qt::ItemFlags flags(const QModelIndex &index) const override;
+  QStringList mimeTypes() const override;
+  QMimeData *mimeData(const QModelIndexList &indexes) const override;
+  bool dropMimeData(const QMimeData *data, Qt::DropAction action, int row, int column,
+                    const QModelIndex &parent) override;
+  Qt::DropActions supportedDropActions() const override { return Qt::MoveAction; }
+  Qt::DropActions supportedDragActions() const override { return Qt::MoveAction; }
+signals:
+  void reorderRequested(QStringList ids, qint64 revision);
+public:
   void search(const QString &text) {
 #if QT_VERSION >= QT_VERSION_CHECK(6, 10, 0)
     beginFilterChange();
@@ -34,7 +47,8 @@ protected:
   bool filterAcceptsRow(int row, const QModelIndex &parent) const override;
 
 private:
-  QString query_;
+  QString query_, room_;
+  qint64 revision_ = -1;
 };
 class RoomPage final : public QWidget {
   Q_OBJECT
@@ -43,12 +57,15 @@ public:
   void setRoom(const QString &room);
   void refresh();
   void fullscreen(bool enabled);
+  PlayerSurface *playerSurface() const { return surface_; }
+  void setPlayerDetached(bool detached);
   void showWatched() { queueTabs_->setCurrentIndex(1); }
   VideoWidget *video() const { return video_; }
 signals:
   void addRequested(QString room);
   void manageRequested(QString room);
   void fullscreenRequested();
+  void popoutRequested();
   void transferRequested(QString transfer);
   void subtitleRequested(QString room);
   void sourceFilesRequested(QString room, QString source);
@@ -59,7 +76,13 @@ private:
   void mark(bool watched);
   void reorder(int direction);
   void rewatch();
+  void approveSelected(bool wholeSources = false);
+  void clearList();
+  void updateQueueActions();
   void trackChoice();
+  void seekPlayer(double seconds);
+  void skipChapter(int direction);
+  bool chapterMetadataReady() const;
   QString selectedEntry() const;
   QStringList selectedEntries() const;
   AppServices &app_;
@@ -68,6 +91,8 @@ private:
   QueueProxy queueProxy_;
   QSortFilterProxyModel historyProxy_;
   QWidget *header_, *queuePanel_, *playbackControls_, *trackControls_;
+  QWidget *playerHeader_, *playerHome_;
+  PlayerSurface *surface_;
   QFrame *overlay_;
   QSplitter *split_;
   VideoWidget *video_;
@@ -77,6 +102,10 @@ private:
   QStackedWidget *queueStack_;
   QLabel *roomTitle_, *roomSubtitle_, *episodeTitle_, *state_, *time_, *overlayText_;
   QPushButton *join_, *leave_, *play_, *next_, *overlayAction_, *loadHistory_;
+  QPushButton *queueUp_, *queueDown_, *queueMark_, *queueApprove_;
+  QAction *queueUnwatched_, *queueWatchAgain_, *queueRename_, *queueRemove_, *queueClear_, *queueApproveSources_;
+  QLabel *queueHint_;
+  QPushButton *previousChapter_, *nextChapter_, *skipBack_, *skipForward_, *popout_, *reattach_;
   QSlider *seek_, *volume_;
   QComboBox *policy_, *rate_, *audio_, *subtitles_, *chapters_;
   QDoubleSpinBox *subtitleDelay_;
@@ -87,6 +116,7 @@ private:
   QString tracksEntry_;
   QJsonArray loadedHistory_;
   QString historyQuery_;
+  qint64 historyGeneration_ = -1;
   QTimer historySearch_;
   std::function<void()> overlayActionFn_;
   QByteArray trackSignature_;

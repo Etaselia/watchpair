@@ -456,6 +456,11 @@ void RoomClient::message(const QString &key, quint64 epoch, const QString &text)
 void RoomClient::apply(const QString &key, const QJsonObject &data, bool snapshot) {
   auto &c = connection(key);
   const auto oldQueue = c.snapshot.value(QStringLiteral("queueRevision")).toInteger(-1);
+  const bool historyReset = data.contains(QStringLiteral("historyGeneration")) &&
+      data.value(QStringLiteral("historyGeneration")).toInteger() !=
+          c.snapshot.value(QStringLiteral("historyGeneration")).toInteger();
+  if (historyReset)
+    ++c.historyEpoch; // Invalidate an in-flight page from before a shared clear.
   if (data.value(QStringLiteral("id")) != c.credential.value(QStringLiteral("roomId")) ||
       !data.value(QStringLiteral("playback")).isObject() ||
       !data.value(QStringLiteral("members")).isArray() ||
@@ -501,6 +506,8 @@ void RoomClient::apply(const QString &key, const QJsonObject &data, bool snapsho
   if (snapshot || oldQueue != c.snapshot.value(QStringLiteral("queueRevision")).toInteger() ||
       data.contains(QStringLiteral("entries")))
     emit queueChanged(key);
+  if (historyReset)
+    emit historyLoaded(key, c.snapshot.value(QStringLiteral("history")).toArray(), true);
   emit changed(key);
 }
 QString RoomClient::command(const QString &key, const QJsonObject &cmd, Preparation preparation,
@@ -732,8 +739,12 @@ void RoomClient::history(const QString &key, const QJsonObject &cursor, const QS
   QUrl url = endpoint(c.credential, QStringLiteral("/history"));
   QUrlQuery query;
   if (!cursor.isEmpty()) {
-    query.addQueryItem(QStringLiteral("beforeTime"),
-                       QString::number(cursor.value(QStringLiteral("watchedAt")).toInteger()));
+    // The shared contract is Unix milliseconds, including legacy fractional
+    // milliseconds. Do not let QJsonValue::toInteger turn a fraction into zero.
+    const auto timestamp = cursor.value(QStringLiteral("watchedAt")).toDouble(-1);
+    if (!std::isfinite(timestamp) || timestamp < 0 || timestamp > 9007199254740991.0)
+      throw AppError(QStringLiteral("HISTORY_CURSOR"), QStringLiteral("The watched-history cursor is invalid. Reload the list."));
+    query.addQueryItem(QStringLiteral("beforeTime"), QString::number(qint64(std::trunc(timestamp))));
     query.addQueryItem(QStringLiteral("beforeId"), cursor.value(QStringLiteral("id")).toString());
   }
   if (!search.isEmpty())

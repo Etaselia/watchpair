@@ -9,6 +9,8 @@
 #include <QInputDialog>
 #include <QJsonDocument>
 #include <QMenu>
+#include <QMessageBox>
+#include <QMimeData>
 #include <QProgressBar>
 #include <QSignalBlocker>
 #include <QStackedWidget>
@@ -26,7 +28,7 @@ QLabel *text(const QString &value, const QString &role = {}) {
   return result;
 }
 QPushButton *button(const QString &value, const QString &glyph) {
-  return new QPushButton(icon(glyph), value);
+  return glyph.isEmpty() ? new QPushButton(value) : new QPushButton(icon(glyph), value);
 }
 void tableStyle(QTableView *table) {
   table->setAlternatingRowColors(true);
@@ -59,14 +61,85 @@ QString trackLabel(const QJsonObject &t) {
   return label.left(100);
 }
 } // namespace
+QueueProxy::QueueProxy(QObject *parent) : QSortFilterProxyModel(parent) {
+  setDynamicSortFilter(true);
+  setFilterRole(ObjectRole);
+}
 bool QueueProxy::filterAcceptsRow(int row, const QModelIndex &) const {
   const auto *model = qobject_cast<JsonTable *>(sourceModel());
   const auto value = model->row(row);
-  return value.value(QStringLiteral("enabled")).toBool() &&
-         !value.value(QStringLiteral("watchedAt")).isDouble() &&
+  return upcoming(value) &&
          (query_.isEmpty() ||
           value.value(QStringLiteral("label")).toString().contains(query_, Qt::CaseInsensitive) ||
+          value.value(QStringLiteral("sourceLabel")).toString().contains(query_, Qt::CaseInsensitive) ||
           value.value(QStringLiteral("path")).toString().contains(query_, Qt::CaseInsensitive));
+}
+Qt::ItemFlags QueueProxy::flags(const QModelIndex &index) const {
+  return QSortFilterProxyModel::flags(index) | Qt::ItemIsDropEnabled |
+         (index.isValid() ? Qt::ItemIsDragEnabled : Qt::NoItemFlags);
+}
+QStringList QueueProxy::mimeTypes() const {
+  return {QStringLiteral("application/x-watchpair-queue-entries")};
+}
+QMimeData *QueueProxy::mimeData(const QModelIndexList &indexes) const {
+  auto *data = new QMimeData;
+  QSet<int> selected;
+  for (const auto &index : indexes)
+    if (index.isValid())
+      selected.insert(index.row());
+  QList<int> rows(selected.begin(), selected.end());
+  std::sort(rows.begin(), rows.end());
+  QJsonArray ids;
+  for (const auto row : rows)
+    ids.append(index(row, 0).data(IdRole).toString());
+  data->setData(mimeTypes().first(), QJsonDocument(QJsonObject{
+      {QStringLiteral("room"), room_}, {QStringLiteral("revision"), revision_},
+      {QStringLiteral("ids"), ids}}).toJson(QJsonDocument::Compact));
+  return data;
+}
+bool QueueProxy::dropMimeData(const QMimeData *data, Qt::DropAction action, int row, int column,
+                              const QModelIndex &parent) {
+  if (action == Qt::IgnoreAction)
+    return true;
+  if (action != Qt::MoveAction || column > 0 || room_.isEmpty() || revision_ < 0 ||
+      !data->hasFormat(mimeTypes().first()))
+    return false;
+  const auto drag = QJsonDocument::fromJson(data->data(mimeTypes().first())).object();
+  if (drag.value(QStringLiteral("room")).toString() != room_ ||
+      drag.value(QStringLiteral("revision")).toInteger(-1) != revision_)
+    return false;
+  const auto *model = qobject_cast<JsonTable *>(sourceModel());
+  QStringList order, moved;
+  for (int i = 0; i < model->rowCount(); ++i)
+    if (upcoming(model->row(i)))
+      order.append(model->index(i, 0).data(IdRole).toString());
+  for (const auto value : drag.value(QStringLiteral("ids")).toArray()) {
+    const auto id = value.toString();
+    if (!order.contains(id) || moved.contains(id))
+      return false;
+    moved.append(id);
+  }
+  if (moved.isEmpty())
+    return false;
+  // Preserve the room's order of a multi-selection, including hidden rows.
+  QStringList moving, remaining;
+  for (const auto &id : order)
+    (moved.contains(id) ? moving : remaining).append(id);
+  const int target = row >= 0 ? row : parent.isValid() ? parent.row() : rowCount();
+  if (target < 0 || target > rowCount())
+    return false;
+  QString anchor = target < rowCount() ? index(target, 0).data(IdRole).toString() : QString();
+  int original = order.indexOf(anchor);
+  while (!anchor.isEmpty() && moving.contains(anchor))
+    anchor = ++original < order.size() ? order[original] : QString();
+  const int insertAt = anchor.isEmpty() ? remaining.size() : remaining.indexOf(anchor);
+  if (insertAt < 0)
+    return false;
+  for (int i = 0; i < moving.size(); ++i)
+    remaining.insert(insertAt + i, moving[i]);
+  if (remaining != order)
+    emit reorderRequested(remaining, revision_);
+  return true;
 }
 RoomPage::RoomPage(AppServices &app, QWidget *parent)
     : QWidget(parent), app_(app), queueModel_(JsonKind::Queue, this), historyModel_(JsonKind::History, this),
@@ -128,6 +201,7 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   queueLayout->setContentsMargins(0, 0, 0, 0);
   queueLayout->setSpacing(7);
   queueTabs_ = new QTabBar;
+  queueTabs_->setObjectName(QStringLiteral("QueueTabs"));
   queueTabs_->addTab(tr("Upcoming"));
   queueTabs_->addTab(tr("Watched"));
   queueTabs_->setExpanding(true);
@@ -144,6 +218,12 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   queue_->setObjectName(QStringLiteral("EpisodeQueue"));
   queue_->setModel(&queueProxy_);
   tableStyle(queue_);
+  queue_->setDragEnabled(true);
+  queue_->setAcceptDrops(true);
+  queue_->setDropIndicatorShown(true);
+  queue_->setDragDropMode(QAbstractItemView::InternalMove);
+  queue_->setDragDropOverwriteMode(false);
+  queue_->setDefaultDropAction(Qt::MoveAction);
   queue_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
   queue_->setColumnWidth(2, 70);
   queue_->hideColumn(1);
@@ -152,6 +232,7 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   historyProxy_.setSourceModel(&historyModel_);
   historyProxy_.setFilterCaseSensitivity(Qt::CaseInsensitive);
   historyProxy_.setFilterKeyColumn(0);
+  historyProxy_.setFilterRole(SearchRole);
   history_ = new QTableView;
   history_->setObjectName(QStringLiteral("WatchedHistory"));
   history_->setModel(&historyProxy_);
@@ -163,29 +244,44 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   queueStack_->addWidget(history_);
   queueLayout->addWidget(queueStack_, 1);
   auto *queueTools = new QHBoxLayout;
-  auto *up = button(QString(), QStringLiteral("up")), *down = button(QString(), QStringLiteral("down")),
-       *watched = button(tr("Watched"), QStringLiteral("check"));
-  up->setToolTip(tr("Move episode up"));
-  down->setToolTip(tr("Move episode down"));
+  queueUp_ = button(QString(), QStringLiteral("up"));
+  queueDown_ = button(QString(), QStringLiteral("down"));
+  queueMark_ = button(tr("Watched"), QString());
+  queueUp_->setObjectName(QStringLiteral("QueueMoveUp"));
+  queueDown_->setObjectName(QStringLiteral("QueueMoveDown"));
+  queueMark_->setObjectName(QStringLiteral("QueueMarkWatched"));
+  queueUp_->setToolTip(tr("Move selected episode up · or drag to reorder"));
+  queueDown_->setToolTip(tr("Move selected episode down · or drag to reorder"));
   auto *queueMore = new QToolButton;
+  queueMore->setObjectName(QStringLiteral("QueueMore"));
   queueMore->setText(tr("More"));
   queueMore->setPopupMode(QToolButton::InstantPopup);
   auto *queueMenu = new QMenu(queueMore);
   queueMore->setMenu(queueMenu);
-  queueTools->addWidget(up);
-  queueTools->addWidget(down);
-  queueTools->addWidget(watched);
+  queueTools->addWidget(queueUp_);
+  queueTools->addWidget(queueDown_);
+  queueTools->addWidget(queueMark_, 1);
   queueTools->addWidget(queueMore);
   queueLayout->addLayout(queueTools);
+  queueApprove_ = button(tr("Approve selected downloads"), QStringLiteral("download"));
+  queueApprove_->setObjectName(QStringLiteral("QueueApproveDownloads"));
+  queueApprove_->setProperty("role", QStringLiteral("primary"));
+  queueApprove_->setToolTip(tr("Download only the selected episodes on this device. The room queue is unchanged."));
+  queueLayout->addWidget(queueApprove_);
+  queueHint_ = text(tr("Select episodes to download here. Drag rows to reorder for everyone."), QStringLiteral("Muted"));
+  queueHint_->setWordWrap(true);
+  queueLayout->addWidget(queueHint_);
   loadHistory_ = button(tr("Load earlier history"), QStringLiteral("clock"));
   loadHistory_->hide();
   queueLayout->addWidget(loadHistory_);
   split_->addWidget(queuePanel_);
-  auto *playerPanel = new QWidget;
-  auto *playerLayout = new QVBoxLayout(playerPanel);
+  playerHome_ = new QWidget;
+  auto *playerLayout = new QVBoxLayout(playerHome_);
   playerLayout->setContentsMargins(0, 0, 0, 0);
   playerLayout->setSpacing(8);
-  auto *playerHeader = new QHBoxLayout;
+  playerHeader_ = new QWidget;
+  auto *playerHeader = new QHBoxLayout(playerHeader_);
+  playerHeader->setContentsMargins(0, 0, 0, 0);
   episodeTitle_ = text(tr("Choose an episode"), QStringLiteral("SectionTitle"));
   episodeTitle_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
   episodeTitle_->setMinimumWidth(0);
@@ -196,15 +292,14 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   leave_ = button(tr("Leave watch"), QStringLiteral("x"));
   playerHeader->addWidget(join_);
   playerHeader->addWidget(leave_);
-  playerLayout->addLayout(playerHeader);
-  auto *frame = new QFrame;
-  frame->setObjectName(QStringLiteral("PlayerFrame"));
-  frame->setMinimumSize(360, 190);
-  auto *frameLayout = new QGridLayout(frame);
-  frameLayout->setContentsMargins(1, 1, 1, 1);
+  playerLayout->addWidget(playerHeader_);
   video_ = new VideoWidget(app_.player);
   video_->setObjectName(QStringLiteral("NativeVideo"));
-  frameLayout->addWidget(video_, 0, 0);
+  surface_ = new PlayerSurface(video_);
+  reattach_ = button(tr("Player is in a separate window · Return here"), QStringLiteral("fullscreen"));
+  reattach_->setObjectName(QStringLiteral("ReturnPlayer"));
+  reattach_->hide();
+  playerLayout->addWidget(reattach_);
   overlay_ = new QFrame;
   overlay_->setObjectName(QStringLiteral("PlayerOverlay"));
   auto *overlayLayout = new QVBoxLayout(overlay_);
@@ -223,8 +318,8 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   overlayAction_->setProperty("role", QStringLiteral("primary"));
   overlayLayout->addWidget(overlayAction_, 0, Qt::AlignHCenter);
   overlayLayout->addStretch();
-  frameLayout->addWidget(overlay_, 0, 0);
-  playerLayout->addWidget(frame, 1);
+  surface_->setBlockingOverlay(overlay_);
+  playerLayout->addWidget(surface_, 1);
   playbackControls_ = new QWidget;
   auto *controls = new QVBoxLayout(playbackControls_);
   controls->setContentsMargins(0, 0, 0, 0);
@@ -232,18 +327,45 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   auto *timeline = new QHBoxLayout;
   seek_ = new QSlider(Qt::Horizontal);
   seek_->setObjectName(QStringLiteral("SeekSlider"));
+  seek_->setAccessibleName(tr("Playback position"));
   seek_->setRange(0, 1000000);
   time_ = text(QStringLiteral("0:00 / —"));
+  time_->setObjectName(QStringLiteral("PlaybackTime"));
   timeline->addWidget(seek_, 1);
   timeline->addWidget(time_);
   controls->addLayout(timeline);
   auto *transport = new QHBoxLayout;
+  transport->setSpacing(5);
   play_ = button(QString(), QStringLiteral("play"));
   play_->setObjectName(QStringLiteral("PlayPause"));
+  play_->setAccessibleName(tr("Play or pause"));
   play_->setToolTip(tr("Play or pause for the room · Space"));
   next_ = button(QString(), QStringLiteral("next"));
+  next_->setObjectName(QStringLiteral("NextEpisode"));
+  next_->setAccessibleName(tr("Next selected episode"));
   next_->setToolTip(tr("Next selected episode"));
+  previousChapter_ = button(QStringLiteral("|‹"), QString());
+  previousChapter_->setObjectName(QStringLiteral("PreviousChapter"));
+  previousChapter_->setToolTip(tr("Previous chapter · Ctrl+Left"));
+  previousChapter_->setAccessibleName(tr("Previous chapter"));
+  nextChapter_ = button(QStringLiteral("›|"), QString());
+  nextChapter_->setObjectName(QStringLiteral("NextChapter"));
+  nextChapter_->setToolTip(tr("Next chapter · Ctrl+Right"));
+  nextChapter_->setAccessibleName(tr("Next chapter"));
+  skipBack_ = button(QStringLiteral("−10"), QString());
+  skipBack_->setObjectName(QStringLiteral("SeekBack"));
+  skipBack_->setToolTip(tr("Seek back 10 seconds · Left"));
+  skipBack_->setAccessibleName(tr("Seek back 10 seconds"));
+  skipForward_ = button(QStringLiteral("+10"), QString());
+  skipForward_->setObjectName(QStringLiteral("SeekForward"));
+  skipForward_->setToolTip(tr("Seek forward 10 seconds · Right"));
+  skipForward_->setAccessibleName(tr("Seek forward 10 seconds"));
+  for (auto *transportButton : {previousChapter_, skipBack_, play_, skipForward_, nextChapter_, next_}) {
+    transportButton->setFixedWidth(36);
+    transportButton->setStyleSheet(QStringLiteral("padding: 6px 4px;"));
+  }
   state_ = text(tr("Not watching"));
+  state_->setObjectName(QStringLiteral("PlaybackState"));
   state_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
   state_->setProperty("muted", true);
   state_->setMinimumWidth(0);
@@ -253,22 +375,38 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   rate_->setFixedWidth(79);
   volume_ = new QSlider(Qt::Horizontal);
   volume_->setObjectName(QStringLiteral("Volume"));
+  volume_->setAccessibleName(tr("Volume"));
   volume_->setRange(0, 130);
   volume_->setValue(int(app_.player.volume()));
   volume_->setMaximumWidth(105);
   auto *volumeIcon = text(QString());
   volumeIcon->setPixmap(icon(QStringLiteral("volume")).pixmap(19, 19));
   auto *full = button(QString(), QStringLiteral("fullscreen"));
+  full->setObjectName(QStringLiteral("PlayerFullscreen"));
   full->setToolTip(tr("Fullscreen · F11"));
+  full->setAccessibleName(tr("Enter or leave fullscreen"));
+  full->setFixedWidth(36);
+  full->setStyleSheet(QStringLiteral("padding: 6px 4px;"));
+  popout_ = button(QStringLiteral("↗"), QString());
+  popout_->setObjectName(QStringLiteral("PopoutPlayer"));
+  popout_->setToolTip(tr("Open player in a separate window"));
+  popout_->setAccessibleName(tr("Detach or return player"));
+  popout_->setFixedWidth(36);
+  popout_->setStyleSheet(QStringLiteral("padding: 6px 4px;"));
+  transport->addWidget(previousChapter_);
+  transport->addWidget(skipBack_);
   transport->addWidget(play_);
+  transport->addWidget(skipForward_);
+  transport->addWidget(nextChapter_);
   transport->addWidget(next_);
   transport->addWidget(state_, 1);
   transport->addWidget(rate_);
   transport->addWidget(volumeIcon);
   transport->addWidget(volume_);
+  transport->addWidget(popout_);
   transport->addWidget(full);
   controls->addLayout(transport);
-  playerLayout->addWidget(playbackControls_);
+  surface_->addControls(playbackControls_);
   trackControls_ = new QWidget;
   auto *tracks = new QHBoxLayout(trackControls_);
   tracks->setContentsMargins(0, 0, 0, 0);
@@ -288,6 +426,7 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   subtitleDelay_->setToolTip(tr("Shared subtitle delay"));
   subtitleDelay_->setMaximumWidth(95);
   chapters_ = new QComboBox;
+  chapters_->setObjectName(QStringLiteral("Chapters"));
   chapters_->setMinimumContentsLength(8);
   chapters_->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
   auto *addSub = button(QString(), QStringLiteral("plus"));
@@ -297,7 +436,7 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   tracks->addWidget(addSub);
   tracks->addWidget(subtitleDelay_);
   tracks->addWidget(chapters_);
-  playerLayout->addWidget(trackControls_);
+  surface_->addControls(trackControls_);
   members_ = new QTableWidget(0, 3);
   members_->setObjectName(QStringLiteral("Watchers"));
   members_->setHorizontalHeaderLabels({tr("Member"), tr("Watch"), tr("Readiness")});
@@ -311,12 +450,29 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   members_->setMaximumHeight(145);
   members_->setContextMenuPolicy(Qt::CustomContextMenu);
   playerLayout->addWidget(members_);
-  split_->addWidget(playerPanel);
+  split_->addWidget(playerHome_);
   split_->setSizes({320, 800});
   layout->addWidget(split_, 1);
   connect(add, &QPushButton::clicked, this, [this] { emit addRequested(room_); });
   connect(manage, &QPushButton::clicked, this, [this] { emit manageRequested(room_); });
   connect(full, &QPushButton::clicked, this, &RoomPage::fullscreenRequested);
+  connect(popout_, &QPushButton::clicked, this, &RoomPage::popoutRequested);
+  connect(reattach_, &QPushButton::clicked, this, &RoomPage::popoutRequested);
+  connect(surface_, &PlayerSurface::fullscreenRequested, this, &RoomPage::fullscreenRequested);
+  connect(surface_, &PlayerSurface::pauseRequested, play_, &QPushButton::click);
+  connect(surface_, &PlayerSurface::seekRequested, this,
+          [this](double offset) { seekPlayer(app_.playback.position() + offset); });
+  connect(surface_, &PlayerSurface::chapterRequested, this, &RoomPage::skipChapter);
+  connect(surface_, &PlayerSurface::volumeRequested, this, [this](int offset) {
+    volume_->setValue(std::clamp(volume_->value() + offset, 0, 130));
+    app_.perform([this] { app_.store.setSetting(QStringLiteral("volume"), volume_->value()); });
+  });
+  connect(skipBack_, &QPushButton::clicked, this,
+          [this] { seekPlayer(app_.playback.position() - 10); });
+  connect(skipForward_, &QPushButton::clicked, this,
+          [this] { seekPlayer(app_.playback.position() + 10); });
+  connect(previousChapter_, &QPushButton::clicked, this, [this] { skipChapter(-1); });
+  connect(nextChapter_, &QPushButton::clicked, this, [this] { skipChapter(1); });
   connect(join_, &QPushButton::clicked, this,
           [this] { app_.perform([this] { app_.playback.joinWatch(); }); });
   connect(leave_, &QPushButton::clicked, this,
@@ -349,6 +505,7 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
     loadHistory_->setVisible(index == 1 && loadedHistory_.size() >= 200);
     if (index == 1 && !room_.isEmpty())
       app_.rooms.history(room_, {}, historyQuery_);
+    updateQueueActions();
   });
   connect(search, &QLineEdit::textChanged, this, [this](const QString &text) {
     historyQuery_ = text;
@@ -362,29 +519,20 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
     if (!room_.isEmpty())
       app_.rooms.history(room_, {}, historyQuery_);
   });
-  connect(up, &QPushButton::clicked, this, [this] { reorder(-1); });
-  connect(down, &QPushButton::clicked, this, [this] { reorder(1); });
-  connect(watched, &QPushButton::clicked, this, [this] { mark(true); });
-  auto *unwatched = queueMenu->addAction(tr("Mark unwatched"));
-  connect(unwatched, &QAction::triggered, this, [this] { mark(false); });
-  auto *acquire = queueMenu->addAction(tr("Approve download on this device"));
-  connect(acquire, &QAction::triggered, this, [this] {
-    const auto ids = selectedEntries();
-    app_.perform([&] {
-      QHash<QString, QStringList> selected;
-      for (const auto &id : ids) {
-        const auto entry = app_.rooms.entry(room_, id);
-        selected[entry.value(QStringLiteral("sourceId")).toString()].append(
-            entry.value(QStringLiteral("mediaId")).toString());
-      }
-      for (auto it = selected.begin(); it != selected.end(); ++it)
-        app_.media.approve(room_, it.key(), it.value());
-    });
+  connect(queueUp_, &QPushButton::clicked, this, [this] { reorder(-1); });
+  connect(queueDown_, &QPushButton::clicked, this, [this] { reorder(1); });
+  connect(queueMark_, &QPushButton::clicked, this, [this] {
+    if (queueTabs_->currentIndex() == 0) mark(true); else rewatch();
   });
-  auto *watchAgain = queueMenu->addAction(tr("Watch again"));
-  connect(watchAgain, &QAction::triggered, this, &RoomPage::rewatch);
-  auto *rename = queueMenu->addAction(tr("Rename episode…"));
-  connect(rename, &QAction::triggered, this, [this] {
+  connect(queueApprove_, &QPushButton::clicked, this, [this] { approveSelected(); });
+  queueUnwatched_ = queueMenu->addAction(tr("Mark unwatched · keep history"));
+  connect(queueUnwatched_, &QAction::triggered, this, [this] { mark(false); });
+  queueWatchAgain_ = queueMenu->addAction(tr("Watch again"));
+  connect(queueWatchAgain_, &QAction::triggered, this, &RoomPage::rewatch);
+  queueApproveSources_ = queueMenu->addAction(tr("Approve selected sources…"));
+  connect(queueApproveSources_, &QAction::triggered, this, [this] { approveSelected(true); });
+  queueRename_ = queueMenu->addAction(tr("Rename episode…"));
+  connect(queueRename_, &QAction::triggered, this, [this] {
     const auto id = selectedEntry();
     if (id.isEmpty())
       return;
@@ -405,8 +553,8 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
     });
     dialog->open();
   });
-  auto *remove = queueMenu->addAction(tr("Remove from upcoming queue"));
-  connect(remove, &QAction::triggered, this, [this] {
+  queueRemove_ = queueMenu->addAction(tr("Remove selected from Upcoming"));
+  connect(queueRemove_, &QAction::triggered, this, [this] {
     const auto ids = selectedEntries();
     QJsonArray array;
     for (const auto &id : ids)
@@ -416,6 +564,19 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
         app_.rooms.command(room_, {{QStringLiteral("type"), QStringLiteral("queue.remove")},
                                    {QStringLiteral("ids"), array}});
       });
+  });
+  queueMenu->addSeparator();
+  queueClear_ = queueMenu->addAction(tr("Clear Upcoming…"));
+  queueClear_->setObjectName(QStringLiteral("QueueClear"));
+  connect(queueClear_, &QAction::triggered, this, &RoomPage::clearList);
+  connect(queueMenu, &QMenu::aboutToShow, this, &RoomPage::updateQueueActions);
+  connect(queue_->selectionModel(), &QItemSelectionModel::selectionChanged, this, &RoomPage::updateQueueActions);
+  connect(history_->selectionModel(), &QItemSelectionModel::selectionChanged, this, &RoomPage::updateQueueActions);
+  connect(&queueProxy_, &QueueProxy::reorderRequested, this, [this](const QStringList &order, qint64 revision) {
+    QJsonArray ids;
+    for (const auto &id : order) ids.append(id);
+    app_.perform([&] { app_.rooms.command(room_, {{QStringLiteral("type"), QStringLiteral("queue.reorder")},
+      {QStringLiteral("ids"), ids}}, {}, {{QStringLiteral("queueRevision"), revision}}); });
   });
   connect(loadHistory_, &QPushButton::clicked, this, [this] {
     if (!loadedHistory_.isEmpty()) {
@@ -438,7 +599,7 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
                 if (!seen.contains(value.toObject().value(QStringLiteral("id")).toString()))
                   loadedHistory_.append(value);
             }
-            historyModel_.setRows(loadedHistory_);
+            updateQueue();
             loadHistory_->setVisible(queueTabs_->currentIndex() == 1 && items.size() == 200);
           });
   connect(policy_, qOverload<int>(&QComboBox::activated), this, [this](int index) {
@@ -481,7 +642,7 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   connect(chapters_, qOverload<int>(&QComboBox::activated), this, [this](int index) {
     if (chapters_->itemData(index).toDouble() >= 0)
       app_.perform([&] {
-        if (app_.playback.entryId() != tracksEntry_)
+        if (!chapterMetadataReady() || app_.playback.entryId() != tracksEntry_)
           throw AppError(QStringLiteral("PLAYBACK_CHANGED"),
                          tr("The episode changed. Choose its chapter again."));
         if (app_.playback.local())
@@ -555,6 +716,7 @@ void RoomPage::setRoom(const QString &room) {
   room_ = room;
   app_.perform([&] { app_.playback.setRoom(room); });
   loadedHistory_ = {};
+  historyGeneration_ = -1;
   updateQueue();
   refresh();
 }
@@ -562,29 +724,75 @@ void RoomPage::updateQueue() {
   if (room_.isEmpty()) {
     queueModel_.setRows({});
     historyModel_.setRows({});
+    queueProxy_.setContext({}, -1);
+    updateQueueActions();
     return;
   }
   const auto snapshot = app_.rooms.room(room_);
-  const auto selected = selectedEntries();
-  queueModel_.setRows(snapshot.value(QStringLiteral("entries")).toArray());
+  const auto historyGeneration = snapshot.value(QStringLiteral("historyGeneration")).toInteger();
+  if (historyGeneration_ != historyGeneration) {
+    loadedHistory_ = {};
+    historyGeneration_ = historyGeneration;
+  }
+  QStringList selected, selectedHistory;
+  for (const auto &index : queue_->selectionModel()->selectedRows())
+    selected.append(index.data(IdRole).toString());
+  for (const auto &index : history_->selectionModel()->selectedRows())
+    selectedHistory.append(index.data(IdRole).toString());
+  const auto currentQueue = queue_->currentIndex().data(IdRole).toString();
+  const auto currentHistory = history_->currentIndex().data(IdRole).toString();
+  queueProxy_.setContext(room_, snapshot.value(QStringLiteral("queueRevision")).toInteger());
+  QHash<QString, QString> sourceLabels;
+  for (const auto value : snapshot.value(QStringLiteral("sources")).toArray()) {
+    const auto source = value.toObject();
+    sourceLabels.insert(source.value(QStringLiteral("id")).toString(), source.value(QStringLiteral("label")).toString());
+  }
+  QJsonArray entries;
+  QHash<QString, QJsonObject> entriesById;
+  for (const auto value : snapshot.value(QStringLiteral("entries")).toArray()) {
+    auto entry = value.toObject();
+    entry.insert(QStringLiteral("sourceLabel"), sourceLabels.value(entry.value(QStringLiteral("sourceId")).toString()));
+    entries.append(entry);
+    entriesById.insert(entry.value(QStringLiteral("id")).toString(), entry);
+  }
+  queueModel_.setRows(entries);
+  queueProxy_.invalidate(); // Watched/status updates must re-run the membership filter now.
   for (const auto &id : selected) {
     const auto index = queueProxy_.mapFromSource(queueModel_.index(queueModel_.indexOf(id), 0));
     if (index.isValid())
       queue_->selectionModel()->select(index, QItemSelectionModel::Select | QItemSelectionModel::Rows);
   }
+  const auto current = queueProxy_.mapFromSource(queueModel_.index(queueModel_.indexOf(currentQueue), 0));
+  if (current.isValid())
+    queue_->selectionModel()->setCurrentIndex(current, QItemSelectionModel::NoUpdate);
   QHash<QString, QJsonObject> items;
-  for (auto value : loadedHistory_)
-    items.insert(value.toObject().value(QStringLiteral("id")).toString(), value.toObject());
+  auto contextualHistory = [&](QJsonObject item) {
+    const auto entry = entriesById.value(item.value(QStringLiteral("entryId")).toString());
+    for (const auto &field : {QStringLiteral("path"), QStringLiteral("sourceId")})
+      if (item.value(field).toString().isEmpty() && !entry.value(field).toString().isEmpty())
+        item.insert(field, entry.value(field));
+    if (item.value(QStringLiteral("sourceLabel")).toString().isEmpty()) {
+      const auto label = sourceLabels.value(item.value(QStringLiteral("sourceId")).toString());
+      if (!label.isEmpty()) item.insert(QStringLiteral("sourceLabel"), label);
+    }
+    return item;
+  };
+  for (auto value : loadedHistory_) {
+    const auto item = contextualHistory(value.toObject());
+    items.insert(item.value(QStringLiteral("id")).toString(), item);
+  }
   for (auto value : snapshot.value(QStringLiteral("history")).toArray()) {
-    const auto item = value.toObject();
+    const auto item = contextualHistory(value.toObject());
     if (historyQuery_.isEmpty() ||
-        item.value(QStringLiteral("label")).toString().contains(historyQuery_, Qt::CaseInsensitive))
+        (item.value(QStringLiteral("label")).toString() + QLatin1Char(' ') +
+         item.value(QStringLiteral("path")).toString() + QLatin1Char(' ') +
+         item.value(QStringLiteral("sourceLabel")).toString()).contains(historyQuery_, Qt::CaseInsensitive))
       items.insert(item.value(QStringLiteral("id")).toString(), item);
   }
   QList<QJsonObject> ordered(items.begin(), items.end());
   std::sort(ordered.begin(), ordered.end(), [](const auto &a, const auto &b) {
-    const auto at = a.value(QStringLiteral("watchedAt")).toInteger(),
-               bt = b.value(QStringLiteral("watchedAt")).toInteger();
+    const auto at = timestampMilliseconds(a.value(QStringLiteral("watchedAt"))).value_or(0),
+               bt = timestampMilliseconds(b.value(QStringLiteral("watchedAt"))).value_or(0);
     return at != bt ? at > bt
                     : a.value(QStringLiteral("id")).toString() > b.value(QStringLiteral("id")).toString();
   });
@@ -592,13 +800,19 @@ void RoomPage::updateQueue() {
   for (const auto &item : ordered)
     loadedHistory_.append(item);
   historyModel_.setRows(loadedHistory_);
+  for (const auto &id : selectedHistory) {
+    const auto index = historyProxy_.mapFromSource(historyModel_.index(historyModel_.indexOf(id), 0));
+    if (index.isValid())
+      history_->selectionModel()->select(index, QItemSelectionModel::Select | QItemSelectionModel::Rows);
+  }
+  const auto historyCurrent = historyProxy_.mapFromSource(historyModel_.index(historyModel_.indexOf(currentHistory), 0));
+  if (historyCurrent.isValid())
+    history_->selectionModel()->setCurrentIndex(historyCurrent, QItemSelectionModel::NoUpdate);
+  updateQueueActions();
 }
 QString RoomPage::selectedEntry() const {
-  if (queueTabs_->currentIndex() == 1)
-    return historyModel_.row(historyProxy_.mapToSource(history_->currentIndex()).row())
-        .value(QStringLiteral("entryId"))
-        .toString();
-  return queueProxy_.mapToSource(queue_->currentIndex()).data(IdRole).toString();
+  const auto selected = selectedEntries();
+  return selected.size() == 1 ? selected.first() : QString();
 }
 QStringList RoomPage::selectedEntries() const {
   QStringList ids;
@@ -610,7 +824,132 @@ QStringList RoomPage::selectedEntries() const {
   } else
     for (auto index : queue_->selectionModel()->selectedRows())
       ids.append(queueProxy_.mapToSource(index).data(IdRole).toString());
+  ids.removeAll(QString());
+  ids.removeDuplicates();
   return ids;
+}
+void RoomPage::updateQueueActions() {
+  const bool watched = queueTabs_->currentIndex() == 1;
+  const bool connected = !room_.isEmpty() && app_.rooms.connected(room_);
+  const auto selected = selectedEntries();
+  const bool one = selected.size() == 1;
+  queueUp_->setVisible(!watched);
+  queueDown_->setVisible(!watched);
+  queueUp_->setEnabled(connected && one);
+  queueDown_->setEnabled(connected && one);
+  queueMark_->setText(watched ? tr("Rewatch") : tr("Watched"));
+  queueMark_->setToolTip(watched
+      ? tr("Return the selected episode to Upcoming for another viewing. Existing watch history stays.")
+      : tr("Mark the selected episodes watched for everyone. They leave Upcoming when the shared update arrives."));
+  queueMark_->setAccessibleName(watched ? tr("Watch selected episode again") : tr("Mark selected episodes watched"));
+  queueMark_->setEnabled(connected && !selected.isEmpty() && (!watched || one));
+  queueApprove_->setVisible(!watched);
+  queueApprove_->setEnabled(connected && !selected.isEmpty());
+  queueApprove_->setText(selected.isEmpty() ? tr("Approve selected downloads")
+      : tr("Approve %n selected download(s)", nullptr, selected.size()));
+  queueUnwatched_->setVisible(watched);
+  queueWatchAgain_->setVisible(watched);
+  queueUnwatched_->setEnabled(connected && !selected.isEmpty());
+  queueWatchAgain_->setEnabled(connected && one);
+  queueRename_->setVisible(!watched);
+  queueRename_->setEnabled(connected && one);
+  queueRemove_->setVisible(!watched);
+  queueRemove_->setEnabled(connected && !selected.isEmpty());
+  queueApproveSources_->setVisible(!watched);
+  queueApproveSources_->setEnabled(connected && !selected.isEmpty());
+  queueClear_->setText(watched ? tr("Clear Watched for everyone…") : tr("Clear Upcoming for everyone…"));
+  queueClear_->setEnabled(connected);
+  queueHint_->setText(watched
+      ? tr("Shared watch history · Clear Watched removes it for everyone. Downloaded files stay.")
+      : tr("Select episodes to download on this device. Drag rows to reorder for everyone."));
+}
+void RoomPage::approveSelected(bool wholeSources) {
+  if (room_.isEmpty() || queueTabs_->currentIndex() != 0)
+    return;
+  const auto room = room_;
+  const auto selected = selectedEntries();
+  if (selected.isEmpty())
+    return;
+  const auto snapshot = app_.rooms.room(room);
+  QSet<QString> sourceIds;
+  for (const auto &id : selected)
+    sourceIds.insert(app_.rooms.entry(room, id).value(QStringLiteral("sourceId")).toString());
+  QHash<QString, QJsonObject> entries;
+  QHash<QString, QString> labels;
+  for (const auto value : snapshot.value(QStringLiteral("sources")).toArray()) {
+    const auto source = value.toObject();
+    labels.insert(source.value(QStringLiteral("id")).toString(), source.value(QStringLiteral("label")).toString());
+  }
+  QStringList details;
+  qint64 size = 0;
+  for (const auto value : snapshot.value(QStringLiteral("entries")).toArray()) {
+    const auto entry = value.toObject();
+    const auto id = entry.value(QStringLiteral("id")).toString();
+    const auto source = entry.value(QStringLiteral("sourceId")).toString();
+    if (upcoming(entry) && (wholeSources ? sourceIds.contains(source) : selected.contains(id))) {
+      entries.insert(id, entry);
+      size += entry.value(QStringLiteral("size")).toInteger();
+      details.append(labels.value(source) + QStringLiteral(" · ") + entry.value(QStringLiteral("path")).toString() +
+          QStringLiteral("\n") + tr("Source: %1").arg(source));
+    }
+  }
+  if (entries.isEmpty())
+    return;
+  auto *dialog = new QMessageBox(QMessageBox::Question, tr("Approve downloads on this device"),
+      tr("Download %n episode(s) on this device?", nullptr, entries.size()) + QStringLiteral("\n\n") +
+      (wholeSources ? tr("This approves every upcoming episode from the selected sources, including rows hidden by search.")
+                    : tr("Only the selected episodes are approved.")) + QStringLiteral("\n") +
+      tr("Total selected size: %1. This does not change the shared room queue or anyone else's download choices.").arg(bytes(size)),
+      QMessageBox::Cancel, this);
+  dialog->setAttribute(Qt::WA_DeleteOnClose);
+  dialog->setObjectName(QStringLiteral("QueueDownloadApproval"));
+  dialog->setTextFormat(Qt::PlainText);
+  dialog->setDetailedText(details.join(QLatin1Char('\n')));
+  auto *approve = dialog->addButton(tr("Approve download"), QMessageBox::AcceptRole);
+  dialog->setDefaultButton(QMessageBox::Cancel);
+  connect(dialog, &QMessageBox::finished, this, [this, dialog, approve, room, entries](int) {
+    if (dialog->clickedButton() != approve)
+      return;
+    app_.perform([&] {
+      QHash<QString, QStringList> bySource;
+      for (auto it = entries.begin(); it != entries.end(); ++it) {
+        const auto current = app_.rooms.entry(room, it.key());
+        if (!upcoming(current) || current.value(QStringLiteral("sourceId")) != it->value(QStringLiteral("sourceId")) ||
+            current.value(QStringLiteral("mediaId")) != it->value(QStringLiteral("mediaId")))
+          throw AppError(QStringLiteral("QUEUE_CHANGED"), tr("The selected episodes changed. Review the list and approve again."));
+        bySource[current.value(QStringLiteral("sourceId")).toString()].append(current.value(QStringLiteral("mediaId")).toString());
+      }
+      for (auto it = bySource.begin(); it != bySource.end(); ++it)
+        app_.media.approve(room, it.key(), it.value());
+    });
+  });
+  dialog->open();
+}
+void RoomPage::clearList() {
+  if (room_.isEmpty())
+    return;
+  const auto room = room_;
+  const bool watched = queueTabs_->currentIndex() == 1;
+  const auto revision = app_.rooms.room(room).value(QStringLiteral("queueRevision"));
+  const auto title = watched ? tr("Clear Watched for everyone?") : tr("Clear Upcoming for everyone?");
+  const auto message = watched
+      ? tr("Permanently delete all shared watch history, including earlier pages, and remove watched episodes from this room's queue for every member?\n\nUpcoming episodes and downloaded files stay. If a removed watched episode is playing, the room advances to the next upcoming episode.")
+      : tr("Remove every upcoming episode from the shared queue for every member, including rows hidden by search?\n\nWatched history and downloaded files stay. Playback of an upcoming episode will stop when the queue is empty.");
+  auto *dialog = new QMessageBox(QMessageBox::Warning, title, message, QMessageBox::Cancel, this);
+  dialog->setAttribute(Qt::WA_DeleteOnClose);
+  dialog->setObjectName(QStringLiteral("QueueClearConfirmation"));
+  dialog->setTextFormat(Qt::PlainText);
+  auto *clear = dialog->addButton(watched ? tr("Clear Watched") : tr("Clear Upcoming"), QMessageBox::DestructiveRole);
+  dialog->setDefaultButton(QMessageBox::Cancel);
+  connect(dialog, &QMessageBox::finished, this, [this, dialog, clear, room, watched, revision](int) {
+    if (dialog->clickedButton() == clear)
+      app_.perform([&] {
+        app_.rooms.command(room, {{QStringLiteral("type"), QStringLiteral("queue.clear")},
+          {QStringLiteral("scope"), watched ? QStringLiteral("watched") : QStringLiteral("upcoming")}},
+          {}, {{QStringLiteral("queueRevision"), revision}});
+      });
+  });
+  dialog->open();
 }
 void RoomPage::mark(bool watched) {
   const auto selected = selectedEntries();
@@ -627,8 +966,17 @@ void RoomPage::mark(bool watched) {
 }
 void RoomPage::rewatch() {
   auto entry = selectedEntry();
+  if (entry.isEmpty())
+    return;
   if (queueTabs_->currentIndex() == 1 && app_.rooms.entry(room_, entry).isEmpty()) {
-    const auto historical = historyModel_.row(historyProxy_.mapToSource(history_->currentIndex()).row());
+    QJsonObject historical;
+    for (const auto &index : history_->selectionModel()->selectedRows()) {
+      const auto row = historyModel_.row(historyProxy_.mapToSource(index).row());
+      if (row.value(QStringLiteral("entryId")).toString() == entry) {
+        historical = row;
+        break;
+      }
+    }
     for (auto value : app_.rooms.room(room_).value(QStringLiteral("entries")).toArray()) {
       const auto item = value.toObject();
       if (item.value(QStringLiteral("mediaId")) == historical.value(QStringLiteral("mediaId"))) {
@@ -659,7 +1007,7 @@ void RoomPage::reorder(int direction) {
   QStringList order;
   for (auto value : snapshot.value(QStringLiteral("entries")).toArray()) {
     const auto e = value.toObject();
-    if (e.value(QStringLiteral("enabled")).toBool() && !e.value(QStringLiteral("watchedAt")).isDouble())
+    if (upcoming(e))
       order.append(e.value(QStringLiteral("id")).toString());
   }
   const int at = order.indexOf(id);
@@ -714,6 +1062,8 @@ void RoomPage::updateTracks() {
                       {QStringLiteral("queueRevision"), snapshot.value(QStringLiteral("queueRevision"))},
                       {QStringLiteral("tracks"), app_.player.tracks()},
                       {QStringLiteral("chapters"), app_.player.chapters()},
+                      {QStringLiteral("loaded"), app_.player.loaded()},
+                      {QStringLiteral("entryId"), app_.playback.entryId()},
                       {QStringLiteral("audio"), app_.playback.audioChoice()},
                       {QStringLiteral("subtitle"), app_.playback.subtitleChoice()},
                       {QStringLiteral("delay"), app_.playback.subtitleDelay()},
@@ -818,7 +1168,7 @@ void RoomPage::updateTracks() {
   if (!chapters_->view()->isVisible()) {
     chapters_->clear();
     chapters_->addItem(tr("Chapters"), -1);
-    if (app_.player.loaded())
+    if (chapterMetadataReady())
       for (auto value : app_.player.chapters()) {
         const auto chapter = value.toObject();
         chapters_->addItem(
@@ -829,6 +1179,7 @@ void RoomPage::updateTracks() {
 }
 void RoomPage::refresh() {
   app_.perform([this] {
+    updateQueueActions();
     const bool local = app_.playback.local(), connected = !room_.isEmpty() && app_.rooms.connected(room_);
     const auto snapshot = room_.isEmpty() ? QJsonObject() : app_.rooms.room(room_);
     const auto p = snapshot.value(QStringLiteral("playback")).toObject();
@@ -866,6 +1217,11 @@ void RoomPage::refresh() {
     time_->setText(elapsed(position) + QStringLiteral(" / ") +
                    (duration > 0 ? elapsed(duration) : QStringLiteral("—")));
     seek_->setEnabled((local || connected) && duration > 0);
+    skipBack_->setEnabled(seek_->isEnabled());
+    skipForward_->setEnabled(seek_->isEnabled());
+    chapters_->setEnabled(seek_->isEnabled() && chapterMetadataReady() && !app_.player.chapters().isEmpty());
+    previousChapter_->setEnabled(chapters_->isEnabled());
+    nextChapter_->setEnabled(previousChapter_->isEnabled());
     if (!seeking_) {
       const QSignalBlocker blocker(seek_);
       seek_->setValue(duration > 0 ? int(std::clamp(position / duration, 0.0, 1.0) * 1000000) : 0);
@@ -883,12 +1239,14 @@ void RoomPage::refresh() {
     const auto localReason = app_.playback.reason();
     const auto sharedReason = p.value(QStringLiteral("reason")).toString();
     state_->setText(!localReason.isEmpty()                                     ? localReason
+                    : local && app_.playback.paused()                         ? tr("Paused")
                     : !local && p.value(QStringLiteral("paused")).toBool(true) ? sharedReason
                                                                                : tr("Playing"));
     state_->setToolTip(state_->text());
     const bool blocking =
         !app_.player.loaded() || (!local && !app_.playback.joined()) || !localReason.isEmpty();
     overlay_->setVisible(blocking);
+    surface_->setPlaybackState(app_.player.loaded() && !app_.player.paused(), blocking);
     overlayText_->setText(localReason.isEmpty() ? tr("Join the watch when you are ready.") : localReason);
     overlayAction_->setText(!local && !app_.playback.joined() ? tr("Join watch") : tr("Retry playback"));
     overlayAction_->setEnabled(local || connected);
@@ -991,7 +1349,70 @@ void RoomPage::fullscreen(bool enabled) {
   fullscreen_ = enabled;
   header_->setVisible(!enabled);
   queuePanel_->setVisible(!enabled);
-  trackControls_->setVisible(!enabled);
+  playerHeader_->setVisible(!enabled);
   members_->setVisible(!enabled);
+  layout()->setContentsMargins(enabled ? 0 : 24, enabled ? 0 : 18, enabled ? 0 : 24, enabled ? 0 : 16);
+  layout()->setSpacing(enabled ? 0 : 12);
+  playerHome_->layout()->setSpacing(enabled ? 0 : 8);
+  surface_->revealControls();
+}
+void RoomPage::setPlayerDetached(bool detached) {
+  reattach_->setVisible(detached);
+  if (detached)
+    playerHome_->layout()->removeWidget(surface_);
+  else {
+    auto *home = static_cast<QVBoxLayout *>(playerHome_->layout());
+    home->insertWidget(home->indexOf(reattach_) + 1, surface_, 1);
+    surface_->show();
+  }
+  popout_->setText(detached ? QStringLiteral("↙") : QStringLiteral("↗"));
+  popout_->setToolTip(detached ? tr("Return player to the room")
+                             : tr("Open player in a separate window"));
+  surface_->revealControls();
+}
+void RoomPage::seekPlayer(double seconds) {
+  app_.perform([&] {
+    const auto duration = app_.playback.duration();
+    if (duration <= 0)
+      return;
+    seconds = std::clamp(seconds, 0.0, std::max(0.0, duration - .05));
+    if (app_.playback.local())
+      app_.playback.seek(seconds);
+    else if (!room_.isEmpty() && app_.rooms.connected(room_)) {
+      const auto generation = app_.rooms.room(room_).value(QStringLiteral("playback"))
+                                  .toObject().value(QStringLiteral("generation"));
+      app_.rooms.command(room_, {{QStringLiteral("type"), QStringLiteral("playback.seek")},
+                                {QStringLiteral("position"), seconds}},
+                         {}, {{QStringLiteral("generation"), generation}});
+    }
+  });
+}
+bool RoomPage::chapterMetadataReady() const {
+  if (!app_.player.loaded())
+    return false;
+  if (app_.playback.local())
+    return true;
+  if (room_.isEmpty())
+    return false;
+  const auto entry = app_.rooms.room(room_).value(QStringLiteral("playback")).toObject()
+                         .value(QStringLiteral("entryId")).toString();
+  return !entry.isEmpty() && entry == app_.playback.entryId();
+}
+void RoomPage::skipChapter(int direction) {
+  if (!chapterMetadataReady())
+    return;
+  const auto position = app_.playback.position();
+  double target = 0;
+  for (auto value : app_.player.chapters()) {
+    const auto at = value.toObject().value(QStringLiteral("time")).toDouble();
+    if (direction > 0 && at > position + .5) {
+      seekPlayer(at);
+      return;
+    }
+    if (direction < 0 && at < position - 3)
+      target = at;
+  }
+  if (direction < 0)
+    seekPlayer(target);
 }
 } // namespace wp::ui

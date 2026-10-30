@@ -20,6 +20,7 @@
 #include <QScrollBar>
 #include <QSplitter>
 #include <QVBoxLayout>
+#include <algorithm>
 namespace wp::ui {
 namespace {
 QLabel *heading(const QString &text, QVBoxLayout *layout) {
@@ -220,6 +221,10 @@ SettingsPage::SettingsPage(AppServices &app, QWidget *parent) : QWidget(parent),
   deliveryStatus->setObjectName(QStringLiteral("UpdateStatus"));
   deliveryStatus->setWordWrap(true);
   form->addRow(deliveryStatus);
+  auto *versions = new QLabel;
+  versions->setObjectName(QStringLiteral("UpdateVersions"));
+  versions->setWordWrap(true);
+  form->addRow(versions);
   auto *installation =
       new QLabel(tr("Per-user installation: %1")
                      .arg(app_.releases.root().isEmpty() ? delivery::defaultRoot() : app_.releases.root()));
@@ -246,21 +251,53 @@ SettingsPage::SettingsPage(AppServices &app, QWidget *parent) : QWidget(parent),
   form->addRow(rollback);
   auto *deliveryProgress = new QProgressBar;
   form->addRow(deliveryProgress);
-  auto refreshDelivery = [this, deliveryStatus, installation, install, check, download, cancelUpdate, restart,
-                          rollback, deliveryProgress] {
+  auto refreshDelivery = [this, deliveryStatus, versions, installation, install, check, download,
+                          cancelUpdate, restart, rollback, deliveryProgress] {
     const auto &release = app_.releases;
+    const auto running = QCoreApplication::applicationVersion();
+    const auto state = release.installation();
+    const auto installed = state.value(QStringLiteral("version")).toString();
+    const auto staged = state.value(QStringLiteral("stagedVersion")).toString();
+    const auto obsolete = state.value(QStringLiteral("stagedObsolete")).toBool();
+    auto newerThanRunning = [&](const QString &version) {
+      if (version.isEmpty() || running.isEmpty())
+        return false;
+      try {
+        return delivery::compareVersions(version, running) > 0;
+      } catch (const AppError &) {
+        return false;
+      }
+    };
+    versions->setText(tr("Running: %1 · Installed: %2%3")
+                          .arg(running.isEmpty() ? tr("Development copy") : running,
+                               installed.isEmpty()
+                                   ? (state.isEmpty() ? tr("Not installed") : tr("Needs repair"))
+                                   : installed,
+                               staged.isEmpty() ? QString()
+                               : obsolete ? tr(" · Older staged copy: %1 (will be discarded)").arg(staged)
+                                          : tr(" · Ready to apply: %1").arg(staged)));
     deliveryStatus->setText(release.status());
     installation->setText(tr("Per-user installation: %1")
                               .arg(release.root().isEmpty() ? delivery::defaultRoot() : release.root()));
-    install->setEnabled(!release.busy());
+    install->setEnabled(!release.busy() && !newerThanRunning(installed) && !newerThanRunning(staged));
+    install->setText(installed.isEmpty() ? tr("Install this copy")
+                                         : tr("Install running copy (%1)").arg(running));
+    install->setToolTip(newerThanRunning(installed) || newerThanRunning(staged)
+                            ? tr("A newer version is already installed or ready. Restart to use it.")
+                            : tr("Install the version you are currently running for this user."));
     check->setEnabled(!release.busy() && release.canUpdate());
     check->setToolTip(release.canUpdate() ? tr("Verify releases using this build’s pinned signing key")
                                           : tr("This development build has no pinned release signing key"));
     download->setEnabled(!release.busy() && release.available() && !release.root().isEmpty());
+    download->setToolTip(release.root().isEmpty()
+                             ? tr("Install this copy first to enable automatic updates.")
+                             : tr("Download and verify the signed update before restarting."));
     cancelUpdate->setEnabled(release.busy() && release.total() > 0);
     restart->setEnabled(!release.busy() && !release.root().isEmpty());
-    restart->setText(release.staged() ? tr("Leave watch and apply verified update")
-                                      : tr("Leave watch and restart installed copy"));
+    restart->setText(!staged.isEmpty() && !obsolete ? tr("Restart and update to %1").arg(staged)
+                     : installed != running && !installed.isEmpty() && !newerThanRunning(installed)
+                         ? tr("Install %1 and restart").arg(running)
+                         : tr("Restart installed version %1").arg(installed));
     rollback->setEnabled(!release.busy() && release.canRollback());
     deliveryProgress->setVisible(release.busy());
     deliveryProgress->setRange(0, release.total() > 0 ? 1000 : 0);
@@ -320,6 +357,16 @@ SettingsPage::SettingsPage(AppServices &app, QWidget *parent) : QWidget(parent),
   });
   down_ = number(form, tr("Device download cap · 0 unlimited"), 2000000, tr(" KiB/s"));
   up_ = number(form, tr("Device upload cap · 0 unlimited"), 2000000, tr(" KiB/s"));
+  seedPolicy_ = new QComboBox;
+  seedPolicy_->setObjectName(QStringLiteral("DefaultSeedPolicy"));
+  seedPolicy_->addItem(tr("Disabled — no torrent file uploads"), QStringLiteral("off"));
+  seedPolicy_->addItem(tr("Seed until ratio 1×"), QStringLiteral("ratio1"));
+  seedPolicy_->addItem(tr("Seed until ratio 2×"), QStringLiteral("ratio2"));
+  seedPolicy_->addItem(tr("Seed without a ratio limit"), QStringLiteral("unlimited"));
+  form->addRow(tr("Default torrent seeding"), seedPolicy_);
+  seedPolicy_->setToolTip(
+      tr("Applies unless a transfer has its own seeding rule. Disabled also blocks "
+         "torrent file uploads while downloading; peer metadata traffic is still required."));
   slots_ = number(form, tr("Concurrent downloads · all transports"), 100);
   slots_->setMinimum(1);
   reserve_ = number(form, tr("Keep free disk space"), 1048576, tr(" MiB"));
@@ -348,6 +395,13 @@ SettingsPage::SettingsPage(AppServices &app, QWidget *parent) : QWidget(parent),
   form->addRow(dht_);
   form->addRow(lsd_);
   form->addRow(upnp_);
+  sharingMode_ = new QComboBox;
+  sharingMode_->setObjectName(QStringLiteral("SharingConnectionMode"));
+  sharingMode_->addItem(tr("Peer to peer, with encrypted relay fallback"), QStringLiteral("p2p-relay"));
+  sharingMode_->addItem(tr("Peer to peer only"), QStringLiteral("p2p-only"));
+  form->addRow(tr("Local-file sharing"), sharingMode_);
+  sharingMode_->setToolTip(tr("Direct connections are attempted first. Peer to peer only keeps the transfer "
+                              "waiting when a direct connection cannot be established."));
   auto *privacy = new QLabel(tr("Proxy mode disables direct discovery and incoming torrent connections. The "
                                 "room connection uses your normal HTTPS route."));
   privacy->setWordWrap(true);
@@ -398,6 +452,11 @@ void SettingsPage::refresh() {
   dht_->setChecked(c.value(QStringLiteral("dht")).toBool(true));
   lsd_->setChecked(c.value(QStringLiteral("lsd")).toBool(true));
   upnp_->setChecked(c.value(QStringLiteral("upnp")).toBool());
+  seedPolicy_->setCurrentIndex(std::max(
+      0, seedPolicy_->findData(c.value(QStringLiteral("seedPolicy")).toString(QStringLiteral("off")))));
+  sharingMode_->setCurrentIndex(std::max(
+      0,
+      sharingMode_->findData(c.value(QStringLiteral("sharingMode")).toString(QStringLiteral("p2p-relay")))));
   server_->setText(app_.store.setting(QStringLiteral("defaultServer")).toString());
   member_->setText(app_.store.setting(QStringLiteral("displayName"), QStringLiteral("You")).toString());
   const auto device = app_.store.setting(QStringLiteral("audioDevice"), QStringLiteral("auto")).toString();
@@ -439,6 +498,8 @@ void SettingsPage::save() {
     c.insert(QStringLiteral("dht"), dht_->isChecked());
     c.insert(QStringLiteral("lsd"), lsd_->isChecked());
     c.insert(QStringLiteral("upnp"), upnp_->isChecked());
+    c.insert(QStringLiteral("seedPolicy"), seedPolicy_->currentData().toString());
+    c.insert(QStringLiteral("sharingMode"), sharingMode_->currentData().toString());
     app_.transfers.configure(c);
     if (startup_->isChecked() != app_.store.setting(QStringLiteral("startup"), false).toBool())
       desktop::startAtLogin(startup_->isChecked());

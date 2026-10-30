@@ -14,6 +14,7 @@ public:
   ~ShareTransport() override;
   bool send(const QString &room, const QString &peer, const QJsonObject &message);
   QString mode(const QString &room, const QString &peer) const;
+  QJsonObject diagnostics(const QString &room, const QString &peer) const;
   void setActive(int downloads, int uploads);
   quint16 port() const { return listener_.serverPort(); }
 signals:
@@ -31,13 +32,17 @@ private:
     QUrl relay;
     QJsonObject endpoint;
     QByteArray key, context;
-    QPointer<QTcpSocket> socket;
-    QByteArray input, output;
+    QPointer<QTcpSocket> socket, candidate;
+    QByteArray input, output, candidateInput;
     QQueue<Frame> queue;
     Frame uploadFrame;
     std::shared_ptr<HttpControl> receive, upload;
     qint64 expires = 0, retry = 0, requested = 0, directRetry = 0;
+    qint64 directStarted = 0;
+    int directAttempts = 0, relayRequests = 0, simultaneousRoutes = 0, standbyPromotions = 0;
     bool ticketPending = false, authenticated = false, connecting = false, helloRead = false;
+    bool outgoing = false;
+    bool directFailed = false, relayActive = false;
     QString state;
   };
   void tick();
@@ -45,10 +50,14 @@ private:
   Peer &peer(const QString &room, const QString &id);
   void ticket(const QString &room, const QString &id, const QJsonObject &ticket);
   void incoming(QTcpSocket *socket);
+  void adoptIncoming(Peer &peer, QTcpSocket *socket, const QByteArray &input);
+  bool promoteCandidate(Peer &peer);
   void attach(Peer &peer, QTcpSocket *socket, bool outgoing);
   void bytes(Peer &peer);
   void packet(Peer &peer, const QByteArray &bytes, bool direct = false);
   void relay(Peer &peer);
+  bool relayAllowed() const;
+  bool canRelay(const Peer &peer) const;
   void close(Peer &peer);
   void fail(Peer &peer, const QString &message);
   LocalStore &store_;

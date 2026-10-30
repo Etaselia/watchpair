@@ -28,9 +28,12 @@ Use CMake 3.22+, Ninja and a C++20 compiler. Dependencies are Qt Core/Gui/Widget
 Windows uses MSYS2 **UCRT64**. Install the toolchain, CMake, Ninja, pkgconf, Qt base/WebSockets/SVG, mpv, libtorrent-rasterbar, curl, OpenSSL, libarchive and FFmpeg packages, then run:
 
 ```powershell
+./v2/scripts/build-libtorrent-matched.ps1 -MsysRoot C:/msys64 -SourceArchive C:/source-kit/dependencies/msys2/mingw-w64-libtorrent-rasterbar-2.1.2-1.src.tar.zst
 ./v2/scripts/build-windows.ps1 -MsysRoot C:/msys64 -RunTests
 ./v2/scripts/bundle-windows.ps1 -MsysRoot C:/msys64 -Destination ./outputs/v2/windows-bundle
 ```
+
+The Windows libtorrent build uses the exact 2.1.2 source archive with `BOOST_ASIO_HAS_PTHREADS=1` applied to every library and application translation unit. The native build script requires a fresh output directory and leaves the SDK unchanged. Its prefix includes `watchpair-libtorrent-build.json`; application configuration and bundling verify this receipt and the selected DLL hash. Pass `-TorrentPrefix` to `build-windows.ps1` when using another output location. The source archive is retained in the complete corresponding-source kit; see [DISTRIBUTION.md](DISTRIBUTION.md).
 
 On Ubuntu 24.04, install the native development libraries and tooling:
 
@@ -65,7 +68,7 @@ bash v2/scripts/test-ui-wayland.sh outputs/v2/app-linux/desktop/ui-flow-tests ou
 
 The fixture generator needs FFmpeg/ffprobe, libx264/libx265/libaom-av1, and a font; see `--help`. On Windows use `build-windows.ps1 -DesktopTests -MediaFixtures <generated-directory>`. On Linux use `build-linux.sh --desktop-tests` with the same fixture environment variables and a working display. The default `--test`/`-RunTests` excludes render tests so it does not silently depend on ungenerated fixtures or a display.
 
-Under WSL, keep `TMPDIR` on the Linux filesystem for real torrent fixtures. The tested virtual software renderer is `GALLIUM_DRIVER=softpipe LIBGL_ALWAYS_SOFTWARE=1`; llvmpipe failed visual validation. Software preview rendering is capped at 640×360 and scaled to the window to preserve event-loop responsiveness. Physical GPU paths retain the full render surface. This is not a claim of physical Linux GPU validation.
+Under WSL, keep `TMPDIR` on the Linux filesystem for real torrent fixtures. Detected CPU renderers automatically use mpv's basic rendering path with bilinear scaling; no driver environment override is required. Tone mapping, subtitles, chapters and audio selection remain supported. Software preview rendering is capped at 640×360 and scaled to the window to preserve event-loop responsiveness. Physical GPU paths retain the full render surface. This is not a claim of physical Linux GPU validation.
 
 Packaged delivery tests use `WATCHPAIR_PACKAGE` and `WATCHPAIR_PREVIOUS_PACKAGE` pointing to different-version complete bundles. They install into temporary directories, launch without the Windows SDK on PATH, simulate an executable crash, then verify automatic runtime and SQLite rollback. For the complete signed-feed/download/staging pass, use a QA build pinned to your QA key:
 

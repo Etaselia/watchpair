@@ -11,6 +11,7 @@ import { Engine } from './engine.js';
 import { PROTOCOL, DomainError, socketMessageSchema, type Change } from './protocol.js';
 
 const name = z.string().trim().min(1).max(100).refine(v => !/[\x00-\x1f\x7f]/.test(v));
+const VERSION = '2.0.0-alpha.4';
 const capability = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const createBody = z.object({ name, memberName: name, retryKey: capability }).strict();
 const joinBody = z.object({ invite: capability, name, retryKey: capability }).strict();
@@ -31,7 +32,7 @@ export async function buildServer(options: ServerOptions = {}) {
   }
   const epoch = Date.now() - performance.now();
   const store = new Store(options.database ?? ':memory:');
-  const engine = new Engine(store, options.now ?? (() => epoch + performance.now()));
+  const engine = new Engine(store, options.now ?? (() => Math.trunc(epoch + performance.now())));
   const app = Fastify({
     logger: options.logger ? { level: 'info', redact: ['req.headers.authorization', 'req.headers.cookie'] } : false,
     logController: new LogController({ disableRequestLogging: true }), bodyLimit: 12 * 1024 * 1024, requestTimeout: 20_000,
@@ -66,7 +67,7 @@ export async function buildServer(options: ServerOptions = {}) {
     app.log.error({ err: error, requestId: request.id }, 'Coordinator operation failed');
     return reply.code(503).send({ error: { code: 'STORAGE_UNAVAILABLE', message: 'The coordinator could not safely save this change. Try again after service recovery.' }, requestId: request.id });
   });
-  app.get('/health', async () => ({ ok: true, protocol: PROTOCOL, version: '2.0.0-dev.1' }));
+  app.get('/health', async () => ({ ok: true, protocol: PROTOCOL, version: VERSION }));
   app.get('/r/:roomId', async (request, reply) => {
     const id = z.string().uuid().parse((request.params as {roomId:string}).roomId);
     const nonce = randomBytes(24).toString('base64');
@@ -79,7 +80,7 @@ export async function buildServer(options: ServerOptions = {}) {
       <a id="open">Open WatchPair</a><a href="/downloads/">Get the desktop app</a><p>Already installed? You can also paste this link into Join room.</p><input id="link" readonly aria-label="Private room link"><button id="copy">Copy link</button><p><small>The private part of this link stays in your browser. Share recovery links only with the room owner.</small></p>
       <script nonce="${nonce}">const fragment=location.hash.slice(1);const match=/^(invite|recovery)=([A-Za-z0-9_-]{43})$/.exec(fragment);const input=document.getElementById('link');input.value=location.href;if(match){const a=document.getElementById('open');a.href='watchpair://room?server='+encodeURIComponent(location.origin)+'&room=${id}#'+fragment;a.style.display='inline-block';if(match[1]==='recovery')document.getElementById('message').textContent='This private recovery link restores host control. Open it only on a device you trust.';}else document.getElementById('message').textContent='This link is incomplete. Ask the host for the full invite, including the private part after #.';document.getElementById('copy').onclick=async()=>{try{await navigator.clipboard.writeText(input.value);document.getElementById('copy').textContent='Copied';}catch{input.select();}};</script></html>`);
   });
-  app.get('/v2/version', async () => ({ protocol: PROTOCOL, version: '2.0.0-dev.1', operationRetryWindow: 10_000 }));
+  app.get('/v2/version', async () => ({ protocol: PROTOCOL, version: VERSION, operationRetryWindow: 10_000 }));
   app.post('/v2/rooms', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async request => {
     const body = createBody.parse(request.body); return engine.create(body.name, body.memberName, body.retryKey);
   });

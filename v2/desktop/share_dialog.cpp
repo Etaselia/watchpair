@@ -2,6 +2,7 @@
 #include <QDialogButtonBox>
 #include <QMessageBox>
 #include <QVBoxLayout>
+#include <algorithm>
 namespace wp::ui {
 SourceSelectionDialog::SourceSelectionDialog(AppServices &app, const QString &room, const QString &source,
                                              QWidget *parent)
@@ -146,6 +147,18 @@ ShareDialog::ShareDialog(AppServices &app, QJsonObject bundle, QWidget *parent)
   hint->setWordWrap(true);
   hint->setProperty("muted", true);
   layout->addWidget(hint);
+  connectionMode_ = new QComboBox;
+  connectionMode_->setObjectName(QStringLiteral("SharingConnectionMode"));
+  connectionMode_->addItem(tr("Peer-to-peer with relay fallback"), QStringLiteral("p2p-relay"));
+  connectionMode_->addItem(tr("Peer-to-peer only"), QStringLiteral("p2p-only"));
+  connectionMode_->setCurrentIndex(std::max(0, connectionMode_->findData(
+      app_.transfers.configuration().value(QStringLiteral("sharingMode")).toString(QStringLiteral("p2p-relay")))));
+  layout->addWidget(new QLabel(tr("Sharing connection on this device")));
+  layout->addWidget(connectionMode_);
+  auto *connectionHint = new QLabel(tr("Both modes try a direct encrypted connection. Relay fallback uses an encrypted relay only when direct cannot connect. Peer-to-peer only never contacts the relay."));
+  connectionHint->setWordWrap(true);
+  connectionHint->setProperty("muted", true);
+  layout->addWidget(connectionHint);
   files_ = new FileSelector;
   const auto existingRoom = app_.rooms.room(bundle_.value(QStringLiteral("room")).toString());
   const auto existingSource = bundle_.value(QStringLiteral("identity")).toString() + QLatin1Char(':') +
@@ -187,10 +200,14 @@ ShareDialog::ShareDialog(AppServices &app, QJsonObject bundle, QWidget *parent)
   connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
   connect(apply_, &QPushButton::clicked, this, [this, room] {
     try {
+      auto configuration = app_.transfers.configuration();
+      configuration.insert(QStringLiteral("sharingMode"), connectionMode_->currentData().toString());
+      app_.transfers.configure(configuration);
       operation_ = app_.sharing.publish(bundle_.value(QStringLiteral("id")).toString(), room,
                                         files_->model.selected(), revision_);
       apply_->setEnabled(false);
       files_->setEnabled(false);
+      connectionMode_->setEnabled(false);
       error_->setText(
           tr("Saving the room selection… You can close this window while the confirmed edit is delivered."));
     } catch (const AppError &e) {
@@ -201,6 +218,7 @@ ShareDialog::ShareDialog(AppServices &app, QJsonObject bundle, QWidget *parent)
     revision_ = app_.rooms.room(room).value(QStringLiteral("queueRevision")).toInteger();
     operation_.clear();
     files_->setEnabled(true);
+    connectionMode_->setEnabled(true);
     apply_->setEnabled(files_->model.selectedCount() > 0);
     reload_->hide();
     error_->clear();
@@ -222,8 +240,10 @@ ShareDialog::ShareDialog(AppServices &app, QJsonObject bundle, QWidget *parent)
               app_.store.get(QStringLiteral("room-command"), op).value(QStringLiteral("state")).toString() ==
               QStringLiteral("pending");
           reload_->setVisible(!pending);
-          if (!pending)
+          if (!pending) {
             files_->setEnabled(true);
+            connectionMode_->setEnabled(true);
+          }
         }
       });
   connect(&app_.rooms, &RoomClient::roomRemoved, this, [this, room](const QString &key) {

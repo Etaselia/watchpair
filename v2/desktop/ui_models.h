@@ -6,12 +6,17 @@
 #include <QStyledItemDelegate>
 #include <QTimer>
 #include <memory>
+#include <optional>
 #include <vector>
 namespace wp::ui {
-enum Roles { SortRole = Qt::UserRole + 1, ProgressRole, IdRole, ObjectRole };
+enum Roles { SortRole = Qt::UserRole + 1, ProgressRole, IdRole, ObjectRole, SearchRole };
 QString bytes(qint64 value);
 QString elapsed(double seconds);
 QString age(qint64 timestamp, qint64 now = 0);
+// Protocol timestamps are numeric Unix milliseconds. Legacy coordinators may
+// send fractional milliseconds; never infer a seconds unit or turn null into 0.
+std::optional<qint64> timestampMilliseconds(const QJsonValue &value);
+bool upcoming(const QJsonObject &entry);
 class TransferTable final : public QAbstractTableModel {
   Q_OBJECT
 public:

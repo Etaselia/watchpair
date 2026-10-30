@@ -36,6 +36,108 @@ function fixture(database = ':memory:') {
 }
 function code(expected: string) { return (e: unknown) => e instanceof DomainError && e.code === expected; }
 
+test('watched timestamps are integer Unix milliseconds even with the production fractional clock', t => {
+  const f = fixture(); t.after(() => f.store.close()); f.add(); f.advance(0.875);
+  const entry = f.room().entries[0]!;
+  f.command({ type: 'history.mark', ids: [entry.id], watched: true });
+  const saved = f.store.history(f.host.roomId)[0]!;
+  assert.equal(saved.watchedAt, Math.trunc(f.now()));
+  assert.equal(f.room().entries[0]!.watchedAt, saved.watchedAt);
+  assert.equal(saved.path, entry.path);
+  assert.equal(saved.sourceLabel, 'Show');
+});
+
+test('legacy fractional history migrates its JSON and SQLite order together without losing cursor pages', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'watchpair-history-ms-'));
+  const path = join(directory, 'room.sqlite');
+  const f = fixture(path); f.add();
+  f.command({ type: 'history.mark', ids: f.room().entries.map(entry => entry.id), watched: true });
+  const legacy = f.store.history(f.host.roomId);
+  for (let i = 0; i < legacy.length; ++i) {
+    const row = legacy[i]!, time = f.now() + (i + 1) / 10;
+    f.store.db.prepare("UPDATE history SET watched_at=?,data=json_set(data,'$.watchedAt',?) WHERE room_id=? AND id=?")
+      .run(time, time, f.host.roomId, row.id);
+    f.store.db.prepare("UPDATE entries SET data=json_set(data,'$.watchedAt',?) WHERE room_id=? AND id=?")
+      .run(time, f.host.roomId, row.entryId);
+  }
+  f.store.close();
+  const reopened = new Store(path);
+  t.after(() => { reopened.close(); rmSync(directory, { recursive: true, force: true }); });
+  const expected = legacy.map(row => row.id).sort().reverse(), actual: string[] = [];
+  let cursor: { time: number; id: string } | null = null;
+  for (;;) {
+    const rows = reopened.history(f.host.roomId, cursor, 1);
+    if (!rows.length) break;
+    const row = rows[0]!;
+    assert.equal(row.watchedAt, Math.trunc(f.now()));
+    actual.push(row.id); cursor = { time: row.watchedAt, id: row.id };
+  }
+  assert.deepEqual(actual, expected);
+  assert.ok(reopened.load()[0]!.entries.every(entry => entry.watchedAt === Math.trunc(f.now())));
+});
+
+test('legacy same-name history gains exact entry/source context for season search without guessing removed entries', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'watchpair-history-context-'));
+  const path = join(directory, 'room.sqlite');
+  const f = fixture(path);
+  f.command({ type: 'queue.add', source: { id: 'pack', kind: 'torrent', label: 'Skyline Stories', uri: 'magnet:?xt=urn:btih:fixture', identity: 'btih:fixture' },
+    files: f.files.slice(0, 2).map((file, i) => ({ ...file, label: 'Episode 1', path: `Show/Season ${i + 1}/Episode 1.mkv` })) });
+  f.command({ type: 'history.mark', ids: f.room().entries.map(entry => entry.id), watched: true });
+  const historical = f.store.history(f.host.roomId)[0]!;
+  f.store.save(f.room(), f.now(), { history: [{ ...historical, id: randomUUID(), entryId: 'removed-entry' }] });
+  f.store.db.prepare("UPDATE history SET data=json_remove(data,'$.path','$.sourceId','$.sourceLabel') WHERE room_id=?").run(f.host.roomId);
+  f.store.close();
+  const reopened = new Store(path);
+  t.after(() => { reopened.close(); rmSync(directory, { recursive: true, force: true }); });
+  const season = reopened.history(f.host.roomId, null, 200, 'Season 2');
+  assert.equal(season.length, 1);
+  assert.equal(season[0]!.path, 'Show/Season 2/Episode 1.mkv');
+  assert.equal(season[0]!.sourceId, 'pack');
+  assert.equal(season[0]!.sourceLabel, 'Skyline Stories');
+  assert.equal(reopened.history(f.host.roomId, null, 200, 'Skyline Stories').length, 2);
+  const removed = reopened.history(f.host.roomId).find(row => row.entryId === 'removed-entry')!;
+  assert.equal(removed.path, undefined);
+  assert.equal(removed.sourceId, undefined);
+  assert.equal(removed.sourceLabel, undefined);
+});
+
+test('all members may clear one shared tab atomically; watched clear removes every history page and replays once', t => {
+  const f = fixture(); t.after(() => f.store.close()); f.add();
+  const [first, second, third] = f.room().entries;
+  f.command({ type: 'history.mark', ids: [first!.id, second!.id], watched: true });
+  const history = f.store.history(f.host.roomId)[0]!;
+  f.store.save(f.room(), f.now(), { history: Array.from({ length: 205 }, (_, i) => ({ ...history, id: randomUUID(), watchedAt: f.now() - i })) });
+  assert.ok(f.store.history(f.host.roomId, null, 1000).length > 200);
+  f.command({ type: 'playback.choose', entryId: first!.id });
+  const revision = f.room().queueRevision;
+  const clear = { operationId: randomUUID(), queueRevision: revision, command: { type: 'queue.clear' as const, scope: 'watched' as const } };
+  f.engine.command(f.host.roomId, f.guest.memberId, clear);
+  assert.deepEqual(f.room().entries.map(entry => entry.id), [third!.id]);
+  assert.equal(f.room().entries[0]!.enabled, true);
+  assert.equal(f.room().playback.entryId, third!.id);
+  assert.equal(f.room().sources.length, 1);
+  assert.equal(f.store.history(f.host.roomId, null, 1000).length, 0);
+  assert.equal(f.room().historyGeneration, 1);
+  assert.equal(f.store.load()[0]!.historyGeneration, 1);
+  assert.equal(f.engine.command(f.host.roomId, f.guest.memberId, clear).replayed, true);
+  assert.equal(f.room().historyGeneration, 1);
+  assert.throws(() => f.command({ type: 'queue.clear', scope: 'upcoming' }, f.guest.memberId, { queueRevision: revision }), code('QUEUE_CONFLICT'));
+  f.command({ type: 'queue.clear', scope: 'upcoming' }, f.guest.memberId);
+  assert.equal(f.room().entries[0]!.enabled, false);
+  assert.equal(f.room().historyGeneration, 1);
+});
+
+test('clearing Upcoming retains watched entries and shared history', t => {
+  const f = fixture(); t.after(() => f.store.close()); f.add();
+  const first = f.room().entries[0]!;
+  f.command({ type: 'history.mark', ids: [first.id], watched: true });
+  f.command({ type: 'queue.clear', scope: 'upcoming' }, f.guest.memberId);
+  assert.equal(f.room().entries.length, 3);
+  assert.deepEqual(f.room().entries.filter(entry => entry.enabled).map(entry => entry.id), [first.id]);
+  assert.equal(f.store.history(f.host.roomId).length, 1);
+  assert.equal(f.room().historyGeneration, 0);
+});
+
 test('removing a catalog source releases its manifest and preserves watched history', t => {
   const f = fixture(); t.after(() => f.store.close());f.add();
   const entry=f.room().entries[0]!;

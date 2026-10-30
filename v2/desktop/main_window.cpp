@@ -241,6 +241,12 @@ MainWindow::MainWindow(AppServices &app) : app_(app) {
   connect(create, &QPushButton::clicked, this, [this] { enterRoom(true); });
   connect(join, &QPushButton::clicked, this, [this] { enterRoom(false); });
   connect(returnButton, &QPushButton::clicked, this, [this] {
+    if (playerWindow_) {
+      playerWindow_->show();
+      playerWindow_->raise();
+      playerWindow_->activateWindow();
+      return;
+    }
     if (app_.playback.local()) {
       navigation_->clearSelection();
       pages_->setCurrentWidget(room_);
@@ -255,7 +261,7 @@ MainWindow::MainWindow(AppServices &app) : app_(app) {
     if (row < 0)
       return;
     roomList_->clearSelection();
-    if (full_)
+    if (full_ && !playerWindow_)
       toggleFullscreen();
     switch (row) {
     case 0:
@@ -307,6 +313,13 @@ MainWindow::MainWindow(AppServices &app) : app_(app) {
   connect(room_, &RoomPage::manageRequested, this, &MainWindow::manageRoom);
   connect(room_, &RoomPage::transferRequested, this, &MainWindow::showTransfers);
   connect(room_, &RoomPage::fullscreenRequested, this, &MainWindow::toggleFullscreen);
+  connect(room_, &RoomPage::popoutRequested, this, &MainWindow::togglePopout);
+  connect(room_->playerSurface(), &PlayerSurface::escapeRequested, this, [this] {
+    if (full_)
+      toggleFullscreen();
+    else if (playerWindow_)
+      reattachPlayer();
+  });
   connect(room_, &RoomPage::sourceFilesRequested, this, [this](const QString &room, const QString &source) {
     app_.perform([&] {
       auto *dialog = new SourceSelectionDialog(app_, room, source, this);
@@ -393,6 +406,7 @@ MainWindow::MainWindow(AppServices &app) : app_(app) {
   connect(transfers_, &TransferDesk::error, this, &MainWindow::issue);
   auto shortcut = [this](const QKeySequence &key, const std::function<void()> &fn) {
     auto *s = new QShortcut(key, this);
+    s->setAutoRepeat(false);
     connect(s, &QShortcut::activated, this, fn);
   };
   shortcut(QKeySequence::Open, [this] { addSource(currentRoom_); });
@@ -400,10 +414,15 @@ MainWindow::MainWindow(AppServices &app) : app_(app) {
   shortcut(QKeySequence(QStringLiteral("Ctrl+L")), [this] { enterRoom(false); });
   shortcut(QKeySequence(Qt::Key_F11), [this] { toggleFullscreen(); });
   shortcut(QKeySequence(Qt::Key_Escape), [this] {
+    if (auto *popup = QApplication::activePopupWidget()) {
+      popup->close();
+      return;
+    }
     if (full_)
       toggleFullscreen();
   });
   auto *space = new QShortcut(QKeySequence(Qt::Key_Space), this);
+  space->setAutoRepeat(false);
   connect(space, &QShortcut::activated, this, [this] {
     if (pages_->currentWidget() == room_ && !editing())
       app_.perform([this] { app_.playback.togglePause(); });
@@ -438,7 +457,10 @@ MainWindow::MainWindow(AppServices &app) : app_(app) {
 void MainWindow::issue(const QString &code, const QString &message) {
   bannerText_->setText(message);
   bannerText_->setToolTip(code);
-  banner_->show();
+  if (full_ && !playerWindow_)
+    bannerBeforeFullscreen_ = true;
+  else
+    banner_->show();
   statusBar()->showMessage(message, 12000);
 }
 void MainWindow::refreshRooms() {
@@ -506,7 +528,7 @@ void MainWindow::restoreWindow() {
       windowHandle()->setWindowStates(Qt::WindowNoState);
     }
   }
-  if (full_)
+  if (full_ && !playerWindow_)
     showFullScreen();
   else
     showNormal();
@@ -747,17 +769,102 @@ void MainWindow::preview(const QJsonObject &file) {
   });
 }
 void MainWindow::toggleFullscreen() {
-  if (pages_->currentWidget() != room_)
+  if (!playerWindow_ && pages_->currentWidget() != room_)
     return;
   full_ = !full_;
-  room_->fullscreen(full_);
-  sidebar_->setVisible(!full_);
-  topbar_->setVisible(!full_);
-  statusBar()->setVisible(!full_);
+  auto *target = playerWindow_ ? playerWindow_ : this;
   if (full_)
-    showFullScreen();
-  else
-    showNormal();
+    playerWindowState_ = target->windowState() & ~Qt::WindowFullScreen;
+  if (!playerWindow_) {
+    room_->fullscreen(full_);
+    sidebar_->setVisible(!full_);
+    topbar_->setVisible(!full_);
+    statusBar()->setVisible(!full_);
+    if (full_) {
+      bannerBeforeFullscreen_ = banner_->isVisible();
+      banner_->hide();
+    } else
+      banner_->setVisible(bannerBeforeFullscreen_);
+  }
+  if (full_)
+    target->showFullScreen();
+  else {
+    target->setWindowState(playerWindowState_);
+    target->show();
+  }
+  room_->playerSurface()->revealControls();
+  room_->video()->setFocus(Qt::OtherFocusReason);
+}
+void MainWindow::togglePopout() {
+  if (playerWindow_) {
+    reattachPlayer();
+    return;
+  }
+  if (pages_->currentWidget() != room_)
+    return;
+  if (full_)
+    toggleFullscreen();
+  auto *surface = room_->playerSurface();
+  room_->setPlayerDetached(true);
+  playerWindow_ = new QWidget(nullptr, Qt::Window);
+  playerWindow_->setObjectName(QStringLiteral("DetachedPlayer"));
+  playerWindow_->setWindowTitle(tr("WatchPair · Player"));
+  playerWindow_->setWindowIcon(windowIcon());
+  playerWindow_->resize(1000, 650);
+  auto *layout = new QVBoxLayout(playerWindow_);
+  layout->setContentsMargins(0, 0, 0, 0);
+  layout->setSpacing(0);
+  layout->addWidget(surface);
+  playerWindow_->installEventFilter(this);
+  auto *full = new QShortcut(QKeySequence(Qt::Key_F11), playerWindow_);
+  full->setAutoRepeat(false);
+  connect(full, &QShortcut::activated, this, &MainWindow::toggleFullscreen);
+  auto *escape = new QShortcut(QKeySequence(Qt::Key_Escape), playerWindow_);
+  escape->setAutoRepeat(false);
+  connect(escape, &QShortcut::activated, this, [this] {
+    if (auto *popup = QApplication::activePopupWidget()) {
+      popup->close();
+      return;
+    }
+    if (full_) toggleFullscreen(); else reattachPlayer();
+  });
+  playerWindow_->show();
+  surface->show();
+  playerWindow_->raise();
+  playerWindow_->activateWindow();
+  room_->video()->setFocus(Qt::OtherFocusReason);
+  surface->revealControls();
+}
+void MainWindow::reattachPlayer(bool restore) {
+  if (!playerWindow_)
+    return;
+  if (full_)
+    toggleFullscreen();
+  auto *old = playerWindow_;
+  playerWindow_ = nullptr;
+  old->removeEventFilter(this);
+  old->layout()->removeWidget(room_->playerSurface());
+  room_->setPlayerDetached(false);
+  pages_->setCurrentWidget(room_);
+  if (restore && !quitting_) {
+    if (isHidden() || isMinimized())
+      restoreWindow();
+    else {
+      raise();
+      activateWindow();
+    }
+  }
+  old->hide();
+  old->deleteLater();
+  room_->video()->setFocus(Qt::OtherFocusReason);
+}
+bool MainWindow::eventFilter(QObject *object, QEvent *event) {
+  if (object == playerWindow_ && event->type() == QEvent::Close) {
+    static_cast<QCloseEvent *>(event)->ignore();
+    reattachPlayer();
+    return true;
+  }
+  return QMainWindow::eventFilter(object, event);
 }
 void MainWindow::manageRoom(const QString &key) {
   app_.perform([&] {
@@ -928,6 +1035,7 @@ void MainWindow::manageRoom(const QString &key) {
   });
 }
 MainWindow::~MainWindow() {
+  reattachPlayer(false);
   // Decoder I/O uses the GUI's verified reader. Abort it before freeing the
   // render context, whose destructor waits for the decoder's video chain.
   app_.perform([this] { app_.playback.stop(); });
@@ -939,6 +1047,7 @@ void MainWindow::prepareToQuit() {
   timer_.stop();
   if (full_)
     toggleFullscreen();
+  reattachPlayer();
   app_.perform([this] {
     app_.store.setSetting(QStringLiteral("windowGeometry"), QString::fromLatin1(saveGeometry().toBase64()));
   });

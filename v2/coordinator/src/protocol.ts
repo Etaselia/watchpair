@@ -33,6 +33,7 @@ const commands = [
   z.object({ type: z.literal('queue.select'), sourceId: id, mediaIds: z.array(id).max(LIMITS.entries) }),
   z.object({ type: z.literal('queue.reorder'), ids: z.array(id).max(LIMITS.entries) }),
   z.object({ type: z.literal('queue.remove'), ids: z.array(id).min(1).max(LIMITS.entries) }),
+  z.object({ type: z.literal('queue.clear'), scope: z.enum(['upcoming', 'watched']) }),
   z.object({ type: z.literal('queue.rename'), entryId: id, label }),
   z.object({ type: z.literal('queue.identify'), entryId: id, sha256: z.string().regex(/^[a-f0-9]{64}$/) }),
   z.object({ type: z.literal('playback.choose'), entryId: id }),
@@ -96,12 +97,14 @@ export type Member = {
 export type Room = {
   id: string; name: string; hostId: string; successorId: string | null;
   inviteHash: string; recoveryHash: string; createdAt: number;
-  revision: number; queueRevision: number; sources: Source[]; entries: Entry[];
+  revision: number; queueRevision: number; historyGeneration: number; sources: Source[]; entries: Entry[];
   playback: Playback; members: Member[]; reporterId: string | null;
   recoveryRetry: { oldHash: string; retryHash: string } | null;
 };
 export type History = {
   id: string; entryId: string; mediaId: string; label: string;
+  path?: string; sourceId?: string; sourceLabel?: string;
+  // Unix epoch milliseconds, stored and sent as an integer (never Unix seconds).
   watchedAt: number; method: 'automatic' | 'manual'; coverage: number; duration: number | null;
 };
 export type Change = { roomId: string; type: 'snapshot' | 'state' | 'presence' | 'deleted'; revision: number; data: unknown };

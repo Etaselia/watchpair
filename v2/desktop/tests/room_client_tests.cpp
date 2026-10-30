@@ -230,6 +230,13 @@ private slots:
     host.history(hostKey, {}, QStringLiteral("episode 2"));
     QTRY_COMPARE_WITH_TIMEOUT(history.size(), 1, 5000);
     QCOMPARE(history.first()[1].toJsonArray().size(), 1);
+    guest.command(guestKey, {{QStringLiteral("type"), QStringLiteral("queue.clear")},
+                             {QStringLiteral("scope"), QStringLiteral("watched")}});
+    QTRY_VERIFY_WITH_TIMEOUT(host.room(hostKey).value(QStringLiteral("history")).toArray().isEmpty(), 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(host.room(hostKey).value(QStringLiteral("historyGeneration")).toInteger(), 1, 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(guest.room(guestKey).value(QStringLiteral("entries")).toArray().size(), 2, 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(history.size() >= 2, 5000);
+    QVERIFY(history.last()[1].toJsonArray().isEmpty());
   }
   void lostResponsesRecoveryAndRestartKeepOneDurableOperation() {
     QTemporaryDir tmp;

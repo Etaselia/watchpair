@@ -154,6 +154,7 @@ SharingService::SharingService(LocalStore &store, RoomClient &rooms, RoomMedia &
     return binding(room, source, entry);
   });
   connect(&transport_, &ShareTransport::received, this, &SharingService::received);
+  connect(&transport_, &ShareTransport::changed, this, &SharingService::changed);
   connect(&transport_, &ShareTransport::problem, this, [this](const QString &room, const QString &message) {
     emit problem(room, QStringLiteral("SHARING_NETWORK"), message);
   });

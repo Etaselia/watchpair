@@ -42,6 +42,10 @@ ShareTransport::ShareTransport(LocalStore &store, RoomClient &rooms, TransferEng
       incoming(listener_.nextPendingConnection());
   });
   connect(&rooms_, &RoomClient::ticketReady, this, &ShareTransport::ticket);
+  connect(&transfers_, &TransferEngine::changed, this, [this] {
+    if (transfers_.configuration() != config_)
+      network();
+  });
   connect(&rooms_, &RoomClient::changed, this, [this](const QString &room) {
     QHash<QString, QByteArray> allowed;
     for (auto value : rooms_.room(room).value(QStringLiteral("members")).toArray()) {
@@ -116,16 +120,17 @@ void ShareTransport::network() {
   QJsonObject old = config_;
   config_ = next;
   for (const auto &key : {QStringLiteral("bind"), QStringLiteral("proxyHost"), QStringLiteral("proxyPort"),
-                          QStringLiteral("offline")})
+                          QStringLiteral("offline"), QStringLiteral("sharingMode")})
     if (old.value(key) != next.value(key)) {
-      for (auto &[_, p] : peers_)
+      for (auto &[_, p] : peers_) {
         close(*p);
+        p->expires = 0;
+      }
       listener_.close();
       break;
     }
   if (next.value(QStringLiteral("offline")).toBool() ||
-      !next.value(QStringLiteral("proxyHost")).toString().isEmpty() ||
-      store_.setting(QStringLiteral("preferRelay"), false).toBool()) {
+      !next.value(QStringLiteral("proxyHost")).toString().isEmpty()) {
     listener_.close();
     return;
   }
@@ -136,7 +141,8 @@ void ShareTransport::network() {
                                           : QHostAddress(bind);
     if (!listener_.listen(address, 0))
       emit problem(
-          {}, QStringLiteral("Local sharing listener could not bind. Relay fallback remains available."));
+          {}, relayAllowed() ? QStringLiteral("The direct listener could not bind; relay fallback is available.")
+                              : QStringLiteral("The direct listener could not bind; relay is disabled."));
   }
 }
 ShareTransport::Peer &ShareTransport::peer(const QString &room, const QString &peerId) {
@@ -170,6 +176,14 @@ void ShareTransport::close(Peer &p) {
     p.receive->cancelled.store(true);
   if (p.upload)
     p.upload->cancelled.store(true);
+  p.receive.reset();
+  p.upload.reset();
+  if (p.candidate) {
+    p.candidate->abort();
+    p.candidate->deleteLater();
+    p.candidate = nullptr;
+  }
+  p.candidateInput.clear();
   if (p.socket) {
     disconnect(p.socket, nullptr, this, nullptr);
     p.socket->abort();
@@ -183,12 +197,21 @@ void ShareTransport::close(Peer &p) {
   p.queue.clear();
   p.uploadFrame = {};
   p.state.clear();
+  p.directStarted = 0;
+  p.directFailed = false;
+  p.relayActive = false;
+  p.retry = 0;
+  p.directRetry = 0;
 }
 void ShareTransport::fail(Peer &p, const QString &message) {
+  if (promoteCandidate(p))
+    return;
   close(p);
   p.retry = now() + 3000;
   p.directRetry = now() + 30000;
-  p.state = message;
+  p.directStarted = now();
+  p.directFailed = true;
+  p.state = relayAllowed() ? message : QStringLiteral("Direct connection unavailable · relay disabled");
   emit changed();
 }
 void ShareTransport::tick() {
@@ -258,8 +281,19 @@ void ShareTransport::tick() {
           p.ticketPending = false;
         if (now() < p.retry)
           continue;
-        if (!p.socket && !p.connecting && self < other && now() > p.directRetry && listener_.isListening()) {
-          const auto endpoint = member.value(QStringLiteral("endpoint")).toObject();
+        if (!p.directStarted && (!p.endpoint.isEmpty() || p.expires > now())) {
+          p.directStarted = now();
+          p.state = QStringLiteral("Trying direct peer-to-peer connection…");
+        }
+        if (!p.authenticated && !p.socket && !listener_.isListening() && p.directStarted) {
+          // A configured proxy forbids a direct connection outside the proxy.
+          p.directFailed = true;
+          p.state = relayAllowed() ? QStringLiteral("Direct unavailable; connecting to encrypted relay…")
+                                  : QStringLiteral("Direct connection unavailable · relay disabled");
+        }
+        if (p.directStarted && !p.socket && !p.connecting && now() > p.directRetry && listener_.isListening()) {
+          const auto endpoint = p.endpoint.isEmpty() ? member.value(QStringLiteral("endpoint")).toObject()
+                                                     : p.endpoint;
           QHostAddress address(endpoint.value(QStringLiteral("address")).toString());
           const int port = endpoint.value(QStringLiteral("port")).toInt();
           if (!address.isNull() && !address.isMulticast() && port > 0 && port <= 65535) {
@@ -268,8 +302,12 @@ void ShareTransport::tick() {
             const auto bind = config_.value(QStringLiteral("bind")).toString();
             if (!bind.isEmpty() && !socket->bind(QHostAddress(bind), 0)) {
               socket->deleteLater();
-              p.directRetry = now() + 30000;
+              fail(p, QStringLiteral("Direct bind failed; connecting to encrypted relay…"));
             } else {
+              p.directStarted = now();
+              p.directFailed = false;
+              ++p.directAttempts;
+              p.state = QStringLiteral("Trying direct peer-to-peer connection…");
               attach(p, socket, true);
               socket->connectToHost(address, quint16(port));
               QTimer::singleShot(2500, socket, [this, socket, key = id(room, other)] {
@@ -279,6 +317,14 @@ void ShareTransport::tick() {
               });
             }
           }
+        }
+        // A missing/invalid advertised endpoint is an explicit direct-route
+        // failure. A pending socket must finish its own bounded attempt.
+        if (!p.authenticated && !p.socket && p.directStarted && !p.directFailed &&
+            now() - p.directStarted >= 3500) {
+          p.directFailed = true;
+          p.state = relayAllowed() ? QStringLiteral("No direct peer endpoint; connecting to encrypted relay…")
+                                  : QStringLiteral("No direct peer endpoint · relay disabled");
         }
         if (!p.authenticated)
           relay(p);
@@ -315,8 +361,15 @@ void ShareTransport::ticket(const QString &room, const QString &other, const QJs
       p.relay = RoomClient::validateServer(relayAddress);
     p.ticket = result.value(QStringLiteral("ticket")).toString();
     p.expires = result.value(QStringLiteral("expiresAt")).toInteger();
-    p.endpoint = result.value(QStringLiteral("peerEndpoint")).toObject();
-    relay(p);
+    const auto endpoint = result.value(QStringLiteral("peerEndpoint")).toObject();
+    if (endpoint != p.endpoint && !p.authenticated) {
+      p.directRetry = 0;
+      p.directFailed = false;
+      p.directStarted = now();
+    }
+    p.endpoint = endpoint;
+    if (!p.directStarted)
+      p.directStarted = now();
     emit changed();
   } catch (const AppError &e) {
     fail(p, e.message());
@@ -325,6 +378,7 @@ void ShareTransport::ticket(const QString &room, const QString &other, const QJs
 }
 void ShareTransport::attach(Peer &p, QTcpSocket *socket, bool outgoing) {
   p.socket = socket;
+  p.outgoing = outgoing;
   p.connecting = outgoing;
   p.authenticated = false;
   p.helloRead = !outgoing;
@@ -365,6 +419,30 @@ void ShareTransport::attach(Peer &p, QTcpSocket *socket, bool outgoing) {
   else
     greeting();
 }
+void ShareTransport::adoptIncoming(Peer &p, QTcpSocket *socket, const QByteArray &input) {
+  if (p.socket) {
+    auto *previous = p.socket.data();
+    disconnect(previous, nullptr, this, nullptr);
+    previous->abort();
+    previous->deleteLater();
+    p.socket = nullptr;
+  }
+  attach(p, socket, false);
+  p.input = input;
+  bytes(p);
+}
+bool ShareTransport::promoteCandidate(Peer &p) {
+  if (p.authenticated || !p.candidate || p.candidate->state() != QAbstractSocket::ConnectedState)
+    return false;
+  auto *socket = p.candidate.data();
+  const auto input = p.candidateInput;
+  p.candidate = nullptr;
+  p.candidateInput.clear();
+  adoptIncoming(p, socket, input);
+  if (p.authenticated)
+    ++p.standbyPromotions;
+  return p.authenticated;
+}
 void ShareTransport::incoming(QTcpSocket *socket) {
   if (findChildren<QTcpSocket *>(QString(), Qt::FindDirectChildrenOnly).size() >= 64) {
     socket->abort();
@@ -386,6 +464,16 @@ void ShareTransport::incoming(QTcpSocket *socket) {
     }
     if (input->size() < int(size) + 4)
       return;
+    const int afterHello = int(size) + 4;
+    if (input->size() < afterHello + 4)
+      return;
+    const auto authenticatedSize = qFromBigEndian<quint32>(input->constData() + afterHello);
+    if (authenticatedSize > 1024 || authenticatedSize < 2) {
+      socket->abort();
+      return;
+    }
+    if (input->size() < afterHello + 4 + int(authenticatedSize))
+      return;
     const auto hello = QJsonDocument::fromJson(input->mid(4, size)).object();
     const auto from = hello.value(QStringLiteral("from")).toString();
     QString room;
@@ -402,14 +490,32 @@ void ShareTransport::incoming(QTcpSocket *socket) {
     }
     try {
       auto &p = peer(room, from);
-      if (p.socket) {
+      // Plaintext room/member IDs cannot displace a valid pending connection.
+      // Authenticate the encrypted hello before considering any route change.
+      const auto greeting = sharing::open(p.key, input->mid(afterHello + 4, int(authenticatedSize)),
+                                          p.context + '\0' + p.id.toUtf8());
+      if (QJsonDocument::fromJson(greeting).object().value(QStringLiteral("type")).toString() !=
+          QStringLiteral("hello")) {
+        socket->abort();
+        return;
+      }
+      if (p.authenticated || p.candidate) {
         socket->abort();
         return;
       }
       disconnect(*connection);
-      attach(p, socket, false);
-      p.input = input->mid(4 + size);
-      bytes(p);
+      const auto authenticatedInput = input->mid(afterHello);
+      if (p.socket)
+        ++p.simultaneousRoutes;
+      if (p.socket && p.outgoing && p.self < p.id) {
+        // Simultaneous routes converge on the lower member's outgoing socket.
+        // Keep the authenticated alternative until that outgoing attempt
+        // actually fails or times out. A delayed response alone cannot prove
+        // that the canonical route failed or that the alternative is alive.
+        p.candidate = socket;
+        p.candidateInput = authenticatedInput;
+      } else
+        adoptIncoming(p, socket, authenticatedInput);
     } catch (const AppError &) {
       socket->abort();
     }
@@ -420,6 +526,8 @@ void ShareTransport::incoming(QTcpSocket *socket) {
     for (const auto &[_, p] : peers_)
       if (p->socket == socket)
         authenticated = p->authenticated;
+      else if (p->candidate == socket)
+        authenticated = true; // Its encrypted hello was verified before storage.
     if (!authenticated)
       socket->abort();
   });
@@ -481,6 +589,19 @@ void ShareTransport::packet(Peer &p, const QByteArray &data, bool direct) {
       if (direct && p.socket) {
         p.authenticated = true;
         p.state = QStringLiteral("Direct · encrypted");
+        if (p.candidate) {
+          p.candidate->abort();
+          p.candidate->deleteLater();
+          p.candidate = nullptr;
+          p.candidateInput.clear();
+        }
+        if (p.receive)
+          p.receive->cancelled.store(true);
+        if (p.upload)
+          p.upload->cancelled.store(true);
+        p.receive.reset();
+        p.upload.reset();
+        p.relayActive = false;
         emit changed();
       }
       return;
@@ -496,7 +617,7 @@ bool ShareTransport::send(const QString &room, const QString &other, const QJson
     auto &p = peer(room, other);
     if (config_.value(QStringLiteral("offline")).toBool() || p.queue.size() >= 2)
       return false;
-    if (!p.authenticated && (p.relay.isEmpty() || p.ticket.isEmpty() || p.expires < now()))
+    if (!p.authenticated && !canRelay(p))
       return false;
     const auto encoded = encode(message);
     qint64 queued = 0;
@@ -522,14 +643,30 @@ QString ShareTransport::mode(const QString &room, const QString &other) const {
   if (it == peers_.end())
     return QStringLiteral("Connecting to publisher…");
   const auto &p = *it->second;
-  return p.authenticated                             ? QStringLiteral("Direct · encrypted")
-         : !p.relay.isEmpty() && !p.ticket.isEmpty() ? QStringLiteral("Relay · end-to-end encrypted")
-         : p.state.isEmpty() ? QStringLiteral("Waiting for publisher or relay configuration")
+  return p.authenticated ? QStringLiteral("Direct · encrypted")
+         : p.relayActive ? QStringLiteral("Relay · end-to-end encrypted")
+         : p.state.isEmpty() ? QStringLiteral("Preparing direct peer-to-peer connection…")
                              : p.state;
 }
+QJsonObject ShareTransport::diagnostics(const QString &room, const QString &other) const {
+  auto it = peers_.find(id(room, other));
+  return {{QStringLiteral("mode"), mode(room, other)},
+          {QStringLiteral("relayAllowed"), relayAllowed()},
+          {QStringLiteral("directAttempts"), it == peers_.end() ? 0 : it->second->directAttempts},
+          {QStringLiteral("relayRequests"), it == peers_.end() ? 0 : it->second->relayRequests},
+          {QStringLiteral("simultaneousRoutes"), it == peers_.end() ? 0 : it->second->simultaneousRoutes},
+          {QStringLiteral("standbyPromotions"), it == peers_.end() ? 0 : it->second->standbyPromotions}};
+}
+bool ShareTransport::relayAllowed() const {
+  return config_.value(QStringLiteral("sharingMode")).toString(QStringLiteral("p2p-relay")) !=
+         QStringLiteral("p2p-only");
+}
+bool ShareTransport::canRelay(const Peer &p) const {
+  return relayAllowed() && p.directFailed && !p.authenticated && !p.relay.isEmpty() &&
+         !p.ticket.isEmpty() && p.expires >= now();
+}
 void ShareTransport::relay(Peer &p) {
-  if (p.authenticated || p.relay.isEmpty() || p.ticket.isEmpty() || p.expires < now() ||
-      config_.value(QStringLiteral("offline")).toBool() || now() < p.retry)
+  if (!canRelay(p) || config_.value(QStringLiteral("offline")).toBool() || now() < p.retry)
     return;
   const auto key = id(p.room, p.id);
   auto options = [&](bool send) {
@@ -549,6 +686,7 @@ void ShareTransport::relay(Peer &p) {
     return o;
   };
   if (!p.receive) {
+    ++p.relayRequests;
     auto o = options(false);
     p.receive = o.control;
     auto *watcher = new QFutureWatcher<HttpResult>(this);
@@ -562,6 +700,10 @@ void ShareTransport::relay(Peer &p) {
       p.receive.reset();
       if (result.cancelled)
         return;
+      if (result.status == 200 || result.status == 204) {
+        p.relayActive = true;
+        emit changed();
+      }
       if (result.status == 200 && !result.body.isEmpty())
         packet(p, result.body);
       else if (result.status != 204) {
@@ -574,6 +716,7 @@ void ShareTransport::relay(Peer &p) {
     watcher->setFuture(QtConcurrent::run(&receives_, [o] { return fetchHttp(o); }));
   }
   if (!p.upload && !p.queue.isEmpty()) {
+    ++p.relayRequests;
     auto o = options(true);
     o.method = QStringLiteral("POST");
     o.headers.insert("Content-Type", "application/octet-stream");
@@ -594,6 +737,8 @@ void ShareTransport::relay(Peer &p) {
       if (result.cancelled)
         return;
       if (result.status == 202) {
+        p.relayActive = true;
+        emit changed();
         // This exact frame was removed at dispatch. A direct connection may
         // have consumed newer queued frames while the relay POST was in flight.
       } else {

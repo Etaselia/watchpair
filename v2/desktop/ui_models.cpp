@@ -3,6 +3,7 @@
 #include <QBrush>
 #include <QCollator>
 #include <QComboBox>
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QFileInfo>
 #include <QFont>
@@ -92,6 +93,8 @@ QString elapsed(double seconds) {
                    : QStringLiteral("%1:%2").arg(n / 60).arg(n % 60, 2, 10, QLatin1Char('0'));
 }
 QString age(qint64 timestamp, qint64 now) {
+  if (timestamp <= 0)
+    return QStringLiteral("—");
   if (now == 0)
     now = QDateTime::currentMSecsSinceEpoch();
   const auto seconds = std::max<qint64>(0, (now - timestamp) / 1000);
@@ -108,6 +111,18 @@ QString age(qint64 timestamp, qint64 now) {
   return QStringLiteral("%1 day%2 ago")
       .arg(seconds / 86400)
       .arg(seconds / 86400 == 1 ? QString() : QStringLiteral("s"));
+}
+std::optional<qint64> timestampMilliseconds(const QJsonValue &value) {
+  if (!value.isDouble())
+    return std::nullopt;
+  const auto number = value.toDouble();
+  if (!std::isfinite(number) || number <= 0 || number > 9007199254740991.0)
+    return std::nullopt;
+  return qint64(std::trunc(number));
+}
+bool upcoming(const QJsonObject &entry) {
+  return entry.value(QStringLiteral("enabled")).toBool() &&
+         entry.value(QStringLiteral("watchedAt")).isNull();
 }
 TransferTable::TransferTable(TransferEngine &engine, QObject *parent)
     : QAbstractTableModel(parent), engine_(engine) {
@@ -144,6 +159,8 @@ QVariant TransferTable::data(const QModelIndex &i, int role) const {
     return {};
   const auto &r = rows_[i.row()];
   const double progress = r.wanted > 0 ? std::clamp(double(r.verified) / r.wanted, 0.0, 1.0) : 0;
+  // Existing copies use their selected size when no download traffic was recorded.
+  const double ratio = double(r.uploaded) / (r.downloaded > 0 ? r.downloaded : std::max<qint64>(1, r.wanted));
   if (role == IdRole)
     return r.id;
   if (role == ProgressRole)
@@ -173,7 +190,7 @@ QVariant TransferTable::data(const QModelIndex &i, int role) const {
     case 9:
       return r.downRate > 0 ? double(r.wanted - r.verified) / r.downRate : 1e20;
     case 10:
-      return r.downloaded > 0 ? double(r.uploaded) / r.downloaded : 0;
+      return ratio;
     default:
       return data(i, Qt::DisplayRole);
     }
@@ -203,7 +220,7 @@ QVariant TransferTable::data(const QModelIndex &i, int role) const {
     return r.downRate > 0 && r.wanted > r.verified ? elapsed(double(r.wanted - r.verified) / r.downRate)
                                                    : QStringLiteral("—");
   case 10:
-    return QString::number(r.downloaded > 0 ? double(r.uploaded) / r.downloaded : 0, 'f', 2);
+    return QString::number(ratio, 'f', 2);
   case 11:
     return r.path;
   }
@@ -536,7 +553,36 @@ int JsonTable::indexOf(const QString &key) const {
       return i;
   return -1;
 }
-void JsonTable::setRows(const QJsonArray &rows) {
+void JsonTable::setRows(const QJsonArray &incoming) {
+  auto rows = incoming;
+  if (kind_ == JsonKind::Queue || kind_ == JsonKind::History) {
+    QHash<QString, QSet<QString>> sources;
+    QHash<QString, QSet<QString>> sameNames;
+    for (const auto value : rows) {
+      const auto row = value.toObject();
+      sources[row.value(QStringLiteral("label")).toString() + QLatin1Char('\0') +
+              row.value(QStringLiteral("path")).toString()].insert(row.value(QStringLiteral("sourceId")).toString());
+      sameNames[row.value(QStringLiteral("label")).toString() + QLatin1Char('\0') +
+                row.value(QStringLiteral("path")).toString() + QLatin1Char('\0') +
+                row.value(QStringLiteral("sourceLabel")).toString()].insert(row.value(QStringLiteral("sourceId")).toString());
+    }
+    for (int i = 0; i < rows.size(); ++i) {
+      auto row = rows[i].toObject();
+      const auto key = row.value(QStringLiteral("label")).toString() + QLatin1Char('\0') +
+                       row.value(QStringLiteral("path")).toString();
+      row.remove(QStringLiteral("_sourceCaption"));
+      if (sources.value(key).size() > 1) {
+        const auto source = row.value(QStringLiteral("sourceId")).toString();
+        auto caption = row.value(QStringLiteral("sourceLabel")).toString(tr("Source"));
+        if (sameNames.value(key + QLatin1Char('\0') + row.value(QStringLiteral("sourceLabel")).toString()).size() > 1) {
+          const auto fingerprint = QString::fromLatin1(QCryptographicHash::hash(source.toUtf8(), QCryptographicHash::Sha256).toHex().left(8));
+          caption += QStringLiteral(" [%1]").arg(fingerprint);
+        }
+        row.insert(QStringLiteral("_sourceCaption"), caption);
+      }
+      rows[i] = row;
+    }
+  }
   bool same = rows.size() == rows_.size();
   if (same)
     for (int i = 0; i < rows.size(); ++i)
@@ -575,6 +621,10 @@ QVariant JsonTable::data(const QModelIndex &i, int role) const {
     return id(r);
   if (role == ObjectRole)
     return QVariant::fromValue(r);
+  if (role == SearchRole)
+    return r.value(QStringLiteral("label")).toString() + QLatin1Char(' ') +
+           r.value(QStringLiteral("path")).toString() + QLatin1Char(' ') +
+           r.value(QStringLiteral("sourceLabel")).toString();
   const bool current = !current_.isEmpty() && (r.value(QStringLiteral("id")).toString() == current_ ||
                                                r.value(QStringLiteral("entryId")).toString() == current_);
   if (role == Qt::FontRole && current && i.column() == 0) {
@@ -584,15 +634,25 @@ QVariant JsonTable::data(const QModelIndex &i, int role) const {
   }
   if (role == Qt::ForegroundRole && current && i.column() == 0)
     return QBrush(QColor(QStringLiteral("#8fb7ff")));
-  if (role == Qt::ToolTipRole)
-    return kind_ == JsonKind::History
-               ? QLocale().toString(
-                     QDateTime::fromMSecsSinceEpoch(r.value(QStringLiteral("watchedAt")).toInteger())
-                         .toLocalTime(),
-                     QLocale::LongFormat)
-               : r.value(QStringLiteral("error"))
+  if (role == Qt::ToolTipRole) {
+    if (kind_ == JsonKind::History) {
+      const auto timestamp = timestampMilliseconds(r.value(QStringLiteral("watchedAt")));
+      return r.value(QStringLiteral("label")).toString() + QLatin1Char('\n') +
+             r.value(QStringLiteral("sourceLabel")).toString() + QLatin1Char('\n') +
+             r.value(QStringLiteral("sourceId")).toString() + QLatin1Char('\n') +
+             r.value(QStringLiteral("path")).toString() + QLatin1Char('\n') +
+             (timestamp ? QLocale().toString(QDateTime::fromMSecsSinceEpoch(*timestamp).toLocalTime(),
+                                            QLocale::LongFormat)
+                        : QStringLiteral("Recorded time unavailable"));
+    }
+    if (kind_ == JsonKind::Queue)
+      return r.value(QStringLiteral("sourceLabel")).toString() + QLatin1Char('\n') +
+             r.value(QStringLiteral("sourceId")).toString() + QLatin1Char('\n') +
+             r.value(QStringLiteral("path")).toString();
+    return r.value(QStringLiteral("error"))
                      .toString(r.value(QStringLiteral("path"))
                                    .toString(r.value(QStringLiteral("label")).toString()));
+  }
   if (role == ProgressRole)
     return kind_ == JsonKind::Peers ? r.value(QStringLiteral("progress")).toDouble()
            : r.value(QStringLiteral("state")).toString() == QStringLiteral("Ready") ? 1.0
@@ -603,16 +663,17 @@ QVariant JsonTable::data(const QModelIndex &i, int role) const {
     return {};
   const auto col = i.column();
   const auto label = r.value(QStringLiteral("label")).toString();
+  const auto context = r.value(QStringLiteral("_sourceCaption")).toString();
   switch (kind_) {
   case JsonKind::Queue:
     if (col == 0) {
-      const auto folder =
-          QFileInfo(r.value(QStringLiteral("path")).toString()).path().section(QLatin1Char('/'), -1);
-      return folder.isEmpty() || folder == QStringLiteral(".") ? label
-                                                               : folder + QStringLiteral(" · ") + label;
+      const auto folder = QFileInfo(r.value(QStringLiteral("path")).toString()).path();
+      return label + (folder.isEmpty() || folder == QStringLiteral(".") ? QString()
+                                                               : QStringLiteral(" · ") + folder) +
+             (context.isEmpty() ? QString() : QStringLiteral(" · ") + context);
     }
     if (col == 1)
-      return r.value(QStringLiteral("watchedAt")).isDouble() ? QStringLiteral("Watched")
+      return timestampMilliseconds(r.value(QStringLiteral("watchedAt"))) ? QStringLiteral("Watched")
              : !r.value(QStringLiteral("enabled")).toBool()  ? QStringLiteral("Not selected")
                                                              : QStringLiteral("Upcoming");
     if (col == 2)
@@ -622,11 +683,17 @@ QVariant JsonTable::data(const QModelIndex &i, int role) const {
                  : QStringLiteral("—");
     return QFileInfo(r.value(QStringLiteral("path")).toString()).path();
   case JsonKind::History:
-    if (col == 0)
-      return label;
-    if (col == 1)
-      return role == SortRole ? r.value(QStringLiteral("watchedAt")).toVariant()
-                              : age(r.value(QStringLiteral("watchedAt")).toInteger());
+    if (col == 0) {
+      const auto folder = QFileInfo(r.value(QStringLiteral("path")).toString()).path();
+      return label + (folder.isEmpty() || folder == QStringLiteral(".") ? QString()
+                                                               : QStringLiteral(" · ") + folder) +
+             (context.isEmpty() ? QString() : QStringLiteral(" · ") + context);
+    }
+    if (col == 1) {
+      const auto timestamp = timestampMilliseconds(r.value(QStringLiteral("watchedAt")));
+      return role == SortRole ? (timestamp ? QVariant(*timestamp) : QVariant())
+                             : (timestamp ? age(*timestamp) : QStringLiteral("—"));
+    }
     if (col == 2)
       return r.value(QStringLiteral("duration")).toDouble() > 0
                  ? QString::number(std::min(100.0, r.value(QStringLiteral("coverage")).toDouble() /

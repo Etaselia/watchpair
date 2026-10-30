@@ -23,6 +23,7 @@ signals:
 
 protected:
   void closeEvent(QCloseEvent *event) override;
+  bool eventFilter(QObject *object, QEvent *event) override;
 
 private:
   void refreshRooms();
@@ -34,6 +35,8 @@ private:
   QString chooseRoom();
   void preview(const QJsonObject &file);
   void toggleFullscreen();
+  void togglePopout();
+  void reattachPlayer(bool restore = true);
   void issue(const QString &code, const QString &message);
   AppServices &app_;
   QWidget *sidebar_, *topbar_, *banner_;
@@ -51,6 +54,9 @@ private:
   QTimer timer_;
   QString currentRoom_;
   bool full_ = false;
+  QWidget *playerWindow_ = nullptr;
+  Qt::WindowStates playerWindowState_;
+  bool bannerBeforeFullscreen_ = false;
   bool quitting_ = false;
 };
 } // namespace wp::ui

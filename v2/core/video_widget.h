@@ -33,6 +33,8 @@ private:
   int frames_ = 0, glError_ = 0;
   int textureUnits_ = 0;
   bool software_ = false;
+  const QOpenGLContext *debugRenderContext_ = nullptr;
+  int debugPaints_ = 0, debugVideoPaints_ = 0, debugHiddenRenders_ = 0;
   std::unique_ptr<QOpenGLFramebufferObject> softwareSurface_;
   QTimer hiddenFrames_;
   std::atomic_bool pendingFrame_{false};

@@ -45,7 +45,7 @@ private:
   QLineEdit *root_, *bind_, *proxy_, *server_, *member_;
   QSpinBox *down_, *up_, *reserve_, *slots_, *connections_, *port_, *proxyPort_;
   QCheckBox *offline_, *dht_, *lsd_, *upnp_, *closeToTray_, *startup_;
-  QComboBox *audio_;
+  QComboBox *audio_, *seedPolicy_, *sharingMode_;
   QDoubleSpinBox *subtitleScale_;
   QLabel *status_;
 };

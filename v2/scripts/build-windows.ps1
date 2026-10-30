@@ -5,14 +5,21 @@ param(
   [switch]$DesktopTests,
   [string]$MediaFixtures = '',
   [string]$AppVersion = '',
+  [string]$TorrentPrefix = '',
   [string]$UpdatePublicKey = ''
 )
 $ErrorActionPreference = 'Stop'
 $taskSource = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $taskPrefix = Join-Path $MsysRoot 'ucrt64'
 if (-not $BuildDirectory) { $BuildDirectory = Join-Path $taskSource '..\outputs\v2\app-windows' }
+if (-not $TorrentPrefix) { $TorrentPrefix = Join-Path $taskSource '..\outputs\v2\native-libtorrent-matched\prefix' }
+$taskTorrentReceipt = Join-Path $TorrentPrefix 'watchpair-libtorrent-build.json'
+if (-not (Test-Path -LiteralPath $taskTorrentReceipt)) {
+  throw 'Build the consistent libtorrent runtime first with build-libtorrent-matched.ps1. Pass its prefix with -TorrentPrefix.'
+}
 $env:Path = (Join-Path $taskPrefix 'bin') + ';' + $env:Path
 $taskConfigure = @('-S', $taskSource, '-B', $BuildDirectory, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=RelWithDebInfo', "-DCMAKE_PREFIX_PATH=$taskPrefix")
+$taskConfigure += @("-DLibtorrentRasterbar_DIR=$TorrentPrefix/lib/cmake/LibtorrentRasterbar", "-DWATCHPAIR_TORRENT_BUILD_RECEIPT=$taskTorrentReceipt")
 if ($AppVersion) { $taskConfigure += "-DWATCHPAIR_APP_VERSION=$AppVersion" }
 if ($UpdatePublicKey) { $taskConfigure += "-DWATCHPAIR_UPDATE_PUBLIC_KEY=$UpdatePublicKey" }
 & (Join-Path $taskPrefix 'bin\cmake.exe') @taskConfigure

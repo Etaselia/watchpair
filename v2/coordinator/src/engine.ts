@@ -78,7 +78,7 @@ export class Engine extends EventEmitter {
   private state(room: Room) {
     return { id: room.id, name: room.name, hostId: room.hostId, successorId: room.successorId,
       inviteVersion: hash(room.inviteHash), recoveryVersion: hash(room.recoveryHash),
-      revision: room.revision, queueRevision: room.queueRevision, playback: room.playback,
+      revision: room.revision, queueRevision: room.queueRevision, historyGeneration: room.historyGeneration, playback: room.playback,
       members: room.members.map(m => this.publicMember(m)), reporterId: room.reporterId, serverTime: this.now() };
   }
   snapshot(id: string) {
@@ -106,7 +106,7 @@ export class Engine extends EventEmitter {
     const token = this.secret('member', id, retryKey), invite = this.secret('initial-invite', id, retryKey), recovery = this.secret('initial-recovery', id, retryKey);
     const room: Room = {
       id, name, hostId: memberId, successorId: null, inviteHash: hash(invite), recoveryHash: hash(recovery), recoveryRetry: null,
-      createdAt: now, revision: 0, queueRevision: 0, sources: [], entries: [], playback: freshPlayback(now), reporterId: null,
+      createdAt: now, revision: 0, queueRevision: 0, historyGeneration: 0, sources: [], entries: [], playback: freshPlayback(now), reporterId: null,
       members: [{ id: memberId, name: memberName, tokenHash: hash(token), publicKey: null, joinHash: retryHash, joinedAt: now, watch: 'idle', live: null }],
     };
     // Creation and its retry mapping commit together; credentials are derived
@@ -227,10 +227,11 @@ export class Engine extends EventEmitter {
     room.playback.requested = !!entry && room.playback.requested;
     this.invalidate(room, 0, entry ? 'Preparing the next episode' : 'No more selected episodes');
   }
-  private complete(entry: Entry, method: History['method']): History | null {
+  private complete(room: Room, entry: Entry, method: History['method']): History | null {
     if (entry.watchedAt !== null) return null;
-    entry.watchedAt = this.now();
+    entry.watchedAt = Math.trunc(this.now());
     return { id: entry.viewingId, entryId: entry.id, mediaId: entry.mediaId, label: entry.label,
+      path: entry.path, sourceId: entry.sourceId, sourceLabel: room.sources.find(source => source.id === entry.sourceId)?.label,
       watchedAt: entry.watchedAt, method, coverage: coverageSeconds(entry.coverage), duration: entry.duration };
   }
   command(id: string, memberId: string, raw: unknown): Ack {
@@ -320,6 +321,19 @@ export class Engine extends EventEmitter {
         queueChanged = true; break;
       }
       case 'queue.remove': for (const entryId of new Set(c.ids)) this.entry(room, entryId).enabled = false; queueChanged = true; break;
+      case 'queue.clear': {
+        if (c.scope === 'upcoming') {
+          for (const entry of room.entries) if (entry.enabled && entry.watchedAt === null) entry.enabled = false;
+        } else {
+          const removed = new Set(room.entries.filter(entry => entry.watchedAt !== null).map(entry => entry.id));
+          for (const entry of room.entries) if (removed.has(entry.id)) entry.enabled = false;
+          if (p.entryId && removed.has(p.entryId)) this.next(room);
+          room.entries = room.entries.filter(entry => !removed.has(entry.id));
+          plan.clearHistory = true;
+          ++room.historyGeneration;
+        }
+        queueChanged = true; break;
+      }
       case 'queue.rename': this.entry(room, c.entryId).label = c.label; queueChanged = true; break;
       case 'queue.identify': {
         const entry = this.entry(room, c.entryId);
@@ -365,7 +379,7 @@ export class Engine extends EventEmitter {
       case 'history.mark': {
         for (const entryId of new Set(c.ids)) {
           const entry = this.entry(room, entryId);
-          if (c.watched) { const history = this.complete(entry, 'manual'); if (history) plan.history!.push(history); }
+          if (c.watched) { const history = this.complete(room, entry, 'manual'); if (history) plan.history!.push(history); }
           else { entry.watchedAt = null; entry.coverage = []; entry.viewingId = randomUUID(); }
         }
         queueChanged = true; break;
@@ -430,7 +444,7 @@ export class Engine extends EventEmitter {
         status.position - live.coveragePosition <= elapsed * p.rate + 0.5 && Math.abs(status.position - this.position(room, now)) <= 1.5 && entry.duration) {
         entry.coverage = mergeCoverage(entry.coverage, live.coveragePosition, status.position, entry.duration);
         if (entry.watchedAt === null && coverageSeconds(entry.coverage) / entry.duration >= 0.9) {
-          const history = this.complete(entry, 'automatic'); if (history) plan.history!.push(history);
+          const history = this.complete(room, entry, 'automatic'); if (history) plan.history!.push(history);
           ++room.queueRevision; changed = true;
         }
         plan.entries!.push(entry);

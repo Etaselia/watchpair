@@ -4,6 +4,7 @@
 #include <QDesktopServices>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
+#include <QEvent>
 #include <QFileDialog>
 #include <QFormLayout>
 #include <QGridLayout>
@@ -14,11 +15,47 @@
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QSplitter>
+#include <QStyledItemDelegate>
+#include <QStyleOptionViewItem>
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <algorithm>
 namespace wp::ui {
 namespace {
+class FilterDelegate final : public QStyledItemDelegate {
+public:
+  using QStyledItemDelegate::QStyledItemDelegate;
+  QSize sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const override {
+    auto size = QStyledItemDelegate::sizeHint(option, index);
+    size.setHeight(std::max(size.height(), option.fontMetrics.lineSpacing() + 20));
+    return size;
+  }
+};
+class FilterList final : public QListWidget {
+public:
+  explicit FilterList(QWidget *parent = nullptr) : QListWidget(parent) {
+    setObjectName(QStringLiteral("TransferFilters"));
+    setItemDelegate(new FilterDelegate(this));
+    setUniformItemSizes(true);
+    setSpacing(2);
+    setWordWrap(false);
+    setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    fitWidth();
+  }
+protected:
+  void changeEvent(QEvent *event) override {
+    QListWidget::changeEvent(event);
+    if (event->type() == QEvent::FontChange || event->type() == QEvent::StyleChange ||
+        event->type() == QEvent::ApplicationFontChange) {
+      fitWidth();
+      scheduleDelayedItemsLayout();
+    }
+  }
+private:
+  void fitWidth() {
+    setFixedWidth(std::max(170, fontMetrics().horizontalAdvance(tr("Metadata / choices")) + 36));
+  }
+};
 QPushButton *button(const QString &text, const QString &glyph, QWidget *parent = nullptr) {
   auto *result = new QPushButton(icon(glyph), text, parent);
   result->setCursor(Qt::PointingHandCursor);
@@ -57,6 +94,23 @@ QHash<int, int> choices(AppServices &app, const QString &id) {
   return result;
 }
 } // namespace
+QListWidget *createTransferFilters(QWidget *parent) {
+  auto *filters = new FilterList(parent);
+  const QList<QPair<QString, QString>> states{{TransferDesk::tr("All transfers"), {}},
+      {TransferDesk::tr("Downloading"), QStringLiteral("Downloading")},
+      {TransferDesk::tr("Metadata / choices"), QStringLiteral("Metadata")},
+      {TransferDesk::tr("Seeding"), QStringLiteral("Seeding")},
+      {TransferDesk::tr("Complete"), QStringLiteral("Complete")},
+      {TransferDesk::tr("Paused"), QStringLiteral("Paused")},
+      {TransferDesk::tr("Waiting"), QStringLiteral("Waiting")},
+      {TransferDesk::tr("Errors"), QStringLiteral("Error")}};
+  for (const auto &[text, state] : states) {
+    auto *item = new QListWidgetItem(text, filters);
+    item->setData(Qt::UserRole, state);
+  }
+  filters->setCurrentRow(0);
+  return filters;
+}
 FileSelector::FileSelector(QWidget *parent) : QWidget(parent), model(this) {
   auto *layout = new QVBoxLayout(this);
   layout->setContentsMargins(8, 8, 8, 8);
@@ -341,21 +395,7 @@ TransferDesk::TransferDesk(AppServices &app, QWidget *parent)
   tools->addWidget(search_);
   layout->addLayout(tools);
   auto *body = new QHBoxLayout;
-  filters_ = new QListWidget;
-  filters_->setObjectName(QStringLiteral("Navigation"));
-  filters_->setMaximumWidth(150);
-  const QList<QPair<QString, QString>> states{{tr("All transfers"), {}},
-                                              {tr("Downloading"), QStringLiteral("Downloading")},
-                                              {tr("Metadata / choices"), QStringLiteral("Metadata")},
-                                              {tr("Seeding"), QStringLiteral("Seeding")},
-                                              {tr("Paused"), QStringLiteral("Paused")},
-                                              {tr("Waiting"), QStringLiteral("Waiting")},
-                                              {tr("Errors"), QStringLiteral("Error")}};
-  for (const auto &[text, state] : states) {
-    auto *item = new QListWidgetItem(text, filters_);
-    item->setData(Qt::UserRole, state);
-  }
-  filters_->setCurrentRow(0);
+  filters_ = createTransferFilters(this);
   body->addWidget(filters_);
   transferTabs_ = new QTabWidget;
   connect(transferTabs_, &QTabWidget::currentChanged, this,
@@ -783,12 +823,15 @@ void TransferDesk::refresh() {
     const auto r = app_.transfers.view(current_);
     selectionTitle_->setText(r.name);
     selectionReason_->setText(r.reason.isEmpty() ? r.state : r.state + QStringLiteral(" · ") + r.reason);
-    stats_->setText(tr("Verified %1 of %2 selected · %3 peers · Uploaded %4%5%6")
+    stats_->setText(tr("Verified %1 of %2 selected · %3 peers · Uploaded %4%5%6%7")
                         .arg(bytes(r.verified), bytes(r.wanted))
                         .arg(r.peers)
                         .arg(bytes(r.uploaded))
                         .arg(r.pinned ? tr(" · Pinned") : QString())
-                        .arg(r.inUse ? tr(" · In use") : QString()));
+                        .arg(r.inUse ? tr(" · In use") : QString())
+                        .arg(r.seedPolicy == QStringLiteral("off") ? tr(" · Torrent uploads off")
+                             : r.uploadsEnabled ? tr(" · Torrent uploads enabled")
+                                                : tr(" · Torrent upload limit reached or paused")));
     location_->setText(r.path);
     identity_->setText(r.identity);
     if (details_->currentIndex() == 1 && !app_.transfers.source(current_)->files().isEmpty()) {
@@ -894,6 +937,14 @@ void TransferDesk::editLimits() {
   dialog->setAttribute(Qt::WA_DeleteOnClose);
   dialog->setWindowTitle(tr("Transfer limits"));
   auto *layout = new QFormLayout(dialog);
+  auto *policy = new QComboBox;
+  policy->setObjectName(QStringLiteral("TransferSeedPolicy"));
+  policy->addItem(tr("Use device default"), QStringLiteral("inherit"));
+  policy->addItem(tr("Off — no file uploads"), QStringLiteral("off"));
+  policy->addItem(tr("Stop at 1× uploaded"), QStringLiteral("ratio1"));
+  policy->addItem(tr("Stop at 2× uploaded"), QStringLiteral("ratio2"));
+  policy->addItem(tr("Unlimited seeding"), QStringLiteral("unlimited"));
+  policy->addItem(tr("Custom ratio / time"), QStringLiteral("custom"));
   auto *down = new QDoubleSpinBox, *up = new QDoubleSpinBox, *ratio = new QDoubleSpinBox;
   for (auto *spin : {down, up}) {
     spin->setRange(0, 2047);
@@ -909,22 +960,36 @@ void TransferDesk::editLimits() {
   minutes->setSuffix(tr(" minutes"));
   minutes->setSpecialValueText(tr("Unlimited"));
   const auto intent = app_.transfers.intent(ids.first());
+  policy->setCurrentIndex(std::max(0, policy->findData(intent.value(QStringLiteral("seedPolicy"))
+                                                         .toString(QStringLiteral("inherit")))));
   down->setValue(intent.value(QStringLiteral("downLimit")).toDouble() / 1048576);
   up->setValue(intent.value(QStringLiteral("upLimit")).toDouble() / 1048576);
   ratio->setValue(intent.value(QStringLiteral("seedRatio")).toDouble());
   minutes->setValue(intent.value(QStringLiteral("seedMinutes")).toInt());
   layout->addRow(tr("Download"), down);
   layout->addRow(tr("Upload"), up);
+  layout->addRow(tr("Torrent seeding"), policy);
+  auto *explanation = new QLabel(tr("Off blocks file payload uploads while downloading and after completion. "
+                                    "Torrent protocol and metadata traffic continue. Explicit local-file shares use their own permission."));
+  explanation->setWordWrap(true);
+  layout->addRow(explanation);
   layout->addRow(tr("Seed ratio"), ratio);
   layout->addRow(tr("Seed time"), minutes);
+  auto updatePolicy = [policy, ratio, minutes] {
+    const bool custom = policy->currentData().toString() == QStringLiteral("custom");
+    ratio->setEnabled(custom);
+    minutes->setEnabled(custom);
+  };
+  connect(policy, &QComboBox::currentIndexChanged, dialog, updatePolicy);
+  updatePolicy();
   auto *buttons = new QDialogButtonBox(QDialogButtonBox::Cancel | QDialogButtonBox::Save);
   layout->addRow(buttons);
   connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::reject);
-  connect(buttons, &QDialogButtonBox::accepted, this, [this, ids, down, up, ratio, minutes, dialog] {
+  connect(buttons, &QDialogButtonBox::accepted, this, [this, ids, down, up, ratio, minutes, policy, dialog] {
     for (const auto &id : ids)
       guard([&] {
         app_.transfers.setLimits(id, int(down->value() * 1048576), int(up->value() * 1048576), ratio->value(),
-                                 minutes->value());
+                                 minutes->value(), policy->currentData().toString());
       });
     dialog->accept();
   });

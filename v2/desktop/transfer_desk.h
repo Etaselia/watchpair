@@ -16,6 +16,7 @@
 #include <QTreeView>
 #include <QWidget>
 namespace wp::ui {
+QListWidget *createTransferFilters(QWidget *parent = nullptr);
 class FileSelector final : public QWidget {
   Q_OBJECT
 public:

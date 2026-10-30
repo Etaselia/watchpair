@@ -1,3 +1,4 @@
+#include "native_runtime.h"
 #include "release_manager.h"
 #include "transfer_engine.h"
 #include <QCryptographicHash>
@@ -12,11 +13,16 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTemporaryDir>
+#include <QThread>
 #include <QtTest>
 #include <archive.h>
 #include <archive_entry.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#ifdef Q_OS_LINUX
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 namespace {
 void write(const QString &path, const QByteArray &data) {
   if (!QDir().mkpath(QFileInfo(path).path()))
@@ -119,6 +125,119 @@ void writeArchive(const QString &path, const QStringList &names, bool symlink = 
 class DeliveryTests final : public QObject {
   Q_OBJECT
 private slots:
+#ifdef Q_OS_LINUX
+  void exitedUnreapedProcessDoesNotBlockActivation() {
+    const auto pid = fork();
+    if (pid == 0)
+      _exit(23);
+    QVERIFY(pid > 0);
+    const auto reap = qScopeGuard([pid] {
+      int status = 0;
+      waitpid(pid, &status, 0);
+    });
+    bool zombie = false;
+    for (int n = 0; n < 100 && !zombie; ++n) {
+      QFile process(QStringLiteral("/proc/%1/stat").arg(pid));
+      if (process.open(QIODevice::ReadOnly)) {
+        const auto state = process.readAll();
+        const auto end = state.lastIndexOf(')');
+        zombie = end >= 0 && end + 2 < state.size() && state[end + 2] == 'Z';
+      }
+      if (!zombie)
+        QThread::msleep(10);
+    }
+    QVERIFY(zombie);
+    QCOMPARE(kill(pid, 0), 0);
+    QElapsedTimer clock;
+    clock.start();
+    wp::delivery::waitForProcess(pid);
+    QVERIFY(clock.elapsed() < 5000);
+  }
+#endif
+  void olderPortableCopiesCannotReplaceANewerInstallation() {
+    QTemporaryDir tmp;
+    const auto profile = tmp.filePath(QStringLiteral("profile")),
+               root = tmp.filePath(QStringLiteral("runtime"));
+    { wp::LocalStore store(profile); }
+    const auto newer = bundle(tmp.path(), QStringLiteral("newer"), QStringLiteral("2.1.0"));
+    const auto older = bundle(tmp.path(), QStringLiteral("older"), QStringLiteral("2.0.0"));
+    const auto installed = wp::delivery::installBundle(newer, root, profile);
+    QVERIFY_EXCEPTION_THROWN(wp::delivery::installBundle(older, root, profile), wp::AppError);
+    QCOMPARE(QString::fromUtf8(read(root + QStringLiteral("/current.txt"))).trimmed(),
+             installed.value(QStringLiteral("key")).toString());
+    QVERIFY(!QFileInfo::exists(root + QStringLiteral("/staged.json")));
+    QCOMPARE(wp::delivery::prepareRestart(older, root, profile), QStringLiteral("installed"));
+  }
+  void restartingANewerPortableCopyStagesItInsteadOfOpeningTheOlderVersion() {
+    QTemporaryDir tmp;
+    const auto profile = tmp.filePath(QStringLiteral("profile")),
+               root = tmp.filePath(QStringLiteral("runtime"));
+    { wp::LocalStore store(profile); }
+    const auto older = bundle(tmp.path(), QStringLiteral("older"), QStringLiteral("2.0.0"));
+    const auto newer = bundle(tmp.path(), QStringLiteral("newer"), QStringLiteral("2.1.0"));
+    const auto previous = wp::delivery::installBundle(older, root, profile);
+    QCOMPARE(wp::delivery::prepareRestart(newer, root, profile), QStringLiteral("activate"));
+    QCOMPARE(wp::delivery::installationState(root).value(QStringLiteral("stagedVersion")).toString(),
+             QStringLiteral("2.1.0"));
+    // Preparing a restart does not switch a live process or alter its database.
+    QCOMPARE(QString::fromUtf8(read(root + QStringLiteral("/current.txt"))).trimmed(),
+             previous.value(QStringLiteral("key")).toString());
+    wp::delivery::activate(root);
+    QCOMPARE(wp::delivery::installationState(root).value(QStringLiteral("version")).toString(),
+             QStringLiteral("2.1.0"));
+  }
+  void legacyStagedDowngradesAreDiscardedWithoutDeletingTheirFiles() {
+    QTemporaryDir tmp;
+    const auto profile = tmp.filePath(QStringLiteral("profile")),
+               root = tmp.filePath(QStringLiteral("runtime"));
+    { wp::LocalStore store(profile); }
+    const auto older = bundle(tmp.path(), QStringLiteral("older"), QStringLiteral("2.0.0"));
+    const auto newer = bundle(tmp.path(), QStringLiteral("newer"), QStringLiteral("2.1.0"));
+    const auto old = wp::delivery::installBundle(older, root, profile);
+    const auto current = wp::delivery::installBundle(newer, root, profile);
+    wp::delivery::activate(root);
+    write(root + QStringLiteral("/staged.json"),
+          QJsonDocument(
+              QJsonObject{{QStringLiteral("from"), current.value(QStringLiteral("key"))},
+                          {QStringLiteral("format"), 1},
+                          {QStringLiteral("to"), old.value(QStringLiteral("key"))},
+                          {QStringLiteral("nonce"), QStringLiteral("legacy-downgrade")},
+                          {QStringLiteral("backup"), QStringLiteral("backups/legacy-downgrade.sqlite")}})
+              .toJson());
+    QCOMPARE(wp::delivery::prepareRestart(newer, root, profile), QStringLiteral("installed"));
+    QVERIFY(!QFileInfo::exists(root + QStringLiteral("/staged.json")));
+    QVERIFY(QFileInfo::exists(root + QStringLiteral("/versions/") +
+                              old.value(QStringLiteral("key")).toString() +
+                              QStringLiteral("/runtime-manifest.json")));
+    QCOMPARE(wp::delivery::installationState(root).value(QStringLiteral("version")).toString(),
+             QStringLiteral("2.1.0"));
+  }
+  void damagedActivationIsRejectedBeforeRestart_data() {
+    QTest::addColumn<QString>("backup");
+    QTest::newRow("missing-backup") << QString();
+    QTest::newRow("wrong-backup") << QStringLiteral("backups/another-update.sqlite");
+  }
+  void damagedActivationIsRejectedBeforeRestart() {
+    QFETCH(QString, backup);
+    QTemporaryDir tmp;
+    const auto profile = tmp.filePath(QStringLiteral("profile")),
+               root = tmp.filePath(QStringLiteral("runtime"));
+    { wp::LocalStore store(profile); }
+    const auto older = bundle(tmp.path(), QStringLiteral("older"), QStringLiteral("2.0.0"));
+    const auto newer = bundle(tmp.path(), QStringLiteral("newer"), QStringLiteral("2.1.0"));
+    const auto current = wp::delivery::installBundle(older, root, profile);
+    wp::delivery::installBundle(newer, root, profile);
+    auto staged = QJsonDocument::fromJson(read(root + QStringLiteral("/staged.json"))).object();
+    if (backup.isEmpty())
+      staged.remove(QStringLiteral("backup"));
+    else
+      staged.insert(QStringLiteral("backup"), backup);
+    write(root + QStringLiteral("/staged.json"), QJsonDocument(staged).toJson());
+    QVERIFY_EXCEPTION_THROWN(wp::delivery::prepareRestart(newer, root, profile), wp::AppError);
+    QCOMPARE(QString::fromUtf8(read(root + QStringLiteral("/current.txt"))).trimmed(),
+             current.value(QStringLiteral("key")).toString());
+    QVERIFY(!QFileInfo::exists(root + QStringLiteral("/pending.txt")));
+  }
   void missingUpdateFeedReportsHttpStatus() {
     QTemporaryDir tmp;
     wp::LocalStore store(tmp.filePath(QStringLiteral("profile")));
@@ -143,6 +262,110 @@ private slots:
     QCOMPARE(problems.size(), 1);
     QVERIFY(updates.status().contains(QStringLiteral("HTTP 404")));
     QVERIFY(!updates.available());
+  }
+  void damagedRecoveryKeepsTheCurrentSessionOpen_data() {
+    QTest::addColumn<QString>("damage");
+    for (const auto *damage : {"missing-backup", "corrupt-backup", "damaged-runtime", "other-profile"})
+      QTest::newRow(damage) << QString::fromLatin1(damage);
+  }
+  void damagedRecoveryKeepsTheCurrentSessionOpen() {
+    QFETCH(QString, damage);
+    QTemporaryDir tmp;
+    const auto profile = tmp.filePath(QStringLiteral("profile")),
+               root = tmp.filePath(QStringLiteral("runtime"));
+    { wp::LocalStore store(profile); }
+    const auto old = wp::delivery::installBundle(
+        bundle(tmp.path(), QStringLiteral("one"), QStringLiteral("2.0.0")), root, profile);
+    wp::delivery::installBundle(bundle(tmp.path(), QStringLiteral("two"), QStringLiteral("2.1.0")), root,
+                                profile);
+    wp::delivery::activate(root);
+    const auto current = read(root + QStringLiteral("/current.txt"));
+    const auto activation =
+        QJsonDocument::fromJson(read(root + QStringLiteral("/last-activation.json"))).object();
+    const auto backup = root + QLatin1Char('/') + activation.value(QStringLiteral("backup")).toString();
+    if (damage == QStringLiteral("missing-backup"))
+      QVERIFY(QFile::remove(backup));
+    else if (damage == QStringLiteral("corrupt-backup"))
+      write(backup, "corrupt");
+    else if (damage == QStringLiteral("damaged-runtime"))
+      write(root + QStringLiteral("/versions/") + old.value(QStringLiteral("key")).toString() +
+                QStringLiteral("/licenses/notice.txt"),
+            "changed");
+    wp::LocalStore store(damage == QStringLiteral("other-profile")
+                             ? tmp.filePath(QStringLiteral("another-profile"))
+                             : profile);
+    store.setSetting(QStringLiteral("installationRoot"), root);
+    wp::TransferEngine transfers(store, nullptr, true);
+    wp::ReleaseManager updates(store, transfers);
+    QSignalSpy restarts(&updates, &wp::ReleaseManager::restartRequested);
+    QSignalSpy problems(&updates, &wp::ReleaseManager::problem);
+    updates.restart(true);
+    QTRY_VERIFY_WITH_TIMEOUT(!updates.busy(), 10000);
+    QCOMPARE(restarts.size(), 0);
+    QCOMPARE(problems.size(), 1);
+    QCOMPARE(read(root + QStringLiteral("/current.txt")), current);
+    QVERIFY(QFileInfo::exists(root + QStringLiteral("/last-activation.json")));
+    store.setSetting(QStringLiteral("sessionStillOpen"), true);
+    QVERIFY(store.setting(QStringLiteral("sessionStillOpen")).toBool());
+  }
+  void packagedUpdateStartsTheNewVersionAndKeepsItAfterAnotherLaunch() {
+    const auto candidate = qEnvironmentVariable("WATCHPAIR_PACKAGE");
+    const auto previous = qEnvironmentVariable("WATCHPAIR_PREVIOUS_PACKAGE");
+    if (candidate.isEmpty() || previous.isEmpty())
+      QSKIP("Set WATCHPAIR_PACKAGE and WATCHPAIR_PREVIOUS_PACKAGE for real activation acceptance");
+    QTemporaryDir tmp;
+    const auto profile = tmp.filePath(QStringLiteral("profile")),
+               root = tmp.filePath(QStringLiteral("installed"));
+    { wp::LocalStore store(profile); }
+    wp::delivery::installBundle(previous, root, profile);
+    QCOMPARE(wp::delivery::prepareRestart(candidate, root, profile), QStringLiteral("activate"));
+    const auto target = wp::delivery::installationState(root).value(QStringLiteral("stagedKey")).toString();
+    auto environment = QProcessEnvironment::systemEnvironment();
+#ifdef Q_OS_WIN
+    environment.insert(QStringLiteral("Path"), qEnvironmentVariable("SystemRoot") +
+                                                   QStringLiteral("/System32;") +
+                                                   qEnvironmentVariable("SystemRoot"));
+    environment.remove(QStringLiteral("QT_PLUGIN_PATH"));
+    environment.remove(QStringLiteral("OPENSSL_MODULES"));
+    const auto helper = candidate + QStringLiteral("/watchpair.exe");
+    const auto childPath =
+        QCoreApplication::applicationDirPath() + QStringLiteral("/delivery-crash-child.exe");
+#else
+    const auto helper = candidate + QStringLiteral("/AppRun");
+    const auto childPath = QCoreApplication::applicationDirPath() + QStringLiteral("/delivery-crash-child");
+#endif
+    QProcess previousProcess;
+    previousProcess.start(childPath, {QStringLiteral("--hold-ms=1000")});
+    QVERIFY(previousProcess.waitForStarted(5000));
+    const auto first = tmp.filePath(QStringLiteral("updated.png"));
+    QProcess activation;
+    activation.setProcessEnvironment(environment);
+    activation.start(helper, {QStringLiteral("--activate-update"), root, QStringLiteral("--wait-pid"),
+                              QString::number(previousProcess.processId()), QStringLiteral("--local-only"),
+                              QStringLiteral("--non-interactive"), QStringLiteral("--exit-after"),
+                              QStringLiteral("4000"), QStringLiteral("--screenshot"), first});
+    QVERIFY(activation.waitForFinished(30000));
+    QCOMPARE(activation.exitCode(), 0);
+    if (previousProcess.state() != QProcess::NotRunning)
+      QVERIFY(previousProcess.waitForFinished(5000));
+    QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(first), 25000);
+    QTRY_VERIFY_WITH_TIMEOUT(!QFileInfo::exists(profile + QStringLiteral("/instance.lock")), 15000);
+    QCOMPARE(QString::fromUtf8(read(root + QStringLiteral("/current.txt"))).trimmed(), target);
+    QVERIFY(!QFileInfo::exists(root + QStringLiteral("/pending.txt")));
+    QVERIFY(QFileInfo::exists(root + QStringLiteral("/healthy.txt")));
+    const auto second = tmp.filePath(QStringLiteral("still-updated.png"));
+    QProcess launch;
+    launch.setProcessEnvironment(environment);
+    launch.start(wp::delivery::launcher(root),
+                 {QStringLiteral("--local-only"), QStringLiteral("--non-interactive"),
+                  QStringLiteral("--exit-after"), QStringLiteral("4000"), QStringLiteral("--screenshot"),
+                  second});
+    QVERIFY(launch.waitForFinished(5000));
+    QCOMPARE(launch.exitCode(), 0);
+    QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(second), 25000);
+    QTRY_VERIFY_WITH_TIMEOUT(!QFileInfo::exists(profile + QStringLiteral("/instance.lock")), 15000);
+    QCOMPARE(QString::fromUtf8(read(root + QStringLiteral("/current.txt"))).trimmed(), target);
+    QVERIFY(!QFileInfo::exists(root + QStringLiteral("/pending.txt")));
   }
   void packagedInstallationLaunchAndAutomaticCrashRollback() {
     const auto candidate = QString::fromLocal8Bit(qgetenv("WATCHPAIR_PACKAGE"));
@@ -377,11 +600,29 @@ private slots:
       connection.close();
     }
     QSqlDatabase::removeDatabase(QStringLiteral("future-fixture"));
+    const auto staged = wp::delivery::installBundle(
+        bundle(tmp.path(), QStringLiteral("three"), QStringLiteral("2.2.0")), root, profile);
+    // Live-session preflight can validate the backup without taking the live
+    // profile lock. Final recovery must still require that session to stop.
+    QVERIFY(lock.tryLock());
+    wp::delivery::prepareRollback(root, profile);
+    QVERIFY_EXCEPTION_THROWN(wp::delivery::rollback(root), wp::AppError);
+    lock.unlock();
     // Recovery deliberately runs before constructing LocalStore, which must
     // refuse a future schema. Both binary and schema return together.
     wp::delivery::rollback(root);
     QCOMPARE(read(root + QStringLiteral("/current.txt")), old);
     QVERIFY(!QFileInfo::exists(root + QStringLiteral("/pending.txt")));
+    QVERIFY(!QFileInfo::exists(root + QStringLiteral("/staged.json")));
+    QVERIFY(QFileInfo::exists(root + QStringLiteral("/versions/") +
+                              staged.value(QStringLiteral("key")).toString() +
+                              QStringLiteral("/runtime-manifest.json")));
+    QCOMPARE(wp::delivery::installationState(root).value(QStringLiteral("version")).toString(),
+             QStringLiteral("2.0.0"));
+    QCOMPARE(wp::delivery::prepareRestart(root + QStringLiteral("/versions/") +
+                                            first.value(QStringLiteral("key")).toString(),
+                                        root, profile),
+             QStringLiteral("installed"));
     wp::LocalStore restored(profile);
     QCOMPARE(restored.setting(QStringLiteral("privateCredential")).toString(),
              QStringLiteral("before-update"));
@@ -413,5 +654,15 @@ private slots:
     QCOMPARE(unchanged.setting(QStringLiteral("value")).toInt(), 42);
   }
 };
-QTEST_GUILESS_MAIN(DeliveryTests)
+int main(int argc, char **argv) {
+  QCoreApplication app(argc, argv);
+  wp::configureNativeRuntime();
+  DeliveryTests tests;
+  try {
+    return QTest::qExec(&tests, argc, argv);
+  } catch (const std::exception &error) {
+    qCritical("Unhandled delivery test failure: %s", error.what());
+    return 1;
+  }
+}
 #include "delivery_tests.moc"

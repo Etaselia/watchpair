@@ -1,9 +1,108 @@
 #include "ui_models.h"
+#include "room_page.h"
+#include <QApplication>
 #include <QAbstractItemModelTester>
+#include <QFontMetrics>
+#include <QMimeData>
 #include <QtTest>
 class UiModels final : public QObject {
   Q_OBJECT
 private slots:
+  void identicalPathsFromDifferentSourcesHaveDistinctCaptionsWithoutChangingIdentity() {
+    for (const auto kind : {wp::ui::JsonKind::Queue, wp::ui::JsonKind::History}) {
+      wp::ui::JsonTable model(kind);
+      QJsonObject first{{QStringLiteral("id"), QStringLiteral("entry-a")},
+        {QStringLiteral("sourceId"), QStringLiteral("torrent-a")},
+        {QStringLiteral("sourceLabel"), QStringLiteral("Same show")},
+        {QStringLiteral("label"), QStringLiteral("Episode 1")},
+        {QStringLiteral("path"), QStringLiteral("A show with a very long series title/Season 1/Episode 1.mkv")}};
+      auto second = first;
+      second.insert(QStringLiteral("id"), QStringLiteral("entry-b"));
+      second.insert(QStringLiteral("sourceId"), QStringLiteral("torrent-b"));
+      model.setRows({first, second});
+      QVERIFY(model.index(0, 0).data().toString() != model.index(1, 0).data().toString());
+      QVERIFY(model.index(0, 0).data().toString().contains(QStringLiteral("Same show")));
+      QCOMPARE(model.index(0, 0).data(wp::ui::IdRole).toString(), QStringLiteral("entry-a"));
+      QCOMPARE(model.index(1, 0).data(wp::ui::IdRole).toString(), QStringLiteral("entry-b"));
+      QVERIFY(model.index(1, 0).data(Qt::ToolTipRole).toString().contains(QStringLiteral("torrent-b")));
+      QVERIFY(model.index(0, 0).data(wp::ui::SearchRole).toString().contains(QStringLiteral("Same show")));
+      second.insert(QStringLiteral("sourceLabel"), QStringLiteral("Different edition"));
+      model.setRows({first, second});
+      QVERIFY(!model.index(0, 0).data().toString().contains(QLatin1Char('[')));
+      QVERIFY(model.index(1, 0).data().toString().contains(QStringLiteral("Different edition")));
+      // A compact table must keep the episode number before eliding context.
+      const QFontMetrics metrics(QApplication::font());
+      for (int row = 0; row < model.rowCount(); ++row) {
+        const auto visible = metrics.elidedText(model.index(row, 0).data().toString(), Qt::ElideRight, 150);
+        QVERIFY2(visible.contains(QStringLiteral("Episode 1")), qPrintable(visible));
+        QVERIFY(model.index(row, 0).data(Qt::ToolTipRole).toString().contains(QStringLiteral("Season 1/Episode 1.mkv")));
+      }
+    }
+  }
+  void fractionalEpochMillisecondsAndMissingTimesNeverDisplayTheEpochAsHistory() {
+    const auto now = QDateTime::currentMSecsSinceEpoch();
+    QCOMPARE(wp::ui::timestampMilliseconds(QJsonValue(double(now) + .75)).value(), now);
+    QVERIFY(!wp::ui::timestampMilliseconds(QJsonValue::Null));
+    QVERIFY(!wp::ui::timestampMilliseconds(QStringLiteral("1800000000000")));
+    QCOMPARE(wp::ui::age(0, now), QStringLiteral("—"));
+    wp::ui::JsonTable history(wp::ui::JsonKind::History);
+    history.setRows({QJsonObject{{QStringLiteral("id"), QStringLiteral("one")},
+      {QStringLiteral("label"), QStringLiteral("Episode 1")},
+      {QStringLiteral("watchedAt"), double(now) + .75}}});
+    QCOMPARE(history.index(0, 1).data().toString(), QStringLiteral("just now"));
+    QCOMPARE(history.index(0, 1).data(wp::ui::SortRole).toLongLong(), now);
+    QVERIFY(!history.index(0, 1).data(Qt::ToolTipRole).toString().contains(QStringLiteral("1970")));
+    history.setRows({QJsonObject{{QStringLiteral("id"), QStringLiteral("one")}, {QStringLiteral("watchedAt"), QJsonValue::Null}}});
+    QCOMPARE(history.index(0, 1).data().toString(), QStringLiteral("—"));
+  }
+  void filteredDuplicateNamesMoveToWatchedByEntryIdAndDisappearImmediately() {
+    wp::ui::JsonTable model(wp::ui::JsonKind::Queue);
+    wp::ui::QueueProxy proxy;
+    proxy.setSourceModel(&model);
+    QAbstractItemModelTester check(&proxy, QAbstractItemModelTester::FailureReportingMode::QtTest);
+    QJsonObject first{{QStringLiteral("id"), QStringLiteral("season-one")},
+      {QStringLiteral("label"), QStringLiteral("Episode 1")},
+      {QStringLiteral("path"), QStringLiteral("Show/Season 1/Episode 1.mkv")},
+      {QStringLiteral("enabled"), true}, {QStringLiteral("watchedAt"), QJsonValue::Null}};
+    auto second = first;
+    second.insert(QStringLiteral("id"), QStringLiteral("season-two"));
+    second.insert(QStringLiteral("path"), QStringLiteral("Show/Season 2/Episode 1.mkv"));
+    model.setRows({first, second});
+    proxy.search(QStringLiteral("Season 2"));
+    QCOMPARE(proxy.rowCount(), 1);
+    QCOMPARE(proxy.index(0, 0).data(wp::ui::IdRole).toString(), QStringLiteral("season-two"));
+    second.insert(QStringLiteral("watchedAt"), 1800000000000.75);
+    model.setRows({first, second});
+    QCOMPARE(proxy.rowCount(), 0);
+    proxy.search({});
+    QCOMPARE(proxy.rowCount(), 1);
+    QCOMPARE(proxy.index(0, 0).data(wp::ui::IdRole).toString(), QStringLiteral("season-one"));
+  }
+  void queueDropUsesStableIdsAndOriginalRevisionWhileRetainingHiddenRows() {
+    wp::ui::JsonTable model(wp::ui::JsonKind::Queue);
+    wp::ui::QueueProxy proxy;
+    proxy.setSourceModel(&model);
+    proxy.setContext(QStringLiteral("room"), 7);
+    QJsonArray rows;
+    for (const auto &id : {QStringLiteral("a"), QStringLiteral("b"), QStringLiteral("c"), QStringLiteral("d")})
+      rows.append(QJsonObject{{QStringLiteral("id"), id}, {QStringLiteral("enabled"), true},
+        {QStringLiteral("watchedAt"), QJsonValue::Null}, {QStringLiteral("label"), QStringLiteral("Episode 1")},
+        {QStringLiteral("path"), (id == QStringLiteral("b") || id == QStringLiteral("c")) ? QStringLiteral("Season 2/Episode 1.mkv") : QStringLiteral("Season 1/Episode 1.mkv")}});
+    model.setRows(rows);
+    proxy.search(QStringLiteral("Season 2"));
+    QSignalSpy reordered(&proxy, &wp::ui::QueueProxy::reorderRequested);
+    std::unique_ptr<QMimeData> drag(proxy.mimeData({proxy.index(1, 0)}));
+    QVERIFY(proxy.dropMimeData(drag.get(), Qt::MoveAction, 0, 0, {}));
+    QCOMPARE(reordered.size(), 1);
+    QCOMPARE(reordered.first()[0].toStringList(), (QStringList{QStringLiteral("a"), QStringLiteral("c"), QStringLiteral("b"), QStringLiteral("d")}));
+    QCOMPARE(reordered.first()[1].toLongLong(), 7);
+    QCOMPARE(model.index(1, 0).data(wp::ui::IdRole).toString(), QStringLiteral("b")); // Wait for the server's accepted order.
+    proxy.setContext(QStringLiteral("room"), 8);
+    QVERIFY(!proxy.dropMimeData(drag.get(), Qt::MoveAction, 0, 0, {}));
+    QCOMPARE(reordered.size(), 1);
+    proxy.setContext(QStringLiteral("other-room"), 7);
+    QVERIFY(!proxy.dropMimeData(drag.get(), Qt::MoveAction, 0, 0, {}));
+  }
   void nestedSelectionRetainsOriginalIndexesAndPriorities() {
     wp::ui::FileTree model;
     QAbstractItemModelTester check(&model, QAbstractItemModelTester::FailureReportingMode::QtTest);

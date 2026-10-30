@@ -10,15 +10,16 @@
 #include <libtorrent/torrent_status.hpp>
 #include <map>
 #include <memory>
+#include <atomic>
 
 namespace wp {
 struct TransferView {
-  QString id, name, state, reason, path, identity, error;
+  QString id, name, state, reason, path, identity, error, seedPolicy;
   qint64 wanted = 0, verified = 0, downloaded = 0, uploaded = 0;
   int downRate = 0, upRate = 0, peers = 0, seeds = 0, order = 0;
   double availability = 0;
   bool manualPaused = false, metadata = false, pinned = false, moving = false;
-  bool inUse = false;
+  bool inUse = false, uploadsEnabled = false;
 };
 class TransferEngine;
 class TorrentTransfer final : public MediaSource {
@@ -66,7 +67,9 @@ public:
   void removeDemand(const QString &key);
   void setPaused(const QString &id, bool paused);
   void setPinned(const QString &id, bool pinned);
-  void setLimits(const QString &id, int downBytes, int upBytes, double ratio, int seedMinutes);
+  void setLimits(const QString &id, int downBytes, int upBytes, double ratio, int seedMinutes,
+                 const QString &seedPolicy = {});
+  QString seedingPolicy(const QString &id) const;
   void setOrder(const QStringList &ids);
   void setExternalWork(const QString &key, bool wanted, bool foreground = false);
   void forgetExternalWork(const QString &key);
@@ -137,12 +140,14 @@ private:
     QJsonArray trackerRows, peerRows;
     qint64 detailsRequested = -10000;
     bool trackersLoaded = false;
+    std::shared_ptr<std::atomic_bool> uploadAllowed = std::make_shared<std::atomic_bool>(false);
   };
   Record &record(const QString &id) const;
   void install(QJsonObject intent, bool restoring);
   void manifest(Record &r);
   void applySelection(Record &r);
   void schedule();
+  bool allowUpload(const Record &record) const;
   void ensureOrder(const QString &key);
   QSet<QString> downloadSlots() const;
   void requestDetails(const QString &id) const;

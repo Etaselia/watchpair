@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import shutil
 import tarfile
+from native_source_overrides import validate_windows_overrides
 
 
 def sha(path):
@@ -43,8 +44,12 @@ def main():
     for name in ('runtime-sources.tsv', 'runtime-sdk.tsv'):
         if (args.linux_bundle / name).read_bytes() != (base / 'build-inputs' / ('linux-' + name)).read_bytes():
             raise ValueError('Linux dependencies changed; collect a new complete source kit')
-    output.mkdir(parents=True)
     project = Path(__file__).resolve().parents[1]
+    override_inputs = validate_windows_overrides(
+        windows, args.windows_bundle, project,
+        [{'name': Path(row['path']).name, 'sha256': row['sha256']} for row in receipt['files']
+         if row['path'].startswith('dependencies/')])
+    output.mkdir(parents=True)
     # Reuse the full collector's exclusion policy for profiles, outputs and keys.
     from importlib.util import spec_from_file_location, module_from_spec
     spec = spec_from_file_location('source_kit', project / 'scripts/create-source-kit.py')
@@ -69,6 +74,8 @@ def main():
         for name in ('runtime-manifest.json', 'build-info.json', 'runtime-packages.tsv', 'runtime-sources.tsv', 'runtime-sdk.tsv'):
             if (bundle / name).is_file():
                 shutil.copyfile(bundle / name, output / 'build-inputs' / f'{label}-{name}')
+    for file in override_inputs:
+        shutil.copyfile(file, output / 'build-inputs' / f'windows-{file.name}')
     (output / 'README.txt').write_text(
         f"WatchPair {windows['version']} corresponding source\n\n"
         f"Requires the complete {receipt['version']} source kit. All native dependency source archives "

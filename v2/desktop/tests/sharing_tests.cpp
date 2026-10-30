@@ -23,6 +23,36 @@ QJsonObject firstEntry(wp::AppServices &app, const QString &room) {
 class SharingTests final : public QObject {
   Q_OBJECT
 private slots:
+  void networkPolicyChangesApplyImmediately() {
+    QTemporaryDir tmp;
+    QVERIFY(tmp.isValid());
+    wp::LocalStore store(tmp.filePath(QStringLiteral("profile")));
+    wp::TransferEngine transfers(store, nullptr, true);
+    wp::RoomClient rooms(store);
+    wp::ShareTransport transport(store, rooms, transfers);
+    QVERIFY(transport.port() > 0);
+    QVERIFY(transport.diagnostics({}, {}).value(QStringLiteral("relayAllowed")).toBool());
+
+    auto config = transfers.configuration();
+    config.insert(QStringLiteral("sharingMode"), QStringLiteral("p2p-only"));
+    transfers.configure(config);
+    QVERIFY(!transport.diagnostics({}, {}).value(QStringLiteral("relayAllowed")).toBool());
+    config.insert(QStringLiteral("offline"), true);
+    transfers.configure(config);
+    QCOMPARE(transport.port(), quint16(0));
+
+    config.insert(QStringLiteral("offline"), false);
+    config.insert(QStringLiteral("proxyHost"), QStringLiteral("127.0.0.1"));
+    config.insert(QStringLiteral("proxyPort"), 1080);
+    config.insert(QStringLiteral("sharingMode"), QStringLiteral("p2p-relay"));
+    transfers.configure(config);
+    QCOMPARE(transport.port(), quint16(0));
+    QVERIFY(transport.diagnostics({}, {}).value(QStringLiteral("relayAllowed")).toBool());
+
+    config.insert(QStringLiteral("proxyHost"), QString());
+    transfers.configure(config);
+    QVERIFY(transport.port() > 0);
+  }
   void authenticatedEncryptionAndOddMerkleProofs() {
     const auto a = wp::sharing::random(32), b = wp::sharing::random(32),
                context =
@@ -51,11 +81,19 @@ private slots:
   }
   void privateCopiesAndVerifiedProgressiveReads_data() {
     QTest::addColumn<bool>("relay");
-    QTest::newRow("direct") << false;
-    QTest::newRow("relay") << true;
+    QTest::addColumn<bool>("fallback");
+    QTest::addColumn<QString>("fault");
+    QTest::newRow("direct-with-fallback") << false << true << QStringLiteral("none");
+    QTest::newRow("direct-only") << false << false << QStringLiteral("none");
+    QTest::newRow("failed-direct-then-relay") << true << true << QStringLiteral("blocked");
+    QTest::newRow("direct-only-blocks-relay-until-opt-in") << true << false << QStringLiteral("blocked");
+    QTest::newRow("simultaneous-direct") << false << true << QStringLiteral("simultaneous");
+    QTest::newRow("one-way-direct-with-delayed-ticket") << false << true << QStringLiteral("oneway");
   }
   void privateCopiesAndVerifiedProgressiveReads() {
     QFETCH(bool, relay);
+    QFETCH(bool, fallback);
+    QFETCH(QString, fault);
     try {
       QTemporaryDir tmp;
       QVERIFY(tmp.isValid());
@@ -69,14 +107,17 @@ private slots:
             QByteArray("1\n00:00:01,000 --> 00:00:02,000\nSubtitles\n"));
       wp::test::Coordinator server;
       server.start(tmp.filePath(QStringLiteral("server.sqlite")));
+      if (fault != QStringLiteral("none"))
+        QVERIFY(server.directFault(fault));
       wp::AppServices host(tmp.filePath(QStringLiteral("host")), nullptr, true, true);
       const auto guestProfile = tmp.filePath(QStringLiteral("guest"));
       auto guest = std::make_unique<wp::AppServices>(guestProfile, nullptr, true, true);
-      host.store.setSetting(QStringLiteral("preferRelay"), relay);
-      guest->store.setSetting(QStringLiteral("preferRelay"), relay);
-      host.transfers.configure({{QStringLiteral("reserveMiB"), 0}, {QStringLiteral("upLimit"), 1024 * 1024}});
+      const auto mode = fallback ? QStringLiteral("p2p-relay") : QStringLiteral("p2p-only");
+      host.transfers.configure({{QStringLiteral("reserveMiB"), 0}, {QStringLiteral("upLimit"), 1024 * 1024},
+                                 {QStringLiteral("sharingMode"), mode}});
       guest->transfers.configure(
-          {{QStringLiteral("reserveMiB"), 0}, {QStringLiteral("downLimit"), 1024 * 1024}});
+          {{QStringLiteral("reserveMiB"), 0}, {QStringLiteral("downLimit"), 1024 * 1024},
+           {QStringLiteral("sharingMode"), mode}});
       QSignalSpy entered(&host.rooms, &wp::RoomClient::entered);
       host.rooms.create(server.url(), QStringLiteral("Share room"), QStringLiteral("Host"));
       QTRY_COMPARE_WITH_TIMEOUT(entered.size(), 1, 5000);
@@ -110,11 +151,44 @@ private slots:
       auto binding = guest->media.binding(guestRoom, entry.value(QStringLiteral("id")).toString());
       QVERIFY(binding.source);
       binding.source->requestPiece(4, -1);
+      const auto hostMember = host.rooms.credential(room).value(QStringLiteral("memberId")).toString();
+      const auto guestMember = guest->rooms.credential(guestRoom).value(QStringLiteral("memberId")).toString();
+      auto diagnostics = [&] {
+        return QList<QJsonObject>{host.sharing.transport().diagnostics(room, guestMember),
+                                  guest->sharing.transport().diagnostics(guestRoom, hostMember)};
+      };
+      auto count = [&](const QString &key) {
+        int result = 0;
+        for (const auto &row : diagnostics())
+          result += row.value(key).toInt();
+        return result;
+      };
+      QTRY_VERIFY_WITH_TIMEOUT(count(QStringLiteral("directAttempts")) > 0, 10000);
+      if (relay && !fallback) {
+        QTest::qWait(4500);
+        QCOMPARE(count(QStringLiteral("relayRequests")), 0);
+        QVERIFY(!binding.source->hasPiece(4));
+        QVERIFY(guest->sharing.transport().mode(guestRoom, hostMember).contains(QStringLiteral("relay disabled")));
+        auto hostConfig = host.transfers.configuration(), guestConfig = guest->transfers.configuration();
+        hostConfig.insert(QStringLiteral("sharingMode"), QStringLiteral("p2p-relay"));
+        guestConfig.insert(QStringLiteral("sharingMode"), QStringLiteral("p2p-relay"));
+        host.transfers.configure(hostConfig);
+        guest->transfers.configure(guestConfig);
+      }
       QTRY_VERIFY_WITH_TIMEOUT(binding.source->hasPiece(4), 20000);
+      if (!relay)
+        QCOMPARE(count(QStringLiteral("relayRequests")), 0);
+      else
+        QVERIFY(count(QStringLiteral("relayRequests")) > 0);
+      if (fault == QStringLiteral("simultaneous")) {
+        QVERIFY(count(QStringLiteral("simultaneousRoutes")) > 0);
+        QCOMPARE(count(QStringLiteral("standbyPromotions")), 0);
+      }
+      if (fault == QStringLiteral("oneway"))
+        QVERIFY(count(QStringLiteral("standbyPromotions")) > 0);
       QVERIFY(!binding.source->hasPiece(2));
       const auto download =
           guest->sharing.downloads().first().toObject().value(QStringLiteral("id")).toString();
-      const auto hostMember = host.rooms.credential(room).value(QStringLiteral("memberId")).toString();
       QTRY_VERIFY_WITH_TIMEOUT(guest->sharing.transport()
                                    .mode(guestRoom, hostMember)
                                    .contains(relay ? QStringLiteral("Relay") : QStringLiteral("Direct")),

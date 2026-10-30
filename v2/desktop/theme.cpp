@@ -79,6 +79,10 @@ void installTheme() {
     QListWidget#Navigation::item { padding: 6px 12px; border-radius: 6px; margin: 2px 6px; color: #9fb1cc; }
     QListWidget#Navigation::item:hover { background: #16253a; color: #dbe7f9; }
     QListWidget#Navigation::item:selected { background: #1c3556; color: #cbe0ff; }
+    QListWidget#TransferFilters { background: transparent; border: none; outline: 0; }
+    QListWidget#TransferFilters::item { padding: 8px 12px; border-radius: 6px; color: #9fb1cc; }
+    QListWidget#TransferFilters::item:hover { background: #16253a; color: #dbe7f9; }
+    QListWidget#TransferFilters::item:selected { background: #1c3556; color: #cbe0ff; }
     QTabWidget::pane { border: 1px solid #283a54; border-radius: 6px; top: -1px; }
     QTabBar::tab { background: #111c2c; padding: 9px 14px; color: #8ea5c6; border-bottom: 2px solid transparent; }
     QTabBar::tab:selected { background: #182940; color: #dbeaff; border-bottom: 2px solid #7dabfa; }
