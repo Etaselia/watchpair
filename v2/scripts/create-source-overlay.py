@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish a complete application snapshot over an unchanged dependency source kit."""
+"""Materialize complete source from a verified base and explicit source revisions."""
 import argparse
 import hashlib
 import json
@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import tarfile
 from native_source_overrides import validate_windows_overrides
+from linux_source_deltas import prepare_linux_delta
 
 
 def sha(path):
@@ -24,6 +25,8 @@ def main():
     parser.add_argument('--windows-bundle', type=Path, required=True)
     parser.add_argument('--linux-bundle', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--linux-source-delta', type=Path,
+                        help='Authenticated collector cache for every changed Ubuntu source revision')
     args = parser.parse_args()
     base, output = args.base_source_kit.resolve(), args.output.resolve()
     receipt = load(base / 'source-kit.json')
@@ -41,9 +44,9 @@ def main():
     package_set = lambda manifest: {(row['base'], row['version']) for row in manifest['runtimePackages']}
     if package_set(windows) != package_set(old_windows):
         raise ValueError('Windows dependencies changed; collect a new complete source kit')
-    for name in ('runtime-sources.tsv', 'runtime-sdk.tsv'):
-        if (args.linux_bundle / name).read_bytes() != (base / 'build-inputs' / ('linux-' + name)).read_bytes():
-            raise ValueError('Linux dependencies changed; collect a new complete source kit')
+    if (args.linux_bundle / 'runtime-sdk.tsv').read_bytes() != (base / 'build-inputs/linux-runtime-sdk.tsv').read_bytes():
+        raise ValueError('Linux SDK dependencies changed; collect a new complete source kit')
+    linux_delta = prepare_linux_delta(base, args.linux_bundle, args.linux_source_delta)
     project = Path(__file__).resolve().parents[1]
     override_inputs = validate_windows_overrides(
         windows, args.windows_bundle, project,
@@ -76,22 +79,35 @@ def main():
                 shutil.copyfile(bundle / name, output / 'build-inputs' / f'{label}-{name}')
     for file in override_inputs:
         shutil.copyfile(file, output / 'build-inputs' / f'windows-{file.name}')
+    if linux_delta:
+        for name, file in linux_delta['files'].items():
+            target = output / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(file, target)
+        (output / 'linux-source-receipt.json').write_text(json.dumps(linux_delta['receipt'], indent=2), encoding='utf-8')
+        (output / 'build-inputs/linux-source-delta-receipt.json').write_text(json.dumps(linux_delta['deltaReceipt'], indent=2), encoding='utf-8')
     (output / 'README.txt').write_text(
         f"WatchPair {windows['version']} corresponding source\n\n"
-        f"Requires the complete {receipt['version']} source kit. All native dependency source archives "
-        'are unchanged and remain available with that release. Remove only watchpair/ and build-inputs/ '
+        f"Materialize a new complete source kit from the pinned {receipt['version']} base and this overlay. "
+        'This version-specific procedure supersedes the older unchanged-only overlay guide. '
+        'Remove only watchpair/ and build-inputs/ '
         'from an extracted copy of the base source kit, then extract this overlay into that same directory. '
-        'Retain dependencies/ and both dependency source receipts. This archive supplies the complete new '
+        'Retain dependencies/ and the Windows source receipt. The overlay replaces the Linux source receipt '
+        'when explicit Ubuntu revisions change; its source-kit-relative paths identify the active sources. '
+        'Older unused dependency files may remain. This archive supplies the complete new '
         'application source and build inputs, replacing the old snapshot. Verify every assembled file '
         'against source-kit.json before rebuilding. See watchpair/v2/README.md and DISTRIBUTION.md.\n',
         encoding='utf-8')
     retained = [row for row in receipt['files'] if row['path'].startswith('dependencies/')
-                or row['path'] in ('windows-source-receipt.json', 'linux-source-receipt.json')]
+                or row['path'] == 'windows-source-receipt.json'
+                or (row['path'] == 'linux-source-receipt.json' and not linux_delta)]
     replacement = [{'path': file.relative_to(output).as_posix(), 'size': file.stat().st_size, 'sha256': sha(file)}
                    for file in sorted(output.rglob('*')) if file.is_file()]
     manifest = {'format': 1, 'version': windows['version'], 'complete': True,
                 'baseVersion': receipt['version'], 'baseManifestSha256': sha(base / 'source-kit.json'),
                 'files': retained + replacement}
+    if linux_delta:
+        manifest['dependencyDeltas'] = {'linux-x64': linux_delta['changes']}
     (output / 'source-kit.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     archive = output.with_name(output.name + '.tar.gz')
     with tarfile.open(archive, 'x:gz') as target:

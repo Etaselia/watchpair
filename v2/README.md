@@ -35,6 +35,8 @@ Windows uses MSYS2 **UCRT64**. Install the toolchain, CMake, Ninja, pkgconf, Qt 
 
 The Windows libtorrent build uses the exact 2.1.2 source archive with `BOOST_ASIO_HAS_PTHREADS=1` applied to every library and application translation unit. The native build script requires a fresh output directory and leaves the SDK unchanged. Its prefix includes `watchpair-libtorrent-build.json`; application configuration and bundling verify this receipt and the selected DLL hash. Pass `-TorrentPrefix` to `build-windows.ps1` when using another output location. The source archive is retained in the complete corresponding-source kit; see [DISTRIBUTION.md](DISTRIBUTION.md).
 
+For alpha.4 corresponding source, follow the release's versioned `SOURCE-README-alpha.4.txt`. It materializes a **new complete kit** from the pinned alpha.2 base and an explicitly verified dependency-delta overlay, including Ubuntu librsvg `2.58.0+dfsg-1ubuntu0.1`. This supersedes the older unchanged-only overlay procedure in DISTRIBUTION.md. The composite Linux receipt gives explicit source-kit-relative paths and identifies every active source version; unused older base archives may remain.
+
 On Ubuntu 24.04, install the native development libraries and tooling:
 
 ```sh
