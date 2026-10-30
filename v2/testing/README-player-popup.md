@@ -35,3 +35,14 @@ These are private platform properties supported by the pinned Qt 6.12
 `qwaylandxdgshell.cpp`; review this compatibility path on Qt upgrades. Other
 platforms retain their normal placement. Each subsequent show clears the
 overrides when the upward placement is no longer needed.
+
+Qt 6.12 also ignores the opening mouse release using a 400 ms wall timer.
+Under software rendering, a quick native release can reach the popup after
+that timer expires and select the row beneath the opening arrow. The Wayland
+compatibility guard compares the same gesture's wrapping native timestamps
+and global coordinates instead. It clears on subsequent presses, releases,
+movement beyond the drag threshold, or hiding. The delayed-release regression
+replays a real 50 ms opening click's release after 500 ms without changing its
+timestamp or position; opening must activate nothing, then a deliberate row
+click must work. A separate native press-drag-release case preserves selection
+by dragging into the list. These two tests require the Wayland harness.

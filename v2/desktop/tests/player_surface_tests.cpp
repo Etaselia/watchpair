@@ -20,6 +20,8 @@
 #include <QWindow>
 #include <QtTest>
 #include <cmath>
+#include <functional>
+#include <memory>
 namespace {
 void movePointer(QWidget &widget, const QPoint &point) {
   const auto global = widget.mapToGlobal(point);
@@ -50,10 +52,10 @@ bool compositorInput(const QStringList &arguments) {
     qWarning().noquote() << input.readAllStandardError();
   return input.exitStatus() == QProcess::NormalExit && input.exitCode() == 0;
 }
-bool clickPopupWidget(QWidget &widget, const QPoint &point) {
+bool clickPopupWidget(QWidget &widget, const QPoint &point, const QString &action = QStringLiteral("click")) {
   if (!qEnvironmentVariableIsEmpty("WATCHPAIR_WAYLAND_POPUP_INPUT")) {
     const auto local = widget.mapTo(widget.window(), point);
-    QStringList arguments{QStringLiteral("click"), QString::number(QCoreApplication::applicationPid()),
+    QStringList arguments{action, QString::number(QCoreApplication::applicationPid()),
         widget.window()->windowType() == Qt::Popup ? QStringLiteral("popup") : QStringLiteral("toplevel"),
         QString::number(local.x()), QString::number(local.y())};
     auto *control = widget.window()->parentWidget();
@@ -63,18 +65,24 @@ bool clickPopupWidget(QWidget &widget, const QPoint &point) {
       arguments.append({QString::number(widget.window()->width()), QString::number(widget.window()->height())});
     return compositorInput(arguments);
   }
-  QTest::mouseClick(&widget, Qt::LeftButton, Qt::NoModifier, point);
+  if (action == QStringLiteral("press"))
+    QTest::mousePress(&widget, Qt::LeftButton, Qt::NoModifier, point);
+  else if (action == QStringLiteral("release"))
+    QTest::mouseRelease(&widget, Qt::LeftButton, Qt::NoModifier, point);
+  else
+    QTest::mouseClick(&widget, Qt::LeftButton, Qt::NoModifier, point);
   return true;
 }
 class PopupClickProbe final : public QObject {
 public:
-  PopupClickProbe(QAbstractItemView &view, int row) : view_(view), row_(row) {
+  PopupClickProbe(QAbstractItemView &view, int row, QEvent::Type type = QEvent::MouseButtonPress)
+      : view_(view), row_(row), type_(type) {
     view_.viewport()->installEventFilter(this);
   }
   bool hit = false;
 protected:
   bool eventFilter(QObject *, QEvent *event) override {
-    if (event->type() == QEvent::MouseButtonPress) {
+    if (event->type() == type_) {
       const auto *mouse = static_cast<QMouseEvent *>(event);
       hit = mouse->button() == Qt::LeftButton && view_.indexAt(mouse->position().toPoint()).row() == row_;
     }
@@ -83,22 +91,57 @@ protected:
 private:
   QAbstractItemView &view_;
   int row_;
+  QEvent::Type type_;
+};
+class DeferredOpeningRelease final : public QObject {
+public:
+  explicit DeferredOpeningRelease(QComboBox &combo) : combo_(combo) { qApp->installEventFilter(this); }
+  ~DeferredOpeningRelease() override { qApp->removeEventFilter(this); }
+  bool replayed = false;
+protected:
+  bool eventFilter(QObject *object, QEvent *event) override {
+    auto *widget = qobject_cast<QWidget *>(object);
+    if (intercepted_ || !widget || widget->window() != combo_.view()->window() ||
+        event->type() != QEvent::MouseButtonRelease)
+      return false;
+    intercepted_ = true;
+    auto saved = std::shared_ptr<QEvent>(event->clone());
+    QPointer<QWidget> target(widget);
+    qInfo() << "Deferred opening release keeps native timestamp" << static_cast<QMouseEvent *>(event)->timestamp();
+    QTimer::singleShot(500, this, [this, target, saved] {
+      if (target)
+        QApplication::sendEvent(target, saved.get());
+      replayed = true;
+    });
+    return true;
+  }
+private:
+  QComboBox &combo_;
+  bool intercepted_ = false;
 };
 bool choosePopup(wp::ui::PlayerSurface &surface, QComboBox &combo, QWidget &host, int row,
-                 const QString &name, bool waitIdle = false) {
+                 const QString &name, bool waitIdle = false, const std::function<bool()> &openingDelivered = {}) {
   if (!qEnvironmentVariableIsEmpty("WATCHPAIR_WAYLAND_POPUP_INPUT") && host.isFullScreen() &&
       !QTest::qWaitFor([&] { return host.size() == host.screen()->geometry().size(); }, 3000))
     return false;
   surface.revealControls();
+  const auto originalIndex = combo.currentIndex();
+  QSignalSpy activated(&combo, qOverload<int>(&QComboBox::activated));
   if (!clickPopupWidget(combo, QPoint(combo.width() - 10, combo.height() / 2)))
     return false;
   if (!QTest::qWaitFor([&] { return combo.view()->isVisible(); }, 3000))
     return false;
   if (!QTest::qWaitForWindowExposed(combo.view()->window()))
     return false;
-  QTest::qWait(QApplication::doubleClickInterval() + 50);
+  if (openingDelivered && !QTest::qWaitFor(openingDelivered, 2000))
+    return false;
+  QTest::qWait(450); // Let Qt 6.12's 400 ms opening-release timer expire.
   if (waitIdle)
     QTest::qWait(2700);
+  qInfo() << name << "opening activations" << activated.size()
+          << "initial/current index" << originalIndex << combo.currentIndex();
+  if (!activated.isEmpty() || combo.currentIndex() != originalIndex)
+    return false;
   auto *popup = combo.view()->window();
   if (!surface.controlsVisible() || !combo.view()->isVisible() ||
       !popup->windowHandle() || !popup->windowHandle()->isExposed())
@@ -134,7 +177,6 @@ bool choosePopup(wp::ui::PlayerSurface &surface, QComboBox &combo, QWidget &host
   // Wayland has no global widgetAt/warp API. Probe the actual native click's
   // receiver and row instead, including compositor-constrained popup placement.
   PopupClickProbe clicked(*combo.view(), row);
-  QSignalSpy activated(&combo, qOverload<int>(&QComboBox::activated));
   if (!clickPopupWidget(*combo.view()->viewport(), point))
     return false;
   const bool selected = QTest::qWaitFor([&] {
@@ -263,6 +305,52 @@ private slots:
     surface->setPlaybackState(true, false);
     QVERIFY2(choosePopup(*surface, *combo, host, 2, QStringLiteral("fresh-fullscreen-subtitles")),
              "A fresh fullscreen popup has no prior native owner or window coordinates");
+  }
+  void delayedNativeOpeningReleaseDoesNotSelectAnOption() {
+    if (qEnvironmentVariableIsEmpty("WATCHPAIR_WAYLAND_POPUP_INPUT"))
+      QSKIP("Use test-player-popup-wayland.sh for real Wayland input timestamps");
+    QWidget host;
+    auto *layout = new QVBoxLayout(&host);
+    auto *surface = new wp::ui::PlayerSurface(new QWidget);
+    auto *combo = new QComboBox;
+    combo->addItems({QStringLiteral("Subtitles off"), QStringLiteral("English subtitles"),
+                     QStringLiteral("German subtitles")});
+    surface->addControls(combo);
+    layout->addWidget(surface);
+    host.resize(900, 600);
+    host.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&host));
+    DeferredOpeningRelease delayed(*combo);
+    QVERIFY2(choosePopup(*surface, *combo, host, 2, QStringLiteral("queued-opening-release"), false,
+                         [&] { return delayed.replayed; }),
+             "A real quick opening release delivered after Qt's wall timer must not activate a row");
+    QVERIFY(delayed.replayed);
+  }
+  void nativeOpeningDragStillSelectsAnOption() {
+    if (qEnvironmentVariableIsEmpty("WATCHPAIR_WAYLAND_POPUP_INPUT"))
+      QSKIP("Use test-player-popup-wayland.sh for native Wayland drag selection");
+    QWidget host;
+    auto *layout = new QVBoxLayout(&host);
+    auto *surface = new wp::ui::PlayerSurface(new QWidget);
+    auto *combo = new QComboBox;
+    combo->addItems({QStringLiteral("Subtitles off"), QStringLiteral("English subtitles"),
+                     QStringLiteral("German subtitles")});
+    surface->addControls(combo);
+    layout->addWidget(surface);
+    host.resize(900, 600);
+    host.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&host));
+    QSignalSpy activated(combo, qOverload<int>(&QComboBox::activated));
+    QVERIFY(clickPopupWidget(*combo, QPoint(combo->width() - 10, combo->height() / 2), QStringLiteral("press")));
+    QTRY_VERIFY(combo->view()->isVisible());
+    QVERIFY(QTest::qWaitForWindowExposed(combo->view()->window()));
+    const auto point = combo->view()->visualRect(combo->model()->index(2, 0)).center();
+    QVERIFY(combo->view()->viewport()->rect().contains(point));
+    PopupClickProbe released(*combo->view(), 2, QEvent::MouseButtonRelease);
+    QVERIFY(clickPopupWidget(*combo->view()->viewport(), point, QStringLiteral("release")));
+    QTRY_VERIFY(released.hit && activated.size() == 1 && !combo->view()->isVisible());
+    QCOMPARE(activated.first().first().toInt(), 2);
+    QCOMPARE(combo->currentIndex(), 2);
   }
 #ifdef WATCHPAIR_PLAYER_NATIVE_FIXTURE
   void nativeRendererSurvivesFullscreenPopoutAndReturnWithWorkingSeeks() {

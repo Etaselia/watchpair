@@ -1,4 +1,5 @@
 #pragma once
+#include <QPointer>
 #include <QTimer>
 #include <QWidget>
 class QGridLayout;
@@ -33,6 +34,9 @@ private:
   QGridLayout *layers_;
   QVBoxLayout *controlLayout_;
   QTimer idle_;
+  QPointer<QWidget> openingCombo_;
+  QPointF openingPosition_;
+  quint64 openingTimestamp_ = 0;
   bool playing_ = false, blocking_ = true;
 };
 } // namespace wp::ui

@@ -52,7 +52,8 @@ if len(compositors) != 1:
 origin_x, origin_y, child = c.c_int(), c.c_int(), window_type()
 x.XTranslateCoordinates(display, compositors[0][0], root, 0, 0, c.byref(origin_x), c.byref(origin_y), c.byref(child))
 
-if sys.argv[1] == 'click':
+if sys.argv[1] in ('click', 'press', 'release'):
+    action = sys.argv[1]
     pid, kind, local_x, local_y = sys.argv[2:6]
     pattern = rf'View \d+ \(role xdg_{re.escape(kind)}, PID {int(pid)},[^\n]+\n\s+position: \((-?\d+), (-?\d+)\) -> \((-?\d+), (-?\d+)\)'
     deadline = time.monotonic() + 3
@@ -90,12 +91,14 @@ if sys.argv[1] == 'click':
         raise RuntimeError(f'Click point {local_x},{local_y} is outside committed {kind} surface {matches[0]}')
     px += origin_x.value + int(local_x)
     py += origin_y.value + int(local_y)
-    print(f'Native XTest {kind} click at {px},{py}', flush=True)
+    print(f'Native XTest {kind} {action} at {px},{py}', flush=True)
     xt.XTestFakeMotionEvent(display, -1, px, py, 0)
-    xt.XTestFakeButtonEvent(display, 1, 1, 0)
+    if action != 'release':
+        xt.XTestFakeButtonEvent(display, 1, 1, 0)
     x.XSync(display, 0)
-    time.sleep(.05)
-    xt.XTestFakeButtonEvent(display, 1, 0, 0)
+    if action != 'press':
+        time.sleep(.05)
+        xt.XTestFakeButtonEvent(display, 1, 0, 0)
     x.XSync(display, 0)
 elif sys.argv[1] == 'capture':
     class Image(c.Structure):
@@ -130,4 +133,4 @@ elif sys.argv[1] == 'capture':
     with open(sys.argv[2], 'wb') as output:
         output.write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(rows)) + chunk(b'IEND', b''))
 else:
-    raise RuntimeError('Expected click or capture')
+    raise RuntimeError('Expected click, press, release, or capture')

@@ -1,4 +1,5 @@
 #include "player_surface.h"
+#include <QAbstractItemView>
 #include <QApplication>
 #include <QComboBox>
 #include <QCursor>
@@ -87,6 +88,8 @@ void PlayerSurface::hideIdleControls() {
   video_->setCursor(Qt::BlankCursor);
 }
 void PlayerSurface::hideEvent(QHideEvent *event) {
+  openingCombo_.clear();
+  openingTimestamp_ = 0;
   idle_.stop();
   unsetCursor();
   video_->unsetCursor();
@@ -94,7 +97,47 @@ void PlayerSurface::hideEvent(QHideEvent *event) {
 }
 bool PlayerSurface::eventFilter(QObject *object, QEvent *event) {
   auto *widget = qobject_cast<QWidget *>(object);
-  if (!contains(widget))
+  const bool owned = contains(widget);
+  if (widget && event->type() == QEvent::MouseButtonPress) {
+    openingCombo_.clear();
+    openingTimestamp_ = 0;
+    if (owned && QApplication::platformName().startsWith(QStringLiteral("wayland"))) {
+      auto *combo = qobject_cast<QComboBox *>(widget);
+      const auto *mouse = static_cast<QMouseEvent *>(event);
+      if (combo && mouse->button() == Qt::LeftButton && mouse->timestamp() > 0 && !combo->view()->isVisible()) {
+        openingCombo_ = combo;
+        openingTimestamp_ = mouse->timestamp();
+        openingPosition_ = mouse->globalPosition();
+      }
+    }
+  } else if (widget && event->type() == QEvent::MouseButtonRelease) {
+    const auto *mouse = static_cast<QMouseEvent *>(event);
+    auto *combo = qobject_cast<QComboBox *>(openingCombo_.data());
+    // Wayland input uses a wrapping 32-bit millisecond timestamp. Qt's popup
+    // 400 ms opening timer (Qt 6.12 qcombobox.cpp) can expire while the GUI is
+    // busy before a quick release is delivered, selecting the opening row.
+    const quint32 elapsed = quint32(mouse->timestamp()) - quint32(openingTimestamp_);
+    const bool openingRelease = owned && combo && openingTimestamp_ > 0 &&
+        widget->window() == combo->view()->window() && mouse->button() == Qt::LeftButton &&
+        elapsed <= 400 &&
+        (mouse->globalPosition() - openingPosition_).manhattanLength() <= QApplication::startDragDistance();
+    openingCombo_.clear();
+    openingTimestamp_ = 0;
+    if (openingRelease)
+      return true;
+  } else if (widget && openingCombo_) {
+    const bool moved = event->type() == QEvent::MouseMove &&
+        (static_cast<QMouseEvent *>(event)->globalPosition() - openingPosition_).manhattanLength() >
+            QApplication::startDragDistance();
+    const bool hidden = event->type() == QEvent::Hide &&
+        (widget == openingCombo_ || widget == openingCombo_->window() ||
+         widget == qobject_cast<QComboBox *>(openingCombo_.data())->view()->window());
+    if (moved || hidden) {
+      openingCombo_.clear();
+      openingTimestamp_ = 0;
+    }
+  }
+  if (!owned)
     return QWidget::eventFilter(object, event);
   auto *popup = widget->window();
   if (popup != window() && popup->windowType() == Qt::Popup) {
