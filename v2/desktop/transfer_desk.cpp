@@ -15,8 +15,8 @@
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QSplitter>
-#include <QStyledItemDelegate>
 #include <QStyleOptionViewItem>
+#include <QStyledItemDelegate>
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <algorithm>
@@ -42,6 +42,7 @@ public:
     setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     fitWidth();
   }
+
 protected:
   void changeEvent(QEvent *event) override {
     QListWidget::changeEvent(event);
@@ -51,6 +52,7 @@ protected:
       scheduleDelayedItemsLayout();
     }
   }
+
 private:
   void fitWidth() {
     setFixedWidth(std::max(170, fontMetrics().horizontalAdvance(tr("Metadata / choices")) + 36));
@@ -96,7 +98,8 @@ QHash<int, int> choices(AppServices &app, const QString &id) {
 } // namespace
 QListWidget *createTransferFilters(QWidget *parent) {
   auto *filters = new FilterList(parent);
-  const QList<QPair<QString, QString>> states{{TransferDesk::tr("All transfers"), {}},
+  const QList<QPair<QString, QString>> states{
+      {TransferDesk::tr("All transfers"), {}},
       {TransferDesk::tr("Downloading"), QStringLiteral("Downloading")},
       {TransferDesk::tr("Metadata / choices"), QStringLiteral("Metadata")},
       {TransferDesk::tr("Seeding"), QStringLiteral("Seeding")},
@@ -206,7 +209,13 @@ TorrentChooser::TorrentChooser(AppServices &services, QString transfer, QString 
   shared_->setEnabled(!room_.isEmpty());
   layout->addWidget(shared_);
   download_ = new QCheckBox(tr("Approve the selected episodes on this device"));
-  download_->setChecked(true);
+  download_->setObjectName(QStringLiteral("DownloadOnThisDevice"));
+  const auto defaults = app_.media.torrentDefaults(transfer_, room_);
+  roomUnavailable_ = defaults.value(QStringLiteral("roomMissing")).toBool();
+  shared_->setEnabled(!room_.isEmpty() && !roomUnavailable_);
+  download_->setChecked(defaults.value(QStringLiteral("download")).toBool());
+  initialPolicy_ = defaults.value(QStringLiteral("policy")).toString();
+  connect(download_, &QCheckBox::toggled, this, [this] { initialPolicy_.clear(); });
   layout->addWidget(download_);
   follow_ = new QCheckBox(tr("Follow room selection on this device (replace existing manual file choices)"));
   follow_->setChecked(
@@ -244,7 +253,7 @@ TorrentChooser::TorrentChooser(AppServices &services, QString transfer, QString 
   connect(shared_, &QCheckBox::toggled, this, [this](bool shared) {
     download_->setVisible(shared);
     follow_->setVisible(shared);
-    apply_->setText(shared ? tr("Apply to room") : tr("Apply on this device"));
+    apply_->setText(shared ? tr("Apply to room") : tr("Download selected"));
   });
   connect(&app_.transfers, &TransferEngine::manifestReady, this, [this](const QString &id) {
     if (id == transfer_)
@@ -278,8 +287,14 @@ TorrentChooser::TorrentChooser(AppServices &services, QString transfer, QString 
       });
   download_->setVisible(!room_.isEmpty());
   follow_->setVisible(!room_.isEmpty());
-  apply_->setText(shared_->isChecked() ? tr("Apply to room") : tr("Apply on this device"));
+  apply_->setText(shared_->isChecked() ? tr("Apply to room") : tr("Download selected"));
   manifest();
+  if (roomUnavailable_)
+    problem(tr("This room is no longer saved on this device. Close this chooser and add the source again."));
+  connect(&files_->model, &FileTree::selectionChanged, this, [this] {
+    if (initialPolicy_ == QStringLiteral("preserve") && files_->model.dirty())
+      initialPolicy_.clear();
+  });
 }
 void TorrentChooser::manifest(bool reload) {
   auto *source = app_.transfers.source(transfer_);
@@ -315,7 +330,7 @@ void TorrentChooser::manifest(bool reload) {
     wanted = files_->model.choices();
   files_->setFiles(source->files(), wanted);
   initialized_ = true;
-  apply_->setEnabled(true);
+  apply_->setEnabled(!roomUnavailable_);
 }
 void TorrentChooser::problem(const QString &text) {
   error_->setText(text);
@@ -323,11 +338,12 @@ void TorrentChooser::problem(const QString &text) {
 }
 void TorrentChooser::apply() {
   try {
-    if (!initialized_ || conflict_)
+    if (!initialized_ || conflict_ || roomUnavailable_)
       return;
     if (shared_->isChecked()) {
-      operation_ = app_.media.publishTorrent(transfer_, room_, files_->model.selected(),
-                                             download_->isChecked(), follow_->isChecked(), queueRevision_);
+      operation_ =
+          app_.media.publishTorrent(transfer_, room_, files_->model.selected(), download_->isChecked(),
+                                    follow_->isChecked(), queueRevision_, initialPolicy_);
       files_->setEnabled(false);
       shared_->setEnabled(false);
       apply_->setEnabled(false);
@@ -830,7 +846,7 @@ void TransferDesk::refresh() {
                         .arg(r.pinned ? tr(" · Pinned") : QString())
                         .arg(r.inUse ? tr(" · In use") : QString())
                         .arg(r.seedPolicy == QStringLiteral("off") ? tr(" · Torrent uploads off")
-                             : r.uploadsEnabled ? tr(" · Torrent uploads enabled")
+                             : r.uploadsEnabled                    ? tr(" · Torrent uploads enabled")
                                                 : tr(" · Torrent upload limit reached or paused")));
     location_->setText(r.path);
     identity_->setText(r.identity);
@@ -960,8 +976,8 @@ void TransferDesk::editLimits() {
   minutes->setSuffix(tr(" minutes"));
   minutes->setSpecialValueText(tr("Unlimited"));
   const auto intent = app_.transfers.intent(ids.first());
-  policy->setCurrentIndex(std::max(0, policy->findData(intent.value(QStringLiteral("seedPolicy"))
-                                                         .toString(QStringLiteral("inherit")))));
+  policy->setCurrentIndex(std::max(
+      0, policy->findData(intent.value(QStringLiteral("seedPolicy")).toString(QStringLiteral("inherit")))));
   down->setValue(intent.value(QStringLiteral("downLimit")).toDouble() / 1048576);
   up->setValue(intent.value(QStringLiteral("upLimit")).toDouble() / 1048576);
   ratio->setValue(intent.value(QStringLiteral("seedRatio")).toDouble());
@@ -970,7 +986,8 @@ void TransferDesk::editLimits() {
   layout->addRow(tr("Upload"), up);
   layout->addRow(tr("Torrent seeding"), policy);
   auto *explanation = new QLabel(tr("Off blocks file payload uploads while downloading and after completion. "
-                                    "Torrent protocol and metadata traffic continue. Explicit local-file shares use their own permission."));
+                                    "Torrent protocol and metadata traffic continue. Explicit local-file "
+                                    "shares use their own permission."));
   explanation->setWordWrap(true);
   layout->addRow(explanation);
   layout->addRow(tr("Seed ratio"), ratio);

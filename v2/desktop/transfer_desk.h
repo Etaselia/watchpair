@@ -41,13 +41,13 @@ private:
   void apply();
   void problem(const QString &text);
   AppServices &app_;
-  QString transfer_, room_, operation_;
+  QString transfer_, room_, operation_, initialPolicy_;
   qint64 queueRevision_ = -1;
   FileSelector *files_;
   QCheckBox *shared_, *download_, *follow_;
   QLabel *error_;
   QPushButton *apply_, *reload_;
-  bool initialized_ = false, conflict_ = false;
+  bool initialized_ = false, conflict_ = false, roomUnavailable_ = false;
 };
 class TransferProxy final : public QSortFilterProxyModel {
 public:

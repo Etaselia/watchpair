@@ -3,7 +3,9 @@
 #include <QApplication>
 #include <QComboBox>
 #include <QCursor>
+#include <QEnterEvent>
 #include <QEvent>
+#include <QFocusEvent>
 #include <QGridLayout>
 #include <QHideEvent>
 #include <QKeyEvent>
@@ -32,8 +34,9 @@ PlayerSurface::PlayerSurface(QWidget *video, QWidget *parent) : QWidget(parent),
   controlLayout_->setContentsMargins(14, 10, 14, 10);
   controlLayout_->setSpacing(8);
   layers_->addWidget(controls_, 0, 0, Qt::AlignBottom);
+  controls_->hide();
   idle_.setSingleShot(true);
-  idle_.setInterval(2500);
+  idle_.setInterval(1000);
   connect(&idle_, &QTimer::timeout, this, &PlayerSurface::hideIdleControls);
   qApp->installEventFilter(this);
 }
@@ -54,42 +57,95 @@ bool PlayerSurface::contains(QWidget *widget) const {
   return false;
 }
 bool PlayerSurface::controlsVisible() const { return !controls_->isHidden(); }
-void PlayerSurface::revealControls() {
+bool PlayerSurface::controlsInUse() const {
+  auto *popup = QApplication::activePopupWidget();
+  auto *focus = QApplication::focusWidget();
+  return (popup && contains(popup)) || pressedControl_ ||
+      (keyboardControls_ && focus && (focus == controls_ || controls_->isAncestorOf(focus)));
+}
+void PlayerSurface::showControls() {
   controls_->show();
-  controls_->raise();
+  auto *popup = QApplication::activePopupWidget();
+  if (!popup || !contains(popup))
+    controls_->raise();
   unsetCursor();
   video_->unsetCursor();
-  if (playing_ && !blocking_ && isVisible())
-    idle_.start();
-  else
+}
+void PlayerSurface::hideControls() {
+  idle_.stop();
+  // Hidden controls must not retain Space/arrow-key handling after a mouse
+  // interaction. Keyboard navigation itself keeps the controls visible.
+  if (controls_->isAncestorOf(QApplication::focusWidget()))
+    video_->setFocus(Qt::OtherFocusReason);
+  controls_->hide();
+  if (pointerInside_ && playing_ && !blocking_) {
+    setCursor(Qt::BlankCursor);
+    video_->setCursor(Qt::BlankCursor);
+  } else {
+    unsetCursor();
+    video_->unsetCursor();
+  }
+}
+void PlayerSurface::updatePointer(const QPoint &globalPosition) {
+  pointerPosition_ = mapFromGlobal(globalPosition);
+  pointerInside_ = rect().contains(pointerPosition_);
+}
+void PlayerSurface::updateVisibility() {
+  if (!isVisible()) {
     idle_.stop();
+    return;
+  }
+  if (controlsInUse()) {
+    idle_.stop();
+    showControls();
+  } else if (!pointerInside_)
+    hideControls();
+  else if (qint64(pointerPosition_.y()) * 4 >= qint64(height()) * 3) {
+    idle_.stop();
+    showControls();
+  } else if (controlsVisible() && !idle_.isActive())
+    idle_.start();
+}
+void PlayerSurface::refreshPointerLater() {
+  QTimer::singleShot(0, this, [this] { updateVisibility(); });
+}
+void PlayerSurface::revealControls() {
+  // Also used after reparent/fullscreen changes: follow the pointer instead of
+  // exposing subtitles to a fresh overlay on every presentation transition.
+  updatePointer(QCursor::pos());
+  updateVisibility();
 }
 void PlayerSurface::setPlaybackState(bool playing, bool blocking) {
   if (playing_ == playing && blocking_ == blocking)
     return;
   playing_ = playing;
   blocking_ = blocking;
-  revealControls();
+  // Playback/buffering refreshes do not reveal controls or restart the hover
+  // deadline. The same mouse rules apply while playing and paused.
+  if (controlsVisible() || !pointerInside_ || !playing_ || blocking_) {
+    unsetCursor();
+    video_->unsetCursor();
+  } else {
+    setCursor(Qt::BlankCursor);
+    video_->setCursor(Qt::BlankCursor);
+  }
 }
 void PlayerSurface::hideIdleControls() {
-  if (!playing_ || blocking_ || !isVisible())
+  if (!isVisible())
     return;
-  const auto point = mapFromGlobal(QCursor::pos());
-  if (QApplication::activePopupWidget() || QApplication::mouseButtons() != Qt::NoButton ||
-      (rect().contains(point) && controls_->geometry().contains(point))) {
-    idle_.start();
+  if (controlsInUse() || (pointerInside_ && qint64(pointerPosition_.y()) * 4 >= qint64(height()) * 3)) {
+    updateVisibility();
     return;
   }
-  // Move focus off a hidden button/slider so Space remains a playback gesture.
-  if (controls_->isAncestorOf(QApplication::focusWidget()))
-    video_->setFocus(Qt::OtherFocusReason);
-  controls_->hide();
-  setCursor(Qt::BlankCursor);
-  video_->setCursor(Qt::BlankCursor);
+  hideControls();
 }
 void PlayerSurface::hideEvent(QHideEvent *event) {
   openingCombo_.clear();
   openingTimestamp_ = 0;
+  pressedControl_.clear();
+  ++controlPressGeneration_;
+  keyboardControls_ = false;
+  pointerInside_ = false;
   idle_.stop();
   unsetCursor();
   video_->unsetCursor();
@@ -98,6 +154,39 @@ void PlayerSurface::hideEvent(QHideEvent *event) {
 bool PlayerSurface::eventFilter(QObject *object, QEvent *event) {
   auto *widget = qobject_cast<QWidget *>(object);
   const bool owned = contains(widget);
+  if (event->type() == QEvent::ApplicationDeactivate) {
+    pressedControl_.clear();
+    ++controlPressGeneration_;
+    keyboardControls_ = false;
+    pointerInside_ = false;
+    hideControls();
+  }
+  // The native window also sees motion over child widgets without mouse
+  // tracking (labels/buttons); those moves must still obey the hover zones.
+  if ((widget || qobject_cast<QWindow *>(object)) &&
+      (event->type() == QEvent::MouseMove || event->type() == QEvent::MouseButtonPress ||
+       event->type() == QEvent::MouseButtonRelease)) {
+    const auto *mouse = static_cast<QMouseEvent *>(event);
+    updatePointer(mouse->globalPosition().toPoint());
+    keyboardControls_ = false;
+    if (owned && event->type() == QEvent::MouseButtonPress &&
+        (widget == controls_ || controls_->isAncestorOf(widget))) {
+      pressedControl_ = widget;
+      ++controlPressGeneration_;
+    }
+    if (event->type() == QEvent::MouseButtonRelease && pressedControl_) {
+      // Deliver the release before hiding a grabbed slider/button. Otherwise
+      // the slider's release (and the room's single guarded seek) can be lost.
+      QTimer::singleShot(0, this, [this, generation = controlPressGeneration_] {
+        if (generation != controlPressGeneration_)
+          return;
+        pressedControl_.clear();
+        updateVisibility();
+      });
+    }
+    if (owned || controlsVisible())
+      updateVisibility();
+  }
   if (widget && event->type() == QEvent::MouseButtonPress) {
     openingCombo_.clear();
     openingTimestamp_ = 0;
@@ -173,19 +262,56 @@ bool PlayerSurface::eventFilter(QObject *object, QEvent *event) {
         }
       }
       idle_.stop();
-    } else if (event->type() == QEvent::Hide && playing_ && !blocking_ && isVisible())
-      idle_.start();
+      // Show happens before the native popup is mapped. Do not raise the
+      // underlying controls here or during an owned popup's input handling.
+      controls_->show();
+      unsetCursor();
+      video_->unsetCursor();
+    } else if (event->type() == QEvent::Hide)
+      refreshPointerLater();
     // Raising the underlying controls while a popup handles input can disturb
     // its native stacking. The popup keeps its own keyboard/mouse handling.
     return QWidget::eventFilter(object, event);
   }
   switch (event->type()) {
-  case QEvent::MouseMove:
-  case QEvent::MouseButtonPress:
-  case QEvent::Wheel:
-  case QEvent::FocusIn:
+  case QEvent::Enter:
+    keyboardControls_ = false;
+    updatePointer(static_cast<QEnterEvent *>(event)->globalPosition().toPoint());
+    updateVisibility();
+    break;
+  case QEvent::Leave:
+    // Child Leave events occur while moving video -> controls -> button. Only
+    // the actual surface boundary may instantly hide the controls.
+    if (widget == this) {
+      keyboardControls_ = false;
+      updatePointer(QCursor::pos());
+      pointerInside_ = false;
+      updateVisibility();
+    }
+    break;
+  case QEvent::FocusIn: {
+    const auto reason = static_cast<QFocusEvent *>(event)->reason();
+    if ((widget == controls_ || controls_->isAncestorOf(widget)) &&
+        (reason == Qt::TabFocusReason || reason == Qt::BacktabFocusReason || reason == Qt::ShortcutFocusReason)) {
+      keyboardControls_ = true;
+      updateVisibility();
+    }
+    break;
+  }
+  case QEvent::FocusOut:
+    refreshPointerLater();
+    break;
+  case QEvent::UngrabMouse:
+    if (widget == pressedControl_) {
+      pressedControl_.clear();
+      ++controlPressGeneration_;
+      refreshPointerLater();
+    }
+    break;
+  case QEvent::Resize:
   case QEvent::Show:
-    revealControls();
+    if (widget == this)
+      QTimer::singleShot(0, this, [this] { revealControls(); });
     break;
   case QEvent::MouseButtonDblClick:
     if ((widget == video_ || widget == this) &&
@@ -195,7 +321,13 @@ bool PlayerSurface::eventFilter(QObject *object, QEvent *event) {
     }
     break;
   case QEvent::KeyPress: {
-    revealControls();
+    if (widget == controls_ || controls_->isAncestorOf(widget) ||
+        static_cast<QKeyEvent *>(event)->key() == Qt::Key_Tab ||
+        static_cast<QKeyEvent *>(event)->key() == Qt::Key_Backtab) {
+      keyboardControls_ = true;
+      showControls();
+      idle_.stop();
+    }
     // Controls retain their native keyboard behavior; player gestures apply to
     // the video itself, including when the same surface lives in the pop-out.
     if (widget != video_ && widget != this)

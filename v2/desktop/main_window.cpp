@@ -1,6 +1,7 @@
 #include "main_window.h"
 #include "share_dialog.h"
 #include "theme.h"
+#include "window_geometry.h"
 #include <QAbstractItemView>
 #include <QAbstractSlider>
 #include <QApplication>
@@ -771,6 +772,8 @@ void MainWindow::preview(const QJsonObject &file) {
 void MainWindow::toggleFullscreen() {
   if (!playerWindow_ && pages_->currentWidget() != room_)
     return;
+  if (playerWindow_ && !full_)
+    rememberPlayerGeometry();
   full_ = !full_;
   auto *target = playerWindow_ ? playerWindow_ : this;
   if (full_)
@@ -810,11 +813,12 @@ void MainWindow::togglePopout() {
   playerWindow_->setObjectName(QStringLiteral("DetachedPlayer"));
   playerWindow_->setWindowTitle(tr("WatchPair · Player"));
   playerWindow_->setWindowIcon(windowIcon());
-  playerWindow_->resize(1000, 650);
   auto *layout = new QVBoxLayout(playerWindow_);
   layout->setContentsMargins(0, 0, 0, 0);
   layout->setSpacing(0);
   layout->addWidget(surface);
+  playerNormalGeometry_ = restoreWindowGeometry(*playerWindow_,
+      app_.store.setting(QStringLiteral("playerWindowGeometry")), screen());
   playerWindow_->installEventFilter(this);
   auto *full = new QShortcut(QKeySequence(Qt::Key_F11), playerWindow_);
   full->setAutoRepeat(false);
@@ -829,6 +833,7 @@ void MainWindow::togglePopout() {
     if (full_) toggleFullscreen(); else reattachPlayer();
   });
   playerWindow_->show();
+  constrainWindowGeometry(*playerWindow_);
   surface->show();
   playerWindow_->raise();
   playerWindow_->activateWindow();
@@ -838,6 +843,7 @@ void MainWindow::togglePopout() {
 void MainWindow::reattachPlayer(bool restore) {
   if (!playerWindow_)
     return;
+  rememberPlayerGeometry();
   if (full_)
     toggleFullscreen();
   auto *old = playerWindow_;
@@ -857,6 +863,15 @@ void MainWindow::reattachPlayer(bool restore) {
   old->hide();
   old->deleteLater();
   room_->video()->setFocus(Qt::OtherFocusReason);
+}
+void MainWindow::rememberPlayerGeometry() {
+  if (!playerWindow_)
+    return;
+  playerNormalGeometry_ = normalWindowGeometry(*playerWindow_, playerNormalGeometry_);
+  if (playerNormalGeometry_.isValid())
+    app_.perform([this] {
+      app_.store.setSetting(QStringLiteral("playerWindowGeometry"), windowGeometrySetting(playerNormalGeometry_));
+    });
 }
 bool MainWindow::eventFilter(QObject *object, QEvent *event) {
   if (object == playerWindow_ && event->type() == QEvent::Close) {
@@ -1045,9 +1060,10 @@ void MainWindow::prepareToQuit() {
     return;
   quitting_ = true;
   timer_.stop();
-  if (full_)
+  if (playerWindow_)
+    reattachPlayer();
+  else if (full_)
     toggleFullscreen();
-  reattachPlayer();
   app_.perform([this] {
     app_.store.setSetting(QStringLiteral("windowGeometry"), QString::fromLatin1(saveGeometry().toBase64()));
   });

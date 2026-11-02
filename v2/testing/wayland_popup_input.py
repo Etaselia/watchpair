@@ -52,7 +52,7 @@ if len(compositors) != 1:
 origin_x, origin_y, child = c.c_int(), c.c_int(), window_type()
 x.XTranslateCoordinates(display, compositors[0][0], root, 0, 0, c.byref(origin_x), c.byref(origin_y), c.byref(child))
 
-if sys.argv[1] in ('click', 'press', 'release'):
+if sys.argv[1] in ('click', 'press', 'release', 'move'):
     action = sys.argv[1]
     pid, kind, local_x, local_y = sys.argv[2:6]
     pattern = rf'View \d+ \(role xdg_{re.escape(kind)}, PID {int(pid)},[^\n]+\n\s+position: \((-?\d+), (-?\d+)\) -> \((-?\d+), (-?\d+)\)'
@@ -71,7 +71,8 @@ if sys.argv[1] in ('click', 'press', 'release'):
         stamp = str(time.time_ns())
         with open(os.path.join(os.environ['WATCHPAIR_UI_OUTPUT'], f'scene-{kind}-{stamp}.txt'), 'w') as output:
             output.write(graph)
-        subprocess.run([sys.executable, __file__, 'capture', os.path.join(os.environ['WATCHPAIR_UI_OUTPUT'], f'before-{kind}-{stamp}.png')], check=True)
+        if action != 'move':
+            subprocess.run([sys.executable, __file__, 'capture', os.path.join(os.environ['WATCHPAIR_UI_OUTPUT'], f'before-{kind}-{stamp}.png')], check=True)
     if len(matches) != 1:
         raise RuntimeError(f'Expected one {kind} for PID {pid}, found {matches}\n{graph}')
     px, py, right, bottom = map(int, matches[0])
@@ -93,10 +94,10 @@ if sys.argv[1] in ('click', 'press', 'release'):
     py += origin_y.value + int(local_y)
     print(f'Native XTest {kind} {action} at {px},{py}', flush=True)
     xt.XTestFakeMotionEvent(display, -1, px, py, 0)
-    if action != 'release':
+    if action in ('click', 'press'):
         xt.XTestFakeButtonEvent(display, 1, 1, 0)
     x.XSync(display, 0)
-    if action != 'press':
+    if action in ('click', 'release'):
         time.sleep(.05)
         xt.XTestFakeButtonEvent(display, 1, 0, 0)
     x.XSync(display, 0)
@@ -133,4 +134,4 @@ elif sys.argv[1] == 'capture':
     with open(sys.argv[2], 'wb') as output:
         output.write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(rows)) + chunk(b'IEND', b''))
 else:
-    raise RuntimeError('Expected click, press, release, or capture')
+    raise RuntimeError('Expected click, press, release, move, or capture')

@@ -8,26 +8,43 @@
 #include <QAbstractItemView>
 #include <QComboBox>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
+#include <QHBoxLayout>
+#include <QLineEdit>
+#include <QLabel>
 #include <QMouseEvent>
 #include <QProcess>
 #include <QPushButton>
 #include <QSignalSpy>
 #include <QScreen>
+#include <QSlider>
+#include <QStyle>
+#include <QStyleOptionSlider>
 #include <QSurfaceFormat>
 #include <QTemporaryDir>
 #include <QVBoxLayout>
 #include <QWindow>
 #include <QtTest>
+#include <algorithm>
 #include <cmath>
 #include <functional>
 #include <memory>
 namespace {
-void movePointer(QWidget &widget, const QPoint &point) {
+bool clickPopupWidget(QWidget &widget, const QPoint &point, const QString &action);
+bool movePointer(QWidget &widget, const QPoint &point, Qt::MouseButtons buttons = Qt::NoButton) {
+  if (!qEnvironmentVariableIsEmpty("WATCHPAIR_WAYLAND_POPUP_INPUT") && buttons == Qt::NoButton) {
+    const bool moved = clickPopupWidget(widget, point, QStringLiteral("move"));
+    if (!moved)
+      QTest::qFail("Native Wayland pointer movement failed", __FILE__, __LINE__);
+    return moved;
+  }
   const auto global = widget.mapToGlobal(point);
-  QCursor::setPos(global);
-  QMouseEvent event(QEvent::MouseMove, point, global, Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+  if (!QApplication::platformName().startsWith(QStringLiteral("wayland")))
+    QCursor::setPos(global);
+  QMouseEvent event(QEvent::MouseMove, point, global, Qt::NoButton, buttons, Qt::NoModifier);
   QApplication::sendEvent(&widget, &event);
+  return true;
 }
 void capture(QWidget &widget, const QString &name) {
   const auto output = qEnvironmentVariable("WATCHPAIR_UI_OUTPUT");
@@ -124,7 +141,13 @@ bool choosePopup(wp::ui::PlayerSurface &surface, QComboBox &combo, QWidget &host
   if (!qEnvironmentVariableIsEmpty("WATCHPAIR_WAYLAND_POPUP_INPUT") && host.isFullScreen() &&
       !QTest::qWaitFor([&] { return host.size() == host.screen()->geometry().size(); }, 3000))
     return false;
+  // Enter the lower region before asking to reveal controls. A programmatic
+  // reveal must not bypass the pointer policy when the player is elsewhere.
+  if (!movePointer(surface, QPoint(2, surface.height() - 2)))
+    return false;
   surface.revealControls();
+  if (!QTest::qWaitFor([&] { return surface.controlsVisible(); }, 1000))
+    return false;
   const auto originalIndex = combo.currentIndex();
   QSignalSpy activated(&combo, qOverload<int>(&QComboBox::activated));
   if (!clickPopupWidget(combo, QPoint(combo.width() - 10, combo.height() / 2)))
@@ -137,7 +160,7 @@ bool choosePopup(wp::ui::PlayerSurface &surface, QComboBox &combo, QWidget &host
     return false;
   QTest::qWait(450); // Let Qt 6.12's 400 ms opening-release timer expire.
   if (waitIdle)
-    QTest::qWait(2700);
+    QTest::qWait(1200);
   qInfo() << name << "opening activations" << activated.size()
           << "initial/current index" << originalIndex << combo.currentIndex();
   if (!activated.isEmpty() || combo.currentIndex() != originalIndex)
@@ -192,27 +215,220 @@ bool choosePopup(wp::ui::PlayerSurface &surface, QComboBox &combo, QWidget &host
 class PlayerSurfaceTests final : public QObject {
   Q_OBJECT
 private slots:
-  void idleControlsDoNotResizeVideoAndPauseRevealsThem() {
-    auto *video = new QWidget;
-    wp::ui::PlayerSurface surface(video);
-    auto *controls = new QPushButton(QStringLiteral("Pause"));
-    surface.addControls(controls);
-    surface.resize(800, 500);
+  void pointerZonesHideControlsInPausedAndPlaying_data() {
+    QTest::addColumn<bool>("playing");
+    QTest::newRow("paused") << false;
+    QTest::newRow("playing") << true;
+  }
+  void pointerZonesHideControlsInPausedAndPlaying() {
+    QFETCH(bool, playing);
+    QWidget host;
+    auto *layout = new QHBoxLayout(&host);
+    auto *surface = new wp::ui::PlayerSurface(new QWidget);
+    auto *button = new QPushButton(QStringLiteral("Pause"));
+    surface->addControls(button);
+    auto *outside = new QWidget;
+    outside->setFixedWidth(80);
+    layout->addWidget(surface);
+    layout->addWidget(outside);
+    host.resize(980, 601);
+    host.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&host));
+    surface->setPlaybackState(playing, false);
+    auto captureZone = [&](const QString &zone) {
+      const auto output = qEnvironmentVariable("WATCHPAIR_UI_OUTPUT");
+      return qEnvironmentVariableIsEmpty("WATCHPAIR_WAYLAND_POPUP_INPUT") || output.isEmpty() ||
+          compositorInput({QStringLiteral("capture"), QDir(output).filePath(
+              QStringLiteral("hover-%1-%2-screen.png").arg(QString::fromLatin1(QTest::currentDataTag()), zone))});
+    };
+    const auto bounds = surface->video()->geometry();
+    const int boundary = (surface->height() * 3 + 3) / 4;
+    movePointer(*surface, QPoint(2, boundary));
+    QTRY_VERIFY(surface->controlsVisible());
+    QTest::qWait(1100);
+    QVERIFY(surface->controlsVisible());
+    QVERIFY(captureZone(QStringLiteral("lower")));
+    // Child Leave is expected when crossing video, controls and their children.
+    QEvent childLeave(QEvent::Leave);
+    QApplication::sendEvent(surface->video(), &childLeave);
+    QApplication::sendEvent(button, &childLeave);
+    QVERIFY(surface->controlsVisible());
+    movePointer(*surface->video(), QPoint(2, boundary - 1));
+    QTest::qWait(600);
+    QVERIFY(surface->controlsVisible());
+    QVERIFY2(QTest::qWaitFor([&] { return !surface->controlsVisible(); }, 700),
+             "Upper region hides after 1000 ms in both paused and playing states");
+    QCOMPARE(surface->video()->geometry(), bounds);
+    QVERIFY(captureZone(QStringLiteral("upper")));
+    movePointer(*surface, QPoint(2, boundary));
+    QTRY_VERIFY(surface->controlsVisible());
+    if (!qEnvironmentVariableIsEmpty("WATCHPAIR_WAYLAND_POPUP_INPUT"))
+      QVERIFY(movePointer(*outside, outside->rect().center()));
+    else {
+      movePointer(*outside, outside->rect().center());
+      QEvent leave(QEvent::Leave);
+      QApplication::sendEvent(surface, &leave);
+    }
+    QVERIFY2(QTest::qWaitFor([&] { return !surface->controlsVisible(); }, 150),
+             "Leaving the player hides immediately, without another one-second grace period");
+    QCOMPARE(surface->video()->geometry(), bounds);
+    QVERIFY(outside->cursor().shape() != Qt::BlankCursor);
+    QVERIFY(captureZone(QStringLiteral("outside")));
+  }
+  void upperMotionAndRefreshDoNotRestartOrRevealControls() {
+    wp::ui::PlayerSurface surface(new QWidget);
+    surface.addControls(new QPushButton(QStringLiteral("Pause")));
+    auto *overlay = new QWidget;
+    overlay->setAttribute(Qt::WA_TransparentForMouseEvents);
+    auto *message = new QLabel(QStringLiteral("Buffering"), overlay);
+    surface.setBlockingOverlay(overlay);
+    overlay->hide();
+    surface.resize(800, 501);
     surface.show();
     QVERIFY(QTest::qWaitForWindowExposed(&surface));
-    movePointer(*video, QPoint(20, 20));
-    surface.setPlaybackState(true, false);
-    const auto bounds = video->geometry();
-    QTRY_VERIFY_WITH_TIMEOUT(!surface.controlsVisible(), 4000);
-    QCOMPARE(video->geometry(), bounds);
-    QCOMPARE(video->cursor().shape(), Qt::BlankCursor);
-    movePointer(*video, QPoint(30, 25));
+    movePointer(surface, QPoint(2, surface.height() - 2));
     QTRY_VERIFY(surface.controlsVisible());
-    QVERIFY(video->cursor().shape() != Qt::BlankCursor);
+    movePointer(*surface.video(), QPoint(20, 20));
+    QElapsedTimer deadline;
+    deadline.start();
+    for (int refresh = 0; refresh < 3; ++refresh) {
+      QTest::qWait(200);
+      movePointer(*surface.video(), QPoint(21 + refresh, 20));
+      surface.setPlaybackState(refresh % 2 == 0, refresh % 2 != 0);
+      overlay->show();
+      message->hide();
+      message->show();
+      overlay->hide();
+      QVERIFY(surface.controlsVisible());
+    }
+    QVERIFY2(QTest::qWaitFor([&] { return !surface.controlsVisible(); },
+                            int(std::max<qint64>(1, 1300 - deadline.elapsed()))),
+             "Upper movement, playback refresh and child Show must not reset the original deadline");
+    for (int refresh = 0; refresh < 3; ++refresh) {
+      surface.setPlaybackState(refresh % 2 != 0, refresh % 2 == 0);
+      overlay->show();
+      overlay->hide();
+      surface.revealControls();
+      QApplication::processEvents();
+      QVERIFY2(!surface.controlsVisible(), "State/overlay refresh cannot resurrect hidden upper-region controls");
+    }
+  }
+  void sliderDragOutsideKeepsReleaseAndThenHides() {
+    wp::ui::PlayerSurface surface(new QWidget);
+    auto *slider = new QSlider(Qt::Horizontal);
+    slider->setRange(0, 100);
+    slider->setValue(50);
+    surface.addControls(slider);
+    surface.resize(800, 501);
+    surface.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&surface));
     surface.setPlaybackState(false, false);
-    QTest::qWait(2700);
+    movePointer(surface, QPoint(2, surface.height() - 2));
+    QTRY_VERIFY(surface.controlsVisible());
+    QStyleOptionSlider option;
+    option.initFrom(slider);
+    option.orientation = Qt::Horizontal;
+    option.minimum = slider->minimum();
+    option.maximum = slider->maximum();
+    option.sliderPosition = slider->sliderPosition();
+    option.sliderValue = slider->value();
+    const auto handle = slider->style()->subControlRect(QStyle::CC_Slider, &option, QStyle::SC_SliderHandle, slider);
+    QSignalSpy pressed(slider, &QSlider::sliderPressed), released(slider, &QSlider::sliderReleased);
+    QTest::mousePress(slider, Qt::LeftButton, Qt::NoModifier, handle.center());
+    QVERIFY(slider->isSliderDown());
+    QCOMPARE(pressed.size(), 1);
+    const auto outside = slider->mapFrom(&surface, QPoint(surface.width() + 20, slider->mapTo(&surface, handle.center()).y()));
+    movePointer(*slider, outside, Qt::LeftButton);
+    QEvent leave(QEvent::Leave);
+    QApplication::sendEvent(&surface, &leave);
+    QTest::qWait(1200);
     QVERIFY(surface.controlsVisible());
-    QCOMPARE(video->geometry(), bounds);
+    QVERIFY(slider->isSliderDown());
+    QCOMPARE(released.size(), 0);
+    QTest::mouseRelease(slider, Qt::LeftButton, Qt::NoModifier, outside);
+    QCOMPARE(released.size(), 1);
+    QVERIFY(!slider->isSliderDown());
+    QVERIFY2(QTest::qWaitFor([&] { return !surface.controlsVisible(); }, 150),
+             "A completed outside drag hides immediately after its release is delivered");
+  }
+  void keyboardEditingSurvivesButMouseFocusDoesNotPinControls() {
+    wp::ui::PlayerSurface surface(new QWidget);
+    auto *controls = new QWidget;
+    auto *layout = new QVBoxLayout(controls);
+    auto *edit = new QLineEdit;
+    auto *button = new QPushButton(QStringLiteral("Pause"));
+    layout->addWidget(edit);
+    layout->addWidget(button);
+    surface.addControls(controls);
+    QWidget::setTabOrder(surface.video(), edit);
+    QWidget::setTabOrder(edit, button);
+    surface.resize(800, 501);
+    surface.show();
+    surface.activateWindow();
+    QVERIFY(QTest::qWaitForWindowExposed(&surface));
+    movePointer(surface, QPoint(2, surface.height() - 2));
+    QTRY_VERIFY(surface.controlsVisible());
+    button->setFocus(Qt::MouseFocusReason);
+    movePointer(*surface.video(), QPoint(20, 20));
+    QVERIFY2(QTest::qWaitFor([&] { return !surface.controlsVisible(); }, 1300),
+             "Residual focus from a mouse click must not pin controls in the upper region");
+    surface.video()->setFocus(Qt::OtherFocusReason);
+    QTest::keyClick(surface.video(), Qt::Key_Tab);
+    QTRY_VERIFY(edit->hasFocus());
+    QVERIFY(surface.controlsVisible());
+    QTest::keyClicks(edit, QStringLiteral("subtitle delay"));
+    QSignalSpy seeks(&surface, &wp::ui::PlayerSurface::seekRequested);
+    QTest::keyClick(edit, Qt::Key_Left);
+    QCOMPARE(seeks.size(), 0);
+    QTest::qWait(1200);
+    QVERIFY(surface.controlsVisible());
+    QVERIFY(edit->hasFocus());
+    QCOMPARE(edit->text(), QStringLiteral("subtitle delay"));
+  }
+  void deferredReleaseDoesNotCancelANewerPressOnTheSameControl() {
+    wp::ui::PlayerSurface surface(new QWidget);
+    auto *slider = new QSlider(Qt::Horizontal);
+    slider->setRange(0, 100);
+    slider->setValue(50);
+    surface.addControls(slider);
+    surface.resize(800, 501);
+    surface.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&surface));
+    movePointer(surface, QPoint(2, surface.height() - 2));
+    QTRY_VERIFY(surface.controlsVisible());
+    QStyleOptionSlider option;
+    option.initFrom(slider);
+    option.orientation = Qt::Horizontal;
+    option.minimum = slider->minimum();
+    option.maximum = slider->maximum();
+    option.sliderPosition = slider->sliderPosition();
+    option.sliderValue = slider->value();
+    const auto handle = slider->style()->subControlRect(QStyle::CC_Slider, &option, QStyle::SC_SliderHandle, slider);
+    QSignalSpy pressed(slider, &QSlider::sliderPressed), released(slider, &QSlider::sliderReleased);
+    auto deliver = [&](QEvent::Type type, Qt::MouseButtons buttons, const QPoint &point) {
+      QMouseEvent event(type, point, slider->mapToGlobal(point), Qt::LeftButton, buttons, Qt::NoModifier);
+      QApplication::sendEvent(slider, &event);
+    };
+    // Deliver one native-style input batch without qWait/processEvents. The
+    // first release's zero-timer must not clear a newer press on this slider.
+    deliver(QEvent::MouseButtonPress, Qt::LeftButton, handle.center());
+    deliver(QEvent::MouseButtonRelease, Qt::NoButton, handle.center());
+    deliver(QEvent::MouseButtonPress, Qt::LeftButton, handle.center());
+    QCOMPARE(pressed.size(), 2);
+    QCOMPARE(released.size(), 1);
+    QVERIFY(slider->isSliderDown());
+    const auto outside = slider->mapFrom(&surface, QPoint(surface.width() + 20, slider->mapTo(&surface, handle.center()).y()));
+    movePointer(*slider, outside, Qt::LeftButton);
+    QEvent leave(QEvent::Leave);
+    QApplication::sendEvent(&surface, &leave);
+    QTest::qWait(1200);
+    QVERIFY2(surface.controlsVisible(), "The earlier release must not hide a newer active drag");
+    QVERIFY(slider->isSliderDown());
+    QCOMPARE(released.size(), 1);
+    deliver(QEvent::MouseButtonRelease, Qt::NoButton, outside);
+    QCOMPARE(released.size(), 2);
+    QVERIFY(!slider->isSliderDown());
+    QVERIFY(QTest::qWaitFor([&] { return !surface.controlsVisible(); }, 150));
   }
   void popupAndEditingKeepNativeInteractionAndPlayerGestures() {
     auto *video = new QWidget;
@@ -243,12 +459,18 @@ private slots:
     QCOMPARE(combo->currentIndex(), 1);
     QCOMPARE(seek.size(), 1);
     surface.setPlaybackState(true, false);
-    combo->showPopup();
-    QTest::qWait(2700);
+    QVERIFY(movePointer(surface, QPoint(2, surface.height() - 2)));
+    QTRY_VERIFY(surface.controlsVisible());
+    QVERIFY(clickPopupWidget(*combo, QPoint(combo->width() - 10, combo->height() / 2)));
+    QTRY_VERIFY(combo->view()->isVisible());
+    QVERIFY(QTest::qWaitForWindowExposed(combo->view()->window()));
+    QTest::qWait(1200);
     QVERIFY(surface.controlsVisible());
+    QVERIFY(combo->view()->isVisible());
     combo->hidePopup();
+    video->setFocus(Qt::MouseFocusReason);
     movePointer(*video, QPoint(25, 20));
-    QTRY_VERIFY_WITH_TIMEOUT(!surface.controlsVisible(), 4000);
+    QVERIFY(QTest::qWaitFor([&] { return !surface.controlsVisible(); }, 1300));
   }
   void clickedPopupFollowsDetachedFullscreenAndReturnedSurface() {
     QWidget room, detached;
@@ -340,6 +562,8 @@ private slots:
     host.resize(900, 600);
     host.show();
     QVERIFY(QTest::qWaitForWindowExposed(&host));
+    QVERIFY(movePointer(*surface, QPoint(2, surface->height() - 2)));
+    QTRY_VERIFY(surface->controlsVisible());
     QSignalSpy activated(combo, qOverload<int>(&QComboBox::activated));
     QVERIFY(clickPopupWidget(*combo, QPoint(combo->width() - 10, combo->height() / 2), QStringLiteral("press")));
     QTRY_VERIFY(combo->view()->isVisible());

@@ -78,6 +78,11 @@ RoomMedia::RoomMedia(LocalStore &store, RoomClient &rooms, TransferEngine &trans
   connect(&transfers_, &TransferEngine::removed, this, [this](const QString &id) {
     manifests_.remove(id);
     identityCache_.clear();
+    for (auto it = torrentDefaults_.begin(); it != torrentDefaults_.end();)
+      if (it.key().endsWith(QLatin1Char(':') + id))
+        it = torrentDefaults_.erase(it);
+      else
+        ++it;
     removedAcquisition(QStringLiteral("transfer"), id);
   });
   connect(&library_, &LibraryService::changed, this, &RoomMedia::libraryChanged);
@@ -229,11 +234,58 @@ QString RoomMedia::mediaId(const QString &identity, int index) {
                                  .toHex());
 }
 QString RoomMedia::prepare(const QString &input, const QString &room, const QString &root) {
+  const auto behavior =
+      store_.setting(QStringLiteral("newTorrentBehavior"), QStringLiteral("follow")).toString();
+  const auto initial = behavior == QStringLiteral("auto")   ? QStringLiteral("Auto")
+                       : behavior == QStringLiteral("wait") ? QStringLiteral("Ask")
+                                                            : policy(room);
   const auto op = resolver_.resolve(input);
-  resolving_.insert(
-      op,
-      {{QStringLiteral("operation"), op}, {QStringLiteral("room"), room}, {QStringLiteral("root"), root}});
+  resolving_.insert(op, {{QStringLiteral("operation"), op},
+                         {QStringLiteral("room"), room},
+                         {QStringLiteral("root"), root},
+                         {QStringLiteral("downloadByDefault"), initial == QStringLiteral("Auto")},
+                         {QStringLiteral("initialPolicy"),
+                          behavior == QStringLiteral("auto")   ? QStringLiteral("Auto")
+                          : behavior == QStringLiteral("wait") ? QStringLiteral("Ask")
+                                                               : QStringLiteral("inherit")}});
   return op;
+}
+QJsonObject RoomMedia::torrentDefaults(const QString &transfer, const QString &room) const {
+  QJsonArray sources;
+  bool knownRoom = room.isEmpty();
+  for (const auto value : rooms_.rooms())
+    if (!room.isEmpty() && value.toObject().value(QStringLiteral("key")).toString() == room) {
+      knownRoom = true;
+      sources = rooms_.room(room).value(QStringLiteral("sources")).toArray();
+      break;
+    }
+  if (!knownRoom)
+    return {{QStringLiteral("download"), false}, {QStringLiteral("roomMissing"), true}};
+  const auto identity = transfers_.view(transfer).identity;
+  const auto decision = acquisition(room, identity);
+  bool published = false;
+  for (const auto value : sources)
+    if (value.toObject().value(QStringLiteral("id")).toString() == identity)
+      published = true;
+  if (published || decision.contains(QStringLiteral("override")) ||
+      !decision.value(QStringLiteral("approved")).toArray().isEmpty()) {
+    const auto effective = decision.value(QStringLiteral("effectivePolicy")).toString();
+    return {
+        {QStringLiteral("download"), effective == QStringLiteral("Auto") ||
+                                         (effective == QStringLiteral("Ask") &&
+                                          !decision.value(QStringLiteral("approved")).toArray().isEmpty())},
+        {QStringLiteral("policy"), QStringLiteral("preserve")}};
+  }
+  const auto native = transfers_.intent(transfer);
+  if (native.value(QStringLiteral("choiceRevision")).toInteger() > 0) {
+    bool selected = false;
+    const auto overrides = native.value(QStringLiteral("overrides")).toObject();
+    for (auto it = overrides.begin(); it != overrides.end(); ++it)
+      selected |= it.value().toInt() > 0;
+    return {{QStringLiteral("download"), selected}, {QStringLiteral("policy"), QStringLiteral("preserve")}};
+  }
+  return torrentDefaults_.value(bindingKey(room, transfer),
+                                {{QStringLiteral("download"), policy(room) == QStringLiteral("Auto")}});
 }
 void RoomMedia::resolved(const ResolvedSource &source) {
   if (!resolving_.contains(source.operationId))
@@ -257,9 +309,16 @@ void RoomMedia::resolved(const ResolvedSource &source) {
                                      work.value(QStringLiteral("root")).toString());
       work.insert(QStringLiteral("kind"), source.kind);
       work.insert(QStringLiteral("transfer"), id);
-      if (key.isEmpty())
+      if (key.isEmpty()) {
+        // Each add has its own snapshot, including a re-add after cancelling
+        // a chooser. Existing source decisions and native choices take priority
+        // when the chooser reads these defaults; preparation changes no demand.
+        torrentDefaults_.insert(
+            bindingKey(room, id),
+            {{QStringLiteral("download"), work.value(QStringLiteral("downloadByDefault"))},
+             {QStringLiteral("policy"), work.value(QStringLiteral("initialPolicy"))}});
         emit prepared(work);
-      else {
+      } else {
         store_.put(QStringLiteral("room-source"), key,
                    {{QStringLiteral("room"), room},
                     {QStringLiteral("source"), work.value(QStringLiteral("source"))},
@@ -288,7 +347,12 @@ void RoomMedia::resolved(const ResolvedSource &source) {
   sourceRequests_.remove(key);
 }
 QString RoomMedia::publishTorrent(const QString &transfer, const QString &room, const QList<int> &selected,
-                                  bool downloadHere, bool followRoom, qint64 expectedQueueRevision) {
+                                  bool downloadHere, bool followRoom, qint64 expectedQueueRevision,
+                                  const QString &initialPolicy) {
+  if (!initialPolicy.isEmpty() && !QStringList{QStringLiteral("inherit"), QStringLiteral("preserve"),
+                                               QStringLiteral("Auto"), QStringLiteral("Ask")}
+                                       .contains(initialPolicy))
+    throw AppError(QStringLiteral("POLICY"), QStringLiteral("Invalid new-torrent behavior."));
   auto *native = transfers_.source(transfer);
   if (!native || native->files().isEmpty())
     throw AppError(QStringLiteral("METADATA_WAIT"),
@@ -346,12 +410,20 @@ QString RoomMedia::publishTorrent(const QString &transfer, const QString &room, 
     if (TransferEngine::video(f.path) && choices.contains(f.index))
       indexes.append(f.index);
   const auto key = bindingKey(room, sourceId);
+  const auto priorDecision = store_.get(QStringLiteral("source-policy"), key);
+  const bool newDecision = !existingSource && !priorDecision.contains(QStringLiteral("override")) &&
+                           priorDecision.value(QStringLiteral("approved")).toArray().isEmpty();
+  const bool preserveAcquisition =
+      initialPolicy == QStringLiteral("preserve") || (!initialPolicy.isEmpty() && !newDecision);
+  const auto initial = preserveAcquisition ? QString() : initialPolicy;
   QJsonObject work{{QStringLiteral("room"), room},
                    {QStringLiteral("source"), sourceId},
                    {QStringLiteral("binding"), key},
                    {QStringLiteral("transfer"), transfer},
                    {QStringLiteral("follow"), followRoom && downloadHere},
                    {QStringLiteral("download"), downloadHere},
+                   {QStringLiteral("initialPolicy"), initial},
+                   {QStringLiteral("preserveAcquisition"), preserveAcquisition},
                    {QStringLiteral("extras"), extras},
                    {QStringLiteral("approved"), approvedIds},
                    {QStringLiteral("files"), indexes},
@@ -946,7 +1018,7 @@ void RoomMedia::finishPublication(const QString &op, bool accepted) {
                          !local.value(QStringLiteral("removed")).toBool();
     const bool download = work.value(QStringLiteral("download")).toBool();
     store_.transaction([&] {
-      if (current) {
+      if (current && !work.value(QStringLiteral("preserveAcquisition")).toBool()) {
         QSet<QString> approved;
         for (auto value : decision.value(QStringLiteral("approved")).toArray())
           approved.insert(value.toString());
@@ -959,15 +1031,23 @@ void RoomMedia::finishPublication(const QString &op, bool accepted) {
         for (const auto &id : approved)
           choices.append(id);
         decision.insert(QStringLiteral("approved"), choices);
-        decision.insert(QStringLiteral("override"),
-                        download ? QStringLiteral("Ask") : QStringLiteral("Never"));
+        const auto initial = work.value(QStringLiteral("initialPolicy")).toString();
+        if (initial == QStringLiteral("inherit"))
+          decision.remove(QStringLiteral("override"));
+        else
+          decision.insert(QStringLiteral("override"),
+                          initial.isEmpty() ? (download ? QStringLiteral("Ask") : QStringLiteral("Never"))
+                                            : initial);
         store_.put(QStringLiteral("source-policy"), key, decision);
         store_.put(QStringLiteral("demand"), key,
                    {{QStringLiteral("id"), key},
                     {QStringLiteral("transfer"), transfer},
                     {QStringLiteral("files"),
                      download ? work.value(QStringLiteral("files")) : QJsonValue(QJsonArray())},
-                    {QStringLiteral("policy"), download ? QStringLiteral("Ask") : QStringLiteral("Never")},
+                    {QStringLiteral("policy"),
+                     initial == QStringLiteral("inherit") ? policy(room)
+                     : initial.isEmpty() ? (download ? QStringLiteral("Ask") : QStringLiteral("Never"))
+                                         : initial},
                     {QStringLiteral("approved"), download}});
         // A delayed shared acknowledgment must not erase a newer local file
         // refusal. Pause state is retained independently in the native intent.
@@ -1023,6 +1103,11 @@ void RoomMedia::resumePublications() {
   }
 }
 void RoomMedia::forgetRoom(const QString &room) {
+  for (auto it = torrentDefaults_.begin(); it != torrentDefaults_.end();)
+    if (it.key().startsWith(room + QLatin1Char(':')))
+      it = torrentDefaults_.erase(it);
+    else
+      ++it;
   for (const auto &op : identifying_.keys()) {
     const auto work = identifying_.value(op);
     if (work.value(QStringLiteral("transfer")).toString().isEmpty() &&

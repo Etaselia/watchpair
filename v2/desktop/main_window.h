@@ -37,6 +37,7 @@ private:
   void toggleFullscreen();
   void togglePopout();
   void reattachPlayer(bool restore = true);
+  void rememberPlayerGeometry();
   void issue(const QString &code, const QString &message);
   AppServices &app_;
   QWidget *sidebar_, *topbar_, *banner_;
@@ -55,6 +56,7 @@ private:
   QString currentRoom_;
   bool full_ = false;
   QWidget *playerWindow_ = nullptr;
+  QRect playerNormalGeometry_;
   Qt::WindowStates playerWindowState_;
   bool bannerBeforeFullscreen_ = false;
   bool quitting_ = false;

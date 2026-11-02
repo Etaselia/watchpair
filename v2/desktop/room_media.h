@@ -21,8 +21,10 @@ public:
             LibraryService &library, DirectDownloads &direct, QObject *parent = nullptr);
   ~RoomMedia() override;
   QString prepare(const QString &input, const QString &room = {}, const QString &root = {});
+  QJsonObject torrentDefaults(const QString &transfer, const QString &room) const;
   QString publishTorrent(const QString &transferId, const QString &room, const QList<int> &selected,
-                         bool downloadHere, bool followRoom, qint64 expectedQueueRevision = -1);
+                         bool downloadHere, bool followRoom, qint64 expectedQueueRevision = -1,
+                         const QString &initialPolicy = {});
   QString publishDirect(const QString &downloadId, const QString &room);
   void requestDirectPublication(const QString &download, const QString &room);
   QString selectSource(const QString &room, const QString &source, const QStringList &mediaIds,
@@ -67,6 +69,7 @@ private:
   LibraryService &library_;
   DirectDownloads &direct_;
   QHash<QString, QJsonObject> resolving_, identifying_, publishing_;
+  QHash<QString, QJsonObject> torrentDefaults_;
   QSet<QString> sourceRequests_, hashing_, fingerprintRooms_;
   QQueue<QPair<QString, int>> identificationQueue_;
   QSet<QString> queuedIdentification_;

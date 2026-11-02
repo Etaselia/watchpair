@@ -1,4 +1,5 @@
 #include "room_page.h"
+#include "seek_slider.h"
 #include "theme.h"
 #include <QApplication>
 #include <QDialogButtonBox>
@@ -371,7 +372,7 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   controls->setContentsMargins(0, 0, 0, 0);
   controls->setSpacing(9);
   auto *timeline = new QHBoxLayout;
-  seek_ = new QSlider(Qt::Horizontal);
+  seek_ = new SeekSlider(Qt::Horizontal);
   seek_->setObjectName(QStringLiteral("SeekSlider"));
   seek_->setAccessibleName(tr("Playback position"));
   seek_->setRange(0, 1000000);
@@ -654,28 +655,23 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   connect(policy_, qOverload<int>(&QComboBox::activated), this, [this](int index) {
     app_.perform([&] { app_.media.setPolicy(room_, policy_->itemData(index).toString()); });
   });
-  connect(seek_, &QSlider::sliderPressed, this, [this] {
-    seeking_ = true;
-    seekDuration_ = app_.playback.duration();
-    seekGeneration_ = room_.isEmpty() ? -1
-                                      : app_.rooms.room(room_)
-                                            .value(QStringLiteral("playback"))
-                                            .toObject()
-                                            .value(QStringLiteral("generation"))
-                                            .toInt();
-  });
+  connect(seek_, &QSlider::sliderPressed, this, &RoomPage::beginSeek);
   connect(seek_, &QSlider::sliderReleased, this, [this] {
-    seeking_ = false;
-    const double seconds = double(seek_->value()) / 1000000 * seekDuration_;
-    app_.perform([&] {
-      if (app_.playback.local())
-        app_.playback.seek(seconds);
-      else
-        app_.rooms.command(room_,
-                           {{QStringLiteral("type"), QStringLiteral("playback.seek")},
-                            {QStringLiteral("position"), seconds}},
-                           {}, {{QStringLiteral("generation"), seekGeneration_}});
-    });
+    finishSeek(seek_->value());
+  });
+  connect(seek_, &SeekSlider::scrubCancelled, this, [this] { seeking_ = false; });
+  connect(seek_, &QSlider::sliderMoved, this, [this](int value) {
+    if (seeking_)
+      time_->setText(elapsed(double(value) / 1000000 * seekDuration_) + QStringLiteral(" / ") +
+                     elapsed(seekDuration_));
+  });
+  connect(seek_, &QSlider::actionTriggered, this, [this](int action) {
+    // Native keyboard/wheel actions use the same guarded commit. Pointer
+    // tracking only changes the preview until sliderReleased.
+    if (!seek_->isSliderDown() && action != QAbstractSlider::SliderNoAction) {
+      beginSeek();
+      finishSeek(seek_->sliderPosition());
+    }
   });
   connect(rate_, qOverload<int>(&QComboBox::activated), this, [this](int index) {
     app_.perform([&] { app_.playback.setRate(rate_->itemData(index).toDouble()); });
@@ -1299,8 +1295,9 @@ void RoomPage::refresh() {
                       : app_.playback.playRequested() ? tr("Pause the room, including automatic resume")
                                                       : tr("Play for the room"));
     const double duration = app_.playback.duration(), position = app_.playback.position();
-    time_->setText(elapsed(position) + QStringLiteral(" / ") +
-                   (duration > 0 ? elapsed(duration) : QStringLiteral("—")));
+    time_->setText(elapsed(seeking_ ? double(seek_->sliderPosition()) / 1000000 * seekDuration_ : position) +
+                   QStringLiteral(" / ") +
+                   (seeking_ ? elapsed(seekDuration_) : duration > 0 ? elapsed(duration) : QStringLiteral("—")));
     seek_->setEnabled((local || connected) && duration > 0);
     skipBack_->setEnabled(seek_->isEnabled());
     skipForward_->setEnabled(seek_->isEnabled());
@@ -1455,6 +1452,56 @@ void RoomPage::setPlayerDetached(bool detached) {
   popout_->setToolTip(detached ? tr("Return player to the room")
                              : tr("Open player in a separate window"));
   surface_->revealControls();
+}
+void RoomPage::beginSeek() {
+  seeking_ = false;
+  app_.perform([this] {
+    seekLocal_ = app_.playback.local();
+    seekRoom_ = room_;
+    seekPlaybackRoom_ = app_.playback.room();
+    if (!seekLocal_ && (room_.isEmpty() || seekPlaybackRoom_ != room_ || !app_.rooms.connected(room_)))
+      return;
+    const auto p = seekLocal_ ? QJsonObject() : app_.rooms.room(room_).value(QStringLiteral("playback")).toObject();
+    seekEntry_ = seekLocal_ ? app_.playback.entryId() : p.value(QStringLiteral("entryId")).toString();
+    if (seekEntry_.isEmpty())
+      return;
+    seekMedia_ = seekLocal_ ? seekEntry_ : app_.rooms.entry(room_, seekEntry_).value(QStringLiteral("mediaId")).toString();
+    seekDuration_ = app_.playback.duration();
+    seekGeneration_ = seekLocal_ ? -1 : p.value(QStringLiteral("generation")).toInt();
+    seeking_ = seekDuration_ > 0;
+  });
+}
+void RoomPage::finishSeek(int position) {
+  if (!seeking_)
+    return;
+  seeking_ = false;
+  app_.perform([this, position] {
+    if (seekLocal_ != app_.playback.local() || seekRoom_ != room_ ||
+        seekPlaybackRoom_ != app_.playback.room())
+      return;
+    if (seekLocal_) {
+      if (seekEntry_ != app_.playback.entryId())
+        return;
+    } else {
+      if (!app_.rooms.connected(room_))
+        return;
+      const auto p = app_.rooms.room(room_).value(QStringLiteral("playback")).toObject();
+      if (p.value(QStringLiteral("generation")).toInt() != seekGeneration_ ||
+          p.value(QStringLiteral("entryId")).toString() != seekEntry_ ||
+          app_.rooms.entry(room_, seekEntry_).value(QStringLiteral("mediaId")).toString() != seekMedia_)
+        return;
+    }
+    if (app_.playback.duration() <= 0)
+      return;
+    const double seconds = double(position) / 1000000 * seekDuration_;
+    if (seekLocal_)
+      app_.playback.seek(seconds);
+    else
+      app_.rooms.command(seekRoom_,
+                         {{QStringLiteral("type"), QStringLiteral("playback.seek")},
+                          {QStringLiteral("position"), seconds}},
+                         {}, {{QStringLiteral("generation"), seekGeneration_}});
+  });
 }
 void RoomPage::seekPlayer(double seconds) {
   app_.perform([&] {

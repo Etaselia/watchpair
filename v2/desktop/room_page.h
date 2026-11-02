@@ -17,6 +17,7 @@
 #include <QTableWidget>
 #include <QWidget>
 namespace wp::ui {
+class SeekSlider;
 class QueueProxy final : public QSortFilterProxyModel {
   Q_OBJECT
 public:
@@ -85,6 +86,8 @@ private:
   void updateQueueActions();
   void trackChoice();
   void seekPlayer(double seconds);
+  void beginSeek();
+  void finishSeek(int position);
   void skipChapter(int direction);
   bool chapterMetadataReady() const;
   bool trackInventoryReady() const;
@@ -111,13 +114,16 @@ private:
   QAction *queueUnwatched_, *queueWatchAgain_, *queueRename_, *queueRemove_, *queueClear_;
   QLabel *queueHint_;
   QPushButton *previousChapter_, *nextChapter_, *skipBack_, *skipForward_, *popout_, *reattach_;
-  QSlider *seek_, *volume_;
+  SeekSlider *seek_;
+  QSlider *volume_;
   QComboBox *policy_, *rate_, *audio_, *subtitles_, *chapters_;
   QDoubleSpinBox *subtitleDelay_;
   QTimer refresh_;
   bool seeking_ = false, fullscreen_ = false;
   double seekDuration_ = 0;
   int seekGeneration_ = -1, tracksGeneration_ = -1;
+  bool seekLocal_ = false;
+  QString seekRoom_, seekPlaybackRoom_, seekEntry_, seekMedia_;
   QString tracksEntry_;
   QJsonArray loadedHistory_;
   QString historyQuery_;

@@ -357,6 +357,15 @@ SettingsPage::SettingsPage(AppServices &app, QWidget *parent) : QWidget(parent),
   });
   down_ = number(form, tr("Device download cap · 0 unlimited"), 2000000, tr(" KiB/s"));
   up_ = number(form, tr("Device upload cap · 0 unlimited"), 2000000, tr(" KiB/s"));
+  torrentBehavior_ = new QComboBox;
+  torrentBehavior_->setObjectName(QStringLiteral("NewTorrentBehavior"));
+  torrentBehavior_->addItem(tr("Follow room preference"), QStringLiteral("follow"));
+  torrentBehavior_->addItem(tr("Start automatically"), QStringLiteral("auto"));
+  torrentBehavior_->addItem(tr("Wait for Download"), QStringLiteral("wait"));
+  form->addRow(tr("New torrents"), torrentBehavior_);
+  torrentBehavior_->setToolTip(
+      tr("Applies to torrents you add next. The file list still loads while waiting. "
+         "Existing approvals, room preferences and manual pauses stay as they are."));
   seedPolicy_ = new QComboBox;
   seedPolicy_->setObjectName(QStringLiteral("DefaultSeedPolicy"));
   seedPolicy_->addItem(tr("Disabled — no torrent file uploads"), QStringLiteral("off"));
@@ -452,6 +461,9 @@ void SettingsPage::refresh() {
   dht_->setChecked(c.value(QStringLiteral("dht")).toBool(true));
   lsd_->setChecked(c.value(QStringLiteral("lsd")).toBool(true));
   upnp_->setChecked(c.value(QStringLiteral("upnp")).toBool());
+  torrentBehavior_->setCurrentIndex(std::max(
+      0, torrentBehavior_->findData(
+             app_.store.setting(QStringLiteral("newTorrentBehavior"), QStringLiteral("follow")).toString())));
   seedPolicy_->setCurrentIndex(std::max(
       0, seedPolicy_->findData(c.value(QStringLiteral("seedPolicy")).toString(QStringLiteral("off")))));
   sharingMode_->setCurrentIndex(std::max(
@@ -501,6 +513,7 @@ void SettingsPage::save() {
     c.insert(QStringLiteral("seedPolicy"), seedPolicy_->currentData().toString());
     c.insert(QStringLiteral("sharingMode"), sharingMode_->currentData().toString());
     app_.transfers.configure(c);
+    app_.store.setSetting(QStringLiteral("newTorrentBehavior"), torrentBehavior_->currentData().toString());
     if (startup_->isChecked() != app_.store.setting(QStringLiteral("startup"), false).toBool())
       desktop::startAtLogin(startup_->isChecked());
     app_.store.setSetting(QStringLiteral("startup"), startup_->isChecked());

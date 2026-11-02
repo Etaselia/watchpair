@@ -29,14 +29,23 @@ protected:
   void hideEvent(QHideEvent *event) override;
 private:
   bool contains(QWidget *widget) const;
+  bool controlsInUse() const;
+  void showControls();
+  void hideControls();
+  void updatePointer(const QPoint &globalPosition);
+  void updateVisibility();
+  void refreshPointerLater();
   void hideIdleControls();
   QWidget *video_, *controls_;
   QGridLayout *layers_;
   QVBoxLayout *controlLayout_;
   QTimer idle_;
   QPointer<QWidget> openingCombo_;
+  QPointer<QWidget> pressedControl_;
   QPointF openingPosition_;
+  QPoint pointerPosition_;
   quint64 openingTimestamp_ = 0;
-  bool playing_ = false, blocking_ = true;
+  quint64 controlPressGeneration_ = 0;
+  bool playing_ = false, blocking_ = true, pointerInside_ = false, keyboardControls_ = false;
 };
 } // namespace wp::ui
