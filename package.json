@@ -46,7 +46,7 @@
     "hls.js": "^1.7.3",
     "jassub": "^2.5.23",
     "lucide-react": "^1.61.0",
-    "next": "16.4.2",
+    "next": "16.4.6",
     "react": "19.3.1",
     "react-dom": "19.3.1",
     "webtorrent": "3.0.21"
