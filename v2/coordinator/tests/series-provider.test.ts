@@ -128,6 +128,33 @@ test('accepts abbreviated torrent filenames only with matching catalog aliases a
   }
 });
 
+test('accepts a catalog-backed whole-word filename prefix for an explicitly numbered season', () => {
+  const listingTitle = '[Judas] Yasei no Last Boss ga Arawareta! (A Wild Last Boss Appeared!) - S02E08 [1080p]';
+  const catalogTitles = ['Yasei no Last Boss ga Arawareta! 2nd Season'];
+  const filename = '[Judas] Yasei no - S02E08.mkv';
+  const { bytes, infoHash } = torrent(filename);
+  const listing = { id: 2186101, title: listingTitle, infoHash, publishedAt };
+  const verified = verifySeriesMetainfo(bytes, listing, catalogTitles);
+  assert.equal(verified.file.path, filename);
+  assert.equal(verified.file.fileIndex, 0);
+  assert.equal(verified.source.identity, `bt:${infoHash}`);
+  assert.throws(() => verifySeriesMetainfo(bytes, listing), /verified single-file/);
+  assert.throws(() => verifySeriesMetainfo(bytes, listing, ['Yasei no Other Series 2nd Season']), /verified single-file/);
+  assert.throws(() => verifySeriesMetainfo(bytes, { ...listing, infoHash: '0'.repeat(40) }, catalogTitles), /verified single-file/);
+
+  for (const badName of [filename.replace('Yasei no', 'Yasei'), filename.replace('Yasei no', 'Yasei n'),
+    filename.replace('Yasei no', 'Other Title'), filename.replace('S02E08', 'S03E08'),
+    filename.replace('S02E08', 'S02E09'), '[Judas] Yasei no S02 - 08.mkv',
+    filename.replace('S02E08', 'E08'), filename.replace('Judas', 'Other Group')]) {
+    const candidate = torrent(badName);
+    assert.throws(() => verifySeriesMetainfo(candidate.bytes, { ...listing, infoHash: candidate.infoHash }, catalogTitles),
+      /verified single-file/, badName);
+  }
+  const unnumbered = torrent(filename.replace('S02E08', '08'));
+  assert.throws(() => verifySeriesMetainfo(unnumbered.bytes,
+    { ...listing, title: listingTitle.replace('S02E08', '08'), infoHash: unnumbered.infoHash }, catalogTitles), /verified single-file/);
+});
+
 test('cached torrent metadata still requires matching catalog aliases for each caller', async () => {
   const { bytes, infoHash } = torrent('[Judas] TenKen - S02E08.mkv');
   const listing = { id: 2187750, title: '[Judas] Reincarnated as a Sword - S02E08 [1080p]', infoHash, publishedAt };

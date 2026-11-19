@@ -232,7 +232,7 @@ type Bencode = Buffer | number | Bencode[] | Map<string, Bencode>;
 
 function invalidTorrent(): never { throw new SeriesProviderError('The torrent metadata does not describe a verified single-file episode.', 422); }
 
-function matchesCatalogAlias(file: SeriesRelease, listing: SeriesRelease, catalogTitles: readonly string[]) {
+function matchesCatalogFilename(file: SeriesRelease, listing: SeriesRelease, catalogTitles: readonly string[]) {
   if (!catalogTitles.length || file.season !== listing.season || file.style !== listing.style) return false;
   const season = listing.season;
   const roman = ['', 'i', 'ii', 'iii', 'iv', 'v', 'vi', 'vii', 'viii', 'ix', 'x'];
@@ -245,7 +245,12 @@ function matchesCatalogAlias(file: SeriesRelease, listing: SeriesRelease, catalo
     return suffix ? [...names, ...names.map(name => name.replace(suffix, ''))] : names;
   };
   const known = new Set(catalogTitles.flatMap(title => [title, ...title.split(/,\s+/u)]).flatMap(variants));
-  return variants(file.stem).some(stem => known.has(stem)) && variants(listing.stem).some(stem => known.has(stem));
+  const listingTitles = variants(listing.stem).filter(title => known.has(title));
+  if (!listingTitles.length) return false;
+  if (variants(file.stem).some(stem => known.has(stem))) return true;
+  // Publishers sometimes keep only the first words of the recognized listing
+  // title in the filename. Require a whole-word prefix and an explicit season.
+  return season !== null && file.stem.includes(' ') && listingTitles.some(title => title.startsWith(file.stem + ' '));
 }
 
 class TorrentReader {
@@ -305,7 +310,7 @@ export function verifySeriesMetainfo(data: Buffer, listing: SeriesListing, catal
   if (!path || /^[ .]|[ .]$/.test(path) || /[\/\\:%<>"?*|\x00-\x1f\x7f]/.test(path) || !VIDEO_SUFFIX.test(path)) invalidTorrent();
   const match = parseSeriesTitle(path), release = parseSeriesTitle(listing.title);
   if (!match || !release || match.episode !== release.episode || match.group !== release.group ||
-      (!sameSeriesStem(match, release) && !matchesCatalogAlias(match, release, catalogTitles))) invalidTorrent();
+      (!sameSeriesStem(match, release) && !matchesCatalogFilename(match, release, catalogTitles))) invalidTorrent();
   const length = info.get('length'), pieceLength = info.get('piece length'), pieces = info.get('pieces');
   if (typeof length !== 'number' || length <= 0 || typeof pieceLength !== 'number' || pieceLength <= 0
     || !Buffer.isBuffer(pieces) || pieces.length !== 20 * Math.ceil(length / pieceLength)) invalidTorrent();
