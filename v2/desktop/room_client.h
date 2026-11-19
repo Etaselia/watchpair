@@ -41,6 +41,16 @@ public:
   void history(const QString &key, const QJsonObject &cursor = {}, const QString &search = {});
   void transferTicket(const QString &key, const QString &peer, quint16 listenPort);
   void refresh(const QString &key);
+  using SeriesReply = std::function<void(QJsonObject, QString)>;
+  void probeSeriesFollows(const QString &key);
+  bool seriesFollowsAvailable(const QString &key) const;
+  void loadSeriesFollows(const QString &key, QObject *context, SeriesReply callback);
+  void previewSeriesFollow(const QString &key, const QJsonObject &body, QObject *context,
+                           SeriesReply callback);
+  void createSeriesFollow(const QString &key, const QJsonObject &body, QObject *context,
+                          SeriesReply callback);
+  void seriesFollowAction(const QString &key, const QString &id, const QJsonObject &body,
+                          QObject *context, SeriesReply callback);
   QString inviteLink(const QString &key, bool recovery = false) const;
   static QUrl validateServer(const QString &server);
 signals:
@@ -54,6 +64,7 @@ signals:
   void error(QString key, QString code, QString message, QString operationId);
   void historyLoaded(QString key, QJsonArray items, bool firstPage);
   void ticketReady(QString key, QString peer, QJsonObject ticket);
+  void seriesCapabilityChanged(QString key);
 
 private:
   struct Connection {
@@ -67,11 +78,15 @@ private:
     double offset = 0, bestRtt = 1e20;
     QList<QPair<double, double>> clockSamples;
     bool online = false, fresh = false, terminal = false, requesting = false, refreshing = false;
+    bool seriesAvailable = false, seriesProbePending = false;
+    qint64 seriesProbeAfter = 0;
     QString state = QStringLiteral("Connecting…");
   };
   using Reply = std::function<void(QJsonObject, int, QString, QString)>;
   Connection &connection(const QString &key) const;
   void request(const QUrl &url, const QByteArray &token, const QJsonObject *body, Reply callback);
+  void seriesRequest(const QString &key, const QString &suffix, const QJsonObject *body, QObject *context,
+                     SeriesReply callback);
   void begin(const QString &key);
   void tick();
   void message(const QString &key, quint64 epoch, const QString &text);

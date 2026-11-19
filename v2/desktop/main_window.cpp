@@ -1,4 +1,5 @@
 #include "main_window.h"
+#include "series_dialog.h"
 #include "share_dialog.h"
 #include "theme.h"
 #include "window_geometry.h"
@@ -154,6 +155,13 @@ MainWindow::MainWindow(AppServices &app) : app_(app) {
     const auto path = QFileDialog::getExistingDirectory(this, tr("Share a local folder"));
     if (!path.isEmpty())
       addSource(currentRoom_, path);
+  });
+  addMenu->addSeparator();
+  auto *follow = addMenu->addAction(tr("Follow a series…"), this, [this] { followSeries(currentRoom_); });
+  connect(addMenu, &QMenu::aboutToShow, this, [this, follow] {
+    const auto available = app_.rooms.seriesFollowsAvailable(currentRoom_);
+    follow->setVisible(available);
+    follow->setEnabled(available && app_.rooms.connected(currentRoom_));
   });
   top->addWidget(returnButton);
   top->addWidget(add);
@@ -312,6 +320,7 @@ MainWindow::MainWindow(AppServices &app) : app_(app) {
   });
   connect(room_, &RoomPage::addRequested, this, [this](const QString &room) { addSource(room); });
   connect(room_, &RoomPage::manageRequested, this, &MainWindow::manageRoom);
+  connect(room_, &RoomPage::seriesRequested, this, &MainWindow::manageSeries);
   connect(room_, &RoomPage::transferRequested, this, &MainWindow::showTransfers);
   connect(room_, &RoomPage::fullscreenRequested, this, &MainWindow::toggleFullscreen);
   connect(room_, &RoomPage::popoutRequested, this, &MainWindow::togglePopout);
@@ -431,7 +440,8 @@ MainWindow::MainWindow(AppServices &app) : app_(app) {
   auto updateSpace = [this, space] {
     space->setEnabled(pages_->currentWidget() == room_ && !editing());
   };
-  connect(qApp, &QApplication::focusChanged, this, [updateSpace](QWidget *, QWidget *) { updateSpace(); });
+  focusConnection_ =
+      connect(qApp, &QApplication::focusChanged, this, [updateSpace](QWidget *, QWidget *) { updateSpace(); });
   connect(pages_, &QStackedWidget::currentChanged, this, [updateSpace] { updateSpace(); });
   updateSpace();
   connect(&timer_, &QTimer::timeout, this, [this] {
@@ -687,6 +697,11 @@ void MainWindow::addSource(const QString &room, const QString &input) {
     auto *folder = new QPushButton(tr("Choose folder…"));
     row->addWidget(file);
     row->addWidget(folder);
+    if (app_.rooms.seriesFollowsAvailable(room) && app_.rooms.connected(room)) {
+      auto *follow = new QPushButton(tr("Follow a series…"));
+      row->addWidget(follow);
+      connect(follow, &QPushButton::clicked, &dialog, [&dialog] { dialog.done(2); });
+    }
     row->addStretch();
     layout->addLayout(row);
     auto *hint = plain(tr("Torrent metadata loads first. You can choose whole seasons, skip extras, and "
@@ -710,7 +725,12 @@ void MainWindow::addSource(const QString &room, const QString &input) {
     });
     connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    if (dialog.exec() != QDialog::Accepted)
+    const int result = dialog.exec();
+    if (result == 2) {
+      followSeries(room);
+      return;
+    }
+    if (result != QDialog::Accepted)
       return;
     source = edit->text().trimmed();
   }
@@ -720,6 +740,21 @@ void MainWindow::addSource(const QString &room, const QString &input) {
     app_.media.prepare(source, room);
     statusBar()->showMessage(tr("Inspecting source…"));
   });
+}
+void MainWindow::followSeries(const QString &room) {
+  if (!app_.rooms.seriesFollowsAvailable(room) || !app_.rooms.connected(room))
+    return;
+  auto *dialog = new SeriesFollowDialog(app_.rooms, room, this);
+  dialog->setAttribute(Qt::WA_DeleteOnClose);
+  connect(dialog, &QDialog::accepted, this, [this] { statusBar()->showMessage(tr("Series followed"), 5000); });
+  dialog->open();
+}
+void MainWindow::manageSeries(const QString &room) {
+  if (!app_.rooms.seriesFollowsAvailable(room) || !app_.rooms.connected(room))
+    return;
+  auto *dialog = new SeriesManagerDialog(app_.rooms, room, this);
+  dialog->setAttribute(Qt::WA_DeleteOnClose);
+  dialog->open();
 }
 void MainWindow::prepared(const QJsonObject &source) {
   const auto kind = source.value(QStringLiteral("kind")).toString(),
@@ -1050,6 +1085,7 @@ void MainWindow::manageRoom(const QString &key) {
   });
 }
 MainWindow::~MainWindow() {
+  disconnect(focusConnection_);
   reattachPlayer(false);
   // Decoder I/O uses the GUI's verified reader. Abort it before freeing the
   // render context, whose destructor waits for the decoder's video chain.

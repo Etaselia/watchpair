@@ -2,10 +2,11 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, chmodSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { timelinePosition, type Entry, type History, type Room } from './protocol.js';
+import { DomainError, timelinePosition, type Entry, type History, type Room } from './protocol.js';
+import type { SeriesEpisode, SeriesFollow, SeriesSave } from './series-state.js';
 
 export type Operation = { memberId: string; id: string; hash: string; revision: number; secret?: string };
-export type Save = { metadata?: boolean; queue?: boolean; entries?: Entry[]; history?: History[]; clearHistory?: boolean; operation?: Operation; creationHash?: string };
+export type Save = { metadata?: boolean; queue?: boolean; entries?: Entry[]; history?: History[]; clearHistory?: boolean; operation?: Operation; creationHash?: string; series?: SeriesSave };
 type Metadata = Pick<Room, 'id' | 'name' | 'hostId' | 'successorId' | 'inviteHash' | 'recoveryHash' | 'createdAt' | 'sources' | 'members' | 'recoveryRetry'>;
 type Runtime = Pick<Room, 'revision' | 'queueRevision' | 'historyGeneration' | 'playback' | 'reporterId'>;
 
@@ -17,7 +18,7 @@ export class Store {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path, { enableForeignKeyConstraints: true });
     const version = Number(this.db.prepare('PRAGMA user_version').get()?.user_version ?? 0);
-    if (version > 1) { this.db.close(); throw new Error('This coordinator cannot open a newer WatchPair database. Update the coordinator.'); }
+    if (version > 2) { this.db.close(); throw new Error('This coordinator cannot open a newer WatchPair database. Update the coordinator.'); }
     this.db.exec(`
       PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS rooms (id TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -29,8 +30,32 @@ export class Store {
       CREATE TABLE IF NOT EXISTS history (room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, id TEXT NOT NULL, watched_at INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(room_id,id));
       CREATE INDEX IF NOT EXISTS history_order ON history(room_id,watched_at DESC,id DESC);
       CREATE TABLE IF NOT EXISTS operations (room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, member_id TEXT NOT NULL, id TEXT NOT NULL, hash TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(room_id,member_id,id));
-      PRAGMA user_version=1;
     `);
+    if (version < 2) this.transaction(() => this.db.exec(`
+      CREATE TABLE series_follows (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        mal_id INTEGER NOT NULL CHECK (mal_id > 0),
+        revision INTEGER NOT NULL CHECK (revision >= 0),
+        status TEXT NOT NULL CHECK (status IN ('active', 'paused', 'stopped', 'finished')),
+        next_check_at INTEGER,
+        next_catalog_at INTEGER,
+        due_at INTEGER GENERATED ALWAYS AS (COALESCE(min(next_check_at, next_catalog_at), next_check_at, next_catalog_at)) VIRTUAL,
+        created_at INTEGER NOT NULL,
+        data TEXT NOT NULL
+      );
+      CREATE INDEX series_by_room ON series_follows(room_id, created_at, id);
+      CREATE INDEX series_due ON series_follows(due_at, id) WHERE status='active';
+      CREATE UNIQUE INDEX series_one_live_rule ON series_follows(room_id,mal_id) WHERE status IN ('active', 'paused');
+      CREATE TABLE series_episodes (
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        mal_id INTEGER NOT NULL CHECK (mal_id > 0),
+        episode INTEGER NOT NULL CHECK (episode > 0),
+        data TEXT NOT NULL,
+        PRIMARY KEY (room_id,mal_id,episode)
+      );
+      PRAGMA user_version=2;
+    `));
     // Older coordinators used an epoch + monotonic clock with fractional
     // milliseconds. Normalize both the JSON and ordering column together so
     // integer history cursors cannot skip records within the same millisecond.
@@ -123,7 +148,82 @@ export class Store {
         // window per room; retaining large snapshots for deduplication is avoided.
         this.db.prepare('DELETE FROM operations WHERE room_id=? AND revision < ?').run(room.id, Math.max(0, room.revision - 10_000));
       }
+      if (plan.series) {
+        if (plan.series.follow.roomId !== room.id) throw new DomainError('SERIES_CONFLICT', 'The follow does not belong to this room.');
+        this.writeSeries(plan.series);
+      }
     });
+  }
+
+  listSeries(roomId: string): SeriesFollow[] {
+    return this.db.prepare('SELECT data FROM series_follows WHERE room_id=? ORDER BY created_at,id').all(roomId)
+      .map(row => JSON.parse(String(row.data)) as SeriesFollow);
+  }
+
+  getSeries(roomId: string, id: string): SeriesFollow | null {
+    const row = this.db.prepare('SELECT data FROM series_follows WHERE room_id=? AND id=?').get(roomId, id);
+    return row ? JSON.parse(String(row.data)) as SeriesFollow : null;
+  }
+
+  dueSeries(now: number, limit = 16): SeriesFollow[] {
+    return this.db.prepare(`
+      SELECT data FROM series_follows WHERE status='active' AND due_at<=? ORDER BY due_at,id LIMIT ?
+    `).all(now, Math.max(0, Math.min(128, Math.trunc(limit))))
+      .map(row => JSON.parse(String(row.data)) as SeriesFollow);
+  }
+
+  getSeriesEpisode(roomId: string, malId: number, episode: number): SeriesEpisode | null {
+    const row = this.db.prepare('SELECT data FROM series_episodes WHERE room_id=? AND mal_id=? AND episode=?')
+      .get(roomId, malId, episode);
+    return row ? JSON.parse(String(row.data)) as SeriesEpisode : null;
+  }
+
+  saveSeries(plan: SeriesSave) {
+    this.transaction(() => this.writeSeries(plan));
+  }
+
+  private writeSeries({ follow, expectedRevision, episodes = [] }: SeriesSave) {
+    if (!this.db.prepare('SELECT 1 FROM rooms WHERE id=?').get(follow.roomId)) {
+      throw new DomainError('ROOM_NOT_FOUND', 'This room no longer exists.', 404);
+    }
+    if (!Number.isSafeInteger(follow.revision) || follow.revision < 0 ||
+        (expectedRevision !== null && follow.revision !== expectedRevision + 1)) {
+      throw new DomainError('SERIES_CONFLICT', 'The follow revision has changed. Refresh it and try again.');
+    }
+    if (follow.status === 'active' || follow.status === 'paused') {
+      const duplicate = this.db.prepare(`
+        SELECT 1 FROM series_follows WHERE room_id=? AND mal_id=? AND id<>? AND status IN ('active','paused')
+      `).get(follow.roomId, follow.malId, follow.id);
+      if (duplicate) throw new DomainError('SERIES_EXISTS', 'This room already follows that series or part.');
+    }
+    const data = JSON.stringify(follow);
+    if (expectedRevision === null) {
+      const result = this.db.prepare(`
+        INSERT INTO series_follows(id,room_id,mal_id,revision,status,next_check_at,next_catalog_at,created_at,data)
+        VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING
+      `).run(follow.id, follow.roomId, follow.malId, follow.revision, follow.status, follow.nextCheckAt,
+        follow.nextCatalogAt, follow.createdAt, data);
+      if (result.changes !== 1) throw new DomainError('SERIES_CONFLICT', 'This follow has already been created.');
+    } else {
+      const result = this.db.prepare(`
+        UPDATE series_follows SET revision=?,status=?,next_check_at=?,next_catalog_at=?,data=?
+        WHERE id=? AND room_id=? AND mal_id=? AND revision=?
+      `).run(follow.revision, follow.status, follow.nextCheckAt, follow.nextCatalogAt, data,
+        follow.id, follow.roomId, follow.malId, expectedRevision);
+      if (result.changes !== 1) throw new DomainError('SERIES_CONFLICT', 'The follow revision has changed. Refresh it and try again.');
+    }
+    const insert = this.db.prepare(`
+      INSERT INTO series_episodes(room_id,mal_id,episode,data) VALUES(?,?,?,?) ON CONFLICT DO NOTHING
+    `);
+    for (const episode of episodes) {
+      if (episode.roomId !== follow.roomId || episode.malId !== follow.malId ||
+          !Number.isSafeInteger(episode.episode) || episode.episode < 1) {
+        throw new DomainError('SERIES_CONFLICT', 'The episode does not belong to this follow.');
+      }
+      if (insert.run(episode.roomId, episode.malId, episode.episode, JSON.stringify(episode)).changes !== 1) {
+        throw new DomainError('SERIES_CONFLICT', 'This episode has already been handled.');
+      }
+    }
   }
   operation(roomId: string, memberId: string, id: string): { hash: string; revision: number } | null {
     const row = this.db.prepare('SELECT hash,revision FROM operations WHERE room_id=? AND member_id=? AND id=?').get(roomId, memberId, id);

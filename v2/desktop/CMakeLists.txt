@@ -35,7 +35,7 @@ add_test(NAME room-media COMMAND room-media-tests)
 set_tests_properties(room-media PROPERTIES TIMEOUT 120)
 add_library(watchpair_ui ui_models.cpp ui_models.h theme.cpp theme.h transfer_desk.cpp transfer_desk.h room_page.cpp room_page.h
   workspace_pages.cpp workspace_pages.h main_window.cpp main_window.h share_dialog.cpp share_dialog.h player_surface.cpp player_surface.h
-  seek_slider.cpp seek_slider.h window_geometry.cpp window_geometry.h)
+  seek_slider.cpp seek_slider.h window_geometry.cpp window_geometry.h series_dialog.cpp series_dialog.h)
 target_link_libraries(watchpair_ui PUBLIC watchpair_local watchpair_video Qt6::Widgets)
 target_include_directories(watchpair_ui PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 add_executable(ui-model-tests tests/ui_models_tests.cpp)

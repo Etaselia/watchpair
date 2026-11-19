@@ -3,8 +3,10 @@ import { EventEmitter } from 'node:events';
 import { Store, type Save } from './store.js';
 import {
   PROTOCOL, LIMITS, DomainError, envelopeSchema, requireThat, coverageSeconds, mergeCoverage, timelinePosition,
-  type Room, type Member, type Entry, type Envelope, type Status, type History, type Change,
+  fileSchema, sourceSchema, type Room, type Member, type Entry, type Envelope, type Status,
+  type History, type Change, type FileDescriptor, type Source,
 } from './protocol.js';
+import type { SeriesSave } from './series-state.js';
 
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 const matches = (value: string, expected: string) => {
@@ -74,6 +76,62 @@ export class Engine extends EventEmitter {
     const canonical=assets.map(a=>Object.fromEntries(Object.entries(a).sort(([a],[b])=>a<b?-1:a>b?1:0)));
     const identity=`share:${hash(JSON.stringify(canonical))}`;
     requireThat(source.identity===identity&&source.id===`${identity}:${memberId}`,'SHARE_MANIFEST','The shared manifest fingerprint is inconsistent.');
+  }
+  private appendSource(room: Room, source: Source, files: FileDescriptor[], memberId?: string) {
+    const automated = memberId === undefined;
+    if (automated) requireThat(source.kind === 'torrent', 'SERIES_SOURCE', 'Series follows only accept verified torrents.');
+    else this.validateShare(source, memberId);
+    const existing = room.sources.find(s => s.id === source.id);
+    requireThat(!existing || (existing.identity === source.identity && existing.kind === source.kind), 'SOURCE_CONFLICT', 'This source ID already identifies different content.');
+    if (!existing) {
+      requireThat(room.sources.length < LIMITS.sources, 'SOURCE_LIMIT', 'This room has reached its source limit.');
+      room.sources.push(source);
+    }
+    const indexes = new Set<number>(), media = new Set<string>(), byId = new Map(room.entries.map(e => [e.id, e]));
+    const assets = new Map(source.assets?.map(a => [a.fileIndex, a]) ?? []);
+    return [...files].sort((a, b) => collator.compare(a.path, b.path)).map(file => {
+      if (source.kind === 'share') {
+        const asset = assets.get(file.fileIndex);
+        requireThat(asset && asset.kind === 'video' && asset.path === file.path && asset.sha256 === file.sha256 && asset.merkleRoot === file.merkleRoot && asset.size === file.size && file.mediaId === `media:${hash(`${source.identity}\0${file.fileIndex}`)}`, 'SHARE_MANIFEST', 'A shared episode does not match its verified asset manifest.');
+      }
+      requireThat(!indexes.has(file.fileIndex) && !media.has(file.mediaId), 'DUPLICATE_FILE', 'Each manifest file must have a unique index and media identity.');
+      indexes.add(file.fileIndex); media.add(file.mediaId);
+      const entryId = hash(`${source.id}\0${file.fileIndex}`), old = byId.get(entryId);
+      if (old) {
+        requireThat(old.mediaId === file.mediaId && old.size === file.size && old.path === file.path, 'MANIFEST_CHANGED', 'The source manifest changed; add it as a new source.');
+        if (!automated) old.enabled = file.selected;
+        return { entryId, added: false };
+      }
+      requireThat(room.entries.length < LIMITS.entries, 'QUEUE_LIMIT', 'A room can contain at most 10,000 media entries.');
+      const { selected, ...descriptor } = file;
+      room.entries.push({ ...descriptor, id: entryId, sourceId: source.id, enabled: selected,
+        watchedAt: null, viewingId: randomUUID(), coverage: [] });
+      return { entryId, added: true };
+    });
+  }
+  private requireManifestCapacity(room: Room) {
+    requireThat(Buffer.byteLength(JSON.stringify([room.sources, room.entries])) <= 8 * 1024 * 1024,
+      'MANIFEST_LIMIT', 'The room manifest exceeds 8 MiB. Use a smaller pack or a separate room.');
+  }
+  commitSeries(plan: SeriesSave, additions: { episode: number; source: Source; file: FileDescriptor }[] = []) {
+    const original = this.room(plan.follow.roomId);
+    if (!additions.length) { this.store.saveSeries(plan); return; }
+    const room = structuredClone(original), episodes = [...(plan.episodes ?? [])];
+    let added = false;
+    for (const { episode, source, file } of additions) {
+      const record = episodes.find(item => item.episode === episode);
+      requireThat(record, 'SERIES_CONFLICT', 'The subscription episode changed. Refresh and retry.', 409);
+      const result = this.appendSource(room, sourceSchema.parse(source), [fileSchema.parse(file)])[0]!;
+      episodes[episodes.indexOf(record)] = { ...record, entryId: result.entryId, disposition: result.added ? 'added' : 'existing' };
+      added ||= result.added;
+    }
+    const series = { ...plan, episodes };
+    if (!added) { this.store.saveSeries(series); return; }
+    this.requireManifestCapacity(room);
+    ++room.revision; ++room.queueRevision;
+    this.store.save(room, this.now(), { metadata: true, queue: true, series });
+    this.rooms.set(room.id, room);
+    this.notify(room, 'snapshot', this.snapshot(room.id));
   }
   private state(room: Room) {
     return { id: room.id, name: room.name, hostId: room.hostId, successorId: room.successorId,
@@ -317,31 +375,7 @@ export class Engine extends EventEmitter {
         plan.metadata = true; queueChanged = true; break;
       }
       case 'queue.add': {
-        this.validateShare(c.source,memberId);
-        const existing = room.sources.find(s => s.id === c.source.id);
-        requireThat(!existing || (existing.identity === c.source.identity && existing.kind === c.source.kind), 'SOURCE_CONFLICT', 'This source ID already identifies different content.');
-        if (!existing) { requireThat(room.sources.length < LIMITS.sources, 'SOURCE_LIMIT', 'This room has reached its source limit.'); room.sources.push(c.source); }
-        if (c.source.kind === 'share') requireThat(c.source.publisherId === memberId, 'INVALID_PUBLISHER', 'A shared source must be published by the authenticated member.', 403);
-        const indexes = new Set<number>(), media = new Set<string>(), byId = new Map(room.entries.map(e => [e.id, e]));
-        const assets=new Map(c.source.assets?.map(a=>[a.fileIndex,a])??[]);
-        for (const file of [...c.files].sort((a, b) => collator.compare(a.path, b.path))) {
-          if(c.source.kind==='share'){
-            const asset=assets.get(file.fileIndex);
-            requireThat(asset&&asset.kind==='video'&&asset.path===file.path&&asset.sha256===file.sha256&&asset.merkleRoot===file.merkleRoot&&asset.size===file.size&&file.mediaId===`media:${hash(`${c.source.identity}\0${file.fileIndex}`)}`,'SHARE_MANIFEST','A shared episode does not match its verified asset manifest.');
-          }
-          requireThat(!indexes.has(file.fileIndex) && !media.has(file.mediaId), 'DUPLICATE_FILE', 'Each manifest file must have a unique index and media identity.');
-          indexes.add(file.fileIndex); media.add(file.mediaId);
-          const entryId = hash(`${c.source.id}\0${file.fileIndex}`), old = byId.get(entryId);
-          if (old) {
-            requireThat(old.mediaId === file.mediaId && old.size === file.size && old.path === file.path, 'MANIFEST_CHANGED', 'The source manifest changed; add it as a new source.');
-            old.enabled = file.selected;
-          } else {
-            const { selected, ...descriptor } = file;
-            room.entries.push({ ...descriptor, id: entryId, sourceId: c.source.id, enabled: selected,
-              watchedAt: null, viewingId: randomUUID(), coverage: [] });
-          }
-        }
-        requireThat(room.entries.length <= LIMITS.entries, 'QUEUE_LIMIT', 'A room can contain at most 10,000 media entries.');
+        this.appendSource(room, c.source, c.files, memberId);
         plan.metadata = true; queueChanged = true; break;
       }
       case 'queue.select': {
@@ -445,9 +479,7 @@ export class Engine extends EventEmitter {
       if (p.entryId && !this.entry(room, p.entryId).enabled) this.next(room);
     }
     this.reporter(room); this.reconcile(room); ++room.revision;
-    if (plan.queue || plan.metadata) requireThat(
-      Buffer.byteLength(JSON.stringify([room.sources, room.entries])) <= 8 * 1024 * 1024,
-      'MANIFEST_LIMIT', 'The room manifest exceeds 8 MiB. Use a smaller pack or a separate room.');
+    if (plan.queue || plan.metadata) this.requireManifestCapacity(room);
     plan.operation = { memberId, id: env.operationId, hash: digest, revision: room.revision };
     this.store.save(room, this.now(), plan); this.rooms.set(id, room);
     const data = queueChanged ? this.snapshot(id) : { ...this.state(room),

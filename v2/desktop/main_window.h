@@ -30,6 +30,8 @@ private:
   void enterRoom(bool create, const QString &link = {});
   void manageRoom(const QString &key);
   void addSource(const QString &room = {}, const QString &input = {});
+  void followSeries(const QString &room);
+  void manageSeries(const QString &room);
   void prepared(const QJsonObject &source);
   void publish(const QString &transfer);
   QString chooseRoom();
@@ -53,6 +55,7 @@ private:
   QSystemTrayIcon *tray_ = nullptr;
   QLabel *bannerText_, *connection_, *rates_;
   QTimer timer_;
+  QMetaObject::Connection focusConnection_;
   QString currentRoom_;
   bool full_ = false;
   QWidget *playerWindow_ = nullptr;

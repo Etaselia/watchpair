@@ -3,13 +3,46 @@
 import { createInterface } from 'node:readline';
 import { buildServer } from '../src/server.js';
 import { buildRelay } from '../src/relay.js';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { createServer as createTcpServer, connect as connectTcp, type Socket } from 'node:net';
+import { SeriesProviderError, verifySeriesMetainfo, type SeriesCatalog, type SeriesListing, type SeriesProvider } from '../src/series-provider.js';
+
+function seriesFixture(): SeriesProvider {
+  const catalog: SeriesCatalog = { id: 101, title: 'Test Anime', status: 'currently_airing', episodeCount: 12,
+    broadcastDayJapan: null, broadcastTimeJapan: null };
+  const releases = new Map<number, { listing: SeriesListing; bytes: Buffer }>();
+  for (const [id, title, uploader] of [
+    [100, '[Origin] Test Anime - 07 (1080p)', 'Original'],
+    [101, '[Other] Test Anime - 08 (1080p)', 'Alternative'],
+  ] as const) {
+    const name = title + '.mkv';
+    const info = Buffer.concat([Buffer.from('d6:lengthi123e4:name' + Buffer.byteLength(name) + ':' + name + '12:piece lengthi16384e6:pieces20:'),
+      Buffer.alloc(20, id), Buffer.from('e')]);
+    const listing = { id, title, uploader, publishedAt: Date.now() - 60_000, infoHash: createHash('sha1').update(info).digest('hex') };
+    releases.set(id, { listing, bytes: Buffer.concat([Buffer.from('d4:info'), info, Buffer.from('e')]) });
+  }
+  const get = (id: number) => {
+    const release = releases.get(id);
+    if (!release) throw new SeriesProviderError('No fixture release', 404);
+    return release;
+  };
+  return {
+    searchCatalog: async () => [catalog],
+    catalog: async () => catalog,
+    searchReleases: async (_query, uploader) => [...releases.values()].map(record => record.listing)
+      .filter(listing => !uploader || listing.uploader === uploader),
+    listing: async id => get(id).listing,
+    metadata: async listing => verifySeriesMetainfo(get(listing.id).bytes, listing),
+  };
+}
+
 const relayKey=randomBytes(32),relay=await buildRelay(relayKey);
 await relay.listen({host:'127.0.0.1',port:0});
 const relayAddress=relay.server.address();if(!relayAddress||typeof relayAddress==='string')throw new Error('No test relay');
 let clockOffset=0;
-const { app,engine } = await buildServer({ database: process.argv[2],now:()=>Date.now()+clockOffset,relayKey,relayUrl:`http://127.0.0.1:${relayAddress.port}` });
+const { app,engine,series } = await buildServer({ database: process.argv[2], now: () => Date.now() + clockOffset, relayKey,
+  relayUrl: 'http://127.0.0.1:' + relayAddress.port,
+  ...(process.argv.includes('--series-fixture') ? { seriesProvider: seriesFixture(), seriesTimer: false } : {}) });
 // Test-only direct-route faults retain actual encrypted TCP transfers. The
 // production coordinator neither proxies direct bytes nor exposes this pipe.
 const directSockets = new Set<Socket>();
@@ -113,11 +146,14 @@ if (!address || typeof address === 'string') throw new Error('No local test list
 process.stdout.write(JSON.stringify({ port: address.port }) + '\n');
 const input = createInterface({ input: process.stdin });
 input.on('line', text => {
-  const value = JSON.parse(text) as { dropPath?: string;advanceTimeMs?:number;inspectRoom?:string;directFault?:string };
+  const value = JSON.parse(text) as { dropPath?: string;advanceTimeMs?:number;inspectRoom?:string;directFault?:string;runSeries?:boolean };
   if (['none','blocked','oneway','simultaneous'].includes(value.directFault ?? '')) { directFault = value.directFault!; process.stdout.write(JSON.stringify({directFault})+'\n'); }
   if (value.dropPath === '/commands' || value.dropPath === '/v2/rooms') { dropPath = value.dropPath; process.stdout.write('{"armed":true}\n'); }
   if(typeof value.advanceTimeMs==='number'&&value.advanceTimeMs>0&&value.advanceTimeMs<=60000){clockOffset+=value.advanceTimeMs;engine.tick();process.stdout.write('{"advanced":true}\n');}
   if(value.inspectRoom) {const room=engine.room(value.inspectRoom);process.stdout.write(JSON.stringify({diagnostics:{entries:room.entries.map(e=>({duration:e.duration,watchedAt:e.watchedAt,coverage:e.coverage,seconds:e.coverage.reduce((n,[a,b])=>n+b-a,0)}))}})+'\n');}
+  if (value.runSeries && series) void series.runOnce().then(
+    () => process.stdout.write('{"seriesChecked":true}\n'),
+    () => process.stdout.write('{"seriesChecked":false}\n'));
 });
 const stop = async () => { input.close();for(const socket of directSockets)socket.destroy();blackhole.close();simultaneous.close();await app.close();await relay.close(); process.exit(0); };
 process.on('SIGTERM', () => { void stop(); }); process.on('SIGINT', () => { void stop(); });

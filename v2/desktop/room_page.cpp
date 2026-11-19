@@ -209,6 +209,9 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   auto *add = button(tr("Add media"), QStringLiteral("plus"));
   add->setProperty("role", QStringLiteral("primary"));
   auto *manage = button(tr("Room"), QStringLiteral("settings"));
+  series_ = button(tr("Series follows"), QStringLiteral(""));
+  series_->setObjectName(QStringLiteral("RoomSeriesFollows"));
+  series_->hide();
   policy_ = new QComboBox;
   policy_->addItem(tr("Ask before download"), QStringLiteral("Ask"));
   policy_->addItem(tr("Auto · follow room"), QStringLiteral("Auto"));
@@ -237,6 +240,7 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
       sourceMenu->addAction(tr("No sources yet"))->setEnabled(false);
   });
   header->addWidget(sources);
+  header->addWidget(series_);
   header->addWidget(add);
   header->addWidget(manage);
   layout->addWidget(header_);
@@ -502,6 +506,7 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   layout->addWidget(split_, 1);
   connect(add, &QPushButton::clicked, this, [this] { emit addRequested(room_); });
   connect(manage, &QPushButton::clicked, this, [this] { emit manageRequested(room_); });
+  connect(series_, &QPushButton::clicked, this, [this] { emit seriesRequested(room_); });
   connect(full, &QPushButton::clicked, this, &RoomPage::fullscreenRequested);
   connect(popout_, &QPushButton::clicked, this, &RoomPage::popoutRequested);
   connect(reattach_, &QPushButton::clicked, this, &RoomPage::popoutRequested);
@@ -738,9 +743,25 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
     if (room == room_ && !refresh_.isActive())
       refresh_.start(100);
   });
+  connect(&app_.rooms, &RoomClient::seriesCapabilityChanged, this, [this](const QString &room) {
+    if (room == room_) {
+      updateSeriesButton();
+      pollSeriesFollows();
+    }
+  });
+  connect(&app_.rooms, &RoomClient::connectionChanged, this, [this](const QString &room) {
+    if (room == room_) {
+      app_.rooms.probeSeriesFollows(room_);
+      updateSeriesButton();
+    }
+  });
+  connect(&seriesRefresh_, &QTimer::timeout, this, &RoomPage::pollSeriesFollows);
+  seriesRefresh_.start(45000);
   connect(&app_.rooms, &RoomClient::roomRemoved, this, [this](const QString &room) {
     if (room == room_) {
       room_.clear();
+      seriesReviewPending_ = false;
+      seriesRequestRoom_.clear();
       loadedHistory_ = {};
       updateQueue();
       refresh();
@@ -763,11 +784,53 @@ void RoomPage::setRoom(const QString &room) {
   if (room_ == room && !app_.playback.local())
     return;
   room_ = room;
+  seriesReviewPending_ = false;
+  seriesRequestRoom_.clear();
+  app_.rooms.probeSeriesFollows(room_);
   app_.perform([&] { app_.playback.setRoom(room); });
   loadedHistory_ = {};
   historyGeneration_ = -1;
   updateQueue();
   refresh();
+  QTimer::singleShot(0, this, &RoomPage::pollSeriesFollows);
+}
+void RoomPage::updateSeriesButton() {
+  const bool available = app_.rooms.seriesFollowsAvailable(room_) && !app_.playback.local();
+  const bool connected = available && app_.rooms.connected(room_);
+  const auto host = connected ? app_.rooms.room(room_).value(QStringLiteral("hostId")).toString() : QString();
+  const bool canReview = connected && !host.isEmpty() &&
+                         host == app_.rooms.credential(room_).value(QStringLiteral("memberId")).toString();
+  series_->setVisible(available);
+  series_->setEnabled(connected);
+  series_->setText(canReview && seriesReviewPending_ ? tr("Series follows · Review") : tr("Series follows"));
+}
+void RoomPage::pollSeriesFollows() {
+  if (!isVisible() || app_.playback.local() || !app_.rooms.connected(room_))
+    return;
+  app_.rooms.probeSeriesFollows(room_);
+  if (!app_.rooms.seriesFollowsAvailable(room_) || seriesRequestRoom_ == room_)
+    return;
+  const auto host = app_.rooms.room(room_).value(QStringLiteral("hostId"));
+  if (!host.isString() || host != app_.rooms.credential(room_).value(QStringLiteral("memberId")))
+    return;
+  seriesRequestRoom_ = room_;
+  app_.rooms.loadSeriesFollows(room_, this,
+                              [this, room = room_](const QJsonObject &result, const QString &error) {
+    if (seriesRequestRoom_ == room)
+      seriesRequestRoom_.clear();
+    if (room != room_ || !error.isEmpty())
+      return;
+    seriesReviewPending_ = false;
+    for (const auto value : result.value(QStringLiteral("items")).toArray()) {
+      const auto item = value.toObject();
+      if (item.value(QStringLiteral("status")).toString() == QStringLiteral("active") &&
+          !item.value(QStringLiteral("alternative")).toObject().isEmpty()) {
+        seriesReviewPending_ = true;
+        break;
+      }
+    }
+    updateSeriesButton();
+  });
 }
 void RoomPage::updateQueue() {
   if (room_.isEmpty()) {
@@ -1261,6 +1324,7 @@ void RoomPage::updateTracks() {
 void RoomPage::refresh() {
   app_.perform([this] {
     updateQueueActions();
+    updateSeriesButton();
     const bool local = app_.playback.local(), connected = !room_.isEmpty() && app_.rooms.connected(room_);
     const auto snapshot = room_.isEmpty() ? QJsonObject() : app_.rooms.room(room_);
     const auto p = snapshot.value(QStringLiteral("playback")).toObject();

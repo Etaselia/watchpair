@@ -1,0 +1,138 @@
+{
+  "cases": [
+    {
+      "name": "The Apothecary Diaries S3 · catch-up",
+      "malId": 61987,
+      "query": "Kusuriya no Hitorigoto",
+      "anchorListingId": 2183108,
+      "anchorTitle": "[DKB] Kusuriya no Hitorigoto - S03E06 [1080p][HEVC x265 10bit][Multi-Subs][weekly]",
+      "expectedAirAt": "2026-11-13T23:00:00+09:00",
+      "episodeAirTimes": { "8": "2026-11-20T23:00:00+09:00" }
+    },
+    {
+      "name": "Black Clover S2 · catch-up",
+      "malId": 61967,
+      "query": "Black Clover 2nd Season",
+      "anchorListingId": 2183419,
+      "anchorTitle": "[Erai-raws] Black Clover 2nd Season - 06 [1080p CR WEB-DL AVC AAC][MultiSub][D4FA28BC]",
+      "expectedAirAt": "2026-11-14T23:00:00+09:00",
+      "episodeAirTimes": { "8": "2026-11-21T23:00:00+09:00" }
+    },
+    {
+      "name": "Tougen Anki: Nikko Kegon Falls Arc · catch-up",
+      "malId": 63181,
+      "query": "Tougen Anki",
+      "anchorListingId": 2183025,
+      "anchorTitle": "[SubsPlease] Tougen Anki - Nikko Kegon no Taki-hen - 06 (1080p) [84B234D3].mkv",
+      "expectedAirAt": "2026-11-13T23:30:00+09:00",
+      "episodeAirTimes": { "8": "2026-11-20T23:30:00+09:00" }
+    },
+    {
+      "name": "Firefly Wedding · catch-up",
+      "malId": 63293,
+      "query": "Hotaru no Yomeiri",
+      "anchorListingId": 2183029,
+      "anchorTitle": "[SubsPlease] Hotaru no Yomeiri - 05 (1080p) [7825FCC8].mkv",
+      "expectedAirAt": "2026-11-13T23:30:00+09:00",
+      "episodeAirTimes": { "7": "2026-11-20T23:30:00+09:00" }
+    },
+    {
+      "name": "FX Fighter Kurumi-chan · catch-up",
+      "malId": 63337,
+      "query": "FX Senshi Kurumi-chan",
+      "anchorListingId": 2182651,
+      "anchorTitle": "[SubsPlease] FX Senshi Kurumi-chan - 06 (1080p) [A53D62D5].mkv",
+      "expectedAirAt": "2026-11-12T21:30:00+09:00",
+      "episodeAirTimes": { "8": "2026-11-19T21:30:00+09:00" }
+    },
+    {
+      "name": "Dragon Ball Super: Beerus · catch-up",
+      "malId": 63367,
+      "query": "Dragon Ball Super Beerus",
+      "anchorListingId": 2184043,
+      "anchorTitle": "[SubsPlease] Dragon Ball Super - Beerus - 05 (1080p) [B8DE4614].mkv",
+      "expectedAirAt": "2026-11-15T23:15:00+09:00",
+      "episodeAirTimes": { "7": "2026-11-22T23:15:00+09:00" }
+    },
+    {
+      "name": "The Apothecary Diaries S3 · next broadcast",
+      "malId": 61987,
+      "query": "Kusuriya no Hitorigoto",
+      "anchorListingId": 2185799,
+      "anchorTitle": "[DKB] Kusuriya no Hitorigoto - S03E07 [1080p][HEVC x265 10bit][Multi-Subs][weekly]",
+      "expectedAirAt": "2026-11-20T23:00:00+09:00"
+    },
+    {
+      "name": "Black Clover S2 · next broadcast",
+      "malId": 61967,
+      "query": "Black Clover 2nd Season",
+      "anchorListingId": 2186055,
+      "anchorTitle": "[Erai-raws] Black Clover 2nd Season - 07 [1080p CR WEB-DL AVC AAC][MultiSub][CAD67218]",
+      "expectedAirAt": "2026-11-21T23:00:00+09:00"
+    },
+    {
+      "name": "Tougen Anki: Nikko Kegon Falls Arc · next broadcast",
+      "malId": 63181,
+      "query": "Tougen Anki",
+      "anchorListingId": 2185680,
+      "anchorTitle": "[SubsPlease] Tougen Anki - Nikko Kegon no Taki-hen - 07 (1080p) [15BA2C81].mkv",
+      "expectedAirAt": "2026-11-20T23:30:00+09:00"
+    },
+    {
+      "name": "Firefly Wedding · next broadcast",
+      "malId": 63293,
+      "query": "Hotaru no Yomeiri",
+      "anchorListingId": 2185679,
+      "anchorTitle": "[SubsPlease] Hotaru no Yomeiri - 06 (1080p) [7604E163].mkv",
+      "expectedAirAt": "2026-11-20T23:30:00+09:00"
+    },
+    {
+      "name": "FX Fighter Kurumi-chan · next broadcast",
+      "malId": 63337,
+      "query": "FX Senshi Kurumi-chan",
+      "anchorListingId": 2185302,
+      "anchorTitle": "[SubsPlease] FX Senshi Kurumi-chan - 07 (1080p) [40A0C56B].mkv",
+      "expectedAirAt": "2026-11-19T21:30:00+09:00"
+    },
+    {
+      "name": "Dragon Ball Super: Beerus · next broadcast",
+      "malId": 63367,
+      "query": "Dragon Ball Super Beerus",
+      "anchorListingId": 2186659,
+      "anchorTitle": "[SubsPlease] Dragon Ball Super - Beerus - 06 (1080p) [0568F08C].mkv",
+      "expectedAirAt": "2026-11-22T23:15:00+09:00"
+    },
+    {
+      "name": "Tougen Anki · identical listings from Doomdos",
+      "malId": 63181,
+      "query": "Tougen Anki",
+      "anchorListingId": 2183035,
+      "anchorTitle": "[Doomdos] - Tougen Anki Nikko Kegon no Taki-hen - S01E06 [1080p BILIBILI INTERNATIONAL WEB-DL] [Tougen Anki: Nikko Kegon Falls Arc]",
+      "expectedAirAt": "2026-11-13T23:30:00+09:00"
+    },
+    {
+      "name": "Black Clover S2 · Anime Time edition running behind",
+      "malId": 61967,
+      "query": "Black Clover",
+      "anchorListingId": 2186282,
+      "anchorTitle": "[Anime Time] Black Clover - S02E05 [1080p][HEVC 10bit x265][AAC][Dual-Audio] [Multi Sub] [Weekly]",
+      "expectedAirAt": "2026-11-14T23:00:00+09:00"
+    },
+    {
+      "name": "Black Clover S2 · Doomdos iQIYI edition gap",
+      "malId": 61967,
+      "query": "Black Clover",
+      "anchorListingId": 2183433,
+      "anchorTitle": "[Doomdos] - Black Clover - S02E06 [1080p IQ WEB-DL]",
+      "expectedAirAt": "2026-11-14T23:00:00+09:00"
+    },
+    {
+      "name": "The Apothecary Diaries S3 · Half-Baked mixed numbering",
+      "malId": 61987,
+      "query": "Kusuriya no Hitorigoto",
+      "anchorListingId": 2183608,
+      "anchorTitle": "[Half-Baked] The Apothecary Diaries - S03E06 [WEB 1080p HEVC AAC] | Kusuriya no Hitorigoto - 54 | The Apothecary Diaries Season 3 - 06",
+      "expectedAirAt": "2026-11-13T23:00:00+09:00"
+    }
+  ]
+}

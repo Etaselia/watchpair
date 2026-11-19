@@ -14,13 +14,16 @@ public:
       process_.waitForFinished(3000);
     }
   }
-  void start(const QString &database) {
+  void start(const QString &database, bool seriesFixture = false) {
     const auto script =
         QString::fromUtf8(WATCHPAIR_COORDINATOR_DIR) + QStringLiteral("/dist/tests/native-server.js");
     if (!QFileInfo::exists(script))
       throw std::runtime_error("Build the coordinator test fixture first");
     process_.setProcessChannelMode(QProcess::SeparateChannels);
-    process_.start(qEnvironmentVariable("WATCHPAIR_NODE", QStringLiteral("node")), {script, database});
+    QStringList arguments{script, database};
+    if (seriesFixture)
+      arguments << QStringLiteral("0") << QStringLiteral("--series-fixture");
+    process_.start(qEnvironmentVariable("WATCHPAIR_NODE", QStringLiteral("node")), arguments);
     if (!process_.waitForStarted(5000))
       throw std::runtime_error("Cannot start the coordinator fixture");
     QElapsedTimer clock;
@@ -54,6 +57,21 @@ public:
     return false;
   }
   bool blockDirect() { return directFault(QStringLiteral("blocked")); }
+  bool checkSeries() {
+    process_.write("{\"runSeries\":true}\n");
+    process_.waitForBytesWritten(1000);
+    QElapsedTimer clock;
+    clock.start();
+    while (clock.elapsed() < 3000) {
+      process_.waitForReadyRead(100);
+      while (process_.canReadLine()) {
+        const auto result = QJsonDocument::fromJson(process_.readLine()).object();
+        if (result.contains(QStringLiteral("seriesChecked")))
+          return result.value(QStringLiteral("seriesChecked")).toBool();
+      }
+    }
+    return false;
+  }
   QJsonObject inspect(const QString &room) {
     process_.write(
         QJsonDocument(QJsonObject{{QStringLiteral("inspectRoom"), room}}).toJson(QJsonDocument::Compact) +

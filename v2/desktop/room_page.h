@@ -69,6 +69,7 @@ public:
 signals:
   void addRequested(QString room);
   void manageRequested(QString room);
+  void seriesRequested(QString room);
   void fullscreenRequested();
   void popoutRequested();
   void transferRequested(QString transfer);
@@ -77,6 +78,8 @@ signals:
 
 private:
   void updateQueue();
+  void pollSeriesFollows();
+  void updateSeriesButton();
   void updateTracks();
   void mark(bool watched);
   void reorder(int direction);
@@ -111,6 +114,7 @@ private:
   QLabel *roomTitle_, *roomSubtitle_, *episodeTitle_, *state_, *time_, *overlayText_;
   QPushButton *join_, *leave_, *play_, *next_, *overlayAction_, *loadHistory_;
   QPushButton *queueUp_, *queueDown_, *queueMark_;
+  QPushButton *series_;
   QAction *queueUnwatched_, *queueWatchAgain_, *queueRename_, *queueRemove_, *queueClear_;
   QLabel *queueHint_;
   QPushButton *previousChapter_, *nextChapter_, *skipBack_, *skipForward_, *popout_, *reattach_;
@@ -119,6 +123,9 @@ private:
   QComboBox *policy_, *rate_, *audio_, *subtitles_, *chapters_;
   QDoubleSpinBox *subtitleDelay_;
   QTimer refresh_;
+  QTimer seriesRefresh_;
+  QString seriesRequestRoom_;
+  bool seriesReviewPending_ = false;
   bool seeking_ = false, fullscreen_ = false;
   double seekDuration_ = 0;
   int seekGeneration_ = -1, tracksGeneration_ = -1;

@@ -3,9 +3,11 @@
 #include "main_window.h"
 #include "native_runtime.h"
 #include "theme.h"
+#include <QAbstractItemView>
 #include <QApplication>
 #include <QDialogButtonBox>
 #include <QFile>
+#include <QListWidget>
 #include <QProcess>
 #include <QMessageBox>
 #include <QMenu>
@@ -57,6 +59,96 @@ void screenshot(QWidget &window, const QString &name) {
 class UiFlowTests final : public QObject {
   Q_OBJECT
 private slots:
+  void followSeriesFromRoomAndApproveAlternate() {
+    try {
+      QTemporaryDir tmp;
+      QVERIFY(tmp.isValid());
+      wp::test::Coordinator server;
+      server.start(tmp.filePath(QStringLiteral("server.sqlite")), true);
+      wp::AppServices services(tmp.filePath(QStringLiteral("profile")), nullptr, true, false);
+      services.store.setSetting(QStringLiteral("acquisitionPolicy"), QStringLiteral("Never"));
+      QSignalSpy entered(&services.rooms, &wp::RoomClient::entered);
+      services.rooms.create(server.url(), QStringLiteral("Series room"), QStringLiteral("Host"));
+      QTRY_COMPARE_WITH_TIMEOUT(entered.size(), 1, 5000);
+      const auto room = entered.first()[1].toString();
+      QTRY_VERIFY_WITH_TIMEOUT(services.rooms.connected(room), 5000);
+      wp::ui::MainWindow window(services);
+      window.show();
+      window.showRoom(room);
+      QVERIFY(QTest::qWaitForWindowExposed(&window));
+      auto *roomSeries = window.findChild<QPushButton *>(QStringLiteral("RoomSeriesFollows"));
+      QVERIFY(roomSeries);
+      QTRY_VERIFY_WITH_TIMEOUT(roomSeries->isVisible() && roomSeries->isEnabled(), 5000);
+      QTest::mouseClick(roomSeries, Qt::LeftButton);
+      auto *manager = window.findChild<QDialog *>(QStringLiteral("SeriesManagerDialog"));
+      QVERIFY(manager);
+      QTRY_VERIFY_WITH_TIMEOUT(button(*manager, QStringLiteral("Follow a series…")) &&
+                                   button(*manager, QStringLiteral("Follow a series…"))->isEnabled(),
+                               5000);
+      QTest::mouseClick(button(*manager, QStringLiteral("Follow a series…")), Qt::LeftButton);
+      QPointer<QDialog> follow = manager->findChild<QDialog *>(QStringLiteral("SeriesFollowDialog"));
+      QVERIFY(follow);
+      auto *query = follow->findChild<QLineEdit *>(QStringLiteral("SeriesSearchInput"));
+      auto *search = follow->findChild<QPushButton *>(QStringLiteral("SeriesSearch"));
+      auto *season = follow->findChild<QComboBox *>(QStringLiteral("SeriesCatalogChoice"));
+      auto *release = follow->findChild<QComboBox *>(QStringLiteral("SeriesReleaseChoice"));
+      auto *confirm = button(*follow, QStringLiteral("Follow series"));
+      QVERIFY(query && search && season && release && confirm);
+      QVERIFY(!confirm->isEnabled());
+      QTest::keyClicks(query, QStringLiteral("Test Anime"));
+      QTest::mouseClick(search, Qt::LeftButton);
+      const auto choose = [](QComboBox *box, int index) {
+        box->showPopup();
+        auto *view = box->view();
+        QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier,
+                          view->visualRect(box->model()->index(index, 0)).center());
+      };
+      QTRY_VERIFY_WITH_TIMEOUT(season->isVisible() && season->isEnabled() && season->count() == 2, 5000);
+      choose(season, 1);
+      QTRY_VERIFY_WITH_TIMEOUT(release->isVisible() && release->isEnabled() && release->count() == 3, 5000);
+      QCOMPARE(season->currentText(), QStringLiteral("Test Anime"));
+      choose(release, 1);
+      QTRY_VERIFY_WITH_TIMEOUT(confirm->isEnabled(), 5000);
+      QVERIFY(release->currentText().contains(QStringLiteral(" - 07 ")));
+      screenshot(*follow, QStringLiteral("series-confirmation"));
+      QTest::mouseClick(confirm, Qt::LeftButton);
+      QTRY_VERIFY_WITH_TIMEOUT(!follow, 5000);
+      QTRY_COMPARE_WITH_TIMEOUT(services.rooms.room(room).value(QStringLiteral("entries")).toArray().size(), 1, 5000);
+      auto *list = manager->findChild<QListWidget *>(QStringLiteral("SeriesFollowList"));
+      QVERIFY(list);
+      const auto available = [manager](const QString &label) {
+        const auto *control = button(*manager, label);
+        return control && control->isEnabled();
+      };
+      QTRY_VERIFY_WITH_TIMEOUT(available(QStringLiteral("Pause")), 5000);
+      QCOMPARE(list->count(), 1);
+      QTest::mouseClick(button(*manager, QStringLiteral("Pause")), Qt::LeftButton);
+      QTRY_VERIFY_WITH_TIMEOUT(available(QStringLiteral("Resume")), 5000);
+      QVERIFY(list->currentItem()->text().contains(QStringLiteral("Paused")));
+      QTest::mouseClick(button(*manager, QStringLiteral("Resume")), Qt::LeftButton);
+      QTRY_VERIFY_WITH_TIMEOUT(available(QStringLiteral("Check now")), 5000);
+      QTest::mouseClick(button(*manager, QStringLiteral("Check now")), Qt::LeftButton);
+      QTRY_VERIFY_WITH_TIMEOUT(available(QStringLiteral("Refresh")), 5000);
+      QVERIFY(server.checkSeries());
+      QTest::mouseClick(button(*manager, QStringLiteral("Refresh")), Qt::LeftButton);
+      QTRY_VERIFY_WITH_TIMEOUT(available(QStringLiteral("Use this release once")), 5000);
+      screenshot(*manager, QStringLiteral("series-host-review"));
+      QTimer::singleShot(0, &window, [] {
+        if (auto *question = qobject_cast<QMessageBox *>(QApplication::activeModalWidget()))
+          question->button(QMessageBox::Yes)->click();
+      });
+      QTest::mouseClick(button(*manager, QStringLiteral("Use this release once")), Qt::LeftButton);
+      QTRY_COMPARE_WITH_TIMEOUT(services.rooms.room(room).value(QStringLiteral("entries")).toArray().size(), 2, 5000);
+      QTRY_VERIFY_WITH_TIMEOUT(!button(*manager, QStringLiteral("Use this release once")), 5000);
+      for (const auto &transfer : services.transfers.transfers())
+        QCOMPARE(transfer.wanted, 0);
+      window.prepareToQuit();
+      services.shutdown();
+    } catch (const std::exception &e) {
+      QFAIL(e.what());
+    }
+  }
+
   void duplicateEpisodeNamesUseSelectedStableIdsAndTabSpecificActions() {
     try {
       QTemporaryDir tmp;
@@ -86,6 +178,7 @@ private slots:
       page.setRoom(room);
       page.show();
       QVERIFY(QTest::qWaitForWindowExposed(&page));
+      QVERIFY(page.findChild<QPushButton *>(QStringLiteral("RoomSeriesFollows"))->isHidden());
       auto *queue = page.findChild<QTableView *>(QStringLiteral("EpisodeQueue"));
       auto *history = page.findChild<QTableView *>(QStringLiteral("WatchedHistory"));
       auto *search = page.findChild<QLineEdit *>(QStringLiteral("queueSearch"));

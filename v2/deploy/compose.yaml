@@ -13,6 +13,8 @@ services:
       WATCHPAIR_TRUST_PROXY: 'true'
       WATCHPAIR_RELAY_URL: https://${WATCHPAIR_RELAY_HOST:?Set the relay hostname}
       WATCHPAIR_RELAY_SECRET: ${WATCHPAIR_RELAY_SECRET:?Generate a 32-byte base64 secret}
+      WATCHPAIR_SERIES_FOLLOWS: ${WATCHPAIR_SERIES_FOLLOWS:-false}
+      WATCHPAIR_MAL_CLIENT_ID: ${WATCHPAIR_MAL_CLIENT_ID:-}
     volumes:
       - room-data:/data
     read_only: true

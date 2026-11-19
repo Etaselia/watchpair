@@ -35,3 +35,16 @@ The current reporter's consecutive, plausible played intervals contribute distin
 `watchedAt` and history cursors use integer Unix epoch milliseconds. Legacy fractional millisecond records are normalized together with their SQLite ordering values on coordinator startup; records sharing a millisecond are ordered by history ID. Timestamps are never interpreted as Unix seconds. History records retain manifest path and source context so identical episode names remain distinguishable.
 
 `queue.clear` takes `scope: "upcoming" | "watched"`, the current queue revision and a durable operation ID. Every room member may use it after an explicit shared-state confirmation. Upcoming clear deselects only enabled, unwatched entries and preserves watched history. Watched clear atomically removes all watched entries and every history page while preserving Upcoming, sources and media files; playback advances using the same rules as removing its source if its current entry is removed. `historyGeneration` increases on a Watched clear, invalidating cached pages and outstanding history requests. Replays are idempotent and stale revisions are rejected.
+
+## Series follows
+
+`GET /v2/version` advertises `seriesFollows`. With the capability enabled, these routes require a room member's bearer token. Paths are relative to `/v2/rooms/:roomId`.
+
+| Route | Contract |
+| --- | --- |
+| `GET /series` | Returns the room's follow rules with their status, revision, next episode, estimated airtime, last check, fallback offer and any review reason. Times use Unix epoch milliseconds. |
+| `POST /series/preview` | Accepts `input` with optional `malId` and `listingId`. Returns catalog and Nyaa candidates. A concrete selection with verified torrent metadata returns a temporary draft bound to the same room and member. |
+| `POST /series` | Confirms a `draftId` with optional `expectedAirAt`, release-numbered `finalEpisode`, and `catalogEpisode` for absolute numbering. Omit `expectedAirAt` to accept the estimate or pass `null` when it is unknown. |
+| `POST /series/:id/actions` | Takes `action` and the current follow `revision`. Actions cover pause, resume, stop, check, skip, link existing, set airtime or finale, replace source, and approve or dismiss an alternate. Only the current host can approve or dismiss an alternate. |
+
+Series status refreshes independently of the room event stream. Added episodes arrive in the ordinary queue snapshot with the same ordering and download rules as other queue entries.

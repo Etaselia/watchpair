@@ -3,6 +3,7 @@
 #include <QDateTime>
 #include <QHostAddress>
 #include <QJsonDocument>
+#include <QPointer>
 #include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QUrlQuery>
@@ -130,6 +131,79 @@ void RoomClient::request(const QUrl &url, const QByteArray &token, const QJsonOb
                   QStringLiteral("Could not reach the coordinator securely. Check its address, connection, "
                                  "and certificate; the pending operation can be retried.")));
   });
+}
+void RoomClient::probeSeriesFollows(const QString &key) {
+  if (!connected(key) || stopping_)
+    return;
+  auto &c = connection(key);
+  if (c.seriesProbePending || now() < c.seriesProbeAfter)
+    return;
+  c.seriesProbePending = true;
+  const auto token = c.credential.value(QStringLiteral("token"));
+  const auto url = QUrl(c.credential.value(QStringLiteral("server")).toString() + QStringLiteral("/v2/version"));
+  request(url, {}, nullptr,
+          [this, key, token](const QJsonObject &result, int, const QString &code, const QString &) {
+            const auto it = connections_.find(key);
+            if (it == connections_.end() || it->second->credential.value(QStringLiteral("token")) != token)
+              return;
+            auto &c = *it->second;
+            c.seriesProbePending = false;
+            c.seriesProbeAfter = now() + (code.isEmpty() ? 300000 : 30000);
+            if (code.isEmpty()) {
+              const bool available = result.value(QStringLiteral("seriesFollows")).toBool();
+              if (c.seriesAvailable != available) {
+                c.seriesAvailable = available;
+                emit seriesCapabilityChanged(key);
+              }
+            }
+          });
+}
+bool RoomClient::seriesFollowsAvailable(const QString &key) const {
+  const auto it = connections_.find(key);
+  return it != connections_.end() && it->second->seriesAvailable;
+}
+void RoomClient::seriesRequest(const QString &key, const QString &suffix, const QJsonObject *body,
+                               QObject *context, SeriesReply callback) {
+  if (!connected(key) || stopping_) {
+    callback({}, tr("Connect to the room to manage series follows."));
+    return;
+  }
+  const auto credential = connection(key).credential;
+  const auto token = credential.value(QStringLiteral("token")).toString().toUtf8();
+  const QPointer<QObject> guard(context);
+  request(endpoint(credential, QStringLiteral("/series") + suffix), token, body,
+          [this, key, token, guard, callback = std::move(callback)](QJsonObject result, int,
+                                                                    const QString &code,
+                                                                    const QString &message) {
+            if (!guard)
+              return;
+            const auto it = connections_.find(key);
+            if (it == connections_.end() || it->second->credential.value(QStringLiteral("token")).toString().toUtf8() != token) {
+              callback({}, tr("Room access changed. Reopen series follows to continue."));
+              return;
+            }
+            callback(std::move(result), code.isEmpty() ? QString() : message);
+          });
+}
+void RoomClient::loadSeriesFollows(const QString &key, QObject *context, SeriesReply callback) {
+  seriesRequest(key, {}, nullptr, context, std::move(callback));
+}
+void RoomClient::previewSeriesFollow(const QString &key, const QJsonObject &body, QObject *context,
+                                    SeriesReply callback) {
+  seriesRequest(key, QStringLiteral("/preview"), &body, context, std::move(callback));
+}
+void RoomClient::createSeriesFollow(const QString &key, const QJsonObject &body, QObject *context,
+                                    SeriesReply callback) {
+  seriesRequest(key, {}, &body, context, std::move(callback));
+}
+void RoomClient::seriesFollowAction(const QString &key, const QString &id, const QJsonObject &body,
+                                    QObject *context, SeriesReply callback) {
+  if (QUuid(id).isNull()) {
+    callback({}, tr("This follow has an invalid identifier."));
+    return;
+  }
+  seriesRequest(key, QStringLiteral("/") + id + QStringLiteral("/actions"), &body, context,
+                std::move(callback));
 }
 void RoomClient::restore() {
   for (const auto value : store_.all(QStringLiteral("room-private"))) {
