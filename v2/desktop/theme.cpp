@@ -45,6 +45,8 @@ void installTheme() {
     QLabel[muted="true"] { color: #8fA2bd; }
     QLabel#NavSection { color: #7286a5; font-size: 11px; font-weight: 600; padding: 10px 8px 3px; }
     QLabel#Badge { border: 1px solid #32445f; background: #1c2b42; color: #bcd3f3; border-radius: 5px; padding: 3px 7px; }
+    QWidget#SeekPreview { background: #131e2d; border: 1px solid #45618a; border-radius: 7px; }
+    QLabel#SeekPreviewTime { color: #edf3fc; font-weight: 600; }
     QLabel[tone="good"] { color: #91e0c5; background: #183831; border: 1px solid #2d594e; }
     QFrame#Card, QFrame#card { background: #131e2d; border: 1px solid #27364c; border-radius: 9px; }
     QWidget#Topbar { background: #111b2a; border-bottom: 1px solid #243147; }

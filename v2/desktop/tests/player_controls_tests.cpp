@@ -1,6 +1,8 @@
 #include "seek_slider.h"
 #include "window_geometry.h"
 #include <QApplication>
+#include <QImage>
+#include <QJsonObject>
 #include <QProxyStyle>
 #include <QSignalSpy>
 #include <QStyleFactory>
@@ -31,6 +33,9 @@ void prepare(wp::ui::SeekSlider &slider, QStyle &style) {
   slider.resize(360, 36);
   slider.show();
   QCoreApplication::processEvents();
+}
+QJsonObject chapter(double time, const QString &title = {}) {
+  return {{QStringLiteral("time"), time}, {QStringLiteral("title"), title}};
 }
 } // namespace
 
@@ -167,6 +172,97 @@ private slots:
     QCOMPARE(slider.value(), 1000);
     QCOMPARE(pressed.size(), 0);
     QCOMPARE(released.size(), 0);
+  }
+  void chapterGapsUseTheSameGeometryAsSeeking_data() {
+    QTest::addColumn<bool>("rtl");
+    QTest::addColumn<int>("first");
+    QTest::addColumn<int>("second");
+    QTest::newRow("ltr") << false << 110 << 215;
+    QTest::newRow("rtl") << true << 145 << 250;
+  }
+  void chapterGapsUseTheSameGeometryAsSeeking() {
+    QFETCH(bool, rtl);
+    QFETCH(int, first);
+    QFETCH(int, second);
+    OffsetSliderStyle style;
+    wp::ui::SeekSlider slider(Qt::Horizontal);
+    prepare(slider, style);
+    slider.setLayoutDirection(rtl ? Qt::RightToLeft : Qt::LeftToRight);
+    slider.setValue(0);
+    slider.setTimeline(120, {chapter(0), chapter(30), chapter(75)});
+    QImage image(slider.size(), QImage::Format_ARGB32);
+    image.fill(Qt::transparent);
+    slider.render(&image);
+    for (const int x : {first, second}) {
+      const auto gap = image.pixelColor(x, 17);
+      QCOMPARE(gap, image.pixelColor(x, 10));
+      QVERIFY(image.pixelColor(x - 8, 17) != gap);
+      QVERIFY(image.pixelColor(x + 8, 17) != gap);
+    }
+  }
+  void hoverShowsChapterAndTimestampWithoutSeeking() {
+    OffsetSliderStyle style;
+    wp::ui::SeekSlider slider(Qt::Horizontal);
+    prepare(slider, style);
+    slider.setValue(100);
+    slider.setTimeline(120, {chapter(75), chapter(-1), chapter(120),
+                             chapter(30, QStringLiteral(" Main    story ")),
+                             chapter(0, QStringLiteral("Opening"))});
+    QSignalSpy previews(&slider, &wp::ui::SeekSlider::previewPosition),
+        dismissed(&slider, &wp::ui::SeekSlider::previewDismissed), released(&slider, &QSlider::sliderReleased);
+
+    QTest::mouseMove(&slider, QPoint(110, 17));
+    QVERIFY(!previews.isEmpty());
+    QCOMPARE(previews.last().at(0).toDouble(), 30.0);
+    QCOMPARE(previews.last().at(1).toString(), QStringLiteral("Main story"));
+    QCOMPARE(previews.last().at(2).toPoint(), QPoint(110, 0));
+    QVERIFY(!previews.last().at(3).toBool());
+    QTest::mouseMove(&slider, QPoint(250, 17));
+    QCOMPARE(previews.last().at(0).toDouble(), 90.0);
+    QCOMPARE(previews.last().at(1).toString(), QStringLiteral("Chapter 3"));
+    QCOMPARE(slider.value(), 100);
+    QCOMPARE(released.size(), 0);
+
+    QEvent leave(QEvent::Leave);
+    QApplication::sendEvent(&slider, &leave);
+    QCOMPARE(dismissed.size(), 1);
+    QTest::mouseMove(&slider, QPoint(170, 17));
+    slider.setTimeline(120, {});
+    QCOMPARE(dismissed.size(), 2);
+    QTest::mouseMove(&slider, QPoint(180, 17));
+    QCOMPARE(previews.last().at(0).toDouble(), 60.0);
+    QVERIFY(previews.last().at(1).toString().isEmpty());
+  }
+  void fineScrubbingKeepsOneFinalSeek_data() {
+    QTest::addColumn<bool>("rtl");
+    QTest::newRow("ltr") << false;
+    QTest::newRow("rtl") << true;
+  }
+  void fineScrubbingKeepsOneFinalSeek() {
+    QFETCH(bool, rtl);
+    OffsetSliderStyle style;
+    wp::ui::SeekSlider slider(Qt::Horizontal);
+    prepare(slider, style);
+    slider.setLayoutDirection(rtl ? Qt::RightToLeft : Qt::LeftToRight);
+    slider.setTimeline(120, {});
+    slider.setValue(100);
+    slider.setTracking(false);
+    QSignalSpy previews(&slider, &wp::ui::SeekSlider::previewPosition), released(&slider, &QSlider::sliderReleased);
+    QTest::mousePress(&slider, Qt::LeftButton, Qt::NoModifier, QPoint(180, 17));
+    QCOMPARE(slider.sliderPosition(), 500);
+
+    QTest::mouseMove(&slider, QPoint(180, -30));
+    QCOMPARE(slider.sliderPosition(), 500);
+    QVERIFY(!previews.isEmpty());
+    QVERIFY(previews.last().at(3).toBool());
+    QTest::mouseMove(&slider, QPoint(250, -30));
+    const auto finePosition = slider.sliderPosition();
+    QVERIFY(rtl ? (finePosition < 500 && finePosition > 250) : (finePosition > 500 && finePosition < 750));
+    QCOMPARE(slider.value(), 100);
+    QCOMPARE(released.size(), 0);
+    QTest::mouseRelease(&slider, Qt::LeftButton, Qt::NoModifier, QPoint(250, -30));
+    QCOMPARE(released.size(), 1);
+    QCOMPARE(slider.value(), finePosition);
   }
   void savedGeometryFitsRemovedAndNegativeCoordinateMonitors() {
     const QRect left(-1920, 0, 1920, 1080), primary(0, 0, 1366, 728);

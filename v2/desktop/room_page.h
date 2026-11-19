@@ -18,6 +18,7 @@
 #include <QWidget>
 namespace wp::ui {
 class SeekSlider;
+class SeekPreview;
 class QueueProxy final : public QSortFilterProxyModel {
   Q_OBJECT
 public:
@@ -121,6 +122,7 @@ private:
   QLabel *queueHint_;
   QPushButton *previousChapter_, *nextChapter_, *skipBack_, *skipForward_, *popout_, *reattach_;
   SeekSlider *seek_;
+  SeekPreview *seekPreview_;
   QSlider *volume_;
   QComboBox *policy_, *rate_, *audio_, *subtitles_, *chapters_;
   QDoubleSpinBox *subtitleDelay_;

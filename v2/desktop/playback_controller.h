@@ -21,6 +21,7 @@ public:
   bool playRequested() const;
   double position() const;
   double duration() const;
+  QJsonObject thumbnailFile() const;
   double rate() const;
   QString audioChoice() const;
   QString subtitleChoice() const;

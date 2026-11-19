@@ -6,8 +6,10 @@
 #include <QCryptographicHash>
 #include <QDataStream>
 #include <QDateTime>
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QMouseEvent>
 #include <QPushButton>
 #include <QScreen>
 #include <QSurfaceFormat>
@@ -24,6 +26,18 @@ QJsonArray seekCommands(wp::LocalStore &store) {
   }
   return result;
 }
+QJsonObject localFile(const QString &path) {
+  QFile file(path);
+  if (!file.open(QIODevice::ReadOnly))
+    throw std::runtime_error("Cannot open local media fixture");
+  QCryptographicHash hash(QCryptographicHash::Sha256);
+  if (!hash.addData(&file))
+    throw std::runtime_error("Cannot hash local media fixture");
+  const QFileInfo info(file);
+  return {{QStringLiteral("path"), info.canonicalFilePath()}, {QStringLiteral("size"), info.size()},
+          {QStringLiteral("mtime"), info.lastModified().toMSecsSinceEpoch()},
+          {QStringLiteral("sha256"), QString::fromLatin1(hash.result().toHex())}};
+}
 QJsonObject wave(const QString &path, char sample) {
   QFile file(path);
   if (!file.open(QIODevice::WriteOnly))
@@ -37,12 +51,7 @@ QJsonObject wave(const QString &path, char sample) {
   out.writeRawData("data", 4); out << bytes;
   file.write(QByteArray(bytes, sample));
   file.close();
-  file.open(QIODevice::ReadOnly);
-  QCryptographicHash hash(QCryptographicHash::Sha256); hash.addData(&file);
-  const QFileInfo info(file);
-  return {{QStringLiteral("path"), info.canonicalFilePath()}, {QStringLiteral("size"), info.size()},
-          {QStringLiteral("mtime"), info.lastModified().toMSecsSinceEpoch()},
-          {QStringLiteral("sha256"), QString::fromLatin1(hash.result().toHex())}};
+  return localFile(path);
 }
 } // namespace
 class PlayerControlFlowTests final : public QObject {
@@ -146,6 +155,76 @@ private slots:
       QTest::mouseRelease(slider, Qt::LeftButton, Qt::NoModifier, QPoint(300, 15));
       QTest::qWait(200);
       QVERIFY(app.player.sampledPosition() < 2);
+      app.shutdown();
+    } catch (const std::exception &error) { QFAIL(error.what()); }
+  }
+  void chapterThumbnailFollowsThePlayerWithoutSeeking() {
+    const auto fixtures = qEnvironmentVariable("WATCHPAIR_MEDIA_FIXTURES");
+    const auto path = QDir(fixtures).filePath(QStringLiteral("tracks.mkv"));
+    if (fixtures.isEmpty() || !QFileInfo::exists(path))
+      QSKIP("Set WATCHPAIR_MEDIA_FIXTURES to the generated chapter and track fixtures.");
+    try {
+      QTemporaryDir tmp;
+      wp::AppServices app(tmp.filePath(QStringLiteral("profile")), nullptr, true, true);
+      wp::ui::MainWindow window(app);
+      window.resize(1100, 750);
+      window.show();
+      window.pages()->setCurrentWidget(window.roomPage());
+      const auto file = localFile(path);
+      const auto identity = QStringLiteral("sha256:") + file.value(QStringLiteral("sha256")).toString();
+      app.store.put(QStringLiteral("resume"), identity, {{QStringLiteral("position"), 1.0}});
+      app.playback.playLocal(file);
+      QTRY_VERIFY_WITH_TIMEOUT(app.player.loaded() && app.player.chapters().size() == 2 &&
+                                   !app.playback.thumbnailFile().isEmpty(),
+                               10000);
+      if (!app.playback.paused())
+        app.playback.togglePause();
+      QTRY_VERIFY(app.player.paused());
+      QTRY_VERIFY_WITH_TIMEOUT(!app.player.seeking() && qAbs(app.player.sampledPosition() - 1.0) < .12, 5000);
+      window.roomPage()->refresh();
+      auto *surface = window.roomPage()->playerSurface();
+      auto *slider = surface->findChild<wp::ui::SeekSlider *>(QStringLiteral("SeekSlider"));
+      auto *preview = surface->findChild<QWidget *>(QStringLiteral("SeekPreview"));
+      auto *frame = surface->findChild<QLabel *>(QStringLiteral("SeekThumbnail"));
+      auto *chapter = surface->findChild<QLabel *>(QStringLiteral("SeekPreviewChapter"));
+      auto *more = window.roomPage()->findChild<QPushButton *>(QStringLiteral("PopoutPlayer"));
+      QVERIFY(slider && preview && frame && chapter && more);
+      const auto unchanged = app.player.sampledPosition();
+      const auto move = [](QWidget *widget, const QPoint &at) {
+        QMouseEvent event(QEvent::MouseMove, at, widget->mapToGlobal(at), Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+        QApplication::sendEvent(widget, &event);
+      };
+      const auto hover = [&] {
+        move(surface, QPoint(surface->width() / 2, surface->height() - 4));
+        move(slider, QPoint(slider->width() * 4 / 5, slider->height() / 2));
+      };
+      const auto ready = [&] { return preview->isVisible() && frame->isVisible() && !frame->pixmap().isNull(); };
+      const auto details = [&] {
+        return tr("Surface %1 · timeline %2 · preview %3 · chapter %4")
+            .arg(surface->isVisible()).arg(slider->isVisible()).arg(preview->isVisible()).arg(chapter->text());
+      };
+      hover();
+      QTRY_VERIFY2_WITH_TIMEOUT(ready(), qPrintable(details()), 5000);
+      QCOMPARE(chapter->text(), QStringLiteral("Episode"));
+      const auto image = frame->pixmap().toImage();
+      QVERIFY(image.pixel(10, 10) != image.pixel(image.width() - 10, 10));
+      QCOMPARE(app.player.sampledPosition(), unchanged);
+      QVERIFY(seekCommands(app.store).isEmpty());
+      QVERIFY(preview->geometry().bottom() < slider->mapTo(surface, QPoint()).y());
+
+      more->click();
+      QVERIFY(surface->window() != &window);
+      QTRY_VERIFY_WITH_TIMEOUT(surface->isVisible(), 5000);
+      hover();
+      QTRY_VERIFY2_WITH_TIMEOUT(ready(), qPrintable(details()), 5000);
+      QCOMPARE(app.player.sampledPosition(), unchanged);
+      QVERIFY(seekCommands(app.store).isEmpty());
+      surface->fullscreenRequested();
+      QTRY_VERIFY(surface->window()->isFullScreen());
+      hover();
+      QTRY_VERIFY2_WITH_TIMEOUT(ready(), qPrintable(details()), 5000);
+      QVERIFY(preview->geometry().bottom() < slider->mapTo(surface, QPoint()).y());
+      window.prepareToQuit();
       app.shutdown();
     } catch (const std::exception &error) { QFAIL(error.what()); }
   }

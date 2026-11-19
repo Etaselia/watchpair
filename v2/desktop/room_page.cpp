@@ -1,4 +1,5 @@
 #include "room_page.h"
+#include "seek_preview.h"
 #include "seek_slider.h"
 #include "theme.h"
 #include <QApplication>
@@ -380,6 +381,12 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   seek_->setObjectName(QStringLiteral("SeekSlider"));
   seek_->setAccessibleName(tr("Playback position"));
   seek_->setRange(0, 1000000);
+  seekPreview_ = new SeekPreview(surface_);
+  connect(seek_, &SeekSlider::previewPosition, this,
+          [this](double seconds, const QString &chapter, const QPoint &anchor, bool precise) {
+    seekPreview_->showAt(seconds, chapter, seek_->mapTo(surface_, anchor), precise, app_.playback.duration());
+  });
+  connect(seek_, &SeekSlider::previewDismissed, seekPreview_, &SeekPreview::dismiss);
   time_ = text(QStringLiteral("0:00 / —"));
   time_->setObjectName(QStringLiteral("PlaybackTime"));
   timeline->addWidget(seek_, 1);
@@ -1382,13 +1389,17 @@ void RoomPage::refresh() {
                       : app_.playback.playRequested() ? tr("Pause the room, including automatic resume")
                                                       : tr("Play for the room"));
     const double duration = app_.playback.duration(), position = app_.playback.position();
+    const bool chaptersReady = chapterMetadataReady();
+    seekPreview_->setSource(chaptersReady ? app_.playback.thumbnailFile() : QJsonObject());
+    const auto chapterList = chaptersReady ? app_.player.chapters() : QJsonArray();
+    seek_->setTimeline(duration, chapterList);
     time_->setText(elapsed(seeking_ ? double(seek_->sliderPosition()) / 1000000 * seekDuration_ : position) +
                    QStringLiteral(" / ") +
                    (seeking_ ? elapsed(seekDuration_) : duration > 0 ? elapsed(duration) : QStringLiteral("—")));
     seek_->setEnabled((local || connected) && duration > 0);
     skipBack_->setEnabled(seek_->isEnabled());
     skipForward_->setEnabled(seek_->isEnabled());
-    chapters_->setEnabled(seek_->isEnabled() && chapterMetadataReady() && !app_.player.chapters().isEmpty());
+    chapters_->setEnabled(seek_->isEnabled() && !chapterList.isEmpty());
     previousChapter_->setEnabled(chapters_->isEnabled());
     nextChapter_->setEnabled(previousChapter_->isEnabled());
     if (!seeking_) {
@@ -1612,7 +1623,7 @@ bool RoomPage::chapterMetadataReady() const {
     return false;
   if (app_.playback.local())
     return true;
-  if (room_.isEmpty())
+  if (room_.isEmpty() || app_.playback.room() != room_)
     return false;
   const auto entry = app_.rooms.room(room_).value(QStringLiteral("playback")).toObject()
                          .value(QStringLiteral("entryId")).toString();

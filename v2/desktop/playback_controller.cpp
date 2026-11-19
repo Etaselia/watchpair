@@ -283,6 +283,12 @@ double PlaybackController::duration() const {
       .value(QStringLiteral("duration"))
       .toDouble(player_.duration());
 }
+QJsonObject PlaybackController::thumbnailFile() const {
+  if (!player_.loaded() || !player_.mediaInfo().value(QStringLiteral("video")).isObject())
+    return {};
+  const auto *copy = qobject_cast<const LocalFileSource *>(binding_.source.data());
+  return copy ? copy->descriptor() : QJsonObject();
+}
 double PlaybackController::rate() const {
   return local_            ? localRate_
          : room_.isEmpty() ? 1
