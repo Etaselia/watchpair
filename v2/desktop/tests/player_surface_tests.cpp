@@ -30,6 +30,9 @@
 #include <cmath>
 #include <functional>
 #include <memory>
+#ifdef Q_OS_WIN
+#include <windows.h>
+#endif
 namespace {
 bool clickPopupWidget(QWidget &widget, const QPoint &point, const QString &action);
 bool movePointer(QWidget &widget, const QPoint &point, Qt::MouseButtons buttons = Qt::NoButton) {
@@ -654,13 +657,39 @@ private slots:
     QTRY_VERIFY_WITH_TIMEOUT(services.player.position() < .3, 5000);
     QTRY_VERIFY(window.roomPage()->findChild<QLabel *>(QStringLiteral("PlaybackTime"))
                     ->text().startsWith(QStringLiteral("0:00 /")));
+    auto *surface = window.roomPage()->playerSurface();
+#ifdef Q_OS_WIN
+    const auto frameStyle = [](QWidget &host) {
+      return GetWindowLongPtr(reinterpret_cast<HWND>(host.winId()), GWL_STYLE) &
+          (WS_BORDER | WS_DLGFRAME | WS_THICKFRAME);
+    };
+    const auto roomFrame = frameStyle(window);
+#endif
     QVERIFY(click(QStringLiteral("PlayerFullscreen")));
     QTRY_VERIFY(window.isFullScreen());
+#ifdef Q_OS_WIN
+    QCOMPARE(frameStyle(window), LONG_PTR(WS_BORDER));
+#endif
     QTRY_COMPARE(video->mapTo(&window, QPoint()), QPoint());
     QTRY_COMPARE(video->size(), window.size());
+    auto *subtitleChoice = surface->findChild<QComboBox *>(QStringLiteral("SharedSubtitles"));
+    auto *chapterChoice = surface->findChild<QComboBox *>(QStringLiteral("Chapters"));
+    QVERIFY(subtitleChoice);
+    QVERIFY(chapterChoice);
+    QTRY_VERIFY(subtitleChoice->count() > 1);
+    const auto subtitleId = subtitleChoice->itemData(1).toString();
+    QVERIFY2(choosePopup(*surface, *subtitleChoice, window, 1, QStringLiteral("native-room-fullscreen-subtitles")),
+             "Room fullscreen accepts a subtitle selection on its first open");
+    QTRY_COMPARE(services.playback.subtitleChoice(), subtitleId);
+    QVERIFY2(choosePopup(*surface, *chapterChoice, window, 2, QStringLiteral("native-room-fullscreen-chapters")),
+             "Room fullscreen accepts a chapter selection");
+    QTRY_VERIFY_WITH_TIMEOUT(std::abs(services.player.position() - 8) < .3, 5000);
     capture(window, QStringLiteral("player-fullscreen"));
     QTest::keyClick(video, Qt::Key_Escape);
     QTRY_VERIFY(!window.isFullScreen());
+#ifdef Q_OS_WIN
+    QCOMPARE(frameStyle(window), roomFrame);
+#endif
     QVERIFY(click(QStringLiteral("PopoutPlayer")));
     QTRY_VERIFY(video->window() != &window);
     auto *detached = video->window();
@@ -675,18 +704,19 @@ private slots:
     window.hide();
     QVERIFY(detached->isVisible());
     capture(*detached, QStringLiteral("player-popout"));
-    auto *surface = window.roomPage()->playerSurface();
-    auto *subtitleChoice = surface->findChild<QComboBox *>(QStringLiteral("SharedSubtitles"));
-    QVERIFY(subtitleChoice);
-    QTRY_VERIFY(subtitleChoice->count() > 1);
-    const auto subtitleId = subtitleChoice->itemData(1).toString();
     QVERIFY2(choosePopup(*surface, *subtitleChoice, *detached, 1,
                          QStringLiteral("native-popout-subtitles"), true),
              "Real renderer pop-out dropdown paints above video and accepts a clicked subtitle");
     QTRY_COMPARE(services.playback.subtitleChoice(), subtitleId);
+#ifdef Q_OS_WIN
+    const auto detachedFrame = frameStyle(*detached);
+#endif
     QTest::mouseDClick(video, Qt::LeftButton);
     QTest::mouseRelease(video, Qt::LeftButton);
     QTRY_VERIFY(detached->isFullScreen());
+#ifdef Q_OS_WIN
+    QCOMPARE(frameStyle(*detached), LONG_PTR(WS_BORDER));
+#endif
     QTRY_COMPARE(video->size(), detached->size());
     QVERIFY2(choosePopup(*surface, *subtitleChoice, *detached, 0,
                          QStringLiteral("native-fullscreen-subtitles")),
@@ -698,6 +728,9 @@ private slots:
     window.hide();
     QTest::keyClick(video, Qt::Key_Escape);
     QTRY_VERIFY(!detached->isFullScreen());
+#ifdef Q_OS_WIN
+    QCOMPARE(frameStyle(*detached), detachedFrame);
+#endif
     detached->close();
     QTRY_VERIFY(window.isVisible());
     QTRY_COMPARE(video->window(), static_cast<QWidget *>(&window));
@@ -733,8 +766,6 @@ private slots:
     QVERIFY2(choosePopup(*surface, *subtitleChoice, window, 0,
                          QStringLiteral("native-new-preview-subtitles")),
              "The next video's popup contains only its own ready subtitle choices");
-    auto *chapterChoice = window.roomPage()->findChild<QComboBox *>(QStringLiteral("Chapters"));
-    QVERIFY(chapterChoice);
     QTRY_VERIFY(chapterChoice->isEnabled());
     QTRY_COMPARE(chapterChoice->count(), 3);
     QSignalSpy staleChapter(&services, &wp::AppServices::issue);
