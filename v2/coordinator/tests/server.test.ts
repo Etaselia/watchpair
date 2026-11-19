@@ -14,15 +14,33 @@ test('HTTP boundary enforces protocol, input validation and membership before ac
   assert.equal(badInput.statusCode, 400);
   const created = await app.inject({ method: 'POST', url: '/v2/rooms', headers, payload: { name: 'Test', memberName: 'Host', retryKey: key() } });
   assert.equal(created.statusCode, 200); const room = created.json();
+  assert.equal(created.headers['cache-control'], 'no-store');
   const unauthorized = await app.inject({ method: 'GET', url: `/v2/rooms/${room.roomId}`, headers }); assert.equal(unauthorized.statusCode, 401);
+  assert.equal(unauthorized.headers['cache-control'], 'no-store');
   const inviteAsAuth = await app.inject({ method: 'GET', url: `/v2/rooms/${room.roomId}`, headers: { ...headers, authorization: `Bearer ${room.invite}` } }); assert.equal(inviteAsAuth.statusCode, 401);
   const auth = { ...headers, authorization: `Bearer ${room.token}` };
   const snapshot = await app.inject({ method: 'GET', url: `/v2/rooms/${room.roomId}`, headers: auth });
   assert.equal(snapshot.statusCode, 200); assert.equal(snapshot.json().hostId, room.memberId);
+  assert.equal(snapshot.headers['cache-control'], 'no-store');
   assert.ok(!snapshot.body.includes(room.token)); assert.ok(!snapshot.body.includes(room.recovery));
   const renamed = await app.inject({ method: 'POST', url: `/v2/rooms/${room.roomId}/commands`, headers: auth,
     payload: { operationId: randomUUID(), command: { type: 'room.rename', name: 'Renamed' } } });
   assert.equal(renamed.statusCode, 200);
+});
+
+test('small room endpoints bound request bodies and commands authenticate before JSON parsing', async t => {
+  const { app, engine } = await buildServer(); t.after(() => app.close());
+  const room = engine.create('Test', 'Host', key());
+  const oversized = await app.inject({ method: 'POST', url: '/v2/rooms', headers,
+    payload: { name: 'x'.repeat(2048), memberName: 'Host', retryKey: key() } });
+  assert.equal(oversized.statusCode, 413);
+
+  const command = { method: 'POST' as const, url: `/v2/rooms/${room.roomId}/commands`, payload: '{',
+    headers: { ...headers, 'content-type': 'application/json' } };
+  const unauthorized = await app.inject(command);
+  assert.equal(unauthorized.statusCode, 401);
+  const authenticated = await app.inject({ ...command, headers: { ...command.headers, authorization: `Bearer ${room.token}` } });
+  assert.equal(authenticated.statusCode, 400);
 });
 
 test('real WebSocket snapshots, heartbeat and credential revocation use authenticated connections', async t => {

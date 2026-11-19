@@ -13,7 +13,8 @@ import { SeriesService } from './series.js';
 import { MAX_SERIES_METADATA_BYTES, type SeriesProvider } from './series-provider.js';
 
 const name = z.string().trim().min(1).max(100).refine(v => !/[\x00-\x1f\x7f]/.test(v));
-const VERSION = '2.0.0-alpha.9';
+const VERSION = '2.0.0';
+const MAX_COMMAND_BYTES = 12 * 1024 * 1024;
 const capability = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const createBody = z.object({ name, memberName: name, retryKey: capability }).strict();
 const joinBody = z.object({ invite: capability, name, retryKey: capability }).strict();
@@ -51,7 +52,7 @@ export async function buildServer(options: ServerOptions = {}) {
   const engine = new Engine(store, options.now ?? (() => Math.trunc(epoch + performance.now())));
   const app = Fastify({
     logger: options.logger ? { level: 'info', redact: ['req.headers.authorization', 'req.headers.cookie'] } : false,
-    logController: new LogController({ disableRequestLogging: true }), bodyLimit: 12 * 1024 * 1024, requestTimeout: 20_000,
+    logController: new LogController({ disableRequestLogging: true }), bodyLimit: 2048, requestTimeout: 20_000,
     trustProxy: options.trustProxy ?? false, genReqId: () => randomUUID(),
   });
   await app.register(rateLimit, { max: 600, timeWindow: '1 minute' });
@@ -91,7 +92,9 @@ export async function buildServer(options: ServerOptions = {}) {
   };
   const roomId = (request: FastifyRequest) => (request.params as { roomId: string }).roomId;
   const auth = (request: FastifyRequest) => engine.authenticate(roomId(request), token(request));
-  app.addHook('onRequest', async request => {
+  const requireMember = async (request: FastifyRequest) => { auth(request); };
+  app.addHook('onRequest', async (request, reply) => {
+    if (request.routeOptions.url?.startsWith('/v2/rooms')) reply.header('Cache-Control', 'no-store');
     if (request.url.startsWith('/v2/') && request.headers['x-watchpair-protocol'] !== String(PROTOCOL))
       throw new DomainError('UPDATE_REQUIRED', 'This coordinator requires WatchPair protocol 2. Update the desktop app.', 426);
   });
@@ -128,23 +131,24 @@ export async function buildServer(options: ServerOptions = {}) {
     const body = recoveryBody.parse(request.body); return engine.recover(roomId(request), body.recovery, body.retryKey);
   });
   app.get('/v2/rooms/:roomId', async request => { auth(request); return engine.snapshot(roomId(request)); });
-  app.post('/v2/rooms/:roomId/commands', async request => engine.command(roomId(request), auth(request).id, request.body));
+  app.post('/v2/rooms/:roomId/commands', { bodyLimit: MAX_COMMAND_BYTES, onRequest: requireMember },
+    async request => engine.command(roomId(request), auth(request).id, request.body));
   const requireSeries = () => {
     if (!series) throw new DomainError('SERIES_DISABLED', 'Series follows are disabled on this coordinator.', 404);
     return series;
   };
-  app.get('/v2/rooms/:roomId/series', async (request, reply) => {
-    auth(request); reply.header('Cache-Control', 'no-store');
+  app.get('/v2/rooms/:roomId/series', async request => {
+    auth(request);
     return series?.list(roomId(request)) ?? { enabled: false, items: [] };
   });
-  app.post('/v2/rooms/:roomId/series/preview', { config: { rateLimit: { max: 12, timeWindow: '1 minute' } }, bodyLimit: 2048 }, async (request, reply) => {
-    const member = auth(request); reply.header('Cache-Control', 'no-store');
+  app.post('/v2/rooms/:roomId/series/preview', { config: { rateLimit: { max: 12, timeWindow: '1 minute' } }, onRequest: requireMember }, async request => {
+    const member = auth(request);
     const result = await requireSeries().preview(roomId(request), member.id, seriesPreview.parse(request.body));
     auth(request);
     return result;
   });
-  app.post('/v2/rooms/:roomId/series', { bodyLimit: 2048 }, async (request, reply) => {
-    const member = auth(request); reply.header('Cache-Control', 'no-store');
+  app.post('/v2/rooms/:roomId/series', { onRequest: requireMember }, async request => {
+    const member = auth(request);
     return requireSeries().add(roomId(request), member.id, seriesConfirm.parse(request.body));
   });
   app.addContentTypeParser('application/vnd.watchpair.torrent', { parseAs: 'buffer',
@@ -152,20 +156,19 @@ export async function buildServer(options: ServerOptions = {}) {
   app.post('/v2/rooms/:roomId/series/metadata/:requestId', {
     config: { rateLimit: { max: 30, timeWindow: '1 minute' } }, bodyLimit: MAX_SERIES_METADATA_BYTES,
     onRequest: async request => { auth(request); requireSeries(); },
-  }, async (request, reply) => {
+  }, async request => {
     const member = auth(request);
     const id = z.string().uuid().parse((request.params as { requestId: string }).requestId);
     if (!Buffer.isBuffer(request.body))
       throw new DomainError('SERIES_METADATA_INVALID', 'Send torrent metadata as a binary file.', 415);
-    reply.header('Cache-Control', 'no-store');
     return requireSeries().acceptMetadata(roomId(request), member.id, id, request.body);
   });
-  app.post('/v2/rooms/:roomId/series/:seriesId/actions', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } }, bodyLimit: 2048 }, async (request, reply) => {
-    const member = auth(request); reply.header('Cache-Control', 'no-store');
+  app.post('/v2/rooms/:roomId/series/:seriesId/actions', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } }, onRequest: requireMember }, async request => {
+    const member = auth(request);
     const id = z.string().uuid().parse((request.params as { seriesId: string }).seriesId);
     return requireSeries().action(roomId(request), id, member.id, seriesAction.parse(request.body), () => { auth(request); });
   });
-  app.post('/v2/rooms/:roomId/transfer-ticket',async request=>{
+  app.post('/v2/rooms/:roomId/transfer-ticket', { onRequest: requireMember }, async request=>{
     const member=auth(request),id=roomId(request);
     const body=z.object({peerId:z.string().uuid(),listenPort:z.number().int().min(0).max(65535)}).strict().parse(request.body);
     const peer=engine.room(id).members.find(m=>m.id===body.peerId);
