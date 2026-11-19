@@ -5,7 +5,9 @@ import {
   episodeSearchTerms, parseSeriesTitle, releaseMatches, sameSeriesStem, seriesTitleParts, SeriesProviderError,
   type SeriesCatalog, type SeriesListing, type SeriesProvider, type SeriesRelease,
 } from './series-provider.js';
-import { estimateAirtime, inferAnchorAirtime, retryAt, type SeriesEpisode, type SeriesFollow } from './series-state.js';
+import { canAskDesktop, retryableMetadata, SeriesMetadata, type AskDesktop } from './series-metadata.js';
+import { estimateAirtime, inferAnchorAirtime, retryAt, type SeriesEntryBinding, type SeriesEpisode,
+  type SeriesFollow, type SeriesMetadataRetry } from './series-state.js';
 
 const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
@@ -23,12 +25,11 @@ const CATALOG_UNAVAILABLE = 'MyAnimeList is temporarily unavailable. The last kn
 const WAITING_FOR_FINALE = 'Reached the current MyAnimeList episode total. Waiting for the catalog to confirm the finale.';
 
 type Manifest = { source: Source; file: FileDescriptor };
-type EntryBinding = Pick<Entry, 'id' | 'mediaId' | 'path' | 'size'>;
 type Draft = {
   id: string; roomId: string; memberId: string; expiresAt: number; catalog: SeriesCatalog;
-  listing: SeriesListing; release: SeriesRelease; manifest: Manifest; anchor?: EntryBinding;
+  listing: SeriesListing; release: SeriesRelease; manifest?: Manifest; anchor?: SeriesEntryBinding;
 };
-type Preview = { input: string; malId?: number; listingId?: number; entryId?: string };
+type Preview = { input: string; malId?: number; listingId?: number; entryId?: string; deferMetadata?: boolean };
 type Confirm = { draftId: string; expectedAirAt?: number | null; finalEpisode?: number | null; catalogEpisode?: number };
 export type SeriesAction = {
   revision: number; action: 'pause' | 'resume' | 'stop' | 'check' | 'skip' | 'approve-alternate' |
@@ -142,6 +143,7 @@ function seedBroadcast(catalog: SeriesCatalog, publishedAt: number, catalogEpiso
 function publicFollow(follow: SeriesFollow) {
   const { id, malId, revision, title, anchorTitle, nextEpisode, status, nextCheckAt, lastCheckedAt, expectedAirAt, error, alternative, episodeCount } = follow;
   return { id, malId, revision, title, anchorTitle, nextEpisode, status, nextCheckAt, lastCheckedAt, expectedAirAt, error,
+    pending: follow.pendingSeed ? 'setup' : follow.pendingRelease ? 'episode' : null,
     episodeCount, finalEpisode: finale(follow), finalEpisodeOverride: follow.finalEpisode,
     alternative: alternative ? { id: alternative.id, title: alternative.title } : null };
 }
@@ -154,8 +156,11 @@ export class SeriesService {
   private nyaaBackoff = 0;
   private malBackoff = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
+  private readonly metadata: SeriesMetadata;
 
-  constructor(private readonly engine: Engine, private readonly provider: SeriesProvider) {}
+  constructor(private readonly engine: Engine, private readonly provider: SeriesProvider, askDesktop: AskDesktop = () => []) {
+    this.metadata = new SeriesMetadata(provider, engine.store, () => engine.now(), askDesktop);
+  }
 
   start(onError: (error: unknown) => void) {
     if (this.timer) return;
@@ -172,6 +177,32 @@ export class SeriesService {
 
   list(roomId: string) {
     return { enabled: true, items: this.engine.store.listSeries(roomId).map(publicFollow) };
+  }
+
+  desktopOnline(roomId: string) {
+    for (const follow of this.engine.store.listSeries(roomId)) {
+      const pending = follow.pendingSeed ?? follow.pendingRelease;
+      if (follow.status === 'active' && pending?.desktopEligible &&
+          !this.engine.store.getSeriesMetadata(pending.listing.infoHash, this.engine.now())) {
+        this.metadata.ask(roomId, pending.listing, follow.catalogTitles, pending.failures);
+      }
+    }
+  }
+
+  acceptMetadata(roomId: string, memberId: string, requestId: string, bytes: Buffer) {
+    const hash = this.metadata.accept(roomId, memberId, requestId, bytes);
+    const now = this.engine.now();
+    for (const follow of this.engine.store.listSeries(roomId)) {
+      const pending = follow.pendingSeed ?? follow.pendingRelease;
+      if (follow.status === 'active' && pending?.listing.infoHash === hash &&
+          follow.nextCheckAt !== null && follow.nextCheckAt > now) {
+        this.engine.commitSeries({
+          follow: { ...follow, nextCheckAt: now, revision: follow.revision + 1, updatedAt: now },
+          expectedRevision: follow.revision,
+        });
+      }
+    }
+    return { accepted: true };
   }
 
   private trimDrafts(now: number) {
@@ -212,7 +243,7 @@ export class SeriesService {
           ? [{ id: item.id, title: item.title, episode: match.episode, group: match.group, edition: match.edition }] : [];
       }).slice(0, 25) };
       if (!listing || !parsed || !malId || !catalog[0]) return result;
-      const manifest = await this.provider.metadata(listing, verifiedCatalogTitles(catalog[0]));
+      const manifest = input.deferMetadata ? undefined : await this.metadata.resolve(roomId, listing, verifiedCatalogTitles(catalog[0]));
       const now = this.engine.now();
       const anchor = entry ? { id: entry.id, mediaId: entry.mediaId, path: entry.path, size: entry.size } : undefined;
       if (anchor) this.checkAnchor(roomId, anchor);
@@ -249,7 +280,7 @@ export class SeriesService {
     return entry;
   }
 
-  private checkAnchor(roomId: string, anchor: EntryBinding) {
+  private checkAnchor(roomId: string, anchor: SeriesEntryBinding) {
     const entry = this.roomEntry(roomId, anchor.id);
     requireThat(entry.mediaId === anchor.mediaId && entry.path === anchor.path && entry.size === anchor.size,
       'SERIES_ANCHOR_CHANGED', 'The episode changed. Preview the current room episode before following it.', 409);
@@ -279,12 +310,14 @@ export class SeriesService {
     if (end !== null && follow.nextEpisode > end) {
       follow.status = 'finished'; follow.nextCheckAt = null; follow.nextCatalogAt = null;
       follow.expectedAirAt = null; follow.alternative = null; follow.manualCheck = false; follow.error = null;
+      delete follow.pendingRelease;
       return true;
     }
     return false;
   }
 
   private advance(follow: SeriesFollow, now: number) {
+    delete follow.pendingRelease;
     ++follow.nextEpisode;
     follow.airtimeManual = false;
     follow.manualCheck = false;
@@ -297,10 +330,10 @@ export class SeriesService {
   }
 
   add(roomId: string, memberId: string, input: Confirm) {
-    const draft = this.draft(roomId, memberId, input.draftId);
     const store = this.engine.store, now = this.engine.now();
-    const previous = store.getSeries(roomId, draft.id);
+    const previous = store.getSeries(roomId, input.draftId);
     if (previous) return { item: publicFollow(previous) };
+    const draft = this.draft(roomId, memberId, input.draftId);
     if (draft.anchor) this.checkAnchor(roomId, draft.anchor);
     const rules = store.listSeries(roomId);
     requireThat(rules.length < MAX_ROOM_RULES && rules.filter(f => f.status === 'active' || f.status === 'paused').length < MAX_FOLLOWS,
@@ -325,17 +358,34 @@ export class SeriesService {
       nextCatalogAt: now + CATALOG_INTERVAL, manualCheck: false, dismissedAlternativeHashes: [],
       error: null, alternative: null, createdAt: now, updatedAt: now };
     follow.expectedAirAt = input.expectedAirAt !== undefined ? input.expectedAirAt : forecast(follow, follow.nextEpisode);
+    if (!draft.manifest && !store.getSeriesEpisode(roomId, follow.malId, catalogEpisode)) {
+      follow.pendingSeed = { listing: draft.listing, anchor: draft.anchor, failures: 0, desktopEligible: false };
+      follow.nextCheckAt = now; follow.nextCatalogAt = null;
+      follow.error = 'Checking the starting release. WatchPair retries automatically if metadata is temporarily unavailable.';
+      this.engine.commitSeries({ follow, expectedRevision: null });
+    } else {
+      this.completeSeed(follow, null, draft.listing, draft.anchor, draft.manifest);
+    }
+    return { item: publicFollow(follow) };
+  }
+
+  private completeSeed(follow: SeriesFollow, revision: number | null, listing: SeriesListing,
+    anchor?: SeriesEntryBinding, manifest?: Manifest) {
+    const now = this.engine.now();
+    if (follow.pendingSeed) follow.lastCheckedAt = null;
+    delete follow.pendingSeed;
+    follow.nextCatalogAt = now + CATALOG_INTERVAL;
     follow.nextCheckAt = scheduledCheck(follow, now);
     follow.error = scopeReview(follow);
     this.finishIfDone(follow);
-    const seed = this.episode(follow, release.episode, draft.anchor ? 'existing' : 'added', draft.listing.id, draft.anchor?.id);
-    if (store.getSeriesEpisode(roomId, follow.malId, seed.episode)) {
-      this.engine.commitSeries({ follow, expectedRevision: null });
+    const seed = this.episode(follow, follow.nextEpisode - 1, anchor ? 'existing' : 'added', listing.id, anchor?.id);
+    if (this.engine.store.getSeriesEpisode(follow.roomId, follow.malId, seed.episode)) {
+      this.engine.commitSeries({ follow, expectedRevision: revision });
     } else {
-      this.engine.commitSeries({ follow, expectedRevision: null, episodes: [seed] },
-        draft.anchor ? [] : [{ episode: seed.episode, ...draft.manifest }]);
+      requireThat(manifest, 'SERIES_METADATA_REQUIRED', 'The starting release still needs verified torrent metadata.', 409);
+      this.engine.commitSeries({ follow, expectedRevision: revision, episodes: [seed] },
+        anchor ? [] : [{ episode: seed.episode, ...manifest }]);
     }
-    return { item: publicFollow(follow) };
   }
 
   async action(roomId: string, id: string, memberId: string, input: SeriesAction, reauthenticate = () => {}) {
@@ -349,15 +399,21 @@ export class SeriesService {
       const review = scopeReview(follow);
       if (review) throw new DomainError('SERIES_FINALE', review, 422);
     };
+    requireThat(!follow.pendingSeed || ['pause', 'resume', 'stop'].includes(input.action),
+      'SERIES_PENDING', 'The starting release needs verified metadata before this action is available.', 409);
     let handled: SeriesEpisode | undefined, manifest: Manifest | undefined;
     switch (input.action) {
       case 'pause':
         active(); follow.status = 'paused'; follow.nextCheckAt = null; follow.manualCheck = false; break;
       case 'resume':
         requireThat(follow.status === 'paused', 'SERIES_INACTIVE', 'Only a paused follow can be resumed.', 409);
-        follow.status = 'active'; follow.nextCatalogAt = now; follow.nextCheckAt = scheduledCheck(follow, now); break;
+        follow.status = 'active';
+        follow.nextCatalogAt = follow.pendingSeed ? null : now;
+        follow.nextCheckAt = follow.pendingSeed || follow.pendingRelease ? now : scheduledCheck(follow, now); break;
       case 'stop':
-        follow.status = 'stopped'; follow.nextCheckAt = null; follow.nextCatalogAt = null; follow.alternative = null; follow.manualCheck = false; break;
+        follow.status = 'stopped'; follow.nextCheckAt = null; follow.nextCatalogAt = null; follow.alternative = null; follow.manualCheck = false;
+        if (follow.pendingSeed || follow.pendingRelease) follow.error = null;
+        delete follow.pendingSeed; delete follow.pendingRelease; break;
       case 'check':
         active(); checkScope();
         requireThat(!follow.manualCheck && (follow.lastCheckedAt === null || now - follow.lastCheckedAt >= CHECK_COOLDOWN),
@@ -370,7 +426,8 @@ export class SeriesService {
           const anchor = parseSeriesTitle(follow.anchorTitle)!;
           follow.anchorBroadcastAt = input.expectedAirAt - (follow.nextEpisode - anchor.episode) * 7 * DAY;
         }
-        follow.nextCheckAt = scheduledCheck(follow, now); break;
+        if (!follow.pendingRelease) follow.nextCheckAt = scheduledCheck(follow, now);
+        break;
       case 'set-finale': {
         active(); requireThat(input.finalEpisode !== undefined && (input.finalEpisode === null || input.finalEpisode >= follow.nextEpisode - 1),
           'SERIES_FINALE', 'The finale cannot come before the episodes already accounted for.', 422);
@@ -378,6 +435,7 @@ export class SeriesService {
         const review = scopeReview(follow);
         if (follow.status === 'active' && review) {
           follow.nextCheckAt = null; follow.manualCheck = false; follow.alternative = null; follow.error = review;
+          delete follow.pendingRelease;
         } else if (follow.status === 'active' && follow.nextCheckAt === null) {
           follow.nextCheckAt = scheduledCheck(follow, now);
           if (follow.error === UNKNOWN_FINALE || follow.error === WAITING_FOR_FINALE) follow.error = null;
@@ -398,6 +456,7 @@ export class SeriesService {
         const draft = this.draft(roomId, memberId, input.draftId);
         requireThat(!draft.anchor && draft.catalog.id === follow.malId && draft.release.episode === follow.nextEpisode, 'SERIES_REPLACE',
           'Choose a release for the same catalog entry and the current missing episode.', 422);
+        requireThat(draft.manifest, 'SERIES_METADATA_REQUIRED', 'Preview the new release to verify its torrent metadata.', 409);
         const priorForecast = forecast(follow, follow.nextEpisode);
         follow.anchorBroadcastAt = follow.expectedAirAt ?? priorForecast;
         follow.anchorPublishedAt = draft.listing.publishedAt;
@@ -421,7 +480,7 @@ export class SeriesService {
           const source = eligible(listing), anchor = parseSeriesTitle(follow.anchorTitle);
           requireThat(source && anchor && sameSeriesStem(anchor, source) && source.episode === follow.nextEpisode,
             'SERIES_ALTERNATE', 'The alternative no longer matches the missing episode.', 409);
-          manifest = await this.provider.metadata(listing, follow.catalogTitles);
+          manifest = await this.metadata.resolve(roomId, listing, follow.catalogTitles);
         } catch (error) {
           if (error instanceof SeriesProviderError) throw providerError(error);
           throw error;
@@ -447,10 +506,49 @@ export class SeriesService {
   private async poll() {
     const original = this.engine.store.dueSeries(this.engine.now(), 1)[0];
     if (!original) return;
-    try { await this.pollFollow(original); }
+    try {
+      if (original.pendingSeed) await this.pollSeed(original, original.pendingSeed);
+      else await this.pollFollow(original);
+    }
     catch (error) {
       if (error instanceof DomainError && ['SERIES_CONFLICT', 'SERIES_NOT_FOUND', 'ROOM_NOT_FOUND'].includes(error.code)) return;
       throw error;
+    }
+  }
+
+  private saveRetry(follow: SeriesFollow, error: SeriesProviderError, pending: SeriesMetadataRetry) {
+    const failures = pending.failures + 1;
+    const delay = this.providerDelay(error, Math.min(30 * 60_000, 60_000 * 2 ** Math.min(5, pending.failures)));
+    follow.nextCheckAt = this.engine.now() + delay;
+    follow.error = 'Waiting for Nyaa torrent metadata. WatchPair will retry automatically.';
+    return { ...pending, failures, desktopEligible: canAskDesktop(error) };
+  }
+
+  private async pollSeed(original: SeriesFollow, pending: NonNullable<SeriesFollow['pendingSeed']>) {
+    const follow = { ...original, revision: original.revision + 1, updatedAt: this.engine.now(),
+      lastCheckedAt: this.engine.now() };
+    const { anchor, listing } = pending;
+    try {
+      if (anchor) this.checkAnchor(follow.roomId, anchor);
+      const manifest = await this.metadata.resolve(follow.roomId, listing, follow.catalogTitles, pending.failures);
+      if (this.closing) return;
+      this.existing(follow.roomId, follow.id, original.revision);
+      if (anchor) this.checkAnchor(follow.roomId, anchor);
+      this.completeSeed(follow, original.revision, listing, anchor, manifest);
+    } catch (error) {
+      if (this.closing) return;
+      Object.assign(follow, original, { revision: original.revision + 1, updatedAt: this.engine.now(), lastCheckedAt: follow.lastCheckedAt });
+      follow.pendingSeed = pending;
+      follow.nextCatalogAt = null;
+      if (retryableMetadata(error)) {
+        follow.pendingSeed = { ...this.saveRetry(follow, error, pending), anchor };
+      } else if (error instanceof SeriesProviderError || error instanceof DomainError &&
+          (QUEUE_APPEND_ERRORS.has(error.code) || ['ENTRY_NOT_FOUND', 'SERIES_ANCHOR_CHANGED'].includes(error.code))) {
+        follow.status = 'paused';
+        follow.nextCheckAt = null;
+        follow.error = error.message;
+      } else throw error;
+      this.engine.commitSeries({ follow, expectedRevision: original.revision });
     }
   }
 
@@ -469,6 +567,7 @@ export class SeriesService {
       if (review) {
         follow.error = review;
         follow.nextCheckAt = null; follow.manualCheck = false; follow.alternative = null;
+        delete follow.pendingRelease;
         return;
       }
       if (follow.error === UNKNOWN_FINALE || follow.error === WAITING_FOR_FINALE || follow.error === CATALOG_UNAVAILABLE) follow.error = null;
@@ -479,10 +578,10 @@ export class SeriesService {
         }
         const predicted = forecast(follow, follow.nextEpisode);
         follow.expectedAirAt = predicted;
-        if (!follow.manualCheck) follow.nextCheckAt = scheduledCheck(follow, now);
+        if (!follow.manualCheck && !follow.pendingRelease) follow.nextCheckAt = scheduledCheck(follow, now);
       }
       if (previousReview && follow.nextCheckAt === null) follow.nextCheckAt = scheduledCheck(follow, now);
-      if (follow.finishConfirmed && (!hadFinale || follow.nextCheckAt === null)) follow.nextCheckAt = now;
+      if (follow.finishConfirmed && !follow.pendingRelease && (!hadFinale || follow.nextCheckAt === null)) follow.nextCheckAt = now;
     } catch (error) {
       if (!(error instanceof SeriesProviderError)) throw error;
       this.malBackoff = now + this.providerDelay(error, HOUR);
@@ -519,6 +618,32 @@ export class SeriesService {
     if (this.closing) return;
     this.existing(follow.roomId, follow.id, revision);
     if (this.finishIfDone(follow) || follow.nextCheckAt === null || follow.nextCheckAt > now) { commit(); return; }
+    if (follow.pendingRelease) {
+      const pending = follow.pendingRelease;
+      const record = this.episode(follow, follow.nextEpisode, 'added', pending.listing.id);
+      try {
+        const manifest = this.engine.store.getSeriesEpisode(follow.roomId, follow.malId, record.episode)
+          ? undefined : await this.metadata.resolve(follow.roomId, pending.listing, follow.catalogTitles, pending.failures);
+        if (this.closing) return;
+        this.advance(follow, now);
+        commit(manifest ? record : undefined, manifest);
+      } catch (error) {
+        if (this.closing) return;
+        if (retryableMetadata(error)) follow.pendingRelease = this.saveRetry(follow, error, pending);
+        else if (error instanceof SeriesProviderError) {
+          delete follow.pendingRelease;
+          follow.error = error.message;
+          follow.nextCheckAt = this.nextRetry(follow, now, follow.manualCheck);
+        } else if (error instanceof DomainError && QUEUE_APPEND_ERRORS.has(error.code)) {
+          Object.assign(follow, original);
+          follow.pendingRelease = { ...pending, desktopEligible: false };
+          follow.error = error.message;
+          follow.nextCheckAt = now + DAY;
+        } else throw error;
+        commit();
+      }
+      return;
+    }
     if (now < this.nyaaBackoff) { follow.nextCheckAt = this.nyaaBackoff; commit(); return; }
     const anchor = eligible({ id: follow.anchorListingId, title: follow.anchorTitle, infoHash: '', publishedAt: now });
     if (!anchor) { follow.error = 'The starting release needs a new preview.'; follow.nextCheckAt = null; commit(); return; }
@@ -561,8 +686,14 @@ export class SeriesService {
         if (exact.length === 1) {
           const listing = exact[0]!.listing;
           let manifest: Manifest | undefined;
-          try { manifest = await this.provider.metadata(listing, follow.catalogTitles); }
+          try { manifest = await this.metadata.resolve(follow.roomId, listing, follow.catalogTitles); }
           catch (error) {
+            if (retryableMetadata(error)) {
+              follow.pendingRelease = this.saveRetry(follow, error, { listing, failures: 0, desktopEligible: false });
+              follow.alternative = null;
+              if (!this.closing) commit();
+              return;
+            }
             if (!unavailableListing(error)) throw error;
             follow.error = error.message;
           }
@@ -610,11 +741,9 @@ export class SeriesService {
     } catch (error) {
       if (!(error instanceof SeriesProviderError)) throw error;
       this.nyaaBackoff = now + this.providerDelay(error, 30 * 60_000);
-      follow.nextCheckAt = manual && follow.expectedAirAt === null && !follow.finishConfirmed
-        ? null : Math.max(this.nyaaBackoff, follow.finishConfirmed ? 0 : follow.expectedAirAt ?? 0);
-      follow.error = follow.nextCheckAt === null
-        ? 'Nyaa is temporarily unavailable. Use Check now to try again later.'
-        : 'Nyaa is temporarily unavailable. WatchPair will retry without advancing the episode.';
+      follow.manualCheck = manual;
+      follow.nextCheckAt = Math.max(this.nyaaBackoff, follow.finishConfirmed ? 0 : follow.expectedAirAt ?? 0);
+      follow.error = 'Nyaa is temporarily unavailable. WatchPair will retry without advancing the episode.';
       if (!this.closing) commit();
     }
   }
@@ -629,7 +758,7 @@ export class SeriesService {
   private async offer(follow: SeriesFollow, alternatives: SeriesListing[]) {
     if (follow.alternative && alternatives.some(listing => listing.infoHash === follow.alternative?.infoHash)) return follow.alternative;
     for (const listing of alternatives.slice(0, 2)) {
-      try { await this.provider.metadata(listing, follow.catalogTitles); return newAlternative(listing); }
+      try { await this.metadata.resolve(follow.roomId, listing, follow.catalogTitles); return newAlternative(listing); }
       catch (error) { if (!unavailableListing(error)) throw error; }
     }
     return null;

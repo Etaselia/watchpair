@@ -19,6 +19,7 @@ class SeriesFollowDialog final : public QDialog {
 public:
   explicit SeriesFollowDialog(RoomClient &rooms, QString room, QWidget *parent = nullptr,
                               QJsonObject replacing = {}, QString anchorEntryId = {});
+  bool isPending() const { return pending_; }
 
 private:
   void lookup();
@@ -39,7 +40,7 @@ private:
   QCheckBox *overrideAir_, *overrideNumber_, *limit_;
   QDateTimeEdit *airtime_;
   QSpinBox *catalogEpisode_, *finalEpisode_;
-  bool busy_ = false;
+  bool busy_ = false, pending_ = false;
 };
 
 class SeriesManagerDialog final : public QDialog {
@@ -49,6 +50,7 @@ public:
 
 private:
   void load();
+  void applyList(const QJsonObject &result);
   void updateRows(const QJsonArray &items);
   QJsonObject selected() const;
   void updateActions();

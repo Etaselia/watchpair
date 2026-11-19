@@ -749,7 +749,10 @@ void MainWindow::followSeries(const QString &room, const QString &entryId) {
     return;
   auto *dialog = new SeriesFollowDialog(app_.rooms, room, this, {}, entryId);
   dialog->setAttribute(Qt::WA_DeleteOnClose);
-  connect(dialog, &QDialog::accepted, this, [this] { statusBar()->showMessage(tr("Series followed"), 5000); });
+  connect(dialog, &QDialog::accepted, this, [this, dialog] {
+    statusBar()->showMessage(dialog->isPending() ? tr("Follow saved. See its status in Series follows.")
+                                                : tr("Series followed"), 7000);
+  });
   dialog->open();
 }
 void MainWindow::manageSeries(const QString &room) {

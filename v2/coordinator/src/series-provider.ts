@@ -4,7 +4,7 @@ import { fileSchema, sourceSchema, type FileDescriptor, type Source } from './pr
 const MAL = 'https://api.myanimelist.net';
 const NYAA = 'https://nyaa.si';
 const NYAA_FIELDS = 'https://nyaa.si/xmlns/nyaa';
-const MAX_BYTES = 2 * 1024 * 1024;
+export const MAX_SERIES_METADATA_BYTES = 2 * 1024 * 1024;
 const MAX_LISTINGS = 150;
 const FIELDS = 'id,title,alternative_titles,broadcast,start_date,end_date,status,num_episodes';
 const VIDEO_SUFFIX = /\.(?:mkv|mp4|webm|avi|m4v|mov|ts|m2ts)$/i;
@@ -38,7 +38,7 @@ export interface SeriesProvider {
   catalog(id: number): Promise<SeriesCatalog>;
   searchReleases(query: string, uploader?: string): Promise<SeriesListing[]>;
   listing(id: number): Promise<SeriesListing>;
-  metadata(listing: SeriesListing, catalogTitles?: readonly string[]): Promise<{ source: Source; file: FileDescriptor }>;
+  metadata(listing: SeriesListing, catalogTitles?: readonly string[]): Promise<{ source: Source; file: FileDescriptor; bytes?: Buffer }>;
 }
 
 export class SeriesProviderError extends Error {
@@ -296,7 +296,7 @@ class TorrentReader {
 }
 
 export function verifySeriesMetainfo(data: Buffer, listing: SeriesListing, catalogTitles: readonly string[] = []): { source: Source; file: FileDescriptor } {
-  if (!data.length || data.length > MAX_BYTES || !validId(listing.id) || !/^[a-f0-9]{40}$/i.test(listing.infoHash)) invalidTorrent();
+  if (!data.length || data.length > MAX_SERIES_METADATA_BYTES || !validId(listing.id) || !/^[a-f0-9]{40}$/i.test(listing.infoHash)) invalidTorrent();
   const reader = new TorrentReader(data), torrent = reader.read();
   if (!(torrent instanceof Map) || reader.offset !== data.length || !reader.infoBytes) invalidTorrent();
   const info = torrent.get('info');
@@ -330,7 +330,7 @@ function retryAfter(header: string | null, now: number) {
 class Cache<T> {
   private ready = new Map<string, { expires: number; value: T }>();
   private pending = new Map<string, Promise<T>>();
-  constructor(private now: () => number, private ttl: number) {}
+  constructor(private now: () => number, private ttl: number, private maxEntries = 64) {}
 
   get(key: string, load: () => Promise<T>): Promise<T> {
     const entry = this.ready.get(key);
@@ -341,7 +341,7 @@ class Cache<T> {
     const pending = load().then(value => {
       this.ready.delete(key);
       this.ready.set(key, { expires: this.now() + this.ttl, value });
-      if (this.ready.size > 64) this.ready.delete(this.ready.keys().next().value!);
+      if (this.ready.size > this.maxEntries) this.ready.delete(this.ready.keys().next().value!);
       return value;
     }).finally(() => this.pending.delete(key));
     this.pending.set(key, pending);
@@ -355,7 +355,7 @@ export function createSeriesProvider(clientId?: string, options: { fetch?: typeo
   const searches = new Cache<SeriesCatalog[]>(now, 15 * 60 * 1000);
   const feeds = new Cache<SeriesListing[]>(now, 5 * 60 * 1000);
   const listings = new Cache<SeriesListing>(now, 5 * 60 * 1000);
-  const metadata = new Cache<{ source: Source; file: FileDescriptor }>(now, 5 * 60 * 1000);
+  const metadata = new Cache<{ source: Source; file: FileDescriptor; bytes: Buffer }>(now, 5 * 60 * 1000, 8);
   const busyUntil = new Map<string, number>();
   let active = 0;
 
@@ -386,7 +386,7 @@ export function createSeriesProvider(clientId?: string, options: { fetch?: typeo
         const { done, value } = await reader.read();
         if (done) break;
         size += value.length;
-        if (size > MAX_BYTES) {
+        if (size > MAX_SERIES_METADATA_BYTES) {
           void reader.cancel().catch(() => {});
           throw new SeriesProviderError(`${unavailable} returned an oversized response.`);
         }
@@ -447,8 +447,10 @@ export function createSeriesProvider(clientId?: string, options: { fetch?: typeo
     async metadata(listing, catalogTitles = []) {
       if (!validId(listing.id) || !HASH.test(listing.infoHash) || !safeTitle(listing.title)) invalidTorrent();
       const key = JSON.stringify([listing.id, listing.infoHash, listing.title, catalogTitles]);
-      return metadata.get(key, async () => verifySeriesMetainfo(
-        await read(new URL(`/download/${listing.id}.torrent`, NYAA), 'application/x-bittorrent'), listing, catalogTitles));
+      return metadata.get(key, async () => {
+        const bytes = await read(new URL(`/download/${listing.id}.torrent`, NYAA), 'application/x-bittorrent');
+        return { ...verifySeriesMetainfo(bytes, listing, catalogTitles), bytes };
+      });
     },
   };
 }

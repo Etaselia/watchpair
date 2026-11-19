@@ -38,13 +38,14 @@ The current reporter's consecutive, plausible played intervals contribute distin
 
 ## Series follows
 
-`GET /v2/version` advertises `seriesFollows` and `seriesFollowFromEntry`. With series follows enabled, these routes require a room member's bearer token. Paths are relative to `/v2/rooms/:roomId`.
+`GET /v2/version` advertises `seriesFollows`, `seriesFollowFromEntry`, and `seriesPendingFollows`. With series follows enabled, these routes require a room member's bearer token. Paths are relative to `/v2/rooms/:roomId`.
 
 | Route | Contract |
 | --- | --- |
-| `GET /series` | Returns the room's follow rules with their status, revision, next episode, estimated airtime, last check, fallback offer and any review reason. Times use Unix epoch milliseconds. |
-| `POST /series/preview` | Accepts `input` with optional `malId`, `listingId`, or room `entryId`. Send an empty `input` with `entryId` to look up an existing episode by its verified Nyaa listing or filename. A concrete selection with verified torrent metadata returns a temporary draft bound to the same room, member, and selected entry. |
+| `GET /series` | Returns the room's follow rules and check times in Unix epoch milliseconds. `pending` can be `setup` while verifying the starting release, `episode` while verifying a later release, or `null`. An active pending rule includes its next verification time. |
+| `POST /series/preview` | Accepts `input` with optional `malId`, `listingId`, or room `entryId`. Send an empty `input` with `entryId` to look up an existing episode by its Nyaa listing or filename. A concrete season and release return a temporary draft bound to the room, member, and selected entry. With `deferMetadata: true`, the coordinator can save a new follow and verify its torrent in the background. Source changes still require a preview with verified metadata. |
 | `POST /series` | Confirms a `draftId` with optional `expectedAirAt`, release-numbered `finalEpisode`, and `catalogEpisode` for absolute numbering. Omit `expectedAirAt` to accept the estimate or pass `null` when it is unknown. A draft for an existing entry records it as the starting episode and begins following the next one. |
 | `POST /series/:id/actions` | Takes `action` and the current follow `revision`. Actions cover pause, resume, stop, check, skip, link existing, set airtime or finale, replace source, and approve or dismiss an alternate. Only the current host can approve or dismiss an alternate. |
+| `POST /series/metadata/:requestId` | A room member who received the matching request can return up to 2 MiB of binary torrent metadata as `application/vnd.watchpair.torrent`. The coordinator checks the info hash from Nyaa and validates the episode before caching or using it. |
 
-Series status refreshes independently of the room event stream. Added episodes arrive in the ordinary queue snapshot with the same ordering and download rules as other queue entries.
+Desktops that can help send `X-WatchPair-Series-Metadata: 1` when opening the room WebSocket. A `series.metadata` event carries a short-lived `requestId` and numeric `listingId`. It asks the desktop to fetch the public HTTPS `.torrent` from Nyaa and return its bytes. A `series.changed` event carries the committed follow list in `data` with the same format as `GET /series`. Added episodes arrive in the ordinary queue snapshot and use the room's usual download rules.

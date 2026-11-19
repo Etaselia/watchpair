@@ -9,6 +9,9 @@ export type Operation = { memberId: string; id: string; hash: string; revision: 
 export type Save = { metadata?: boolean; queue?: boolean; entries?: Entry[]; history?: History[]; clearHistory?: boolean; operation?: Operation; creationHash?: string; series?: SeriesSave };
 type Metadata = Pick<Room, 'id' | 'name' | 'hostId' | 'successorId' | 'inviteHash' | 'recoveryHash' | 'createdAt' | 'sources' | 'members' | 'recoveryRetry'>;
 type Runtime = Pick<Room, 'revision' | 'queueRevision' | 'historyGeneration' | 'playback' | 'reporterId'>;
+const SERIES_METADATA_RETENTION = 14 * 24 * 60 * 60_000;
+const SERIES_METADATA_MAX_ENTRIES = 64;
+const SERIES_METADATA_MAX_BYTES = 16 * 1024 * 1024;
 
 // Only the small runtime row is checkpointed during playback. A 10,000-entry
 // season pack is never rewritten on every heartbeat or coverage report.
@@ -18,7 +21,7 @@ export class Store {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path, { enableForeignKeyConstraints: true });
     const version = Number(this.db.prepare('PRAGMA user_version').get()?.user_version ?? 0);
-    if (version > 2) { this.db.close(); throw new Error('This coordinator cannot open a newer WatchPair database. Update the coordinator.'); }
+    if (version > 3) { this.db.close(); throw new Error('This coordinator cannot open a newer WatchPair database. Update the coordinator.'); }
     this.db.exec(`
       PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS rooms (id TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -55,6 +58,15 @@ export class Store {
         PRIMARY KEY (room_id,mal_id,episode)
       );
       PRAGMA user_version=2;
+    `));
+    if (version < 3) this.transaction(() => this.db.exec(`
+      CREATE TABLE IF NOT EXISTS series_metadata (
+        info_hash TEXT PRIMARY KEY,
+        verified_at INTEGER NOT NULL,
+        metadata BLOB NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS series_metadata_age ON series_metadata(verified_at,info_hash);
+      PRAGMA user_version=3;
     `));
     // Older coordinators used an epoch + monotonic clock with fractional
     // milliseconds. Normalize both the JSON and ordering column together so
@@ -176,6 +188,29 @@ export class Store {
     const row = this.db.prepare('SELECT data FROM series_episodes WHERE room_id=? AND mal_id=? AND episode=?')
       .get(roomId, malId, episode);
     return row ? JSON.parse(String(row.data)) as SeriesEpisode : null;
+  }
+
+  getSeriesMetadata(hash: string, now: number): Buffer | null {
+    const row = this.db.prepare('SELECT metadata FROM series_metadata WHERE info_hash=? AND verified_at>?')
+      .get(hash, now - SERIES_METADATA_RETENTION);
+    return row?.metadata instanceof Uint8Array ? Buffer.from(row.metadata) : null;
+  }
+
+  saveSeriesMetadata(hash: string, bytes: Buffer, now: number) {
+    this.transaction(() => {
+      this.db.prepare('DELETE FROM series_metadata WHERE verified_at<=?').run(now - SERIES_METADATA_RETENTION);
+      this.db.prepare('INSERT INTO series_metadata VALUES(?,?,?) ON CONFLICT(info_hash) DO UPDATE SET verified_at=excluded.verified_at,metadata=excluded.metadata')
+        .run(hash, now, bytes);
+      // Bound the cache by both count and combined blob size.
+      this.db.prepare(`
+        DELETE FROM series_metadata WHERE info_hash IN (
+          SELECT info_hash FROM (
+            SELECT info_hash, row_number() OVER age AS ordinal, sum(length(metadata)) OVER age AS bytes
+            FROM series_metadata WINDOW age AS (ORDER BY verified_at DESC, info_hash ROWS UNBOUNDED PRECEDING)
+          ) WHERE ordinal>? OR bytes>?
+        )
+      `).run(SERIES_METADATA_MAX_ENTRIES, SERIES_METADATA_MAX_BYTES);
+    });
   }
 
   saveSeries(plan: SeriesSave) {

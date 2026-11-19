@@ -80,6 +80,7 @@ signals:
 private:
   void updateQueue();
   void pollSeriesFollows();
+  void applySeriesFollows(const QJsonObject &result);
   void updateSeriesButton();
   void updateTracks();
   void mark(bool watched);
@@ -126,7 +127,8 @@ private:
   QTimer refresh_;
   QTimer seriesRefresh_;
   QString seriesRequestRoom_;
-  bool seriesReviewPending_ = false;
+  quint64 seriesRequestGeneration_ = 0;
+  bool seriesReviewPending_ = false, seriesMetadataPending_ = false;
   bool seeking_ = false, fullscreen_ = false;
   double seekDuration_ = 0;
   int seekGeneration_ = -1, tracksGeneration_ = -1;

@@ -13,6 +13,7 @@
 #include <QProcess>
 #include <QMessageBox>
 #include <QMenu>
+#include <QStatusBar>
 #include <QToolButton>
 #include <QSurfaceFormat>
 #include <QTemporaryDir>
@@ -115,13 +116,43 @@ private slots:
       screenshot(*follow, QStringLiteral("series-confirmation"));
       QTest::mouseClick(confirm, Qt::LeftButton);
       QTRY_VERIFY_WITH_TIMEOUT(!follow, 5000);
-      QTRY_COMPARE_WITH_TIMEOUT(services.rooms.room(room).value(QStringLiteral("entries")).toArray().size(), 1, 5000);
       auto *list = manager->findChild<QListWidget *>(QStringLiteral("SeriesFollowList"));
       QVERIFY(list);
       const auto available = [manager](const QString &label) {
         const auto *control = button(*manager, label);
         return control && control->isEnabled();
       };
+      QTRY_COMPARE_WITH_TIMEOUT(list->count(), 1, 5000);
+      QVERIFY(list->currentItem()->text().contains(QStringLiteral("Pending · Verifying starting release")));
+      QTRY_COMPARE_WITH_TIMEOUT(roomSeries->text(), QStringLiteral("Series follows · Pending"), 5000);
+      QCOMPARE(services.rooms.room(room).value(QStringLiteral("entries")).toArray().size(), 0);
+      QVERIFY(!available(QStringLiteral("Check now")));
+      QLabel *pendingDetails = nullptr;
+      for (auto *label : manager->findChildren<QLabel *>()) {
+        if (label->text().contains(QStringLiteral("Next verification attempt:"))) {
+          pendingDetails = label;
+          break;
+        }
+      }
+      QVERIFY(pendingDetails);
+      QTRY_VERIFY_WITH_TIMEOUT(pendingDetails->isVisible() &&
+                                   pendingDetails->height() >= pendingDetails->heightForWidth(pendingDetails->width()),
+                               5000);
+      screenshot(*manager, QStringLiteral("series-pending"));
+
+      QSignalSpy seriesChanged(&services.rooms, &wp::RoomClient::seriesFollowsChanged);
+      QVERIFY(server.checkSeries());
+      QTRY_COMPARE_WITH_TIMEOUT(services.rooms.room(room).value(QStringLiteral("entries")).toArray().size(), 1, 5000);
+      const auto followState = [&] {
+        return QStringLiteral("Notifications=%1, connection=%2, manager visible=%3, selected row=%4")
+            .arg(seriesChanged.size())
+            .arg(services.rooms.connectionState(room))
+            .arg(manager->isVisible())
+            .arg(list->currentItem() ? list->currentItem()->text() : QStringLiteral("None"));
+      };
+      QTRY_VERIFY2_WITH_TIMEOUT(available(QStringLiteral("Check now")), qPrintable(followState()), 5000);
+      QVERIFY(!list->currentItem()->text().contains(QStringLiteral("Pending")));
+      QTRY_COMPARE_WITH_TIMEOUT(roomSeries->text(), QStringLiteral("Series follows"), 5000);
       QTRY_VERIFY_WITH_TIMEOUT(available(QStringLiteral("Pause")), 5000);
       QCOMPARE(list->count(), 1);
       QTest::mouseClick(button(*manager, QStringLiteral("Pause")), Qt::LeftButton);
@@ -132,7 +163,6 @@ private slots:
       QTest::mouseClick(button(*manager, QStringLiteral("Check now")), Qt::LeftButton);
       QTRY_VERIFY_WITH_TIMEOUT(available(QStringLiteral("Refresh")), 5000);
       QVERIFY(server.checkSeries());
-      QTest::mouseClick(button(*manager, QStringLiteral("Refresh")), Qt::LeftButton);
       QTRY_VERIFY_WITH_TIMEOUT(available(QStringLiteral("Use this release once")), 5000);
       screenshot(*manager, QStringLiteral("series-host-review"));
       QTimer::singleShot(0, &window, [] {
@@ -221,11 +251,20 @@ private slots:
       QVERIFY(preview->text().contains(QStringLiteral("Next episode: 8")));
       QTest::mouseClick(confirm, Qt::LeftButton);
       QTRY_VERIFY_WITH_TIMEOUT(!follow, 5000);
+      QVERIFY(window.statusBar()->currentMessage().contains(QStringLiteral("Follow saved")));
       QJsonArray rules;
       services.rooms.loadSeriesFollows(room, &window, [&](const QJsonObject &result, const QString &) {
         rules = result.value(QStringLiteral("items")).toArray();
       });
       QTRY_COMPARE_WITH_TIMEOUT(rules.size(), 1, 5000);
+      QCOMPARE(rules.first().toObject().value(QStringLiteral("pending")).toString(), QStringLiteral("setup"));
+      QVERIFY(server.checkSeries());
+      rules = {};
+      services.rooms.loadSeriesFollows(room, &window, [&](const QJsonObject &result, const QString &) {
+        rules = result.value(QStringLiteral("items")).toArray();
+      });
+      QTRY_COMPARE_WITH_TIMEOUT(rules.size(), 1, 5000);
+      QVERIFY(rules.first().toObject().value(QStringLiteral("pending")).isNull());
       QCOMPARE(rules.first().toObject().value(QStringLiteral("nextEpisode")).toInt(), 8);
       const auto roomId = services.rooms.credential(room).value(QStringLiteral("roomId")).toString();
       QCOMPARE(server.inspect(roomId).value(QStringLiteral("entries")).toArray().size(), 1);

@@ -115,7 +115,11 @@ export class Engine extends EventEmitter {
   }
   commitSeries(plan: SeriesSave, additions: { episode: number; source: Source; file: FileDescriptor }[] = []) {
     const original = this.room(plan.follow.roomId);
-    if (!additions.length) { this.store.saveSeries(plan); return; }
+    if (!additions.length) {
+      this.store.saveSeries(plan);
+      this.emit('seriesChanged', plan.follow.roomId);
+      return;
+    }
     const room = structuredClone(original), episodes = [...(plan.episodes ?? [])];
     let added = false;
     for (const { episode, source, file } of additions) {
@@ -126,12 +130,17 @@ export class Engine extends EventEmitter {
       added ||= result.added;
     }
     const series = { ...plan, episodes };
-    if (!added) { this.store.saveSeries(series); return; }
+    if (!added) {
+      this.store.saveSeries(series);
+      this.emit('seriesChanged', room.id);
+      return;
+    }
     this.requireManifestCapacity(room);
     ++room.revision; ++room.queueRevision;
     this.store.save(room, this.now(), { metadata: true, queue: true, series });
     this.rooms.set(room.id, room);
     this.notify(room, 'snapshot', this.snapshot(room.id));
+    this.emit('seriesChanged', room.id);
   }
   private state(room: Room) {
     return { id: room.id, name: room.name, hostId: room.hostId, successorId: room.successorId,

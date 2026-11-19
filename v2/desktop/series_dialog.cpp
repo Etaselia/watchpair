@@ -54,6 +54,11 @@ QString statusLabel(const QJsonObject &item) {
     return QObject::tr("Stopped");
   if (status == QStringLiteral("finished"))
     return QObject::tr("Finished");
+  const auto pending = item.value(QStringLiteral("pending")).toString();
+  if (pending == QStringLiteral("setup"))
+    return QObject::tr("Pending · Verifying starting release");
+  if (pending == QStringLiteral("episode"))
+    return QObject::tr("Pending · Verifying episode metadata");
   if (!item.value(QStringLiteral("alternative")).toObject().isEmpty())
     return QObject::tr("Host review");
   if (!item.value(QStringLiteral("error")).toString().isEmpty())
@@ -270,6 +275,8 @@ void SeriesFollowDialog::lookup() {
     return;
   invalidatePreview();
   QJsonObject body{{QStringLiteral("input"), input_->text().trimmed()}};
+  if (replacing_.isEmpty() && rooms_.seriesPendingFollowsAvailable(room_))
+    body.insert(QStringLiteral("deferMetadata"), true);
   if (!anchorEntryId_.isEmpty())
     body.insert(QStringLiteral("entryId"), anchorEntryId_);
   auto malId = catalog_->currentData().toLongLong();
@@ -357,9 +364,10 @@ void SeriesFollowDialog::submit() {
   if (!confirm_->isEnabled())
     return;
   QJsonObject body{{QStringLiteral("draftId"), draft_.value(QStringLiteral("id"))}};
-  const auto done = [this](const QJsonObject &, const QString &error) {
+  const auto done = [this](const QJsonObject &result, const QString &error) {
     busy_ = false;
     if (error.isEmpty()) {
+      pending_ = result.value(QStringLiteral("item")).toObject().value(QStringLiteral("pending")).isString();
       accept();
       return;
     }
@@ -367,6 +375,7 @@ void SeriesFollowDialog::submit() {
     updateActions();
   };
   busy_ = true;
+  feedback_->setText(tr("Saving follow…"));
   updateActions();
   if (!replacing_.isEmpty()) {
     body.insert(QStringLiteral("action"), QStringLiteral("replace-source"));
@@ -458,6 +467,14 @@ SeriesManagerDialog::SeriesManagerDialog(RoomClient &rooms, QString room, QWidge
     if (key == room_)
       updateActions();
   });
+  connect(&rooms_, &RoomClient::seriesFollowsChanged, this, [this](const QString &key, const QJsonObject &result) {
+    if (key == room_) {
+      ++refreshGeneration_;
+      loading_ = false;
+      applyList(result);
+      updateActions();
+    }
+  });
   connect(&rooms_, &RoomClient::connectionChanged, this, [this](const QString &key) {
     if (key == room_)
       updateActions();
@@ -477,17 +494,21 @@ void SeriesManagerDialog::load() {
     if (generation != refreshGeneration_)
       return;
     loading_ = false;
-    if (error.isEmpty()) {
-      enabled_ = result.value(QStringLiteral("enabled")).toBool();
-      updateRows(result.value(QStringLiteral("items")).toArray());
-      feedback_->setText(!enabled_          ? tr("The coordinator has disabled series follows.")
-                         : items_.isEmpty() ? tr("This room is not following any series yet.")
-                                            : QString());
-    } else {
+    if (error.isEmpty())
+      applyList(result);
+    else
       feedback_->setText(error);
-    }
     updateActions();
   });
+}
+
+void SeriesManagerDialog::applyList(const QJsonObject &result) {
+  enabled_ = result.value(QStringLiteral("enabled")).toBool();
+  updateRows(result.value(QStringLiteral("items")).toArray());
+  if (!busy_)
+    feedback_->setText(!enabled_          ? tr("The coordinator has disabled series follows.")
+                       : items_.isEmpty() ? tr("This room is not following any series yet.")
+                                          : QString());
 }
 
 void SeriesManagerDialog::updateRows(const QJsonArray &items) {
@@ -526,13 +547,14 @@ void SeriesManagerDialog::updateActions() {
   const auto item = selected();
   const auto status = item.value(QStringLiteral("status")).toString();
   const bool active = status == QStringLiteral("active"), paused = status == QStringLiteral("paused");
+  const bool settingUp = item.value(QStringLiteral("pending")).toString() == QStringLiteral("setup");
   const bool connected = rooms_.connected(room_);
   const bool ready = enabled_ && connected && !busy_ && !loading_;
   const auto proposal = item.value(QStringLiteral("alternative")).toObject();
   const bool awaiting = !proposal.isEmpty() && active;
   add_->setEnabled(ready);
   refresh_->setEnabled(connected && !busy_ && !loading_);
-  check_->setEnabled(ready && active);
+  check_->setEnabled(ready && active && !settingUp);
   pause_->setText(paused ? tr("Resume") : tr("Pause"));
   pause_->setEnabled(ready && (active || paused));
   more_->setEnabled(ready && (active || paused));
@@ -553,7 +575,10 @@ void SeriesManagerDialog::updateActions() {
   const auto message = item.value(QStringLiteral("error")).toString();
   QString details =
       tr("%1\nRelease rule: %2").arg(statusLabel(item), item.value(QStringLiteral("anchorTitle")).toString());
-  if (active || paused)
+  if (settingUp && active)
+    details += tr("\nNext verification attempt: %1")
+                   .arg(localTime(item.value(QStringLiteral("nextCheckAt")), tr("Pending")));
+  else if (!settingUp && (active || paused))
     details += tr("\nNext episode: %1 · Airtime: %2\nLast check: %3 · Next check: %4")
                    .arg(item.value(QStringLiteral("nextEpisode")).toInt())
                    .arg(localTime(item.value(QStringLiteral("expectedAirAt")), tr("Unknown")),
@@ -686,7 +711,9 @@ void SeriesManagerDialog::linkExisting() {
 void SeriesManagerDialog::showActions() {
   auto *menu = more_->menu();
   menu->clear();
-  if (selected().value(QStringLiteral("status")).toString() == QStringLiteral("active")) {
+  const auto follow = selected();
+  const bool settingUp = follow.value(QStringLiteral("pending")).toString() == QStringLiteral("setup");
+  if (!settingUp && follow.value(QStringLiteral("status")).toString() == QStringLiteral("active")) {
     menu->addAction(tr("Set next airtime…"), this, &SeriesManagerDialog::editAirtime);
     menu->addAction(tr("Set final episode…"), this, &SeriesManagerDialog::editFinale);
     menu->addAction(tr("Change release rule…"), this, [this] { openFollow(selected()); });
@@ -702,11 +729,13 @@ void SeriesManagerDialog::showActions() {
     });
     menu->addSeparator();
   }
-  menu->addAction(tr("Stop following…"), this, [this] {
+  menu->addAction(settingUp ? tr("Cancel pending follow…") : tr("Stop following…"), this, [this] {
     const auto item = selected();
+    const bool settingUp = item.value(QStringLiteral("pending")).toString() == QStringLiteral("setup");
     if (QMessageBox::question(
-            this, tr("Stop following this series?"),
-            tr("Episodes already added to the room will remain in the queue or watch history.")) ==
+            this, settingUp ? tr("Cancel this pending follow?") : tr("Stop following this series?"),
+            settingUp ? tr("WatchPair will stop checking the starting release.")
+                      : tr("Episodes already added to the room will remain in the queue or watch history.")) ==
         QMessageBox::Yes)
       action(QStringLiteral("stop"), {}, item);
   });

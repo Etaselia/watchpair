@@ -1,4 +1,9 @@
+import type { Entry } from './protocol.js';
+import type { SeriesListing } from './series-provider.js';
+
 export type SeriesFollowStatus = 'active' | 'paused' | 'stopped' | 'finished';
+export type SeriesEntryBinding = Pick<Entry, 'id' | 'mediaId' | 'path' | 'size'>;
+export type SeriesMetadataRetry = { listing: SeriesListing; failures: number; desktopEligible: boolean };
 
 export type SeriesAlternative = {
   id: string;
@@ -41,6 +46,8 @@ export type SeriesFollow = {
   dismissedAlternativeHashes: string[];
   createdAt: number;
   updatedAt: number;
+  pendingSeed?: SeriesMetadataRetry & { anchor?: SeriesEntryBinding };
+  pendingRelease?: SeriesMetadataRetry;
 };
 
 export type SeriesEpisode = {

@@ -756,6 +756,13 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
       pollSeriesFollows();
     }
   });
+  connect(&app_.rooms, &RoomClient::seriesFollowsChanged, this, [this](const QString &room, const QJsonObject &result) {
+    if (room == room_) {
+      seriesRequestRoom_.clear();
+      ++seriesRequestGeneration_;
+      applySeriesFollows(result);
+    }
+  });
   connect(&app_.rooms, &RoomClient::connectionChanged, this, [this](const QString &room) {
     if (room == room_) {
       app_.rooms.probeSeriesFollows(room_);
@@ -768,7 +775,9 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
     if (room == room_) {
       room_.clear();
       seriesReviewPending_ = false;
+      seriesMetadataPending_ = false;
       seriesRequestRoom_.clear();
+      ++seriesRequestGeneration_;
       loadedHistory_ = {};
       updateQueue();
       refresh();
@@ -792,7 +801,9 @@ void RoomPage::setRoom(const QString &room) {
     return;
   room_ = room;
   seriesReviewPending_ = false;
+  seriesMetadataPending_ = false;
   seriesRequestRoom_.clear();
+  ++seriesRequestGeneration_;
   app_.rooms.probeSeriesFollows(room_);
   app_.perform([&] { app_.playback.setRoom(room); });
   loadedHistory_ = {};
@@ -809,7 +820,8 @@ void RoomPage::updateSeriesButton() {
                          host == app_.rooms.credential(room_).value(QStringLiteral("memberId")).toString();
   series_->setVisible(available);
   series_->setEnabled(connected);
-  series_->setText(canReview && seriesReviewPending_ ? tr("Series follows · Review") : tr("Series follows"));
+  series_->setText(canReview && seriesReviewPending_ ? tr("Series follows · Review")
+                  : connected && seriesMetadataPending_ ? tr("Series follows · Pending") : tr("Series follows"));
 }
 void RoomPage::pollSeriesFollows() {
   if (!isVisible() || app_.playback.local() || !app_.rooms.connected(room_))
@@ -817,27 +829,28 @@ void RoomPage::pollSeriesFollows() {
   app_.rooms.probeSeriesFollows(room_);
   if (!app_.rooms.seriesFollowsAvailable(room_) || seriesRequestRoom_ == room_)
     return;
-  const auto host = app_.rooms.room(room_).value(QStringLiteral("hostId"));
-  if (!host.isString() || host != app_.rooms.credential(room_).value(QStringLiteral("memberId")))
-    return;
   seriesRequestRoom_ = room_;
+  const auto generation = ++seriesRequestGeneration_;
   app_.rooms.loadSeriesFollows(room_, this,
-                              [this, room = room_](const QJsonObject &result, const QString &error) {
-    if (seriesRequestRoom_ == room)
-      seriesRequestRoom_.clear();
-    if (room != room_ || !error.isEmpty())
+                              [this, generation](const QJsonObject &result, const QString &error) {
+    if (generation != seriesRequestGeneration_)
       return;
-    seriesReviewPending_ = false;
-    for (const auto value : result.value(QStringLiteral("items")).toArray()) {
-      const auto item = value.toObject();
-      if (item.value(QStringLiteral("status")).toString() == QStringLiteral("active") &&
-          !item.value(QStringLiteral("alternative")).toObject().isEmpty()) {
-        seriesReviewPending_ = true;
-        break;
-      }
-    }
-    updateSeriesButton();
+    seriesRequestRoom_.clear();
+    if (error.isEmpty())
+      applySeriesFollows(result);
   });
+}
+void RoomPage::applySeriesFollows(const QJsonObject &result) {
+  seriesReviewPending_ = false;
+  seriesMetadataPending_ = false;
+  for (const auto value : result.value(QStringLiteral("items")).toArray()) {
+    const auto item = value.toObject();
+    if (item.value(QStringLiteral("status")).toString() != QStringLiteral("active"))
+      continue;
+    seriesReviewPending_ |= !item.value(QStringLiteral("alternative")).toObject().isEmpty();
+    seriesMetadataPending_ |= item.value(QStringLiteral("pending")).isString();
+  }
+  updateSeriesButton();
 }
 void RoomPage::updateQueue() {
   if (room_.isEmpty()) {

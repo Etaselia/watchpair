@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 import type { TestContext } from 'node:test';
+import { WebSocket } from 'ws';
 import type { Change } from '../src/protocol.js';
 import { SeriesProviderError, verifySeriesMetainfo, type SeriesCatalog, type SeriesListing, type SeriesProvider } from '../src/series-provider.js';
 import { buildServer } from '../src/server.js';
@@ -71,9 +76,10 @@ async function fixture(t: TestContext) {
   const path = `/v2/rooms/${room.roomId}`;
   const changes: Change[] = [];
   engine.on('change', change => changes.push(change));
-  async function preview(token = room.token, listingId = 100) {
+  async function preview(token = room.token, listingId = 100, deferMetadata = false) {
     const response = await app.inject({ method: 'POST', url: `${path}/series/preview`, headers: auth(token),
-      payload: { input: `https://nyaa.si/view/${listingId}`, malId: provider.entry.id } });
+      payload: { input: `https://nyaa.si/view/${listingId}`, malId: provider.entry.id,
+        ...(deferMetadata ? { deferMetadata: true } : {}) } });
     assert.equal(response.statusCode, 200, response.body);
     return response.json().draft;
   }
@@ -90,6 +96,131 @@ async function fixture(t: TestContext) {
   return { ...built, provider, get now() { return now; }, set now(value: number) { now = value; },
     room, guest, path, changes, preview, add, rules, action };
 }
+
+test('one click saves a pending follow even when metadata is down, and the VPS retries without a desktop', async t => {
+  const f = await fixture(t);
+  f.provider.beforeMetadata = async () => { throw new SeriesProviderError('Gateway timeout', 504); };
+  const draft = await f.preview(f.room.token, 100, true);
+  assert.deepEqual(f.provider.metadataCalls, []);
+  const submit = () => f.app.inject({ method: 'POST', url: `${f.path}/series`, headers: auth(f.room.token),
+    payload: { draftId: draft.id } });
+  const saved = (await submit()).json().item;
+  assert.equal(saved.pending, 'setup');
+  assert.equal((await submit()).json().item.id, saved.id);
+  await f.series!.runOnce();
+  assert.equal(f.rules()[0]?.pending, 'setup');
+  assert.match(f.rules()[0]!.error!, /retry automatically/);
+  assert.equal(f.engine.snapshot(f.room.roomId).entries.length, 0);
+  assert.equal(f.engine.store.getSeriesEpisode(f.room.roomId, f.provider.entry.id, 7), null);
+  f.provider.beforeMetadata = undefined;
+  f.now = f.rules()[0]!.nextCheckAt! - 1;
+  await f.series!.runOnce();
+  assert.deepEqual(f.provider.metadataCalls, [100]);
+  ++f.now;
+  await f.series!.runOnce();
+  assert.equal(f.rules()[0]?.pending, null);
+  assert.equal(f.rules()[0]?.nextEpisode, 8);
+  assert.equal(f.engine.snapshot(f.room.roomId).entries.length, 1);
+});
+
+test('an online desktop helps a persisted follow and only hash-verified metadata survives a restart', { timeout: 10_000 }, async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'watchpair-series-'));
+  const database = join(dir, 'room.sqlite');
+  const provider = new FixtureProvider();
+  provider.beforeMetadata = async () => { throw new SeriesProviderError('Gateway timeout', 504); };
+  let current = start;
+  const open = () => buildServer({ database, now: () => current, seriesProvider: provider, seriesTimer: false });
+  let built = await open();
+  let ws: WebSocket | undefined;
+  t.after(async () => { ws?.terminate(); await built.app.close(); rmSync(dir, { recursive: true, force: true }); });
+  const room = built.engine.create('Restart test', 'Host', key());
+  const desktop = built.engine.join(room.roomId, room.invite, 'Online desktop', key());
+  const path = `/v2/rooms/${room.roomId}`;
+  const preview = await built.app.inject({ method: 'POST', url: `${path}/series/preview`, headers: auth(room.token),
+    payload: { input: 'https://nyaa.si/view/100', malId: provider.entry.id, deferMetadata: true } });
+  assert.equal(preview.statusCode, 200, preview.body);
+  const confirm = { method: 'POST' as const, url: `${path}/series`, headers: auth(room.token),
+    payload: { draftId: preview.json().draft.id } };
+  const pending = (await built.app.inject(confirm)).json().item;
+  await built.series!.runOnce();
+  assert.equal(built.series!.list(room.roomId).items[0]?.nextCheckAt, current + 60_000);
+  await built.app.close();
+  built = await open();
+  assert.equal((await built.app.inject(confirm)).json().item.id, pending.id);
+  assert.equal(built.series!.list(room.roomId).items[0]?.pending, 'setup');
+  await built.app.listen({ host: '127.0.0.1', port: 0 });
+  const address = built.app.server.address();
+  assert.ok(address && typeof address !== 'string');
+  ws = new WebSocket(`ws://127.0.0.1:${address.port}${path}/events`,
+    { headers: { ...auth(desktop.token), 'x-watchpair-series-metadata': '1' } });
+  let job: { requestId: string; listingId: number } | undefined;
+  ws.on('message', bytes => {
+    const event = JSON.parse(bytes.toString());
+    if (event.type === 'series.metadata') job = event;
+  });
+  await new Promise<void>((resolve, reject) => { ws!.once('open', resolve); ws!.once('error', reject); });
+  for (let i = 0; i < 100 && !job; ++i) await delay(10);
+  assert.equal(job?.listingId, 100);
+  const submit = (token: string, bytes: Buffer) => built.app.inject({ method: 'POST',
+    url: `${path}/series/metadata/${job!.requestId}`, payload: bytes,
+    headers: { ...auth(token), 'content-type': 'application/vnd.watchpair.torrent' } });
+  const seed = provider.records.get(100)!;
+  assert.equal((await submit(room.token, seed.bytes)).statusCode, 404);
+  assert.equal((await submit(desktop.token, Buffer.alloc(2 * 1024 * 1024 + 1))).statusCode, 413);
+  assert.equal((await submit(desktop.token, release(101, seedTitle, start).bytes)).statusCode, 422);
+  assert.equal(built.engine.snapshot(room.roomId).entries.length, 0);
+  assert.equal(built.store.getSeriesMetadata(seed.listing.infoHash, current), null);
+  assert.equal((await submit(desktop.token, seed.bytes)).statusCode, 200);
+  assert.equal((await submit(desktop.token, seed.bytes)).statusCode, 404);
+  ws.terminate(); ws = undefined;
+  await built.app.close();
+  built = await open();
+  await built.series!.runOnce();
+  assert.deepEqual(provider.metadataCalls, [100]);
+  assert.equal(built.series!.list(room.roomId).items[0]?.pending, null);
+  assert.equal(built.engine.snapshot(room.roomId).entries[0]?.path, `${seedTitle}.mkv`);
+});
+
+test('later episodes hold their exact release through metadata failure and retry without another search', async t => {
+  const f = await fixture(t);
+  await f.add();
+  f.provider.put(108, '[Origin] Test Anime - 08 (1080p)', air, 'Original');
+  f.provider.beforeMetadata = async () => { throw new SeriesProviderError('Gateway timeout', 504); };
+  f.now = air;
+  await f.series!.runOnce();
+  assert.equal(f.rules()[0]?.pending, 'episode');
+  assert.equal(f.rules()[0]?.nextEpisode, 8);
+  assert.equal(f.engine.snapshot(f.room.roomId).entries.length, 1);
+  const searches = f.provider.searches.length;
+  f.now = f.rules()[0]!.nextCheckAt!;
+  f.provider.beforeMetadata = undefined;
+  await f.series!.runOnce();
+  assert.equal(f.provider.searches.length, searches);
+  assert.equal(f.rules()[0]?.pending, null);
+  assert.equal(f.rules()[0]?.nextEpisode, 9);
+  assert.equal(f.engine.snapshot(f.room.roomId).entries.length, 2);
+});
+
+test('a definitive metadata error holds the pending rule for review and cancellation prevents retries', async t => {
+  const f = await fixture(t);
+  const draft = await f.preview(f.room.token, 100, true);
+  const result = await f.app.inject({ method: 'POST', url: `${f.path}/series`, headers: auth(f.room.token),
+    payload: { draftId: draft.id } });
+  assert.equal(result.statusCode, 200, result.body);
+  f.provider.beforeMetadata = async () => { throw new SeriesProviderError('This release has several files.', 422); };
+  await f.series!.runOnce();
+  const rule = f.rules()[0]!;
+  assert.equal(rule.status, 'paused');
+  assert.equal(rule.error, 'This release has several files.');
+  assert.equal(rule.nextCheckAt, null);
+  const stopped = await f.action(rule.id, { revision: rule.revision, action: 'stop' }, f.guest.token);
+  assert.equal(stopped.statusCode, 200, stopped.body);
+  assert.equal(stopped.json().item.pending, null);
+  f.now += 60 * 60_000;
+  await f.series!.runOnce();
+  assert.equal(f.engine.snapshot(f.room.roomId).entries.length, 0);
+  assert.deepEqual(f.provider.metadataCalls, [100]);
+});
 
 test('legacy coordinator advertises disabled capability and still requires room membership', async t => {
   const { app, engine } = await buildServer({ seriesTimer: false });

@@ -78,7 +78,7 @@ test('a v1 coordinator database migrates, retains its room, and resumes due seri
 
   const migrated = new Store(path);
   try {
-    assert.equal(migrated.db.prepare('PRAGMA user_version').get()?.user_version, 2);
+    assert.equal(migrated.db.prepare('PRAGMA user_version').get()?.user_version, 3);
     assert.equal(migrated.load().find(room => room.id === roomId)?.name, 'Friday room');
     const first = follow(roomId, { nextCheckAt: air + hour, nextCatalogAt: air });
     const second = follow(roomId, { id: 'follow-2', malId: 1001, nextCheckAt: null, nextCatalogAt: air - hour });

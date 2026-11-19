@@ -152,9 +152,12 @@ void RoomClient::probeSeriesFollows(const QString &key) {
             if (code.isEmpty()) {
               const bool available = result.value(QStringLiteral("seriesFollows")).toBool();
               const bool fromEntry = available && result.value(QStringLiteral("seriesFollowFromEntry")).toBool();
-              if (c.seriesAvailable != available || c.seriesEntryAvailable != fromEntry) {
+              const bool pending = available && result.value(QStringLiteral("seriesPendingFollows")).toBool();
+              if (c.seriesAvailable != available || c.seriesEntryAvailable != fromEntry ||
+                  c.seriesPendingAvailable != pending) {
                 c.seriesAvailable = available;
                 c.seriesEntryAvailable = fromEntry;
+                c.seriesPendingAvailable = pending;
                 emit seriesCapabilityChanged(key);
               }
             }
@@ -167,6 +170,10 @@ bool RoomClient::seriesFollowsAvailable(const QString &key) const {
 bool RoomClient::seriesFollowFromEntryAvailable(const QString &key) const {
   const auto it = connections_.find(key);
   return it != connections_.end() && it->second->seriesEntryAvailable;
+}
+bool RoomClient::seriesPendingFollowsAvailable(const QString &key) const {
+  const auto it = connections_.find(key);
+  return it != connections_.end() && it->second->seriesPendingAvailable;
 }
 void RoomClient::seriesRequest(const QString &key, const QString &suffix, const QJsonObject *body,
                                QObject *context, SeriesReply callback) {
@@ -210,6 +217,61 @@ void RoomClient::seriesFollowAction(const QString &key, const QString &id, const
   }
   seriesRequest(key, QStringLiteral("/") + id + QStringLiteral("/actions"), &body, context,
                 std::move(callback));
+}
+void RoomClient::provideSeriesMetadata(const QString &key, quint64 epoch, const QJsonObject &event) {
+  constexpr qint64 maxMetadata = 2 * 1024 * 1024;
+  const auto requestId = event.value(QStringLiteral("requestId")).toString();
+  const auto requestUuid = QUuid(requestId);
+  const auto listingId = event.value(QStringLiteral("listingId")).toInteger();
+  if (requestUuid.isNull() || requestUuid.toString(QUuid::WithoutBraces) != requestId ||
+      listingId < 1 || listingId > 999999999999LL ||
+      seriesMetadataJobs_.contains(requestId) || seriesMetadataJobs_.size() >= 2 || stopping_)
+    return;
+
+  // Only this fixed public origin can receive a fallback fetch. The room token
+  // goes to the saved coordinator when we submit the response.
+  const QUrl url(QStringLiteral("https://nyaa.si/download/%1.torrent").arg(listingId));
+  QNetworkRequest request(url);
+  request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
+  request.setAttribute(QNetworkRequest::CookieLoadControlAttribute, QNetworkRequest::Manual);
+  request.setAttribute(QNetworkRequest::CookieSaveControlAttribute, QNetworkRequest::Manual);
+  request.setRawHeader("Accept", "application/x-bittorrent");
+  request.setRawHeader("User-Agent", "WatchPair/2 series follows");
+  request.setTransferTimeout(12000);
+  request.setPriority(QNetworkRequest::LowPriority);
+  seriesMetadataJobs_.insert(requestId);
+  auto *reply = network_.get(request);
+  connect(reply, &QNetworkReply::readyRead, this, [reply] {
+    if (reply->bytesAvailable() > maxMetadata)
+      reply->abort();
+  });
+  QTimer::singleShot(18000, reply, [reply] {
+    if (reply->isRunning())
+      reply->abort();
+  });
+  connect(reply, &QNetworkReply::finished, this, [this, reply, key, epoch, requestId] {
+    reply->deleteLater();
+    const auto it = connections_.find(key);
+    if (stopping_ || it == connections_.end() || it->second->epoch != epoch || !connected(key) ||
+        reply->error() != QNetworkReply::NoError ||
+        reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() != 200 ||
+        reply->bytesAvailable() <= 0 || reply->bytesAvailable() > maxMetadata) {
+      seriesMetadataJobs_.remove(requestId);
+      return;
+    }
+    const auto &credential = it->second->credential;
+    QNetworkRequest deliver(endpoint(credential, QStringLiteral("/series/metadata/") + requestId));
+    deliver.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
+    deliver.setRawHeader("X-WatchPair-Protocol", "2");
+    deliver.setRawHeader("Authorization", "Bearer " + credential.value(QStringLiteral("token")).toString().toUtf8());
+    deliver.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/vnd.watchpair.torrent"));
+    deliver.setTransferTimeout(12000);
+    auto *submission = network_.post(deliver, reply->readAll());
+    connect(submission, &QNetworkReply::finished, this, [this, submission, requestId] {
+      submission->deleteLater();
+      seriesMetadataJobs_.remove(requestId);
+    });
+  });
 }
 void RoomClient::restore() {
   for (const auto value : store_.all(QStringLiteral("room-private"))) {
@@ -391,6 +453,7 @@ void RoomClient::begin(const QString &key) {
   url.setScheme(url.scheme() == QStringLiteral("https") ? QStringLiteral("wss") : QStringLiteral("ws"));
   QNetworkRequest request(url);
   request.setRawHeader("X-WatchPair-Protocol", "2");
+  request.setRawHeader("X-WatchPair-Series-Metadata", "1");
   request.setRawHeader("Authorization",
                        "Bearer " + c.credential.value(QStringLiteral("token")).toString().toLatin1());
   connect(c.socket.get(), &QWebSocket::connected, this, [this, key, epoch] {
@@ -482,6 +545,17 @@ void RoomClient::message(const QString &key, quint64 epoch, const QString &text)
     }
     if (type == QStringLiteral("deleted")) {
       deleted(key);
+      return;
+    }
+    if (type == QStringLiteral("series.metadata")) {
+      if (c.fresh)
+        provideSeriesMetadata(key, epoch, event);
+      return;
+    }
+    if (type == QStringLiteral("series.changed")) {
+      const auto result = event.value(QStringLiteral("data")).toObject();
+      if (c.fresh && result.value(QStringLiteral("items")).isArray())
+        emit seriesFollowsChanged(key, result);
       return;
     }
     const auto data = event.value(QStringLiteral("data")).toObject();

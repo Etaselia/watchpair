@@ -10,10 +10,10 @@ import { Store } from './store.js';
 import { Engine } from './engine.js';
 import { PROTOCOL, DomainError, socketMessageSchema, type Change } from './protocol.js';
 import { SeriesService } from './series.js';
-import type { SeriesProvider } from './series-provider.js';
+import { MAX_SERIES_METADATA_BYTES, type SeriesProvider } from './series-provider.js';
 
 const name = z.string().trim().min(1).max(100).refine(v => !/[\x00-\x1f\x7f]/.test(v));
-const VERSION = '2.0.0-alpha.8';
+const VERSION = '2.0.0-alpha.9';
 const capability = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const createBody = z.object({ name, memberName: name, retryKey: capability }).strict();
 const joinBody = z.object({ invite: capability, name, retryKey: capability }).strict();
@@ -22,7 +22,8 @@ const episodeNumber = z.number().int().min(1).max(99_999);
 const seriesAirtime = z.number().int().min(0).max(Date.UTC(2100, 0, 1)).nullable();
 const seriesEntryId = z.string().regex(/^[a-f0-9]{64}$/);
 const seriesPreview = z.object({ input: z.string().trim().max(300), malId: z.number().int().min(1).max(999_999_999).optional(),
-  listingId: z.number().int().min(1).max(999_999_999_999).optional(), entryId: seriesEntryId.optional() }).strict()
+  listingId: z.number().int().min(1).max(999_999_999_999).optional(), entryId: seriesEntryId.optional(),
+  deferMetadata: z.literal(true).optional() }).strict()
   .refine(value => Boolean(value.input || value.entryId), 'Enter a title or link or choose a room episode.');
 const seriesConfirm = z.object({ draftId: z.string().uuid(), expectedAirAt: seriesAirtime.optional(),
   finalEpisode: episodeNumber.nullable().optional(), catalogEpisode: episodeNumber.optional() }).strict();
@@ -30,7 +31,7 @@ const seriesAction = z.object({ revision: z.number().int().min(1).max(Number.MAX
   action: z.enum(['pause', 'resume', 'stop', 'check', 'skip', 'approve-alternate', 'dismiss-alternate', 'set-airtime', 'set-finale', 'replace-source', 'link-existing']),
   expectedAirAt: seriesAirtime.optional(), finalEpisode: episodeNumber.nullable().optional(), alternativeId: z.string().uuid().optional(),
   draftId: z.string().uuid().optional(), entryId: seriesEntryId.optional() }).strict();
-type Socket = { ws: WebSocket; roomId: string; memberId: string; token: string; connectionId: string };
+type Socket = { ws: WebSocket; roomId: string; memberId: string; token: string; connectionId: string; helpsSeries: boolean };
 export type ServerOptions = { database?: string; now?: () => number; logger?: boolean; trustProxy?: boolean; relayUrl?:string; relayKey?:Buffer;
   seriesProvider?: SeriesProvider; seriesTimer?: boolean };
 
@@ -48,7 +49,6 @@ export async function buildServer(options: ServerOptions = {}) {
   const epoch = Date.now() - performance.now();
   const store = new Store(options.database ?? ':memory:');
   const engine = new Engine(store, options.now ?? (() => Math.trunc(epoch + performance.now())));
-  const series = options.seriesProvider ? new SeriesService(engine, options.seriesProvider) : null;
   const app = Fastify({
     logger: options.logger ? { level: 'info', redact: ['req.headers.authorization', 'req.headers.cookie'] } : false,
     logController: new LogController({ disableRequestLogging: true }), bodyLimit: 12 * 1024 * 1024, requestTimeout: 20_000,
@@ -63,6 +63,26 @@ export async function buildServer(options: ServerOptions = {}) {
     if (ws.bufferedAmount > 4 * 1024 * 1024) { ws.close(1013, 'Reconnect for a fresh snapshot'); return; }
     ws.send(JSON.stringify(value));
   };
+  const series = options.seriesProvider ? new SeriesService(engine, options.seriesProvider, (room, request, sent, attempt) => {
+    const eligible: Socket[] = [];
+    for (const connection of sockets) {
+      if (connection.roomId !== room || connection.ws.readyState !== WebSocket.OPEN || !connection.helpsSeries ||
+          sent.has(connection.memberId)) continue;
+      try {
+        if (engine.authenticate(room, connection.token).live?.connectionId === connection.connectionId) eligible.push(connection);
+      }
+      catch { continue; }
+    }
+    const delivered: string[] = [];
+    const count = Math.min(2 - sent.size, eligible.length);
+    const start = eligible.length ? (2 * attempt) % eligible.length : 0;
+    for (let i = 0; i < count; ++i) {
+      const connection = eligible[(start + i) % eligible.length]!;
+      send(connection.ws, request);
+      delivered.push(connection.memberId);
+    }
+    return delivered;
+  }) : null;
   const token = (request: FastifyRequest) => {
     const value = request.headers.authorization;
     if (!value?.startsWith('Bearer ') || !/^[A-Za-z0-9_-]{43}$/.test(value.slice(7)))
@@ -97,7 +117,7 @@ export async function buildServer(options: ServerOptions = {}) {
       <script nonce="${nonce}">const fragment=location.hash.slice(1);const match=/^(invite|recovery)=([A-Za-z0-9_-]{43})$/.exec(fragment);const input=document.getElementById('link');input.value=location.href;if(match){const a=document.getElementById('open');a.href='watchpair://room?server='+encodeURIComponent(location.origin)+'&room=${id}#'+fragment;a.style.display='inline-block';if(match[1]==='recovery')document.getElementById('message').textContent='This private recovery link restores host control. Open it only on a device you trust.';}else document.getElementById('message').textContent='This link is incomplete. Ask the host for the full invite, including the private part after #.';document.getElementById('copy').onclick=async()=>{try{await navigator.clipboard.writeText(input.value);document.getElementById('copy').textContent='Copied';}catch{input.select();}};</script></html>`);
   });
   app.get('/v2/version', async () => ({ protocol: PROTOCOL, version: VERSION, operationRetryWindow: 10_000,
-    seriesFollows: series !== null, seriesFollowFromEntry: series !== null }));
+    seriesFollows: series !== null, seriesFollowFromEntry: series !== null, seriesPendingFollows: series !== null }));
   app.post('/v2/rooms', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async request => {
     const body = createBody.parse(request.body); return engine.create(body.name, body.memberName, body.retryKey);
   });
@@ -127,6 +147,19 @@ export async function buildServer(options: ServerOptions = {}) {
     const member = auth(request); reply.header('Cache-Control', 'no-store');
     return requireSeries().add(roomId(request), member.id, seriesConfirm.parse(request.body));
   });
+  app.addContentTypeParser('application/vnd.watchpair.torrent', { parseAs: 'buffer',
+    bodyLimit: MAX_SERIES_METADATA_BYTES }, (_request, body, done) => done(null, body));
+  app.post('/v2/rooms/:roomId/series/metadata/:requestId', {
+    config: { rateLimit: { max: 30, timeWindow: '1 minute' } }, bodyLimit: MAX_SERIES_METADATA_BYTES,
+    onRequest: async request => { auth(request); requireSeries(); },
+  }, async (request, reply) => {
+    const member = auth(request);
+    const id = z.string().uuid().parse((request.params as { requestId: string }).requestId);
+    if (!Buffer.isBuffer(request.body))
+      throw new DomainError('SERIES_METADATA_INVALID', 'Send torrent metadata as a binary file.', 415);
+    reply.header('Cache-Control', 'no-store');
+    return requireSeries().acceptMetadata(roomId(request), member.id, id, request.body);
+  });
   app.post('/v2/rooms/:roomId/series/:seriesId/actions', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } }, bodyLimit: 2048 }, async (request, reply) => {
     const member = auth(request); reply.header('Cache-Control', 'no-store');
     const id = z.string().uuid().parse((request.params as { seriesId: string }).seriesId);
@@ -151,7 +184,9 @@ export async function buildServer(options: ServerOptions = {}) {
     const id = roomId(request), credential = token(request), memberId = auth(request).id;
     const connectionId = engine.connect(id, memberId);
     for (const old of sockets) if (old.roomId === id && old.memberId === memberId) old.ws.close(4001, 'Connected from another session');
-    const connection: Socket = { ws, roomId: id, memberId, token: credential, connectionId }; sockets.add(connection);
+    const connection: Socket = { ws, roomId: id, memberId, token: credential, connectionId,
+      helpsSeries: request.headers['x-watchpair-series-metadata'] === '1' };
+    sockets.add(connection);
     let windowAt = engine.now(), messages = 0;
     ws.on('message', bytes => {
       try {
@@ -179,6 +214,7 @@ export async function buildServer(options: ServerOptions = {}) {
     });
     ws.on('error', () => ws.close());
     send(ws, { type: 'snapshot', revision: engine.room(id).revision, data: engine.snapshot(id) });
+    if (connection.helpsSeries) series?.desktopOnline(id);
   });
   const change = (event: Change) => {
     for (const connection of sockets) if (connection.roomId === event.roomId) {
@@ -188,12 +224,23 @@ export async function buildServer(options: ServerOptions = {}) {
       send(connection.ws, event);
     }
   };
+  const seriesChanged = (id: string) => {
+    if (!series) return;
+    let event: { type: 'series.changed'; data: ReturnType<SeriesService['list']> } | undefined;
+    for (const connection of sockets) if (connection.roomId === id && connection.helpsSeries) {
+      try { engine.authenticate(id, connection.token); }
+      catch { continue; }
+      event ??= { type: 'series.changed', data: series.list(id) };
+      send(connection.ws, event);
+    }
+  };
   engine.on('change', change);
+  engine.on('seriesChanged', seriesChanged);
   const timer = setInterval(() => { try { engine.tick(); } catch (error) { app.log.error({ err: error }, 'Room checkpoint failed'); } }, 500);
   timer.unref();
   if (options.seriesTimer !== false) series?.start(error => app.log.error({ err: error }, 'Series follow check failed'));
   app.addHook('onClose', async () => {
-    closing = true; clearInterval(timer); engine.off('change', change);
+    closing = true; clearInterval(timer); engine.off('change', change); engine.off('seriesChanged', seriesChanged);
     try {
       await series?.close();
       for (const connection of sockets) {

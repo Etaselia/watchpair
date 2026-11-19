@@ -45,6 +45,7 @@ public:
   void probeSeriesFollows(const QString &key);
   bool seriesFollowsAvailable(const QString &key) const;
   bool seriesFollowFromEntryAvailable(const QString &key) const;
+  bool seriesPendingFollowsAvailable(const QString &key) const;
   void loadSeriesFollows(const QString &key, QObject *context, SeriesReply callback);
   void previewSeriesFollow(const QString &key, const QJsonObject &body, QObject *context,
                            SeriesReply callback);
@@ -66,6 +67,7 @@ signals:
   void historyLoaded(QString key, QJsonArray items, bool firstPage);
   void ticketReady(QString key, QString peer, QJsonObject ticket);
   void seriesCapabilityChanged(QString key);
+  void seriesFollowsChanged(QString key, QJsonObject result);
 
 private:
   struct Connection {
@@ -79,7 +81,8 @@ private:
     double offset = 0, bestRtt = 1e20;
     QList<QPair<double, double>> clockSamples;
     bool online = false, fresh = false, terminal = false, requesting = false, refreshing = false;
-    bool seriesAvailable = false, seriesEntryAvailable = false, seriesProbePending = false;
+    bool seriesAvailable = false, seriesEntryAvailable = false, seriesPendingAvailable = false,
+         seriesProbePending = false;
     qint64 seriesProbeAfter = 0;
     QString state = QStringLiteral("Connecting…");
   };
@@ -88,6 +91,7 @@ private:
   void request(const QUrl &url, const QByteArray &token, const QJsonObject *body, Reply callback);
   void seriesRequest(const QString &key, const QString &suffix, const QJsonObject *body, QObject *context,
                      SeriesReply callback);
+  void provideSeriesMetadata(const QString &key, quint64 epoch, const QJsonObject &event);
   void begin(const QString &key);
   void tick();
   void message(const QString &key, quint64 epoch, const QString &text);
@@ -105,6 +109,7 @@ private:
   quint64 connectionEpoch_ = 0;
   bool stopping_ = false;
   QSet<QString> entering_;
+  QSet<QString> seriesMetadataJobs_;
   std::map<QString, std::unique_ptr<Connection>> connections_;
 };
 } // namespace wp
