@@ -131,9 +131,12 @@ function seedBroadcast(catalog: SeriesCatalog, publishedAt: number, catalogEpiso
   const inferred = inferAnchorAirtime(publishedAt, catalog);
   const start = Date.parse(catalog.startDate + 'T00:00:00+09:00');
   if (inferred === null || !Number.isFinite(start)) return null;
-  // The listing can be late. Only use the weekly slot if the numbered anchor
-  // also agrees with the catalog's first date. Irregular schedules need input.
-  return Math.floor((inferred - start) / DAY) === (catalogEpisode - 1) * 7 ? inferred : null;
+  const daysSincePremiere = Math.floor((inferred - start) / DAY);
+  const numberedWeek = (catalogEpisode - 1) * 7;
+  // A verified early episode can put the numbering one slot ahead of the TV
+  // premiere. A late upload or a larger gap still needs a confirmed airtime.
+  return daysSincePremiere >= 0 && (daysSincePremiere === numberedWeek || daysSincePremiere === numberedWeek - 7)
+    ? inferred : null;
 }
 
 function publicFollow(follow: SeriesFollow) {

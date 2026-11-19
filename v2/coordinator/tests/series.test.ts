@@ -468,6 +468,66 @@ test('a later MAL broadcast slot schedules an initially unscheduled follow using
   assert.equal(f.store.getSeriesEpisode(f.room.roomId, catalogWithSlot.id, 8)?.listingId, 101);
 });
 
+test('an early opening episode can put the verified release schedule one week ahead of the MAL premiere', async t => {
+  const title = 'Yasei no Last Boss ga Arawareta!';
+  const catalog: SeriesCatalog = { id: 63140, title: `${title} 2nd Season`, status: 'currently_airing',
+    episodeCount: null, startDate: '2026-10-03', broadcastDayJapan: 'saturday', broadcastTimeJapan: '22:30' };
+  const listingId = 2186101;
+  function putRelease(provider: FixtureProvider, episode: string, publishedAt: string) {
+    provider.entry = catalog;
+    return provider.put(listingId, `[Judas] ${title} (A Wild Last Boss Appeared!) - S02E${episode} [1080p]`,
+      Date.parse(publishedAt), 'Judas', `[Judas] Yasei no - S02E${episode}.mkv`);
+  }
+
+  await t.test('following watched episode 8 estimates episode 9 at the next Saturday slot', async t => {
+    const f = await fixture(t);
+    f.now = Date.parse('2026-11-19T12:41:00Z');
+    const record = putRelease(f.provider, '08', '2026-11-14T16:00:57Z');
+    const manifest = verifySeriesMetainfo(record.bytes, record.listing, [catalog.title]);
+    const queue = () => f.engine.snapshot(f.room.roomId);
+    const command = (payload: object) => f.engine.command(f.room.roomId, f.room.memberId,
+      { operationId: randomUUID(), queueRevision: queue().queueRevision, command: payload });
+    command({ type: 'queue.add', source: manifest.source, files: [manifest.file] });
+    const entryId = queue().entries[0]!.id;
+    command({ type: 'history.mark', ids: [entryId], watched: true });
+    const before = queue();
+
+    const preview = await f.app.inject({ method: 'POST', url: `${f.path}/series/preview`,
+      headers: auth(f.guest.token), payload: { input: '', entryId, malId: catalog.id } });
+    assert.equal(preview.statusCode, 200, preview.body);
+    const { draft } = preview.json();
+    const expectedAirAt = Date.parse('2026-11-21T13:30:00Z');
+    assert.equal(draft.anchorEpisode, 8);
+    assert.equal(draft.nextEpisode, 9);
+    assert.equal(draft.expectedAirAt, expectedAirAt);
+
+    const submitted = await f.app.inject({ method: 'POST', url: `${f.path}/series`,
+      headers: auth(f.guest.token), payload: { draftId: draft.id } });
+    assert.equal(submitted.statusCode, 200, submitted.body);
+    const { item } = submitted.json();
+    assert.equal(item.nextEpisode, 9);
+    assert.equal(item.expectedAirAt, expectedAirAt);
+    assert.equal(item.nextCheckAt, expectedAirAt);
+    assert.deepEqual(queue(), before);
+  });
+
+  for (const [name, episode, publishedAt] of [
+    ['a release before the listed premiere', '01', '2026-09-26T16:00:57Z'],
+    ['a release two weeks ahead of the numbering', '08', '2026-11-07T16:00:57Z'],
+    ['a release uploaded a week late', '08', '2026-11-28T16:00:57Z'],
+  ] as const) {
+    await t.test(`${name} keeps the estimate unknown`, async t => {
+      const f = await fixture(t);
+      f.now = Date.parse('2026-12-01T12:00:00Z');
+      putRelease(f.provider, episode, publishedAt);
+      assert.equal((await f.preview(f.room.token, listingId)).expectedAirAt, null);
+      const item = await f.add({}, listingId);
+      assert.equal(item.expectedAirAt, null);
+      assert.equal(item.nextCheckAt, null);
+    });
+  }
+});
+
 test('the announced part count caps additions while the catalog still reports the part airing', async t => {
   const f = await fixture(t);
   f.provider.entry = { ...f.provider.entry, episodeCount: 8 };
