@@ -38,7 +38,7 @@ export interface SeriesProvider {
   catalog(id: number): Promise<SeriesCatalog>;
   searchReleases(query: string, uploader?: string): Promise<SeriesListing[]>;
   listing(id: number): Promise<SeriesListing>;
-  metadata(listing: SeriesListing): Promise<{ source: Source; file: FileDescriptor }>;
+  metadata(listing: SeriesListing, catalogTitles?: readonly string[]): Promise<{ source: Source; file: FileDescriptor }>;
 }
 
 export class SeriesProviderError extends Error {
@@ -53,6 +53,12 @@ const EPISODE_PATTERNS: [SeriesRelease['style'], RegExp][] = [
 ].map(([style, episode]) => [style as SeriesRelease['style'], new RegExp(`^(?<stem>.+?)${episode}${RELEASE_TAIL}`, 'i')]);
 
 function normalize(value: string) { return value.normalize('NFC').toLowerCase().trim().replace(/\s+/gu, ' '); }
+
+export function seriesTitleParts(value: string) {
+  const match = /^(.+?)\s+\(([^()]+)\)$/u.exec(value);
+  return match?.[2] && /\p{L}/u.test(match[2]) ? { primary: match[1]!, alternate: match[2] }
+    : { primary: value, alternate: undefined };
+}
 
 export function parseSeriesTitle(title: string): SeriesRelease | null {
   if (!title || title.length > 600 || /[|\x00-\x1f\x7f]/.test(title)) return null;
@@ -226,6 +232,22 @@ type Bencode = Buffer | number | Bencode[] | Map<string, Bencode>;
 
 function invalidTorrent(): never { throw new SeriesProviderError('The torrent metadata does not describe a verified single-file episode.', 422); }
 
+function matchesCatalogAlias(file: SeriesRelease, listing: SeriesRelease, catalogTitles: readonly string[]) {
+  if (!catalogTitles.length || file.season !== listing.season || file.style !== listing.style) return false;
+  const season = listing.season;
+  const roman = ['', 'i', 'ii', 'iii', 'iv', 'v', 'vi', 'vii', 'viii', 'ix', 'x'];
+  const suffix = season ? new RegExp(` (?:s0?${season}|season 0?${season}|0?${season}(?:(?:st|nd|rd|th) season)?${
+    roman[season] ? '|' + roman[season] : ''})$`, 'u') : null;
+  const variants = (value: string) => {
+    const normalized = normalize(value);
+    const { primary, alternate } = seriesTitleParts(normalized);
+    const names = [normalized, primary, ...(alternate ? [alternate] : [])];
+    return suffix ? [...names, ...names.map(name => name.replace(suffix, ''))] : names;
+  };
+  const known = new Set(catalogTitles.flatMap(title => [title, ...title.split(/,\s+/u)]).flatMap(variants));
+  return variants(file.stem).some(stem => known.has(stem)) && variants(listing.stem).some(stem => known.has(stem));
+}
+
 class TorrentReader {
   offset = 0;
   infoBytes: Buffer | null = null;
@@ -268,7 +290,7 @@ class TorrentReader {
   }
 }
 
-export function verifySeriesMetainfo(data: Buffer, listing: SeriesListing): { source: Source; file: FileDescriptor } {
+export function verifySeriesMetainfo(data: Buffer, listing: SeriesListing, catalogTitles: readonly string[] = []): { source: Source; file: FileDescriptor } {
   if (!data.length || data.length > MAX_BYTES || !validId(listing.id) || !/^[a-f0-9]{40}$/i.test(listing.infoHash)) invalidTorrent();
   const reader = new TorrentReader(data), torrent = reader.read();
   if (!(torrent instanceof Map) || reader.offset !== data.length || !reader.infoBytes) invalidTorrent();
@@ -282,7 +304,8 @@ export function verifySeriesMetainfo(data: Buffer, listing: SeriesListing): { so
   try { path = UTF8.decode(nativeName); } catch { return invalidTorrent(); }
   if (!path || /^[ .]|[ .]$/.test(path) || /[\/\\:%<>"?*|\x00-\x1f\x7f]/.test(path) || !VIDEO_SUFFIX.test(path)) invalidTorrent();
   const match = parseSeriesTitle(path), release = parseSeriesTitle(listing.title);
-  if (!match || !release || !sameSeriesStem(match, release) || match.episode !== release.episode || match.group !== release.group) invalidTorrent();
+  if (!match || !release || match.episode !== release.episode || match.group !== release.group ||
+      (!sameSeriesStem(match, release) && !matchesCatalogAlias(match, release, catalogTitles))) invalidTorrent();
   const length = info.get('length'), pieceLength = info.get('piece length'), pieces = info.get('pieces');
   if (typeof length !== 'number' || length <= 0 || typeof pieceLength !== 'number' || pieceLength <= 0
     || !Buffer.isBuffer(pieces) || pieces.length !== 20 * Math.ceil(length / pieceLength)) invalidTorrent();
@@ -339,8 +362,9 @@ export function createSeriesProvider(clientId?: string, options: { fetch?: typeo
     if (wait > 0) throw new SeriesProviderError(`${unavailable} requested a pause before checking again.`, 429, wait);
     if (active >= 4) throw new SeriesProviderError('Too many catalog requests are in progress.', 503, 5000);
     active++;
+    const signal = AbortSignal.timeout(10_000);
     try {
-      const response = await send(url, { redirect: 'manual', signal: AbortSignal.timeout(10_000),
+      const response = await send(url, { redirect: 'manual', signal,
         headers: { Accept: accept, 'User-Agent': 'WatchPair/2 series follows', ...(mal ? { 'X-MAL-CLIENT-ID': clientId! } : {}) } });
       if (!response.ok) {
         void response.body?.cancel().catch(() => {});
@@ -366,6 +390,7 @@ export function createSeriesProvider(clientId?: string, options: { fetch?: typeo
       return Buffer.concat(chunks, size);
     } catch (error) {
       if (error instanceof SeriesProviderError) throw error;
+      if (signal.aborted) throw new SeriesProviderError(`${unavailable} did not respond in time. Try again shortly.`, 504);
       throw new SeriesProviderError(`${unavailable} could not be reached.`);
     } finally { active--; }
   }
@@ -414,10 +439,11 @@ export function createSeriesProvider(clientId?: string, options: { fetch?: typeo
       if (!validId(id)) throw new SeriesProviderError('Choose a valid Nyaa listing.', 400);
       return listings.get(String(id), async () => parseNyaaListing(await readText(new URL(`/view/${id}`, NYAA), 'text/html'), id));
     },
-    async metadata(listing) {
+    async metadata(listing, catalogTitles = []) {
       if (!validId(listing.id) || !HASH.test(listing.infoHash) || !safeTitle(listing.title)) invalidTorrent();
-      const key = `${listing.id}/${listing.infoHash}/${listing.title}`;
-      return metadata.get(key, async () => verifySeriesMetainfo(await read(new URL(`/download/${listing.id}.torrent`, NYAA), 'application/x-bittorrent'), listing));
+      const key = JSON.stringify([listing.id, listing.infoHash, listing.title, catalogTitles]);
+      return metadata.get(key, async () => verifySeriesMetainfo(
+        await read(new URL(`/download/${listing.id}.torrent`, NYAA), 'application/x-bittorrent'), listing, catalogTitles));
     },
   };
 }

@@ -19,8 +19,7 @@ function barrier() {
   return { promise, resolve };
 }
 
-function release(id: number, title: string, publishedAt: number, uploader?: string) {
-  const name = `${title}.mkv`;
+function release(id: number, title: string, publishedAt: number, uploader?: string, name = `${title}.mkv`) {
   const info = Buffer.concat([Buffer.from(`d6:lengthi123e4:name${Buffer.byteLength(name)}:${name}12:piece lengthi16384e6:pieces20:`),
     Buffer.alloc(20, id % 255), Buffer.from('e')]);
   const bytes = Buffer.concat([Buffer.from('d4:info'), info, Buffer.from('e')]);
@@ -41,8 +40,8 @@ class FixtureProvider implements SeriesProvider {
     this.put(100, seedTitle, Date.parse('2026-11-13T15:00:00Z'), 'Original');
   }
 
-  put(id: number, title: string, publishedAt = air, uploader?: string) {
-    const record = release(id, title, publishedAt, uploader);
+  put(id: number, title: string, publishedAt = air, uploader?: string, filename?: string) {
+    const record = release(id, title, publishedAt, uploader, filename);
     this.records.set(id, record);
     return record;
   }
@@ -54,10 +53,10 @@ class FixtureProvider implements SeriesProvider {
     this.searches.push({ query, uploader });
     return [...this.records.values()].map(record => record.listing).filter(listing => !uploader || listing.uploader === uploader);
   }
-  async metadata(listing: SeriesListing) {
+  async metadata(listing: SeriesListing, catalogTitles?: readonly string[]) {
     this.metadataCalls.push(listing.id);
     await this.beforeMetadata?.(listing);
-    return verifySeriesMetainfo(this.records.get(listing.id)!.bytes, listing);
+    return verifySeriesMetainfo(this.records.get(listing.id)!.bytes, listing, catalogTitles);
   }
 }
 
@@ -104,6 +103,45 @@ test('legacy coordinator advertises disabled capability and still requires room 
   const disabled = await app.inject({ method: 'POST', url: `${path}/preview`, headers: auth(room.token), payload: { input: 'Test Anime' } });
   assert.equal(disabled.statusCode, 404);
   assert.equal(disabled.json().error.code, 'SERIES_DISABLED');
+});
+
+test('looks up the main title from a Nyaa link and follows catalog-verified abbreviated filenames', async t => {
+  const f = await fixture(t);
+  const { app, room, path, provider } = f;
+  const primary = 'tensei shitara ken deshita';
+  const supplied = 'Tensei shitara Ken deshita (Reincarnated as a Sword)';
+  const title = `[Judas] ${supplied} - S02E08 [1080p]`;
+  provider.entry = { ...provider.entry, title: 'Tensei shitara Ken deshita II',
+    alternativeTitles: ['Reincarnated as a Sword Season 2', 'I became the sword by transmigrating 2nd Season, TenKen 2'] };
+  provider.put(2187750, title, start, 'Judas', '[Judas] TenKen - S02E08.mkv');
+  const queries: string[] = [];
+  provider.searchCatalog = async query => {
+    queries.push(query);
+    return query.toLowerCase() === primary ? [provider.entry] : [];
+  };
+  const preview = (input: string) => app.inject({ method: 'POST', url: `${path}/series/preview`, headers: auth(room.token),
+    payload: { input } });
+  const link = await preview('https://nyaa.si/view/2187750');
+  assert.equal(link.statusCode, 200, link.body);
+  assert.deepEqual(queries, [primary]);
+  assert.equal(link.json().catalog[0]?.id, provider.entry.id);
+  assert.equal(link.json().releases[0]?.title, title);
+
+  queries.length = 0;
+  const typed = await preview(supplied);
+  assert.equal(typed.statusCode, 200, typed.body);
+  assert.deepEqual(queries.map(query => query.toLowerCase()), [supplied.toLowerCase(), primary]);
+  assert.equal(queries[0], supplied);
+  assert.equal(typed.json().catalog[0]?.id, provider.entry.id);
+
+  const item = await f.add({ expectedAirAt: air }, 2187750);
+  assert.equal(item.nextEpisode, 9);
+  provider.put(2187751, title.replace('E08', 'E09'), air, 'Judas', '[Judas] TenKen - S02E09.mkv');
+  f.now = air;
+  await f.series!.runOnce();
+  assert.equal(f.rules()[0]!.nextEpisode, 10);
+  assert.deepEqual(f.engine.snapshot(room.roomId).entries.map(entry => entry.path),
+    ['[Judas] TenKen - S02E08.mkv', '[Judas] TenKen - S02E09.mkv']);
 });
 
 test('preview verifies the seed; confirm is scoped and idempotent, and timed catch-up sends ordinary queue snapshots', async t => {

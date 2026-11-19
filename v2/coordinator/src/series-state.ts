@@ -14,6 +14,7 @@ export type SeriesFollow = {
   malId: number;
   revision: number;
   title: string;
+  catalogTitles?: string[];
   anchorTitle: string;
   anchorListingId: number;
   preferredUploader: string | null;

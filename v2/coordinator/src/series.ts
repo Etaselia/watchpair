@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Engine } from './engine.js';
 import { DomainError, requireThat, type Entry, type FileDescriptor, type Source } from './protocol.js';
 import {
-  episodeSearchTerms, parseSeriesTitle, releaseMatches, sameSeriesStem, SeriesProviderError,
+  episodeSearchTerms, parseSeriesTitle, releaseMatches, sameSeriesStem, seriesTitleParts, SeriesProviderError,
   type SeriesCatalog, type SeriesListing, type SeriesProvider, type SeriesRelease,
 } from './series-provider.js';
 import { estimateAirtime, inferAnchorAirtime, retryAt, type SeriesEpisode, type SeriesFollow } from './series-state.js';
@@ -51,6 +51,10 @@ function inputParts(input: string) {
 function eligible(listing: SeriesListing) {
   const release = parseSeriesTitle(listing.title);
   return release?.edition ? release : null;
+}
+
+function verifiedCatalogTitles(catalog: SeriesCatalog) {
+  return [catalog.title, ...(catalog.alternativeTitles ?? [])];
 }
 
 function entryRelease(entry: Entry) {
@@ -190,8 +194,14 @@ export class SeriesService {
       if (listing) requireThat(parsed, 'SERIES_UNSUPPORTED_TITLE', 'This release does not identify a single episode and edition. Choose a clearer Nyaa release.', 422);
       if (parsed) requireThat(sameEntryEpisode(knownRelease, parsed), 'SERIES_ANCHOR_MISMATCH',
         'Choose a Nyaa release of the same episode as the selected room item.', 422);
-      const query = parts.title || (parsed?.stem ?? knownRelease?.stem)?.slice(0, 160);
-      const catalog = malId ? [await this.provider.catalog(malId)] : query ? await this.provider.searchCatalog(query) : [];
+      const stem = parsed?.stem ?? knownRelease?.stem;
+      const query = parts.title || stem?.slice(0, 160);
+      const inferredTitle = stem ? seriesTitleParts(stem) : undefined;
+      const catalogQuery = parts.title || inferredTitle?.primary.slice(0, 160);
+      let catalog = malId ? [await this.provider.catalog(malId)] : catalogQuery ? await this.provider.searchCatalog(catalogQuery) : [];
+      const fallbackTitle = parts.title ? seriesTitleParts(parts.title).primary : inferredTitle?.alternate?.slice(0, 160);
+      if (!catalog.length && fallbackTitle && fallbackTitle !== catalogQuery)
+        catalog = await this.provider.searchCatalog(fallbackTitle);
       const releases = listing ? [listing] : query || catalog[0] ? await this.provider.searchReleases(query ?? catalog[0]!.title) : [];
       const result = { catalog: catalog.slice(0, 12), releases: releases.flatMap(item => {
         const match = eligible(item);
@@ -199,7 +209,7 @@ export class SeriesService {
           ? [{ id: item.id, title: item.title, episode: match.episode, group: match.group, edition: match.edition }] : [];
       }).slice(0, 25) };
       if (!listing || !parsed || !malId || !catalog[0]) return result;
-      const manifest = await this.provider.metadata(listing);
+      const manifest = await this.provider.metadata(listing, verifiedCatalogTitles(catalog[0]));
       const now = this.engine.now();
       const anchor = entry ? { id: entry.id, mediaId: entry.mediaId, path: entry.path, size: entry.size } : undefined;
       if (anchor) this.checkAnchor(roomId, anchor);
@@ -299,7 +309,8 @@ export class SeriesService {
     requireThat(input.finalEpisode == null || input.finalEpisode >= release.episode,
       'SERIES_FINALE', 'The last episode cannot come before the starting release.', 422);
     const follow: SeriesFollow = { id: draft.id, roomId, malId: draft.catalog.id, revision: 1,
-      title: draft.catalog.title, anchorTitle: draft.listing.title, anchorListingId: draft.listing.id,
+      title: draft.catalog.title, catalogTitles: verifiedCatalogTitles(draft.catalog),
+      anchorTitle: draft.listing.title, anchorListingId: draft.listing.id,
       preferredUploader: draft.listing.uploader ?? null, nextEpisode: release.episode + 1, status: 'active',
       catalogEpisodeOffset: release.episode - catalogEpisode, episodeCount: draft.catalog.episodeCount,
       broadcastDayJapan: draft.catalog.broadcastDayJapan, broadcastTimeJapan: draft.catalog.broadcastTimeJapan,
@@ -388,6 +399,7 @@ export class SeriesService {
         follow.anchorBroadcastAt = follow.expectedAirAt ?? priorForecast;
         follow.anchorPublishedAt = draft.listing.publishedAt;
         follow.anchorTitle = draft.listing.title; follow.anchorListingId = draft.listing.id;
+        follow.catalogTitles = verifiedCatalogTitles(draft.catalog);
         follow.preferredUploader = draft.listing.uploader ?? null;
         handled = this.episode(follow, follow.nextEpisode, 'added', draft.listing.id);
         manifest = draft.manifest; this.advance(follow, now); break;
@@ -406,7 +418,7 @@ export class SeriesService {
           const source = eligible(listing), anchor = parseSeriesTitle(follow.anchorTitle);
           requireThat(source && anchor && sameSeriesStem(anchor, source) && source.episode === follow.nextEpisode,
             'SERIES_ALTERNATE', 'The alternative no longer matches the missing episode.', 409);
-          manifest = await this.provider.metadata(listing);
+          manifest = await this.provider.metadata(listing, follow.catalogTitles);
         } catch (error) {
           if (error instanceof SeriesProviderError) throw providerError(error);
           throw error;
@@ -440,14 +452,14 @@ export class SeriesService {
   }
 
   private async refreshCatalog(follow: SeriesFollow, now: number) {
-    if (follow.nextCatalogAt === null || follow.nextCatalogAt > now) return;
+    if (follow.nextCatalogAt === null || (follow.catalogTitles && follow.nextCatalogAt > now)) return;
     if (this.malBackoff > now) { follow.nextCatalogAt = this.malBackoff; return; }
     try {
       const catalog = await this.provider.catalog(follow.malId);
       const hadFinale = follow.finishConfirmed && finale(follow) !== null;
       const previousReview = scopeReview(follow);
       follow.nextCatalogAt = now + CATALOG_INTERVAL;
-      follow.title = catalog.title; follow.episodeCount = catalog.episodeCount;
+      follow.title = catalog.title; follow.catalogTitles = verifiedCatalogTitles(catalog); follow.episodeCount = catalog.episodeCount;
       follow.finishConfirmed = catalog.status === 'finished_airing';
       follow.broadcastDayJapan = catalog.broadcastDayJapan; follow.broadcastTimeJapan = catalog.broadcastTimeJapan;
       const review = scopeReview(follow);
@@ -546,7 +558,7 @@ export class SeriesService {
         if (exact.length === 1) {
           const listing = exact[0]!.listing;
           let manifest: Manifest | undefined;
-          try { manifest = await this.provider.metadata(listing); }
+          try { manifest = await this.provider.metadata(listing, follow.catalogTitles); }
           catch (error) {
             if (!unavailableListing(error)) throw error;
             follow.error = error.message;
@@ -614,7 +626,7 @@ export class SeriesService {
   private async offer(follow: SeriesFollow, alternatives: SeriesListing[]) {
     if (follow.alternative && alternatives.some(listing => listing.infoHash === follow.alternative?.infoHash)) return follow.alternative;
     for (const listing of alternatives.slice(0, 2)) {
-      try { await this.provider.metadata(listing); return newAlternative(listing); }
+      try { await this.provider.metadata(listing, follow.catalogTitles); return newAlternative(listing); }
       catch (error) { if (!unavailableListing(error)) throw error; }
     }
     return null;

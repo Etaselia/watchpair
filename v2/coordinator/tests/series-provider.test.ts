@@ -104,6 +104,40 @@ test('reconstructs the existing WatchPair wire descriptors from raw verified tor
     fileIndex: 0, path: media, label: title, size: 123, duration: null, selected: true });
 });
 
+test('accepts abbreviated torrent filenames only with matching catalog aliases and episode identity', () => {
+  const listingTitle = '[Judas] Tensei shitara Ken deshita (Reincarnated as a Sword) - S02E08 [1080p]';
+  const filename = '[Judas] TenKen - S02E08.mkv';
+  const titles = ['Tensei shitara Ken deshita II', 'Reincarnated as a Sword Season 2',
+    'I became the sword by transmigrating 2nd Season, TenKen 2'];
+  const { bytes, infoHash } = torrent(filename);
+  const listing = { id: 2187750, title: listingTitle, infoHash, publishedAt };
+  assert.throws(() => verifySeriesMetainfo(bytes, listing), /verified single-file/);
+  const verified = verifySeriesMetainfo(bytes, listing, titles);
+  assert.equal(verified.file.path, filename);
+  assert.equal(verified.file.fileIndex, 0);
+  assert.equal(verified.source.identity, `bt:${infoHash}`);
+  const englishLabel = { ...listing, title: '[Judas] I became the sword by transmigrating - S02E08 [1080p]' };
+  assert.equal(verifySeriesMetainfo(bytes, englishLabel, titles).file.path, filename);
+  assert.throws(() => verifySeriesMetainfo(bytes, listing, ['TenKen 2']), /verified single-file/);
+  assert.throws(() => verifySeriesMetainfo(bytes, { ...listing, infoHash: '0'.repeat(40) }, titles), /verified single-file/);
+  for (const badName of [filename.replace('TenKen', 'Other Series'), filename.replace('E08', 'E09'),
+    filename.replace('S02', 'S03'), filename.replace('Judas', 'Other Group')]) {
+    const candidate = torrent(badName);
+    assert.throws(() => verifySeriesMetainfo(candidate.bytes, { ...listing, infoHash: candidate.infoHash }, titles),
+      /verified single-file/, badName);
+  }
+});
+
+test('cached torrent metadata still requires matching catalog aliases for each caller', async () => {
+  const { bytes, infoHash } = torrent('[Judas] TenKen - S02E08.mkv');
+  const listing = { id: 2187750, title: '[Judas] Reincarnated as a Sword - S02E08 [1080p]', infoHash, publishedAt };
+  const provider = createSeriesProvider(undefined, { fetch: async () => new Response(Uint8Array.from(bytes)) });
+  const manifest = await provider.metadata(listing, ['Reincarnated as a Sword Season 2', 'TenKen 2']);
+  assert.equal(manifest.file.path, '[Judas] TenKen - S02E08.mkv');
+  await assert.rejects(provider.metadata(listing, ['Other Series Season 2', 'TenKen 2']), /verified single-file/);
+  await assert.rejects(provider.metadata(listing), /verified single-file/);
+});
+
 test('rejects unsafe paths, bad hashes, wrong episodes and multi-file or hybrid metainfo', () => {
   const hash = 'a'.repeat(40);
   const wrong = torrent(media);
