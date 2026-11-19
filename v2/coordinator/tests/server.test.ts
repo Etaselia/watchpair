@@ -34,6 +34,9 @@ test('small room endpoints bound request bodies and commands authenticate before
   const oversized = await app.inject({ method: 'POST', url: '/v2/rooms', headers,
     payload: { name: 'x'.repeat(2048), memberName: 'Host', retryKey: key() } });
   assert.equal(oversized.statusCode, 413);
+  const oversizedBinary = await app.inject({ method: 'POST', url: '/v2/rooms',
+    headers: { ...headers, 'content-type': 'application/vnd.watchpair.torrent' }, payload: Buffer.alloc(2049) });
+  assert.equal(oversizedBinary.statusCode, 413);
 
   const command = { method: 'POST' as const, url: `/v2/rooms/${room.roomId}/commands`, payload: '{',
     headers: { ...headers, 'content-type': 'application/json' } };

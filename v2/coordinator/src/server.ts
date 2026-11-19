@@ -151,8 +151,8 @@ export async function buildServer(options: ServerOptions = {}) {
     const member = auth(request);
     return requireSeries().add(roomId(request), member.id, seriesConfirm.parse(request.body));
   });
-  app.addContentTypeParser('application/vnd.watchpair.torrent', { parseAs: 'buffer',
-    bodyLimit: MAX_SERIES_METADATA_BYTES }, (_request, body, done) => done(null, body));
+  app.addContentTypeParser('application/vnd.watchpair.torrent', { parseAs: 'buffer' },
+    (_request, body, done) => done(null, body));
   app.post('/v2/rooms/:roomId/series/metadata/:requestId', {
     config: { rateLimit: { max: 30, timeWindow: '1 minute' } }, bodyLimit: MAX_SERIES_METADATA_BYTES,
     onRequest: async request => { auth(request); requireSeries(); },
