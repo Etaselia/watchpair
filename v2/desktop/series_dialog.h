@@ -18,7 +18,7 @@ class SeriesFollowDialog final : public QDialog {
   Q_OBJECT
 public:
   explicit SeriesFollowDialog(RoomClient &rooms, QString room, QWidget *parent = nullptr,
-                              QJsonObject replacing = {});
+                              QJsonObject replacing = {}, QString anchorEntryId = {});
 
 private:
   void lookup();
@@ -29,6 +29,7 @@ private:
   RoomClient &rooms_;
   const QString room_;
   const QJsonObject replacing_;
+  const QString anchorEntryId_;
   QJsonObject draft_;
   QLineEdit *input_;
   QComboBox *catalog_, *release_;

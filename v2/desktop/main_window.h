@@ -30,7 +30,7 @@ private:
   void enterRoom(bool create, const QString &link = {});
   void manageRoom(const QString &key);
   void addSource(const QString &room = {}, const QString &input = {});
-  void followSeries(const QString &room);
+  void followSeries(const QString &room, const QString &entryId = {});
   void manageSeries(const QString &room);
   void prepared(const QJsonObject &source);
   void publish(const QString &transfer);

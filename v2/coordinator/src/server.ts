@@ -13,21 +13,23 @@ import { SeriesService } from './series.js';
 import type { SeriesProvider } from './series-provider.js';
 
 const name = z.string().trim().min(1).max(100).refine(v => !/[\x00-\x1f\x7f]/.test(v));
-const VERSION = '2.0.0-alpha.7';
+const VERSION = '2.0.0-alpha.8';
 const capability = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const createBody = z.object({ name, memberName: name, retryKey: capability }).strict();
 const joinBody = z.object({ invite: capability, name, retryKey: capability }).strict();
 const recoveryBody = z.object({ recovery: capability, retryKey: capability }).strict();
 const episodeNumber = z.number().int().min(1).max(99_999);
 const seriesAirtime = z.number().int().min(0).max(Date.UTC(2100, 0, 1)).nullable();
-const seriesPreview = z.object({ input: z.string().trim().min(1).max(300), malId: z.number().int().min(1).max(999_999_999).optional(),
-  listingId: z.number().int().min(1).max(999_999_999_999).optional() }).strict();
+const seriesEntryId = z.string().regex(/^[a-f0-9]{64}$/);
+const seriesPreview = z.object({ input: z.string().trim().max(300), malId: z.number().int().min(1).max(999_999_999).optional(),
+  listingId: z.number().int().min(1).max(999_999_999_999).optional(), entryId: seriesEntryId.optional() }).strict()
+  .refine(value => Boolean(value.input || value.entryId), 'Enter a title or link or choose a room episode.');
 const seriesConfirm = z.object({ draftId: z.string().uuid(), expectedAirAt: seriesAirtime.optional(),
   finalEpisode: episodeNumber.nullable().optional(), catalogEpisode: episodeNumber.optional() }).strict();
 const seriesAction = z.object({ revision: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
   action: z.enum(['pause', 'resume', 'stop', 'check', 'skip', 'approve-alternate', 'dismiss-alternate', 'set-airtime', 'set-finale', 'replace-source', 'link-existing']),
   expectedAirAt: seriesAirtime.optional(), finalEpisode: episodeNumber.nullable().optional(), alternativeId: z.string().uuid().optional(),
-  draftId: z.string().uuid().optional(), entryId: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict();
+  draftId: z.string().uuid().optional(), entryId: seriesEntryId.optional() }).strict();
 type Socket = { ws: WebSocket; roomId: string; memberId: string; token: string; connectionId: string };
 export type ServerOptions = { database?: string; now?: () => number; logger?: boolean; trustProxy?: boolean; relayUrl?:string; relayKey?:Buffer;
   seriesProvider?: SeriesProvider; seriesTimer?: boolean };
@@ -94,7 +96,8 @@ export async function buildServer(options: ServerOptions = {}) {
       <a id="open">Open WatchPair</a><a href="/downloads/">Get the desktop app</a><p>Already installed? You can also paste this link into Join room.</p><input id="link" readonly aria-label="Private room link"><button id="copy">Copy link</button><p><small>The private part of this link stays in your browser. Share recovery links only with the room owner.</small></p>
       <script nonce="${nonce}">const fragment=location.hash.slice(1);const match=/^(invite|recovery)=([A-Za-z0-9_-]{43})$/.exec(fragment);const input=document.getElementById('link');input.value=location.href;if(match){const a=document.getElementById('open');a.href='watchpair://room?server='+encodeURIComponent(location.origin)+'&room=${id}#'+fragment;a.style.display='inline-block';if(match[1]==='recovery')document.getElementById('message').textContent='This private recovery link restores host control. Open it only on a device you trust.';}else document.getElementById('message').textContent='This link is incomplete. Ask the host for the full invite, including the private part after #.';document.getElementById('copy').onclick=async()=>{try{await navigator.clipboard.writeText(input.value);document.getElementById('copy').textContent='Copied';}catch{input.select();}};</script></html>`);
   });
-  app.get('/v2/version', async () => ({ protocol: PROTOCOL, version: VERSION, operationRetryWindow: 10_000, seriesFollows: series !== null }));
+  app.get('/v2/version', async () => ({ protocol: PROTOCOL, version: VERSION, operationRetryWindow: 10_000,
+    seriesFollows: series !== null, seriesFollowFromEntry: series !== null }));
   app.post('/v2/rooms', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async request => {
     const body = createBody.parse(request.body); return engine.create(body.name, body.memberName, body.retryKey);
   });

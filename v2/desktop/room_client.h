@@ -44,6 +44,7 @@ public:
   using SeriesReply = std::function<void(QJsonObject, QString)>;
   void probeSeriesFollows(const QString &key);
   bool seriesFollowsAvailable(const QString &key) const;
+  bool seriesFollowFromEntryAvailable(const QString &key) const;
   void loadSeriesFollows(const QString &key, QObject *context, SeriesReply callback);
   void previewSeriesFollow(const QString &key, const QJsonObject &body, QObject *context,
                            SeriesReply callback);
@@ -78,7 +79,7 @@ private:
     double offset = 0, bestRtt = 1e20;
     QList<QPair<double, double>> clockSamples;
     bool online = false, fresh = false, terminal = false, requesting = false, refreshing = false;
-    bool seriesAvailable = false, seriesProbePending = false;
+    bool seriesAvailable = false, seriesEntryAvailable = false, seriesProbePending = false;
     qint64 seriesProbeAfter = 0;
     QString state = QStringLiteral("Connecting…");
   };

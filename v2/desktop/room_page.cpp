@@ -586,6 +586,13 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   connect(queueUnwatched_, &QAction::triggered, this, [this] { mark(false); });
   queueWatchAgain_ = queueMenu->addAction(tr("Watch again"));
   connect(queueWatchAgain_, &QAction::triggered, this, &RoomPage::rewatch);
+  queueFollow_ = queueMenu->addAction(tr("Follow this series…"));
+  queueFollow_->setObjectName(QStringLiteral("QueueFollowSeries"));
+  connect(queueFollow_, &QAction::triggered, this, [this] {
+    const auto id = selectedEntry();
+    if (!id.isEmpty() && !app_.rooms.entry(room_, id).isEmpty())
+      emit followEntryRequested(room_, id);
+  });
   queueRename_ = queueMenu->addAction(tr("Rename episode…"));
   connect(queueRename_, &QAction::triggered, this, [this] {
     const auto id = selectedEntry();
@@ -985,6 +992,9 @@ void RoomPage::updateQueueActions() {
   queueWatchAgain_->setVisible(watched);
   queueUnwatched_->setEnabled(connected && !selected.isEmpty());
   queueWatchAgain_->setEnabled(connected && one);
+  const bool canFollow = app_.rooms.seriesFollowFromEntryAvailable(room_);
+  queueFollow_->setVisible(canFollow);
+  queueFollow_->setEnabled(connected && canFollow && one && !app_.rooms.entry(room_, selected.first()).isEmpty());
   queueRename_->setVisible(!watched);
   queueRename_->setEnabled(connected && one);
   queueRemove_->setVisible(!watched);

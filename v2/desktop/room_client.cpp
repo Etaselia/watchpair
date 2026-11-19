@@ -151,8 +151,10 @@ void RoomClient::probeSeriesFollows(const QString &key) {
             c.seriesProbeAfter = now() + (code.isEmpty() ? 300000 : 30000);
             if (code.isEmpty()) {
               const bool available = result.value(QStringLiteral("seriesFollows")).toBool();
-              if (c.seriesAvailable != available) {
+              const bool fromEntry = available && result.value(QStringLiteral("seriesFollowFromEntry")).toBool();
+              if (c.seriesAvailable != available || c.seriesEntryAvailable != fromEntry) {
                 c.seriesAvailable = available;
+                c.seriesEntryAvailable = fromEntry;
                 emit seriesCapabilityChanged(key);
               }
             }
@@ -161,6 +163,10 @@ void RoomClient::probeSeriesFollows(const QString &key) {
 bool RoomClient::seriesFollowsAvailable(const QString &key) const {
   const auto it = connections_.find(key);
   return it != connections_.end() && it->second->seriesAvailable;
+}
+bool RoomClient::seriesFollowFromEntryAvailable(const QString &key) const {
+  const auto it = connections_.find(key);
+  return it != connections_.end() && it->second->seriesEntryAvailable;
 }
 void RoomClient::seriesRequest(const QString &key, const QString &suffix, const QJsonObject *body,
                                QObject *context, SeriesReply callback) {

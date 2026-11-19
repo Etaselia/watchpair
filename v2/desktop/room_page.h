@@ -70,6 +70,7 @@ signals:
   void addRequested(QString room);
   void manageRequested(QString room);
   void seriesRequested(QString room);
+  void followEntryRequested(QString room, QString entry);
   void fullscreenRequested();
   void popoutRequested();
   void transferRequested(QString transfer);
@@ -115,7 +116,7 @@ private:
   QPushButton *join_, *leave_, *play_, *next_, *overlayAction_, *loadHistory_;
   QPushButton *queueUp_, *queueDown_, *queueMark_;
   QPushButton *series_;
-  QAction *queueUnwatched_, *queueWatchAgain_, *queueRename_, *queueRemove_, *queueClear_;
+  QAction *queueUnwatched_, *queueWatchAgain_, *queueFollow_, *queueRename_, *queueRemove_, *queueClear_;
   QLabel *queueHint_;
   QPushButton *previousChapter_, *nextChapter_, *skipBack_, *skipForward_, *popout_, *reattach_;
   SeekSlider *seek_;

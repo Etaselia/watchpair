@@ -5,8 +5,10 @@
 #include "theme.h"
 #include <QAbstractItemView>
 #include <QApplication>
+#include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFile>
+#include <QLabel>
 #include <QListWidget>
 #include <QProcess>
 #include <QMessageBox>
@@ -55,6 +57,12 @@ void screenshot(QWidget &window, const QString &name) {
   QDir().mkpath(root);
   window.grab().save(QDir(root).filePath(name + QStringLiteral(".png")));
 }
+void chooseOption(QComboBox *box, int index) {
+  box->showPopup();
+  auto *view = box->view();
+  QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier,
+                    view->visualRect(box->model()->index(index, 0)).center());
+}
 } // namespace
 class UiFlowTests final : public QObject {
   Q_OBJECT
@@ -97,17 +105,11 @@ private slots:
       QVERIFY(!confirm->isEnabled());
       QTest::keyClicks(query, QStringLiteral("Test Anime"));
       QTest::mouseClick(search, Qt::LeftButton);
-      const auto choose = [](QComboBox *box, int index) {
-        box->showPopup();
-        auto *view = box->view();
-        QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier,
-                          view->visualRect(box->model()->index(index, 0)).center());
-      };
       QTRY_VERIFY_WITH_TIMEOUT(season->isVisible() && season->isEnabled() && season->count() == 2, 5000);
-      choose(season, 1);
+      chooseOption(season, 1);
       QTRY_VERIFY_WITH_TIMEOUT(release->isVisible() && release->isEnabled() && release->count() == 3, 5000);
       QCOMPARE(season->currentText(), QStringLiteral("Test Anime"));
-      choose(release, 1);
+      chooseOption(release, 1);
       QTRY_VERIFY_WITH_TIMEOUT(confirm->isEnabled(), 5000);
       QVERIFY(release->currentText().contains(QStringLiteral(" - 07 ")));
       screenshot(*follow, QStringLiteral("series-confirmation"));
@@ -142,6 +144,95 @@ private slots:
       QTRY_VERIFY_WITH_TIMEOUT(!button(*manager, QStringLiteral("Use this release once")), 5000);
       for (const auto &transfer : services.transfers.transfers())
         QCOMPARE(transfer.wanted, 0);
+      window.prepareToQuit();
+      services.shutdown();
+    } catch (const std::exception &e) {
+      QFAIL(e.what());
+    }
+  }
+
+  void followAnExistingWatchedEpisodeWithoutRequeuingIt() {
+    try {
+      QTemporaryDir tmp;
+      QVERIFY(tmp.isValid());
+      wp::test::Coordinator server;
+      server.start(tmp.filePath(QStringLiteral("server.sqlite")), true);
+      wp::AppServices services(tmp.filePath(QStringLiteral("profile")), nullptr, true, false);
+      services.store.setSetting(QStringLiteral("acquisitionPolicy"), QStringLiteral("Never"));
+      QSignalSpy entered(&services.rooms, &wp::RoomClient::entered);
+      services.rooms.create(server.url(), QStringLiteral("Existing episode"), QStringLiteral("Host"));
+      QTRY_COMPARE_WITH_TIMEOUT(entered.size(), 1, 5000);
+      const auto room = entered.first()[1].toString();
+      QTRY_VERIFY_WITH_TIMEOUT(services.rooms.connected(room), 5000);
+      const QJsonObject source{{QStringLiteral("id"), QStringLiteral("existing-source")},
+                               {QStringLiteral("kind"), QStringLiteral("direct")},
+                               {QStringLiteral("label"), QStringLiteral("Existing source")},
+                               {QStringLiteral("uri"), server.url() + QStringLiteral("/episode.mkv")},
+                               {QStringLiteral("identity"), QStringLiteral("existing-source")}};
+      const QJsonObject file{{QStringLiteral("mediaId"), QStringLiteral("existing-episode")},
+                             {QStringLiteral("path"), QStringLiteral("Season/Test Anime - 07 (1080p).mkv")},
+                             {QStringLiteral("label"), QStringLiteral("Our episode title")},
+                             {QStringLiteral("fileIndex"), 0}, {QStringLiteral("size"), 123},
+                             {QStringLiteral("selected"), true}};
+      services.rooms.command(room, {{QStringLiteral("type"), QStringLiteral("queue.add")},
+                                    {QStringLiteral("source"), source},
+                                    {QStringLiteral("files"), QJsonArray{file}}});
+      QTRY_COMPARE_WITH_TIMEOUT(services.rooms.room(room).value(QStringLiteral("entries")).toArray().size(), 1, 5000);
+      const auto entryId = services.rooms.room(room).value(QStringLiteral("entries")).toArray().first().toObject()
+                               .value(QStringLiteral("id")).toString();
+      wp::ui::MainWindow window(services);
+      window.show();
+      window.showRoom(room);
+      QVERIFY(QTest::qWaitForWindowExposed(&window));
+      auto *queue = window.findChild<QTableView *>(QStringLiteral("EpisodeQueue"));
+      auto *history = window.findChild<QTableView *>(QStringLiteral("WatchedHistory"));
+      auto *tabs = window.findChild<QTabBar *>(QStringLiteral("QueueTabs"));
+      auto *more = window.findChild<QToolButton *>(QStringLiteral("QueueMore"));
+      auto *mark = window.findChild<QPushButton *>(QStringLiteral("QueueMarkWatched"));
+      QVERIFY(queue && history && tabs && more && mark);
+      auto *action = more->menu()->findChild<QAction *>(QStringLiteral("QueueFollowSeries"));
+      QVERIFY(action);
+      QTRY_VERIFY_WITH_TIMEOUT(services.rooms.seriesFollowFromEntryAvailable(room), 5000);
+      QTRY_COMPARE(queue->model()->rowCount(), 1);
+      queue->selectRow(0);
+      QVERIFY(action->isVisible() && action->isEnabled());
+      QTest::mouseClick(mark, Qt::LeftButton);
+      QTRY_VERIFY_WITH_TIMEOUT(services.rooms.entry(room, entryId).value(QStringLiteral("watchedAt")).isDouble(), 5000);
+      tabs->setCurrentIndex(1);
+      QTRY_COMPARE(history->model()->rowCount(), 1);
+      history->selectRow(0);
+      QVERIFY(action->isVisible() && action->isEnabled());
+      const auto revision = services.rooms.room(room).value(QStringLiteral("queueRevision"));
+      const auto original = services.rooms.entry(room, entryId);
+
+      action->trigger();
+      QPointer<QDialog> follow = window.findChild<QDialog *>(QStringLiteral("SeriesFollowDialog"));
+      QVERIFY(follow);
+      auto *season = follow->findChild<QComboBox *>(QStringLiteral("SeriesCatalogChoice"));
+      auto *release = follow->findChild<QComboBox *>(QStringLiteral("SeriesReleaseChoice"));
+      auto *confirm = button(*follow, QStringLiteral("Follow series"));
+      auto *preview = follow->findChild<QLabel *>(QStringLiteral("SeriesPreview"));
+      QVERIFY(season && release && confirm && preview);
+      QTRY_VERIFY_WITH_TIMEOUT(season->isVisible() && season->isEnabled() && season->count() == 2, 5000);
+      chooseOption(season, 1);
+      QTRY_VERIFY_WITH_TIMEOUT(release->isVisible() && release->isEnabled() && release->count() == 2, 5000);
+      chooseOption(release, 1);
+      QTRY_VERIFY_WITH_TIMEOUT(confirm->isEnabled(), 5000);
+      QVERIFY(preview->text().contains(QStringLiteral("Next episode: 8")));
+      QTest::mouseClick(confirm, Qt::LeftButton);
+      QTRY_VERIFY_WITH_TIMEOUT(!follow, 5000);
+      QJsonArray rules;
+      services.rooms.loadSeriesFollows(room, &window, [&](const QJsonObject &result, const QString &) {
+        rules = result.value(QStringLiteral("items")).toArray();
+      });
+      QTRY_COMPARE_WITH_TIMEOUT(rules.size(), 1, 5000);
+      QCOMPARE(rules.first().toObject().value(QStringLiteral("nextEpisode")).toInt(), 8);
+      const auto roomId = services.rooms.credential(room).value(QStringLiteral("roomId")).toString();
+      QCOMPARE(server.inspect(roomId).value(QStringLiteral("entries")).toArray().size(), 1);
+      QCOMPARE(services.rooms.room(room).value(QStringLiteral("queueRevision")), revision);
+      QCOMPARE(services.rooms.entry(room, entryId), original);
+      QCOMPARE(queue->model()->rowCount(), 0);
+      QCOMPARE(history->model()->rowCount(), 1);
       window.prepareToQuit();
       services.shutdown();
     } catch (const std::exception &e) {

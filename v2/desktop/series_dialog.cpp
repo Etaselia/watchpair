@@ -111,17 +111,28 @@ void populateChoices(QComboBox *box, const QJsonArray &items, const QString &pla
 } // namespace
 
 SeriesFollowDialog::SeriesFollowDialog(RoomClient &rooms, QString room, QWidget *parent,
-                                       QJsonObject replacing)
-    : QDialog(parent), rooms_(rooms), room_(std::move(room)), replacing_(std::move(replacing)) {
+                                       QJsonObject replacing, QString anchorEntryId)
+    : QDialog(parent), rooms_(rooms), room_(std::move(room)), replacing_(std::move(replacing)),
+      anchorEntryId_(std::move(anchorEntryId)) {
   setObjectName(QStringLiteral("SeriesFollowDialog"));
-  setWindowTitle(replacing_.isEmpty() ? tr("Follow a series") : tr("Change release rule"));
+  setWindowTitle(!replacing_.isEmpty() ? tr("Change release rule") : anchorEntryId_.isEmpty()
+                         ? tr("Follow a series") : tr("Follow this series"));
   setMinimumWidth(560);
   auto *layout = new QVBoxLayout(this);
   layout->addWidget(plainLabel(windowTitle(), "SectionTitle"));
-  layout->addWidget(plainLabel(replacing_.isEmpty()
-                                   ? tr("Find a season, then choose the Nyaa release you want to follow.")
-                                   : tr("Choose a different release of the next episode. It will be added "
-                                        "now, and future episodes will use this release rule.")));
+  if (!anchorEntryId_.isEmpty()) {
+    const auto entry = rooms_.entry(room_, anchorEntryId_);
+    auto *label = plainLabel(tr("Room episode: %1").arg(entry.value(QStringLiteral("label")).toString()));
+    label->setToolTip(QStringLiteral("<p>") + entry.value(QStringLiteral("path")).toString().toHtmlEscaped() +
+                      QStringLiteral("</p>"));
+    layout->addWidget(label);
+    layout->addWidget(plainLabel(tr("Choose a release of this episode. The follow starts with the next one.")));
+  } else {
+    layout->addWidget(plainLabel(replacing_.isEmpty()
+                                     ? tr("Find a season, then choose the Nyaa release you want to follow.")
+                                     : tr("Choose a different release of the next episode. It will be added "
+                                          "now, and future episodes will use this release rule.")));
+  }
   auto *queryRow = new QHBoxLayout;
   input_ = new QLineEdit;
   input_->setObjectName(QStringLiteral("SeriesSearchInput"));
@@ -228,6 +239,8 @@ SeriesFollowDialog::SeriesFollowDialog(RoomClient &rooms, QString room, QWidget 
   });
   updateActions();
   input_->setFocus();
+  if (!anchorEntryId_.isEmpty())
+    QTimer::singleShot(0, this, &SeriesFollowDialog::lookup);
 }
 
 void SeriesFollowDialog::invalidatePreview() {
@@ -247,7 +260,7 @@ void SeriesFollowDialog::updateActions() {
   releaseLabel_->setVisible(!release_->isHidden());
   feedback_->setVisible(!feedback_->text().isEmpty());
   summary_->setVisible(!summary_->text().isEmpty());
-  search_->setEnabled(!busy_ && connected && !input_->text().trimmed().isEmpty());
+  search_->setEnabled(!busy_ && connected && (!input_->text().trimmed().isEmpty() || !anchorEntryId_.isEmpty()));
   const bool numbered = !overrideNumber_->isChecked() || catalogEpisode_->value() > 0;
   confirm_->setEnabled(!busy_ && connected && !draft_.isEmpty() && numbered);
 }
@@ -257,6 +270,8 @@ void SeriesFollowDialog::lookup() {
     return;
   invalidatePreview();
   QJsonObject body{{QStringLiteral("input"), input_->text().trimmed()}};
+  if (!anchorEntryId_.isEmpty())
+    body.insert(QStringLiteral("entryId"), anchorEntryId_);
   auto malId = catalog_->currentData().toLongLong();
   if (!malId && !replacing_.isEmpty())
     malId = replacing_.value(QStringLiteral("malId")).toInteger();
@@ -287,11 +302,16 @@ void SeriesFollowDialog::acceptPreview(const QJsonObject &result) {
     feedback_->setText(release_->isVisible() ? tr("Choose the release group and edition to follow.")
                        : catalog_->isVisible()
                            ? tr("Choose the exact season to search for.")
-                           : tr("No matching release was found. Try a Nyaa episode link."));
+                           : anchorEntryId_.isEmpty()
+                                 ? tr("No matching release was found. Try a Nyaa episode link.")
+                                 : tr("Enter an anime title or paste a Nyaa release link for this episode."));
     return;
   }
   const auto startingEpisode = draft.value(QStringLiteral("anchorEpisode")).toInt();
   const auto nextEpisode = draft.value(QStringLiteral("nextEpisode")).toInt();
+  const auto matchingRelease = release_->findData(draft.value(QStringLiteral("anchorListingId")).toInteger());
+  if (matchingRelease > 0)
+    release_->setCurrentIndex(matchingRelease);
   if (!replacing_.isEmpty() && startingEpisode != replacing_.value(QStringLiteral("nextEpisode")).toInt()) {
     feedback_->setText(tr("Choose episode %1, the one this follow is waiting for.")
                            .arg(replacing_.value(QStringLiteral("nextEpisode")).toInt()));
@@ -303,7 +323,9 @@ void SeriesFollowDialog::acceptPreview(const QJsonObject &result) {
   const auto anchor = draft.value(QStringLiteral("anchorTitle")).toString();
   const auto when = draft.value(QStringLiteral("expectedAirAt"));
   summary_->setText(replacing_.isEmpty()
-                        ? tr("%1\nStarting release: %2\nNext episode: %3\nEstimated airtime: %4")
+                        ? (anchorEntryId_.isEmpty()
+                               ? tr("%1\nStarting release: %2\nNext episode: %3\nEstimated airtime: %4")
+                               : tr("%1\nNyaa reference: %2\nNext episode: %3\nEstimated airtime: %4"))
                               .arg(title, anchor)
                               .arg(nextEpisode)
                               .arg(localTime(when, tr("Unknown")))

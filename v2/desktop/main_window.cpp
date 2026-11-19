@@ -321,6 +321,7 @@ MainWindow::MainWindow(AppServices &app) : app_(app) {
   connect(room_, &RoomPage::addRequested, this, [this](const QString &room) { addSource(room); });
   connect(room_, &RoomPage::manageRequested, this, &MainWindow::manageRoom);
   connect(room_, &RoomPage::seriesRequested, this, &MainWindow::manageSeries);
+  connect(room_, &RoomPage::followEntryRequested, this, &MainWindow::followSeries);
   connect(room_, &RoomPage::transferRequested, this, &MainWindow::showTransfers);
   connect(room_, &RoomPage::fullscreenRequested, this, &MainWindow::toggleFullscreen);
   connect(room_, &RoomPage::popoutRequested, this, &MainWindow::togglePopout);
@@ -741,10 +742,12 @@ void MainWindow::addSource(const QString &room, const QString &input) {
     statusBar()->showMessage(tr("Inspecting source…"));
   });
 }
-void MainWindow::followSeries(const QString &room) {
+void MainWindow::followSeries(const QString &room, const QString &entryId) {
   if (!app_.rooms.seriesFollowsAvailable(room) || !app_.rooms.connected(room))
     return;
-  auto *dialog = new SeriesFollowDialog(app_.rooms, room, this);
+  if (!entryId.isEmpty() && (!app_.rooms.seriesFollowFromEntryAvailable(room) || app_.rooms.entry(room, entryId).isEmpty()))
+    return;
+  auto *dialog = new SeriesFollowDialog(app_.rooms, room, this, {}, entryId);
   dialog->setAttribute(Qt::WA_DeleteOnClose);
   connect(dialog, &QDialog::accepted, this, [this] { statusBar()->showMessage(tr("Series followed"), 5000); });
   dialog->open();

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { Engine } from './engine.js';
-import { DomainError, requireThat, type FileDescriptor, type Source } from './protocol.js';
+import { DomainError, requireThat, type Entry, type FileDescriptor, type Source } from './protocol.js';
 import {
   episodeSearchTerms, parseSeriesTitle, releaseMatches, sameSeriesStem, SeriesProviderError,
   type SeriesCatalog, type SeriesListing, type SeriesProvider, type SeriesRelease,
@@ -23,11 +23,12 @@ const CATALOG_UNAVAILABLE = 'MyAnimeList is temporarily unavailable. The last kn
 const WAITING_FOR_FINALE = 'Reached the current MyAnimeList episode total. Waiting for the catalog to confirm the finale.';
 
 type Manifest = { source: Source; file: FileDescriptor };
+type EntryBinding = Pick<Entry, 'id' | 'mediaId' | 'path' | 'size'>;
 type Draft = {
   id: string; roomId: string; memberId: string; expiresAt: number; catalog: SeriesCatalog;
-  listing: SeriesListing; release: SeriesRelease; manifest: Manifest;
+  listing: SeriesListing; release: SeriesRelease; manifest: Manifest; anchor?: EntryBinding;
 };
-type Preview = { input: string; malId?: number; listingId?: number };
+type Preview = { input: string; malId?: number; listingId?: number; entryId?: string };
 type Confirm = { draftId: string; expectedAirAt?: number | null; finalEpisode?: number | null; catalogEpisode?: number };
 export type SeriesAction = {
   revision: number; action: 'pause' | 'resume' | 'stop' | 'check' | 'skip' | 'approve-alternate' |
@@ -50,6 +51,27 @@ function inputParts(input: string) {
 function eligible(listing: SeriesListing) {
   const release = parseSeriesTitle(listing.title);
   return release?.edition ? release : null;
+}
+
+function entryRelease(entry: Entry) {
+  const name = entry.path.split('/').at(-1)!;
+  return parseSeriesTitle(name) ?? (!name.startsWith('[') ? parseSeriesTitle(`[Room] ${name}`) : null);
+}
+
+function sameEntryEpisode(entry: SeriesRelease | null, release: SeriesRelease) {
+  return !entry || (entry.episode === release.episode &&
+    (entry.season === null || release.season === null || entry.season === release.season));
+}
+
+function sourceListingId(source: Source | undefined) {
+  if (source?.kind !== 'torrent') return null;
+  try {
+    const url = new URL(source.uri);
+    if (url.protocol !== 'https:' || !['nyaa.si', 'www.nyaa.si'].includes(url.hostname) ||
+        url.port || url.username || url.password) return null;
+    const match = /^(?:\/view\/(\d{1,12})\/?|\/download\/(\d{1,12})\.torrent)$/.exec(url.pathname);
+    return match ? Number(match[1] ?? match[2]) || null : null;
+  } catch { return null; }
 }
 
 function newAlternative(listing: SeriesListing) {
@@ -154,34 +176,70 @@ export class SeriesService {
     requireThat(this.previews < 2, 'SERIES_BUSY', 'Series search is busy. Try again in a moment.', 429);
     ++this.previews;
     try {
+      const entry = input.entryId ? this.roomEntry(roomId, input.entryId) : null;
+      const knownRelease = entry && entryRelease(entry);
       const parts = inputParts(input.input);
       const listingId = input.listingId ?? parts.listingId;
       const malId = input.malId ?? parts.malId;
-      const listing = listingId ? await this.provider.listing(listingId) : null;
+      let listing = listingId ? await this.provider.listing(listingId) : null;
+      if (!listing && entry && !parts.title) {
+        const source = this.engine.room(roomId).sources.find(item => item.id === entry.sourceId);
+        listing = await this.findEntryListing(source, knownRelease);
+      }
       const parsed = listing && eligible(listing);
       if (listing) requireThat(parsed, 'SERIES_UNSUPPORTED_TITLE', 'This release does not identify a single episode and edition. Choose a clearer Nyaa release.', 422);
-      const query = parts.title ?? parsed?.stem;
+      if (parsed) requireThat(sameEntryEpisode(knownRelease, parsed), 'SERIES_ANCHOR_MISMATCH',
+        'Choose a Nyaa release of the same episode as the selected room item.', 422);
+      const query = parts.title || (parsed?.stem ?? knownRelease?.stem)?.slice(0, 160);
       const catalog = malId ? [await this.provider.catalog(malId)] : query ? await this.provider.searchCatalog(query) : [];
       const releases = listing ? [listing] : query || catalog[0] ? await this.provider.searchReleases(query ?? catalog[0]!.title) : [];
       const result = { catalog: catalog.slice(0, 12), releases: releases.flatMap(item => {
         const match = eligible(item);
-        return match ? [{ id: item.id, title: item.title, episode: match.episode, group: match.group, edition: match.edition }] : [];
+        return match && sameEntryEpisode(knownRelease, match)
+          ? [{ id: item.id, title: item.title, episode: match.episode, group: match.group, edition: match.edition }] : [];
       }).slice(0, 25) };
       if (!listing || !parsed || !malId || !catalog[0]) return result;
       const manifest = await this.provider.metadata(listing);
       const now = this.engine.now();
+      const anchor = entry ? { id: entry.id, mediaId: entry.mediaId, path: entry.path, size: entry.size } : undefined;
+      if (anchor) this.checkAnchor(roomId, anchor);
       const draft: Draft = { id: randomUUID(), roomId, memberId, expiresAt: now + DRAFT_TTL, catalog: catalog[0],
-        listing, release: parsed, manifest };
+        listing, release: parsed, manifest, anchor };
       const seed = seedBroadcast(draft.catalog, listing.publishedAt, parsed.episode);
       this.trimDrafts(now);
       this.drafts.set(draft.id, draft);
-      return { ...result, draft: { id: draft.id, title: draft.catalog.title, anchorTitle: listing.title,
+      return { ...result, draft: { id: draft.id, title: draft.catalog.title, anchorTitle: listing.title, anchorListingId: listing.id,
         anchorEpisode: parsed.episode, nextEpisode: parsed.episode + 1, episodeCount: draft.catalog.episodeCount,
         expectedAirAt: seed === null ? null : estimateAirtime(seed, parsed.episode + 1, parsed.episode, draft.catalog) } };
     } catch (error) {
       if (error instanceof SeriesProviderError) throw providerError(error);
       throw error;
     } finally { --this.previews; }
+  }
+
+  private async findEntryListing(source: Source | undefined, knownRelease: SeriesRelease | null) {
+    const id = sourceListingId(source);
+    if (!id) return null;
+    try {
+      const listing = await this.provider.listing(id);
+      const release = eligible(listing);
+      return release && sameEntryEpisode(knownRelease, release) && source?.identity === `bt:${listing.infoHash}` ? listing : null;
+    } catch (error) {
+      if (unavailableListing(error)) return null;
+      throw error;
+    }
+  }
+
+  private roomEntry(roomId: string, id: string) {
+    const entry = this.engine.room(roomId).entries.find(item => item.id === id);
+    requireThat(entry, 'ENTRY_NOT_FOUND', 'This episode is no longer in the room. Choose another episode.', 404);
+    return entry;
+  }
+
+  private checkAnchor(roomId: string, anchor: EntryBinding) {
+    const entry = this.roomEntry(roomId, anchor.id);
+    requireThat(entry.mediaId === anchor.mediaId && entry.path === anchor.path && entry.size === anchor.size,
+      'SERIES_ANCHOR_CHANGED', 'The episode changed. Preview the current room episode before following it.', 409);
   }
 
   private draft(roomId: string, memberId: string, id: string | undefined) {
@@ -230,6 +288,7 @@ export class SeriesService {
     const store = this.engine.store, now = this.engine.now();
     const previous = store.getSeries(roomId, draft.id);
     if (previous) return { item: publicFollow(previous) };
+    if (draft.anchor) this.checkAnchor(roomId, draft.anchor);
     const rules = store.listSeries(roomId);
     requireThat(rules.length < MAX_ROOM_RULES && rules.filter(f => f.status === 'active' || f.status === 'paused').length < MAX_FOLLOWS,
       'SERIES_LIMIT', 'This room has reached its series follow limit.', 409);
@@ -255,11 +314,12 @@ export class SeriesService {
     follow.nextCheckAt = scheduledCheck(follow, now);
     follow.error = scopeReview(follow);
     this.finishIfDone(follow);
-    const seed = this.episode(follow, release.episode, 'added', draft.listing.id);
+    const seed = this.episode(follow, release.episode, draft.anchor ? 'existing' : 'added', draft.listing.id, draft.anchor?.id);
     if (store.getSeriesEpisode(roomId, follow.malId, seed.episode)) {
       this.engine.commitSeries({ follow, expectedRevision: null });
     } else {
-      this.engine.commitSeries({ follow, expectedRevision: null, episodes: [seed] }, [{ episode: seed.episode, ...draft.manifest }]);
+      this.engine.commitSeries({ follow, expectedRevision: null, episodes: [seed] },
+        draft.anchor ? [] : [{ episode: seed.episode, ...draft.manifest }]);
     }
     return { item: publicFollow(follow) };
   }
@@ -322,7 +382,7 @@ export class SeriesService {
       case 'replace-source': {
         active(); checkScope();
         const draft = this.draft(roomId, memberId, input.draftId);
-        requireThat(draft.catalog.id === follow.malId && draft.release.episode === follow.nextEpisode, 'SERIES_REPLACE',
+        requireThat(!draft.anchor && draft.catalog.id === follow.malId && draft.release.episode === follow.nextEpisode, 'SERIES_REPLACE',
           'Choose a release for the same catalog entry and the current missing episode.', 422);
         const priorForecast = forecast(follow, follow.nextEpisode);
         follow.anchorBroadcastAt = follow.expectedAirAt ?? priorForecast;

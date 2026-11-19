@@ -284,6 +284,88 @@ test('an existing disabled entry is recorded without reenabling it, and a skippe
   assert.equal(f.provider.metadataCalls.includes(102), false);
 });
 
+test('a member can follow a watched Nyaa episode using its original listing and start with the next release', async t => {
+  const f = await fixture(t);
+  const original = f.provider.records.get(100)!;
+  const manifest = verifySeriesMetainfo(original.bytes, original.listing);
+  const queue = () => f.engine.snapshot(f.room.roomId);
+  const command = (payload: object) => f.engine.command(f.room.roomId, f.room.memberId,
+    { operationId: randomUUID(), queueRevision: queue().queueRevision, command: payload });
+  command({ type: 'queue.add', source: manifest.source, files: [manifest.file] });
+  const entryId = queue().entries[0]!.id;
+  command({ type: 'history.mark', ids: [entryId], watched: true });
+  const before = queue();
+
+  const version = await f.app.inject({ url: '/v2/version', headers });
+  assert.equal(version.json().seriesFollowFromEntry, true);
+  const preview = (malId?: number) => f.app.inject({ method: 'POST', url: `${f.path}/series/preview`,
+    headers: auth(f.guest.token), payload: { input: '', entryId, malId } });
+  const found = await preview();
+  assert.equal(found.statusCode, 200, found.body);
+  assert.equal(found.json().releases[0].id, 100);
+  assert.equal(f.provider.searches.length, 0);
+  const verified = await preview(f.provider.entry.id);
+  assert.equal(verified.statusCode, 200, verified.body);
+  const confirmed = await f.app.inject({ method: 'POST', url: `${f.path}/series`, headers: auth(f.guest.token),
+    payload: { draftId: verified.json().draft.id } });
+  assert.equal(confirmed.statusCode, 200, confirmed.body);
+  assert.equal(confirmed.json().item.nextEpisode, 8);
+  assert.deepEqual(queue(), before);
+  assert.equal(f.store.getSeriesEpisode(f.room.roomId, f.provider.entry.id, 7)?.disposition, 'existing');
+  assert.equal(f.store.getSeriesEpisode(f.room.roomId, f.provider.entry.id, 7)?.entryId, entryId);
+
+  f.provider.put(101, '[Origin] Test Anime - 08 (1080p)', air, 'Original');
+  f.now = air;
+  await f.series!.runOnce();
+  assert.equal(f.rules()[0]!.nextEpisode, 9);
+  assert.equal(queue().entries.length, 2);
+  assert.deepEqual(queue().entries[0], before.entries[0]);
+});
+
+test('a room episode with a separate source can use a matching Nyaa reference and a stale anchor is rejected', async t => {
+  const f = await fixture(t);
+  f.provider.put(101, '[Origin] Test Anime - 08 (1080p)', air, 'Original');
+  const source = { id: 'room-copy', kind: 'direct', uri: 'https://example.test/test.mp4',
+    identity: 'room-copy', label: 'Imported episode' };
+  const file = { mediaId: 'room-copy:old', path: 'Season 1/Test Anime - 07 (1080p).mkv',
+    label: 'A different display name', fileIndex: 0, size: 1000, selected: true };
+  const queue = () => f.engine.snapshot(f.room.roomId);
+  const command = (payload: object) => f.engine.command(f.room.roomId, f.room.memberId,
+    { operationId: randomUUID(), queueRevision: queue().queueRevision, command: payload });
+  command({ type: 'queue.add', source, files: [file] });
+  const entryId = queue().entries[0]!.id;
+  const preview = (input = '', listingId?: number) => f.app.inject({ method: 'POST', url: `${f.path}/series/preview`,
+    headers: auth(f.room.token), payload: { input, entryId, listingId, malId: f.provider.entry.id } });
+  const confirm = (draftId: string) => f.app.inject({ method: 'POST', url: `${f.path}/series`, headers: auth(f.room.token),
+    payload: { draftId } });
+  const candidates = await preview();
+  assert.equal(candidates.statusCode, 200, candidates.body);
+  assert.deepEqual(candidates.json().releases.map((item: SeriesListing) => item.id), [100]);
+  const mismatch = await preview('https://nyaa.si/view/101');
+  assert.equal(mismatch.statusCode, 422, mismatch.body);
+  assert.equal(mismatch.json().error.code, 'SERIES_ANCHOR_MISMATCH');
+
+  const reviewed = await preview('', 100);
+  assert.equal(reviewed.statusCode, 200, reviewed.body);
+  const draft = reviewed.json().draft;
+  command({ type: 'source.remove', sourceId: source.id });
+  assert.equal((await confirm(draft.id)).statusCode, 404);
+  command({ type: 'queue.add', source, files: [{ ...file, mediaId: 'room-copy:replacement' }] });
+  const stale = await confirm(draft.id);
+  assert.equal(stale.statusCode, 409, stale.body);
+  assert.equal(stale.json().error.code, 'SERIES_ANCHOR_CHANGED');
+  assert.equal(f.rules().length, 0);
+
+  const refreshed = await preview('', 100);
+  assert.equal(refreshed.statusCode, 200, refreshed.body);
+  const before = queue();
+  const followed = await confirm(refreshed.json().draft.id);
+  assert.equal(followed.statusCode, 200, followed.body);
+  assert.equal(followed.json().item.nextEpisode, 8);
+  assert.deepEqual(queue(), before);
+  assert.equal(f.store.getSeriesEpisode(f.room.roomId, f.provider.entry.id, 7)?.entryId, entryId);
+});
+
 test('a manifest conflict backs off the oldest due rule so another series can run', async t => {
   const f = await fixture(t);
   const firstMalId = f.provider.entry.id;

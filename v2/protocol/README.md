@@ -38,13 +38,13 @@ The current reporter's consecutive, plausible played intervals contribute distin
 
 ## Series follows
 
-`GET /v2/version` advertises `seriesFollows`. With the capability enabled, these routes require a room member's bearer token. Paths are relative to `/v2/rooms/:roomId`.
+`GET /v2/version` advertises `seriesFollows` and `seriesFollowFromEntry`. With series follows enabled, these routes require a room member's bearer token. Paths are relative to `/v2/rooms/:roomId`.
 
 | Route | Contract |
 | --- | --- |
 | `GET /series` | Returns the room's follow rules with their status, revision, next episode, estimated airtime, last check, fallback offer and any review reason. Times use Unix epoch milliseconds. |
-| `POST /series/preview` | Accepts `input` with optional `malId` and `listingId`. Returns catalog and Nyaa candidates. A concrete selection with verified torrent metadata returns a temporary draft bound to the same room and member. |
-| `POST /series` | Confirms a `draftId` with optional `expectedAirAt`, release-numbered `finalEpisode`, and `catalogEpisode` for absolute numbering. Omit `expectedAirAt` to accept the estimate or pass `null` when it is unknown. |
+| `POST /series/preview` | Accepts `input` with optional `malId`, `listingId`, or room `entryId`. Send an empty `input` with `entryId` to look up an existing episode by its verified Nyaa listing or filename. A concrete selection with verified torrent metadata returns a temporary draft bound to the same room, member, and selected entry. |
+| `POST /series` | Confirms a `draftId` with optional `expectedAirAt`, release-numbered `finalEpisode`, and `catalogEpisode` for absolute numbering. Omit `expectedAirAt` to accept the estimate or pass `null` when it is unknown. A draft for an existing entry records it as the starting episode and begins following the next one. |
 | `POST /series/:id/actions` | Takes `action` and the current follow `revision`. Actions cover pause, resume, stop, check, skip, link existing, set airtime or finale, replace source, and approve or dismiss an alternate. Only the current host can approve or dismiss an alternate. |
 
 Series status refreshes independently of the room event stream. Added episodes arrive in the ordinary queue snapshot with the same ordering and download rules as other queue entries.
