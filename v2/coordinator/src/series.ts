@@ -4,9 +4,10 @@ import { DomainError, requireThat, type Entry, type FileDescriptor, type Source 
 import {
   catalogSearchTerms, episodeSearchTerms, matchesCatalogTitle, parseSeriesTitle, sameSeriesStem, seriesTitleParts,
   SeriesProviderError,
-  type SeriesCatalog, type SeriesListing, type SeriesProvider, type SeriesRelease,
+  type AnimeSeason, type SeriesCatalog, type SeriesListing, type SeriesProvider, type SeriesRelease,
 } from './series-provider.js';
-import { canAskDesktop, retryableMetadata, SeriesLookupWaiting, SeriesMetadata, type AskDesktop } from './series-metadata.js';
+import { canAskDesktop, retryableMetadata, SeriesLookupWaiting, SeriesMetadata, type AskDesktop,
+  type InteractiveLookup } from './series-metadata.js';
 import { estimateAirtime, inferAnchorAirtime, retryAt, type SeriesEntryBinding, type SeriesEpisode,
   type SeriesFollow, type SeriesMetadataRetry } from './series-state.js';
 
@@ -28,9 +29,9 @@ const WAITING_FOR_FINALE = 'Reached the current MyAnimeList episode total. Waiti
 type Manifest = { source: Source; file: FileDescriptor };
 type Draft = {
   id: string; roomId: string; memberId: string; expiresAt: number; catalog: SeriesCatalog;
-  listing: SeriesListing; release: SeriesRelease; manifest?: Manifest; anchor?: SeriesEntryBinding;
+  listing: SeriesListing; release: SeriesRelease; manifest?: Manifest; anchor?: SeriesEntryBinding; exactWatched?: boolean;
 };
-type Preview = { input: string; malId?: number; listingId?: number; entryId?: string; deferMetadata?: boolean };
+type Preview = { input: string; malId?: number; listingId?: number; entryId?: string; deferMetadata?: boolean; exactWatched?: boolean };
 type Confirm = { draftId: string; expectedAirAt?: number | null; finalEpisode?: number | null; catalogEpisode?: number };
 export type SeriesAction = {
   revision: number; action: 'pause' | 'resume' | 'stop' | 'check' | 'skip' | 'approve-alternate' |
@@ -57,6 +58,19 @@ function eligible(listing: SeriesListing) {
 
 function verifiedCatalogTitles(catalog: SeriesCatalog) {
   return [catalog.title, ...(catalog.alternativeTitles ?? [])];
+}
+
+function seasonTitle(title: string) {
+  const match = /\s+(?:s(?:eason\s*)?0?(\d{1,2})|0?(\d{1,2})(?:st|nd|rd|th) season|([ivx]{1,4}))$/iu.exec(title);
+  const roman = ['', 'i', 'ii', 'iii', 'iv', 'v', 'vi', 'vii', 'viii', 'ix', 'x'];
+  const number = match && (Number(match[1] ?? match[2]) || roman.indexOf(match[3]?.toLowerCase() ?? ''));
+  return number && number > 0 ? { title: title.slice(0, match!.index), number } : { title, number: null };
+}
+
+function matchKeys(value: string) {
+  const { primary, alternate } = seriesTitleParts(value);
+  return [value, primary, alternate].flatMap(name => name ? [name.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '')] : [])
+    .filter(key => key.length >= 3);
 }
 
 function entryRelease(entry: Entry) {
@@ -122,9 +136,11 @@ function scheduledCheck(follow: SeriesFollow, now: number) {
 
 function forecast(follow: SeriesFollow, episode: number) {
   const release = parseSeriesTitle(follow.anchorTitle);
-  return release && follow.anchorBroadcastAt !== null
-    ? estimateAirtime(follow.anchorBroadcastAt, episode, release.episode, follow)
-    : null;
+  if (!release || follow.anchorBroadcastAt === null) return null;
+  // A member-supplied slot can carry the weekly schedule for streaming shows
+  // whose catalog entry provides no broadcast time.
+  return estimateAirtime(follow.anchorBroadcastAt, episode, release.episode, follow)
+    ?? follow.anchorBroadcastAt + (episode - release.episode) * 7 * DAY;
 }
 
 function seedBroadcast(catalog: SeriesCatalog, publishedAt: number, catalogEpisode: number, nextAir?: number | null) {
@@ -144,7 +160,7 @@ function seedBroadcast(catalog: SeriesCatalog, publishedAt: number, catalogEpiso
 function publicFollow(follow: SeriesFollow) {
   const { id, malId, revision, title, anchorTitle, nextEpisode, status, nextCheckAt, lastCheckedAt, expectedAirAt, error, alternative, episodeCount } = follow;
   return { id, malId, revision, title, anchorTitle, nextEpisode, status, nextCheckAt, lastCheckedAt, expectedAirAt, error,
-    pending: follow.pendingSeed ? 'setup' : follow.pendingRelease ? 'episode' : null,
+    pending: status === 'stopped' ? null : follow.pendingSeed ? 'setup' : follow.pendingRelease ? 'episode' : null,
     episodeCount, finalEpisode: finale(follow), finalEpisodeOverride: follow.finalEpisode,
     alternative: alternative ? { id: alternative.id, title: alternative.title } : null };
 }
@@ -158,6 +174,8 @@ export class SeriesService {
   private malBackoff = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
   private readonly metadata: SeriesMetadata;
+  private lookupWaiters = new Map<string, string>();
+  private onPollError?: (error: unknown) => void;
 
   constructor(private readonly engine: Engine, private readonly provider: SeriesProvider, askDesktop: AskDesktop = () => undefined) {
     this.metadata = new SeriesMetadata(provider, engine.store, () => engine.now(), askDesktop);
@@ -165,6 +183,7 @@ export class SeriesService {
 
   start(onError: (error: unknown) => void) {
     if (this.timer) return;
+    this.onPollError = onError;
     this.timer = setInterval(() => { void this.runOnce().catch(onError); }, 15_000);
     this.timer.unref();
   }
@@ -173,8 +192,8 @@ export class SeriesService {
     this.closing = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    await this.running?.catch(() => {});
     this.metadata.close();
+    await this.running?.catch(() => {});
   }
 
   list(roomId: string) {
@@ -182,7 +201,6 @@ export class SeriesService {
   }
 
   desktopOnline(roomId: string) {
-    this.metadata.desktopOnline(roomId);
     for (const follow of this.engine.store.listSeries(roomId)) {
       const pending = follow.pendingSeed ?? follow.pendingRelease;
       if (follow.status === 'active' && pending?.desktopEligible &&
@@ -199,20 +217,67 @@ export class SeriesService {
   }
 
   acceptMetadata(roomId: string, memberId: string, connectionId: string, requestId: string, bytes: Buffer, lookup: boolean) {
-    const hash = this.metadata.accept(roomId, memberId, connectionId, requestId, bytes, lookup);
-    if (!hash) return { accepted: true };
+    const { hash, key } = this.metadata.accept(roomId, memberId, connectionId, requestId, bytes, lookup);
     const now = this.engine.now();
+    let wake = false;
     for (const follow of this.engine.store.listSeries(roomId)) {
       const pending = follow.pendingSeed ?? follow.pendingRelease;
-      if (follow.status === 'active' && pending?.listing.infoHash === hash &&
+      const waitingForLookup = this.lookupWaiters.get(follow.id) === key;
+      if (waitingForLookup) this.lookupWaiters.delete(follow.id);
+      if (follow.status === 'active' && (waitingForLookup || (hash && pending?.listing.infoHash === hash)) &&
           follow.nextCheckAt !== null && follow.nextCheckAt > now) {
         this.engine.commitSeries({
           follow: { ...follow, nextCheckAt: now, revision: follow.revision + 1, updatedAt: now },
           expectedRevision: follow.revision,
         });
+        wake = true;
       }
     }
+    if (wake && this.timer)
+      void (this.running ?? Promise.resolve()).then(() => this.runOnce()).catch(this.onPollError);
     return { accepted: true };
+  }
+
+  async seasonFromWatched(roomId: string, year: number, season: AnimeSeason) {
+    requireThat(this.provider.season, 'SERIES_DISABLED', 'Season lookup is unavailable on this coordinator.', 404);
+    let catalog: SeriesCatalog[];
+    try { catalog = await this.provider.season(year, season); }
+    catch (error) { if (error instanceof SeriesProviderError) throw providerError(error); throw error; }
+    const aliases = new Map<string, Set<SeriesCatalog>>();
+    for (const show of catalog) for (const title of verifiedCatalogTitles(show).flatMap(title => title.split(/,\s+/u))) {
+      for (const key of [...matchKeys(title), ...matchKeys(seasonTitle(title).title)]) {
+        const set = aliases.get(key) ?? new Set<SeriesCatalog>();
+        set.add(show);
+        aliases.set(key, set);
+      }
+    }
+    const room = this.engine.room(roomId), sources = new Map(room.sources.map(source => [source.id, source]));
+    const followed = new Set(this.engine.store.listSeries(roomId).map(follow => follow.malId));
+    const rows = new Map<string, { entryId: string; label: string; episode: number; catalog: SeriesCatalog | null;
+      status: 'ready' | 'followed' | 'review'; watchedAt: number }>();
+    for (const entry of room.entries) {
+      if (entry.watchedAt === null) continue;
+      const release = entryRelease(entry);
+      if (!release) continue;
+      const shows = new Set(matchKeys(release.stem).flatMap(key => [...aliases.get(key) ?? []]).filter(show => {
+        const number = seasonTitle(show.title).number;
+        return release.season === null || (number ?? 1) === release.season;
+      }));
+      const match = shows.size === 1 ? [...shows][0]! : null;
+      const key = match ? String(match.id) : `${release.stem}:${release.season ?? ''}`;
+      const previous = rows.get(key);
+      if (previous && (previous.episode > release.episode ||
+          (previous.episode === release.episode && previous.watchedAt >= entry.watchedAt))) continue;
+      const identity = sources.get(entry.sourceId)?.identity ?? '';
+      const status = match && followed.has(match.id) ? 'followed'
+        : match && /^bt:[a-f0-9]{40}$/i.test(identity) && release.episode <= (match.episodeCount ?? Infinity) ? 'ready' : 'review';
+      rows.set(key, { entryId: entry.id, label: entry.label, episode: release.episode, catalog: match, status,
+        watchedAt: entry.watchedAt });
+    }
+    const ordered = [...rows.values()].sort((a, b) => b.watchedAt - a.watchedAt);
+    const unresolved = ordered.filter(row => row.status === 'review');
+    return { items: [...ordered.filter(row => row.status !== 'review'), ...unresolved.slice(0, 30)],
+      additionalReview: Math.max(0, unresolved.length - 30) };
   }
 
   private trimDrafts(now: number) {
@@ -220,7 +285,7 @@ export class SeriesService {
     if (this.drafts.size >= 128) this.drafts.delete(this.drafts.keys().next().value!);
   }
 
-  async preview(roomId: string, memberId: string, input: Preview, waitForLookup = false) {
+  async preview(roomId: string, memberId: string, input: Preview, waitForLookup = false, mode?: InteractiveLookup) {
     requireThat(this.previews < 2, 'SERIES_BUSY', 'Series search is busy. Try again in a moment.', 429);
     ++this.previews;
     try {
@@ -229,10 +294,30 @@ export class SeriesService {
       const parts = inputParts(input.input);
       const listingId = input.listingId ?? parts.listingId;
       const malId = input.malId ?? parts.malId;
-      let listing = listingId ? await this.metadata.listing(roomId, listingId) : null;
+      let exactCatalog: SeriesCatalog | undefined;
+      let listing = listingId ? await this.metadata.listing(roomId, listingId, mode) : null;
+      const source = entry && this.engine.room(roomId).sources.find(item => item.id === entry.sourceId);
       if (!listing && entry && !parts.title) {
-        const source = this.engine.room(roomId).sources.find(item => item.id === entry.sourceId);
-        listing = await this.findEntryListing(roomId, source, knownRelease);
+        listing = await this.findEntryListing(roomId, source || undefined, knownRelease, mode);
+      }
+      if (input.exactWatched) {
+        requireThat(entry && entry.watchedAt !== null && knownRelease && malId && source && source.kind === 'torrent' &&
+          /^bt:[a-f0-9]{40}$/i.test(source.identity), 'SERIES_WATCHED_SOURCE', 'Choose a watched episode with its original torrent.', 422);
+        const show = exactCatalog = await this.provider.catalog(malId);
+        if (!listing) {
+          const titles = [seriesTitleParts(knownRelease.stem).primary, seasonTitle(show.title).title, show.title,
+            ...(show.alternativeTitles ?? []).slice(0, 2)];
+          for (const title of [...new Set(titles.map(title => title.toLowerCase()))].slice(0, 4)) {
+            const stem = title.replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+            if (!stem) continue;
+            const [term] = episodeSearchTerms({ ...knownRelease, stem }, knownRelease.episode);
+            const match = (await this.metadata.searchReleases(roomId, term!, undefined, mode))
+              .find(item => `bt:${item.infoHash}` === source.identity);
+            if (match) { listing = await this.metadata.listing(roomId, match.id, mode); break; }
+          }
+        }
+        requireThat(listing && `bt:${listing.infoHash}` === source.identity && eligible(listing)?.group === knownRelease.group,
+          'SERIES_WATCHED_RELEASE', 'The original watched release could not be identified. Review the Nyaa link for this episode.', 422);
       }
       const parsed = listing && eligible(listing);
       if (listing) requireThat(parsed, 'SERIES_UNSUPPORTED_TITLE', 'This release does not identify a single episode and edition. Choose a clearer Nyaa release.', 422);
@@ -242,7 +327,7 @@ export class SeriesService {
       const query = parts.title || stem?.slice(0, 160);
       const inferredTitle = stem ? seriesTitleParts(stem) : undefined;
       const catalogQuery = parts.title || inferredTitle?.primary.slice(0, 160);
-      let catalog = malId ? [await this.provider.catalog(malId)] : catalogQuery ? await this.provider.searchCatalog(catalogQuery) : [];
+      let catalog = malId ? [exactCatalog ?? await this.provider.catalog(malId)] : catalogQuery ? await this.provider.searchCatalog(catalogQuery) : [];
       const fallbackTitle = parts.title ? seriesTitleParts(parts.title).primary : inferredTitle?.alternate?.slice(0, 160);
       if (!catalog.length && fallbackTitle && fallbackTitle !== catalogQuery)
         catalog = await this.provider.searchCatalog(fallbackTitle);
@@ -259,21 +344,21 @@ export class SeriesService {
         return [{ id: item.id, title: item.title, episode: match.episode, group: match.group, edition: match.edition }];
       }).slice(0, 25);
       let releases = listing ? candidates([listing]) :
-        firstQuery ? candidates(await this.metadata.searchReleases(roomId, firstQuery), Boolean(knownRelease)) : [];
+        firstQuery ? candidates(await this.metadata.searchReleases(roomId, firstQuery, undefined, mode), Boolean(knownRelease)) : [];
       if (!listing && !releases.length && selectedCatalog) {
         for (const term of catalogSearchTerms(selectedCatalog.title, knownRelease?.season ?? null, firstQuery)) {
-          releases = candidates(await this.metadata.searchReleases(roomId, term), true);
+          releases = candidates(await this.metadata.searchReleases(roomId, term, undefined, mode), true);
           if (releases.length) break;
         }
       }
       const result = { catalog: catalog.slice(0, 12), releases };
       if (!listing || !parsed || !malId || !catalog[0]) return result;
-      const manifest = input.deferMetadata ? undefined : await this.metadata.resolve(roomId, listing, verifiedCatalogTitles(catalog[0]));
+      const manifest = input.deferMetadata ? undefined : await this.metadata.resolve(roomId, listing, verifiedCatalogTitles(catalog[0]), mode);
       const now = this.engine.now();
       const anchor = entry ? { id: entry.id, mediaId: entry.mediaId, path: entry.path, size: entry.size } : undefined;
       if (anchor) this.checkAnchor(roomId, anchor);
       const draft: Draft = { id: randomUUID(), roomId, memberId, expiresAt: now + DRAFT_TTL, catalog: catalog[0],
-        listing, release: parsed, manifest, anchor };
+        listing, release: parsed, manifest, anchor, exactWatched: input.exactWatched };
       const seed = seedBroadcast(draft.catalog, listing.publishedAt, parsed.episode);
       this.trimDrafts(now);
       this.drafts.set(draft.id, draft);
@@ -287,11 +372,11 @@ export class SeriesService {
     } finally { --this.previews; }
   }
 
-  private async findEntryListing(roomId: string, source: Source | undefined, knownRelease: SeriesRelease | null) {
+  private async findEntryListing(roomId: string, source: Source | undefined, knownRelease: SeriesRelease | null, mode?: InteractiveLookup) {
     const id = sourceListingId(source);
     if (!id) return null;
     try {
-      const listing = await this.metadata.listing(roomId, id);
+      const listing = await this.metadata.listing(roomId, id, mode);
       const release = eligible(listing);
       return release && sameEntryEpisode(knownRelease, release) && source?.identity === `bt:${listing.infoHash}` ? listing : null;
     } catch (error) {
@@ -361,6 +446,9 @@ export class SeriesService {
     if (previous) return { item: publicFollow(previous) };
     const draft = this.draft(roomId, memberId, input.draftId);
     if (draft.anchor) this.checkAnchor(roomId, draft.anchor);
+    if (draft.exactWatched && draft.anchor)
+      requireThat(this.roomEntry(roomId, draft.anchor.id).watchedAt !== null, 'SERIES_ANCHOR_CHANGED',
+        'This episode is no longer in Watched. Review the series again.', 409);
     const rules = store.listSeries(roomId);
     requireThat(rules.length < MAX_ROOM_RULES && rules.filter(f => f.status === 'active' || f.status === 'paused').length < MAX_FOLLOWS,
       'SERIES_LIMIT', 'This room has reached its series follow limit.', 409);
@@ -432,14 +520,24 @@ export class SeriesService {
       case 'pause':
         active(); follow.status = 'paused'; follow.nextCheckAt = null; follow.manualCheck = false; break;
       case 'resume':
-        requireThat(follow.status === 'paused', 'SERIES_INACTIVE', 'Only a paused follow can be resumed.', 409);
+        requireThat(follow.status === 'paused' || follow.status === 'stopped', 'SERIES_INACTIVE',
+          'Choose a paused or stopped follow.', 409);
+        if (follow.status === 'stopped') {
+          const live = ledger.listSeries(roomId).filter(item => item.status === 'active' || item.status === 'paused');
+          requireThat(!live.some(item => item.malId === follow.malId), 'SERIES_ALREADY_FOLLOWED',
+            'This season already has an active or paused follow.', 409);
+          requireThat(live.length < MAX_FOLLOWS, 'SERIES_LIMIT', 'This room has reached its series follow limit.', 409);
+          const seed = parseSeriesTitle(follow.anchorTitle)?.episode;
+          requireThat(follow.pendingSeed || (seed && ledger.getSeriesEpisode(roomId, follow.malId, seed - follow.catalogEpisodeOffset)),
+            'SERIES_RESTART_REQUIRED', 'This starting release was never verified. Use Follow a series to choose it again.', 409);
+        }
         follow.status = 'active';
         follow.nextCatalogAt = follow.pendingSeed ? null : now;
         follow.nextCheckAt = follow.pendingSeed || follow.pendingRelease ? now : scheduledCheck(follow, now); break;
       case 'stop':
         follow.status = 'stopped'; follow.nextCheckAt = null; follow.nextCatalogAt = null; follow.alternative = null; follow.manualCheck = false;
         if (follow.pendingSeed || follow.pendingRelease) follow.error = null;
-        delete follow.pendingSeed; delete follow.pendingRelease; break;
+        delete follow.pendingRelease; break;
       case 'check':
         active(); checkScope();
         requireThat(!follow.manualCheck && (follow.lastCheckedAt === null || now - follow.lastCheckedAt >= CHECK_COOLDOWN),
@@ -556,7 +654,7 @@ export class SeriesService {
     const { anchor, listing } = pending;
     try {
       if (anchor) this.checkAnchor(follow.roomId, anchor);
-      const manifest = await this.metadata.resolve(follow.roomId, listing, follow.catalogTitles);
+      const manifest = await this.metadata.resolve(follow.roomId, listing, follow.catalogTitles, undefined, true);
       if (this.closing) return;
       this.existing(follow.roomId, follow.id, original.revision);
       if (anchor) this.checkAnchor(follow.roomId, anchor);
@@ -640,6 +738,7 @@ export class SeriesService {
   private async pollFollow(original: SeriesFollow) {
     let revision = original.revision;
     const follow = { ...original }, now = this.engine.now();
+    this.lookupWaiters.delete(follow.id);
     const commit = (record?: SeriesEpisode, manifest?: Manifest) => {
       follow.revision = revision + 1; follow.updatedAt = this.engine.now();
       this.engine.commitSeries({ follow, expectedRevision: revision, episodes: record ? [record] : [] },
@@ -655,7 +754,7 @@ export class SeriesService {
       const record = this.episode(follow, follow.nextEpisode, 'added', pending.listing.id);
       try {
         const manifest = this.engine.store.getSeriesEpisode(follow.roomId, follow.malId, record.episode)
-          ? undefined : await this.metadata.resolve(follow.roomId, pending.listing, follow.catalogTitles);
+          ? undefined : await this.metadata.resolve(follow.roomId, pending.listing, follow.catalogTitles, undefined, true);
         if (this.closing) return;
         this.advance(follow, now);
         commit(manifest ? record : undefined, manifest);
@@ -692,7 +791,7 @@ export class SeriesService {
         const key = JSON.stringify([term, uploader]);
         let request = searches.get(key);
         if (!request) {
-          request = this.metadata.searchReleases(follow.roomId, term, uploader);
+          request = this.metadata.searchReleases(follow.roomId, term, uploader, undefined, true);
           searches.set(key, request);
         }
         return request;
@@ -724,7 +823,7 @@ export class SeriesService {
         if (exact.length === 1) {
           const listing = exact[0]!.listing;
           let manifest: Manifest | undefined;
-          try { manifest = await this.metadata.resolve(follow.roomId, listing, follow.catalogTitles); }
+          try { manifest = await this.metadata.resolve(follow.roomId, listing, follow.catalogTitles, undefined, true); }
           catch (error) {
             if (retryableMetadata(error)) {
               follow.pendingRelease = this.saveRetry(follow, error, { listing, failures: 0, desktopEligible: false });
@@ -779,6 +878,10 @@ export class SeriesService {
         follow.error = error.message;
         follow.manualCheck = manual;
         follow.nextCheckAt = error.checkAt;
+        if (error.pending && error.lookupKey) {
+          if (this.lookupWaiters.size >= 128) this.lookupWaiters.delete(this.lookupWaiters.keys().next().value!);
+          this.lookupWaiters.set(follow.id, error.lookupKey);
+        }
         if (!this.closing) commit();
         return;
       }

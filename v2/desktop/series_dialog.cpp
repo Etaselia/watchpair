@@ -5,6 +5,7 @@
 #include <QDialogButtonBox>
 #include <QFormLayout>
 #include <QHBoxLayout>
+#include <QHeaderView>
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
@@ -15,9 +16,12 @@
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QSpinBox>
+#include <QTableWidget>
+#include <QTimeZone>
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <algorithm>
+#include <array>
 
 namespace wp::ui {
 namespace {
@@ -452,9 +456,8 @@ SeriesManagerDialog::SeriesManagerDialog(RoomClient &rooms, QString room, QWidge
   connect(add_, &QPushButton::clicked, this, [this] { openFollow(); });
   connect(check_, &QPushButton::clicked, this, [this] { action(QStringLiteral("check")); });
   connect(pause_, &QPushButton::clicked, this, [this] {
-    action(selected().value(QStringLiteral("status")).toString() == QStringLiteral("paused")
-               ? QStringLiteral("resume")
-               : QStringLiteral("pause"));
+    const auto status = selected().value(QStringLiteral("status")).toString();
+    action(status == QStringLiteral("active") ? QStringLiteral("pause") : QStringLiteral("resume"));
   });
   connect(menu, &QMenu::aboutToShow, this, &SeriesManagerDialog::showActions);
   connect(approve_, &QPushButton::clicked, this, [this] {
@@ -557,6 +560,7 @@ void SeriesManagerDialog::updateActions() {
   const auto item = selected();
   const auto status = item.value(QStringLiteral("status")).toString();
   const bool active = status == QStringLiteral("active"), paused = status == QStringLiteral("paused");
+  const bool stopped = status == QStringLiteral("stopped") && rooms_.seriesInteractiveAvailable(room_);
   const bool settingUp = item.value(QStringLiteral("pending")).toString() == QStringLiteral("setup");
   const bool connected = rooms_.connected(room_);
   const bool ready = enabled_ && connected && !busy_ && !loading_;
@@ -565,8 +569,8 @@ void SeriesManagerDialog::updateActions() {
   add_->setEnabled(ready);
   refresh_->setEnabled(connected && !busy_ && !loading_);
   check_->setEnabled(ready && active && !settingUp);
-  pause_->setText(paused ? tr("Resume") : tr("Pause"));
-  pause_->setEnabled(ready && (active || paused));
+  pause_->setText(stopped ? tr("Follow again") : paused ? tr("Resume") : tr("Pause"));
+  pause_->setEnabled(ready && (active || paused || stopped));
   more_->setEnabled(ready && (active || paused));
   const bool host = awaiting && currentHost(rooms_, room_);
   approve_->setVisible(host);
@@ -749,5 +753,202 @@ void SeriesManagerDialog::showActions() {
         QMessageBox::Yes)
       action(QStringLiteral("stop"), {}, item);
   });
+}
+SeasonFollowDialog::SeasonFollowDialog(RoomClient &rooms, QString room, QWidget *parent)
+    : QDialog(parent), rooms_(rooms), room_(std::move(room)) {
+  setObjectName(QStringLiteral("SeasonFollowDialog"));
+  setWindowTitle(tr("Follow this season from Watched"));
+  resize(780, 450);
+  auto *layout = new QVBoxLayout(this);
+  feedback_ = plainLabel(tr("Matching Watched against MyAnimeList…"), "muted");
+  layout->addWidget(feedback_);
+  table_ = new QTableWidget(0, 3);
+  table_->setObjectName(QStringLiteral("SeasonFollowTable"));
+  table_->setHorizontalHeaderLabels({tr("Series"), tr("Watched episode"), tr("Original release")});
+  table_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+  table_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+  table_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
+  table_->verticalHeader()->hide();
+  table_->setSelectionBehavior(QAbstractItemView::SelectRows);
+  table_->setSelectionMode(QAbstractItemView::SingleSelection);
+  table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+  layout->addWidget(table_);
+  auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close);
+  review_ = buttons->addButton(tr("Review selected…"), QDialogButtonBox::ActionRole);
+  confirm_ = buttons->addButton(tr("Follow selected"), QDialogButtonBox::AcceptRole);
+  confirm_->setObjectName(QStringLiteral("ConfirmSeasonFollows"));
+  confirm_->setAutoDefault(false);
+  layout->addWidget(buttons);
+  connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+  connect(review_, &QPushButton::clicked, this, &SeasonFollowDialog::reviewCurrent);
+  connect(confirm_, &QPushButton::clicked, this, [this] {
+    if (!confirm_->isEnabled())
+      return;
+    for (int row = 0; row < table_->rowCount(); ++row)
+      if (table_->item(row, 0)->checkState() == Qt::Checked)
+        toSave_.append(row);
+    saving_ = true;
+    saved_ = failed_ = 0;
+    updateActions();
+    saveNext();
+  });
+  connect(table_, &QTableWidget::itemChanged, this, &SeasonFollowDialog::updateActions);
+  connect(table_, &QTableWidget::currentItemChanged, this, &SeasonFollowDialog::updateActions);
+  connect(&rooms_, &RoomClient::connectionChanged, this, [this](const QString &room) {
+    if (room == room_)
+      updateActions();
+  });
+  updateActions();
+  QTimer::singleShot(0, this, &SeasonFollowDialog::load);
+}
+
+void SeasonFollowDialog::load() {
+  const auto today = QDateTime::currentDateTimeUtc().toTimeZone(QTimeZone(9 * 3600)).date();
+  const std::array seasons{QStringLiteral("winter"), QStringLiteral("spring"), QStringLiteral("summer"),
+                           QStringLiteral("fall")};
+  const std::array names{tr("Winter"), tr("Spring"), tr("Summer"), tr("Fall")};
+  const auto quarter = size_t((today.month() - 1) / 3);
+  setWindowTitle(tr("Follow %1 %2 from Watched").arg(names[quarter]).arg(today.year()));
+  rooms_.loadSeriesSeason(room_, today.year(), seasons[quarter], this,
+      [this](const QJsonObject &result, const QString &error) {
+        const auto rows = result.value(QStringLiteral("items")).toArray();
+        if (!error.isEmpty() || rows.isEmpty()) {
+          loading_ = false;
+          feedback_->setText(error.isEmpty() ? tr("No watched episodes could be matched to this season.") : error);
+          updateActions();
+          return;
+        }
+        const QSignalBlocker guard(table_);
+        table_->setRowCount(rows.size());
+        for (int row = 0; row < table_->rowCount(); ++row) {
+          const auto item = rows.at(row).toObject();
+          const auto catalog = item.value(QStringLiteral("catalog")).toObject();
+          const auto label = item.value(QStringLiteral("label")).toString();
+          const auto title = catalog.value(QStringLiteral("title")).toString(label);
+          auto *show = new QTableWidgetItem(title);
+          show->setToolTip(label);
+          show->setFlags(Qt::ItemIsSelectable | Qt::ItemIsEnabled);
+          show->setData(Qt::UserRole, item);
+          table_->setItem(row, 0, show);
+          table_->setItem(row, 1, new QTableWidgetItem(QString::number(item.value(QStringLiteral("episode")).toInt())));
+          table_->setItem(row, 2, new QTableWidgetItem);
+          const auto state = item.value(QStringLiteral("status")).toString();
+          setRowState(row, state == QStringLiteral("ready") ? tr("Waiting to verify…")
+                            : state == QStringLiteral("followed") ? tr("Already in Series follows")
+                                                                  : tr("Needs review"));
+        }
+        const int more = result.value(QStringLiteral("additionalReview")).toInt();
+        if (more > 0)
+          table_->setToolTip(tr("%1 more items without a confirmed season match can be opened from Watched.").arg(more));
+        table_->setCurrentCell(0, 0);
+        QTimer::singleShot(0, this, &SeasonFollowDialog::verifyNext);
+      });
+}
+
+void SeasonFollowDialog::setRowState(int row, const QString &text) {
+  auto *cell = table_->item(row, 2);
+  cell->setText(text);
+  cell->setToolTip(text);
+}
+
+void SeasonFollowDialog::verifyNext() {
+  while (verifying_ < table_->rowCount()) {
+    const int row = verifying_++;
+    auto *cell = table_->item(row, 0);
+    const auto item = cell->data(Qt::UserRole).toJsonObject();
+    if (item.value(QStringLiteral("status")).toString() != QStringLiteral("ready"))
+      continue;
+    feedback_->setText(tr("Verifying original releases…"));
+    setRowState(row, tr("Checking Nyaa…"));
+    const auto catalog = item.value(QStringLiteral("catalog")).toObject();
+    rooms_.previewSeriesFollow(room_,
+        {{QStringLiteral("input"), QString()}, {QStringLiteral("entryId"), item.value(QStringLiteral("entryId"))},
+         {QStringLiteral("malId"), catalog.value(QStringLiteral("id"))},
+         {QStringLiteral("exactWatched"), true}, {QStringLiteral("deferMetadata"), true}}, this,
+        [this, row](const QJsonObject &result, const QString &error) {
+          auto *cell = table_->item(row, 0);
+          const auto draft = result.value(QStringLiteral("draft")).toObject();
+          if (error.isEmpty() && draft.value(QStringLiteral("id")).isString()) {
+            cell->setData(Qt::UserRole + 1, draft);
+            cell->setFlags(cell->flags() | Qt::ItemIsUserCheckable);
+            cell->setCheckState(Qt::Checked);
+            setRowState(row, tr("Next episode %1 · %2")
+                             .arg(draft.value(QStringLiteral("nextEpisode")).toInt())
+                             .arg(draft.value(QStringLiteral("anchorTitle")).toString()));
+          } else {
+            setRowState(row, error.isEmpty() ? tr("Review the starting release") : error);
+          }
+          QTimer::singleShot(0, this, &SeasonFollowDialog::verifyNext);
+        });
+    return;
+  }
+  loading_ = false;
+  feedback_->setText(tr("Choose which series to follow. Each starts after its watched episode."));
+  updateActions();
+}
+
+void SeasonFollowDialog::saveNext() {
+  if (toSave_.isEmpty()) {
+    saving_ = false;
+    feedback_->setText(failed_ ? tr("%1 followed. %2 need review.").arg(saved_).arg(failed_)
+                               : tr("%1 series followed.").arg(saved_));
+    updateActions();
+    return;
+  }
+  const int row = toSave_.takeFirst();
+  const auto id = table_->item(row, 0)->data(Qt::UserRole + 1).toJsonObject().value(QStringLiteral("id"));
+  setRowState(row, tr("Saving…"));
+  rooms_.createSeriesFollow(room_, {{QStringLiteral("draftId"), id}}, this,
+      [this, row](const QJsonObject &result, const QString &error) {
+        auto *cell = table_->item(row, 0);
+        const auto item = result.value(QStringLiteral("item")).toObject();
+        if (error.isEmpty() && !item.isEmpty()) {
+          ++saved_;
+          cell->setCheckState(Qt::Unchecked);
+          cell->setFlags(cell->flags() & ~Qt::ItemIsUserCheckable);
+          cell->setData(Qt::UserRole + 1, QVariant());
+          auto plan = cell->data(Qt::UserRole).toJsonObject();
+          plan.insert(QStringLiteral("status"), QStringLiteral("followed"));
+          cell->setData(Qt::UserRole, plan);
+          setRowState(row, item.value(QStringLiteral("pending")).isString()
+                               ? tr("Follow saved · verifying metadata") : tr("Following"));
+        } else {
+          ++failed_;
+          setRowState(row, error.isEmpty() ? tr("Could not save the follow") : error);
+        }
+        QTimer::singleShot(0, this, &SeasonFollowDialog::saveNext);
+      });
+}
+
+void SeasonFollowDialog::updateActions() {
+  bool selected = false;
+  for (int row = 0; row < table_->rowCount(); ++row) {
+    const auto *cell = table_->item(row, 0);
+    selected |= cell && cell->checkState() == Qt::Checked;
+  }
+  const bool ready = rooms_.connected(room_) && !loading_ && !saving_;
+  confirm_->setEnabled(ready && selected);
+  table_->setEnabled(!saving_);
+  const auto *cell = table_->item(table_->currentRow(), 0);
+  review_->setEnabled(ready && cell && !cell->data(Qt::UserRole + 1).isValid() &&
+      cell->data(Qt::UserRole).toJsonObject().value(QStringLiteral("status")).toString() != QStringLiteral("followed"));
+}
+
+void SeasonFollowDialog::reviewCurrent() {
+  const auto *cell = table_->item(table_->currentRow(), 0);
+  if (!cell || !review_->isEnabled())
+    return;
+  const auto id = cell->data(Qt::UserRole).toJsonObject().value(QStringLiteral("entryId")).toString();
+  auto *dialog = new SeriesFollowDialog(rooms_, room_, this, {}, id);
+  dialog->setAttribute(Qt::WA_DeleteOnClose);
+  const int row = table_->currentRow();
+  connect(dialog, &QDialog::accepted, this, [this, row, dialog] {
+    auto *cell = table_->item(row, 0);
+    auto plan = cell->data(Qt::UserRole).toJsonObject();
+    plan.insert(QStringLiteral("status"), QStringLiteral("followed"));
+    cell->setData(Qt::UserRole, plan);
+    setRowState(row, dialog->isPending() ? tr("Follow saved · verifying metadata") : tr("Following"));
+  });
+  dialog->open();
 }
 } // namespace wp::ui

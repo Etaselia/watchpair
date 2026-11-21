@@ -32,10 +32,12 @@ export type SeriesCatalog = {
   broadcastTimeJapan: string | null; episodeCount: number | null;
   startDate?: string | null; endDate?: string | null; alternativeTitles?: string[];
 };
+export type AnimeSeason = 'winter' | 'spring' | 'summer' | 'fall';
 
 export interface SeriesProvider {
   searchCatalog(query: string): Promise<SeriesCatalog[]>;
   catalog(id: number): Promise<SeriesCatalog>;
+  season?(year: number, season: AnimeSeason): Promise<SeriesCatalog[]>;
   searchReleases(query: string, uploader?: string): Promise<SeriesListing[]>;
   listing(id: number): Promise<SeriesListing>;
   metadata(listing: SeriesListing, catalogTitles?: readonly string[]): Promise<{ source: Source; file: FileDescriptor; bytes?: Buffer }>;
@@ -62,7 +64,13 @@ export function seriesTitleParts(value: string) {
 
 export function parseSeriesTitle(title: string): SeriesRelease | null {
   if (!title || title.length > 600 || /[|\x00-\x1f\x7f]/.test(title)) return null;
-  const prefix = /^\[(?<group>[^\[\]]+)\]\s*(?:-\s+)?(?<body>.+)$/.exec(title.trim().replace(VIDEO_SUFFIX, ''))?.groups;
+  const name = title.trim().replace(VIDEO_SUFFIX, '');
+  let prefix = /^\[(?<group>[^\[\]]+)\]\s*(?:-\s+)?(?<body>.+)$/.exec(name)?.groups;
+  if (!prefix) {
+    const scene = /^(?<title>.+?)\.(?<number>S[0-9]{1,3}E[0-9]{1,5}(?:v[0-9]+)?)\.(?<edition>[^\s/\\]+)-(?<group>[a-z0-9][a-z0-9_-]{1,39})$/i.exec(name)?.groups;
+    if (scene?.edition && TECH_MARKER.test(scene.edition) && scene.title && scene.number && scene.group)
+      prefix = { group: scene.group, body: `${scene.title.replaceAll('.', ' ')} ${scene.number} [${scene.edition}]` };
+  }
   if (!prefix?.group || !prefix.body) return null;
   for (const [style, pattern] of EPISODE_PATTERNS) {
     const match = pattern.exec(prefix.body)?.groups;
@@ -372,6 +380,7 @@ class Cache<T> {
 export function createSeriesProvider(clientId?: string, options: { fetch?: typeof fetch; now?: () => number } = {}): SeriesProvider {
   const send = options.fetch ?? fetch, now = options.now ?? Date.now;
   const catalogs = new Cache<SeriesCatalog>(now, 12 * 60 * 60 * 1000);
+  const seasons = new Cache<SeriesCatalog[]>(now, 12 * 60 * 60 * 1000, 8);
   const searches = new Cache<SeriesCatalog[]>(now, 15 * 60 * 1000);
   const feeds = new Cache<SeriesListing[]>(now, 5 * 60 * 1000);
   const listings = new Cache<SeriesListing>(now, 5 * 60 * 1000);
@@ -449,6 +458,26 @@ export function createSeriesProvider(clientId?: string, options: { fetch?: typeo
         const row = catalogEntry(await readJson(url));
         if (row?.id !== id) throw new SeriesProviderError('MyAnimeList returned invalid anime details.');
         return row;
+      });
+    },
+    async season(year, season) {
+      if (!Number.isInteger(year) || year < 1900 || year > 2100 || !['winter', 'spring', 'summer', 'fall'].includes(season))
+        throw new SeriesProviderError('Choose a valid MyAnimeList season.', 400);
+      const path = `/v2/anime/season/${year}/${season}`;
+      return seasons.get(path, async () => {
+        const entries = new Map<number, SeriesCatalog>();
+        for (let offset = 0; offset < 1000; offset += 100) {
+          const url = new URL(path, MAL);
+          url.search = new URLSearchParams({ limit: '100', offset: String(offset), fields: FIELDS, nsfw: 'true' }).toString();
+          const result = object(await readJson(url));
+          if (!Array.isArray(result?.data)) throw new SeriesProviderError('MyAnimeList returned an invalid season.');
+          for (const item of result.data) {
+            const row = catalogEntry(object(item)?.node);
+            if (row) entries.set(row.id, row);
+          }
+          if (!object(result.paging)?.next) return [...entries.values()];
+        }
+        throw new SeriesProviderError('MyAnimeList returned too many season entries.');
       });
     },
     async searchReleases(query, uploader) {

@@ -113,9 +113,11 @@ void RoomClient::request(const QUrl &url, const QByteArray &token, const QJsonOb
   request.setRawHeader("Accept", "application/json");
   request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
   const bool seriesPreview = url.path().endsWith(QStringLiteral("/series/preview"));
-  if (seriesPreview)
+  if (seriesPreview) {
     request.setRawHeader("X-WatchPair-Series-Lookup", "1");
-  request.setTransferTimeout(seriesPreview ? 25000 : 15000);
+    request.setRawHeader("X-WatchPair-Series-Interactive", "1");
+  }
+  request.setTransferTimeout(seriesPreview ? 30000 : 15000);
   if (!token.isEmpty())
     request.setRawHeader("Authorization", "Bearer " + token);
   QNetworkReply *reply;
@@ -171,11 +173,16 @@ void RoomClient::probeSeriesFollows(const QString &key) {
               const bool available = result.value(QStringLiteral("seriesFollows")).toBool();
               const bool fromEntry = available && result.value(QStringLiteral("seriesFollowFromEntry")).toBool();
               const bool pending = available && result.value(QStringLiteral("seriesPendingFollows")).toBool();
+              const bool interactive = available && result.value(QStringLiteral("seriesInteractive")).toBool();
+              const bool season = available && result.value(QStringLiteral("seriesSeasonFromWatched")).toBool();
               if (c.seriesAvailable != available || c.seriesEntryAvailable != fromEntry ||
-                  c.seriesPendingAvailable != pending) {
+                  c.seriesPendingAvailable != pending || c.seriesInteractive != interactive ||
+                  c.seriesSeasonFromWatched != season) {
                 c.seriesAvailable = available;
                 c.seriesEntryAvailable = fromEntry;
                 c.seriesPendingAvailable = pending;
+                c.seriesInteractive = interactive;
+                c.seriesSeasonFromWatched = season;
                 emit seriesCapabilityChanged(key);
               }
             }
@@ -192,6 +199,14 @@ bool RoomClient::seriesFollowFromEntryAvailable(const QString &key) const {
 bool RoomClient::seriesPendingFollowsAvailable(const QString &key) const {
   const auto it = connections_.find(key);
   return it != connections_.end() && it->second->seriesPendingAvailable;
+}
+bool RoomClient::seriesInteractiveAvailable(const QString &key) const {
+  const auto it = connections_.find(key);
+  return it != connections_.end() && it->second->seriesInteractive;
+}
+bool RoomClient::seriesSeasonFromWatchedAvailable(const QString &key) const {
+  const auto it = connections_.find(key);
+  return it != connections_.end() && it->second->seriesSeasonFromWatched;
 }
 void RoomClient::seriesRequest(const QString &key, const QString &suffix, const QJsonObject *body,
                                QObject *context, SeriesReply callback) {
@@ -218,6 +233,14 @@ void RoomClient::seriesRequest(const QString &key, const QString &suffix, const 
 }
 void RoomClient::loadSeriesFollows(const QString &key, QObject *context, SeriesReply callback) {
   seriesRequest(key, {}, nullptr, context, std::move(callback));
+}
+void RoomClient::loadSeriesSeason(const QString &key, int year, const QString &season, QObject *context,
+                                 SeriesReply callback) {
+  QUrlQuery query;
+  query.addQueryItem(QStringLiteral("year"), QString::number(year));
+  query.addQueryItem(QStringLiteral("season"), season);
+  seriesRequest(key, QStringLiteral("/season?") + query.toString(QUrl::FullyEncoded), nullptr, context,
+                std::move(callback));
 }
 void RoomClient::previewSeriesFollow(const QString &key, const QJsonObject &body, QObject *context,
                                     SeriesReply callback) {
@@ -313,7 +336,8 @@ void RoomClient::provideSeriesResponse(const QString &key, quint64 epoch, const 
   request.setAttribute(QNetworkRequest::CookieSaveControlAttribute, QNetworkRequest::Manual);
   request.setRawHeader("Accept", accept);
   request.setRawHeader("User-Agent", "WatchPair/2 series follows");
-  request.setTransferTimeout(12000);
+  const int timeout = std::clamp(event.value(QStringLiteral("timeoutMs")).toInt(12000), 1000, 12000);
+  request.setTransferTimeout(timeout);
   request.setPriority(QNetworkRequest::LowPriority);
   auto *reply = network_.get(request);
   seriesMetadataJobs_.insert(requestId, reply);
@@ -321,7 +345,7 @@ void RoomClient::provideSeriesResponse(const QString &key, quint64 epoch, const 
     if (reply->bytesAvailable() > maxResponse)
       reply->abort();
   });
-  QTimer::singleShot(18000, reply, [reply] {
+  QTimer::singleShot(timeout < 12000 ? timeout : 18000, reply, [reply] {
     if (reply->isRunning())
       reply->abort();
   });

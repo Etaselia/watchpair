@@ -71,6 +71,7 @@ signals:
   void addRequested(QString room);
   void manageRequested(QString room);
   void seriesRequested(QString room);
+  void seasonFollowRequested(QString room);
   void followEntryRequested(QString room, QString entry);
   void fullscreenRequested();
   void popoutRequested();
@@ -119,6 +120,7 @@ private:
   QPushButton *queueUp_, *queueDown_, *queueMark_;
   QPushButton *series_;
   QAction *queueUnwatched_, *queueWatchAgain_, *queueFollow_, *queueRename_, *queueRemove_, *queueClear_;
+  QPushButton *queueFollowSeason_;
   QLabel *queueHint_;
   QPushButton *previousChapter_, *nextChapter_, *skipBack_, *skipForward_, *popout_, *reattach_;
   SeekSlider *seek_;

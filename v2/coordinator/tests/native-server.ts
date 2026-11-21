@@ -29,6 +29,7 @@ function seriesFixture(): SeriesProvider {
   return {
     searchCatalog: async () => [catalog],
     catalog: async () => catalog,
+    season: async () => [catalog],
     searchReleases: async (_query, uploader) => [...releases.values()].map(record => record.listing)
       .filter(listing => !uploader || listing.uploader === uploader),
     listing: async id => get(id).listing,

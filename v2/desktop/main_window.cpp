@@ -321,6 +321,13 @@ MainWindow::MainWindow(AppServices &app) : app_(app) {
   connect(room_, &RoomPage::addRequested, this, [this](const QString &room) { addSource(room); });
   connect(room_, &RoomPage::manageRequested, this, &MainWindow::manageRoom);
   connect(room_, &RoomPage::seriesRequested, this, &MainWindow::manageSeries);
+  connect(room_, &RoomPage::seasonFollowRequested, this, [this](const QString &room) {
+    if (!app_.rooms.connected(room) || !app_.rooms.seriesSeasonFromWatchedAvailable(room))
+      return;
+    auto *dialog = new SeasonFollowDialog(app_.rooms, room, this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->open();
+  });
   connect(room_, &RoomPage::followEntryRequested, this, &MainWindow::followSeries);
   connect(room_, &RoomPage::transferRequested, this, &MainWindow::showTransfers);
   connect(room_, &RoomPage::fullscreenRequested, this, &MainWindow::toggleFullscreen);

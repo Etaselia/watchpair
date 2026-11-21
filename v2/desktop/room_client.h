@@ -47,9 +47,13 @@ public:
   bool seriesFollowsAvailable(const QString &key) const;
   bool seriesFollowFromEntryAvailable(const QString &key) const;
   bool seriesPendingFollowsAvailable(const QString &key) const;
+  bool seriesInteractiveAvailable(const QString &key) const;
+  bool seriesSeasonFromWatchedAvailable(const QString &key) const;
   bool seriesFallbackEnabled() const { return seriesFallbackEnabled_; }
   void setSeriesFallbackEnabled(bool enabled);
   void loadSeriesFollows(const QString &key, QObject *context, SeriesReply callback);
+  void loadSeriesSeason(const QString &key, int year, const QString &season, QObject *context,
+                        SeriesReply callback);
   void previewSeriesFollow(const QString &key, const QJsonObject &body, QObject *context,
                            SeriesReply callback);
   void createSeriesFollow(const QString &key, const QJsonObject &body, QObject *context,
@@ -85,7 +89,7 @@ private:
     QList<QPair<double, double>> clockSamples;
     bool online = false, fresh = false, terminal = false, requesting = false, refreshing = false;
     bool seriesAvailable = false, seriesEntryAvailable = false, seriesPendingAvailable = false,
-         seriesProbePending = false;
+         seriesProbePending = false, seriesInteractive = false, seriesSeasonFromWatched = false;
     bool seriesPreferenceSupported = false, seriesAdvertised = false;
     qint64 seriesProbeAfter = 0;
     QString state = QStringLiteral("Connecting…");

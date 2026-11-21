@@ -258,6 +258,11 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   queueTabs_->addTab(tr("Watched"));
   queueTabs_->setExpanding(true);
   queueLayout->addWidget(queueTabs_);
+  queueFollowSeason_ = button(tr("Follow this season from Watched"), QStringLiteral(""));
+  queueFollowSeason_->setObjectName(QStringLiteral("QueueFollowSeason"));
+  queueFollowSeason_->hide();
+  queueLayout->addWidget(queueFollowSeason_);
+  connect(queueFollowSeason_, &QPushButton::clicked, this, [this] { emit seasonFollowRequested(room_); });
   auto *search = new QLineEdit;
   search->setPlaceholderText(tr("Find an episode or season"));
   search->setObjectName(QStringLiteral("queueSearch"));
@@ -1019,6 +1024,9 @@ void RoomPage::updateQueueActions() {
   const bool canFollow = app_.rooms.seriesFollowFromEntryAvailable(room_);
   queueFollow_->setVisible(canFollow);
   queueFollow_->setEnabled(connected && canFollow && one && !app_.rooms.entry(room_, selected.first()).isEmpty());
+  const bool canFollowSeason = watched && app_.rooms.seriesSeasonFromWatchedAvailable(room_);
+  queueFollowSeason_->setVisible(canFollowSeason);
+  queueFollowSeason_->setEnabled(connected && canFollowSeason);
   queueRename_->setVisible(!watched);
   queueRename_->setEnabled(connected && one);
   queueRemove_->setVisible(!watched);

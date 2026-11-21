@@ -14,7 +14,7 @@ import { SeriesService } from './series.js';
 import { MAX_SERIES_METADATA_BYTES, type SeriesProvider } from './series-provider.js';
 
 const name = z.string().trim().min(1).max(100).refine(v => !/[\x00-\x1f\x7f]/.test(v));
-const VERSION = '2.0.4';
+const VERSION = '2.0.5';
 const MAX_COMMAND_BYTES = 12 * 1024 * 1024;
 const capability = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const createBody = z.object({ name, memberName: name, retryKey: capability }).strict();
@@ -25,8 +25,10 @@ const seriesAirtime = z.number().int().min(0).max(Date.UTC(2100, 0, 1)).nullable
 const seriesEntryId = z.string().regex(/^[a-f0-9]{64}$/);
 const seriesPreview = z.object({ input: z.string().trim().max(300), malId: z.number().int().min(1).max(999_999_999).optional(),
   listingId: z.number().int().min(1).max(999_999_999_999).optional(), entryId: seriesEntryId.optional(),
-  deferMetadata: z.literal(true).optional() }).strict()
+  exactWatched: z.literal(true).optional(), deferMetadata: z.literal(true).optional() }).strict()
   .refine(value => Boolean(value.input || value.entryId), 'Enter a title or link or choose a room episode.');
+const seasonQuery = z.object({ year: z.coerce.number().int().min(1900).max(2100),
+  season: z.enum(['winter', 'spring', 'summer', 'fall']) }).strict();
 const seriesConfirm = z.object({ draftId: z.string().uuid(), expectedAirAt: seriesAirtime.optional(),
   finalEpisode: episodeNumber.nullable().optional(), catalogEpisode: episodeNumber.optional() }).strict();
 const seriesAction = z.object({ revision: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
@@ -78,10 +80,10 @@ export async function buildServer(options: ServerOptions = {}) {
     ws.send(JSON.stringify(value));
     return true;
   };
-  const series = options.seriesProvider ? new SeriesService(engine, options.seriesProvider, (room, request, tried) => {
+  const series = options.seriesProvider ? new SeriesService(engine, options.seriesProvider, (room, request, tried, preferred) => {
     for (const connection of sockets) {
       const { memberId, connectionId, network } = connection;
-      if (connection.roomId !== room || !network || tried.has(network) ||
+      if (connection.roomId !== room || !network || tried.has(network) || (preferred && preferred !== connectionId) ||
           (request.type === 'series.lookup' ? !connection.helpsLookup : !connection.helpsSeries)) continue;
       try {
         if (engine.authenticate(room, connection.token).live?.connectionId !== connectionId) continue;
@@ -126,7 +128,8 @@ export async function buildServer(options: ServerOptions = {}) {
       <script nonce="${nonce}">const fragment=location.hash.slice(1);const match=/^(invite|recovery)=([A-Za-z0-9_-]{43})$/.exec(fragment);const input=document.getElementById('link');input.value=location.href;if(match){const a=document.getElementById('open');a.href='watchpair://room?server='+encodeURIComponent(location.origin)+'&room=${id}#'+fragment;a.style.display='inline-block';if(match[1]==='recovery')document.getElementById('message').textContent='This private recovery link restores host control. Open it only on a device you trust.';}else document.getElementById('message').textContent='This link is incomplete. Ask the host for the full invite, including the private part after #.';document.getElementById('copy').onclick=async()=>{try{await navigator.clipboard.writeText(input.value);document.getElementById('copy').textContent='Copied';}catch{input.select();}};</script></html>`);
   });
   app.get('/v2/version', async () => ({ protocol: PROTOCOL, version: VERSION, operationRetryWindow: 10_000,
-    seriesFollows: series !== null, seriesFollowFromEntry: series !== null, seriesPendingFollows: series !== null }));
+    seriesFollows: series !== null, seriesFollowFromEntry: series !== null, seriesPendingFollows: series !== null,
+    seriesInteractive: series !== null, seriesSeasonFromWatched: Boolean(options.seriesProvider?.season) }));
   app.post('/v2/rooms', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async request => {
     const body = createBody.parse(request.body); return engine.create(body.name, body.memberName, body.retryKey);
   });
@@ -147,10 +150,23 @@ export async function buildServer(options: ServerOptions = {}) {
     auth(request);
     return series?.list(roomId(request)) ?? { enabled: false, items: [] };
   });
-  app.post('/v2/rooms/:roomId/series/preview', { config: { rateLimit: { max: 12, timeWindow: '1 minute' } }, onRequest: requireMember }, async request => {
+  app.get('/v2/rooms/:roomId/series/season', { config: { rateLimit: { max: 6, timeWindow: '1 minute' } },
+    onRequest: requireMember }, async request => {
+    const { year, season } = seasonQuery.parse(request.query);
+    const result = await requireSeries().seasonFromWatched(roomId(request), year, season);
+    auth(request);
+    return result;
+  });
+  app.post('/v2/rooms/:roomId/series/preview', { config: { rateLimit: { max: 24, timeWindow: '1 minute' } }, onRequest: requireMember }, async request => {
     const member = auth(request);
+    const ip = networkAddress(request.ip);
+    const local = [...sockets].find(c => c.roomId === roomId(request) && c.memberId === member.id &&
+      c.connectionId === member.live?.connectionId && c.network === ip && (c.helpsSeries || c.helpsLookup) &&
+      c.ws.readyState === WebSocket.OPEN);
+    const mode = request.headers['x-watchpair-series-interactive'] === '1' ?
+      { connectionId: local?.connectionId, signal: AbortSignal.timeout(23_000) } : undefined;
     const result = await requireSeries().preview(roomId(request), member.id, seriesPreview.parse(request.body),
-      request.headers['x-watchpair-series-lookup'] === '1');
+      !mode && request.headers['x-watchpair-series-lookup'] === '1', mode);
     auth(request);
     return result;
   });

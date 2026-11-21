@@ -38,11 +38,12 @@ The current reporter's consecutive, plausible played intervals contribute distin
 
 ## Series follows
 
-`GET /v2/version` advertises `seriesFollows`, `seriesFollowFromEntry`, and `seriesPendingFollows`. With series follows enabled, these routes require a room member's bearer token. Paths are relative to `/v2/rooms/:roomId`.
+`GET /v2/version` advertises `seriesFollows`, `seriesFollowFromEntry`, `seriesPendingFollows`, `seriesInteractive`, and `seriesSeasonFromWatched`. With series follows enabled, these routes require a room member's bearer token. Paths are relative to `/v2/rooms/:roomId`.
 
 | Route | Contract |
 | --- | --- |
 | `GET /series` | Returns the room's follow rules and check times in Unix epoch milliseconds. `pending` can be `setup` while verifying the starting release, `episode` while verifying a later release, or `null`. An active pending rule includes its next verification time. |
+| `GET /series/season?year=2026&season=fall` | Previews candidates using watched room entries and the selected MAL season. Returns the latest watched episode per match, entries with existing follows and ambiguous items for review. |
 | `POST /series/preview` | Accepts `input` with optional `malId`, `listingId`, or room `entryId`. Send an empty `input` with `entryId` to look up an existing episode by its Nyaa listing or filename. A concrete season and release return a temporary draft bound to the room, member, and selected entry. With `deferMetadata: true`, the coordinator can save a new follow and verify its torrent in the background. Source changes still require a preview with verified metadata. |
 | `POST /series` | Confirms a `draftId` with optional `expectedAirAt`, release-numbered `finalEpisode`, and `catalogEpisode` for absolute numbering. Omit `expectedAirAt` to accept the estimate or pass `null` when it is unknown. A draft for an existing entry records it as the starting episode and begins following the next one. |
 | `POST /series/:id/actions` | Takes `action` and the current follow `revision`. Actions cover pause, resume, stop, check, skip, link existing, set airtime or finale, replace source, and approve or dismiss an alternate. Only the current host can approve or dismiss an alternate. |
@@ -52,6 +53,10 @@ The current reporter's consecutive, plausible played intervals contribute distin
 Desktops advertise `X-WatchPair-Series-Metadata: 1` and `X-WatchPair-Series-Lookup: 1` on the room WebSocket when their local Nyaa preference is enabled. When the initial snapshot advertises `seriesPreference: true`, the desktop can update eligibility on that same connection with `{"type":"series.preference","enabled":false}` or `enabled: true`. Disabling the preference releases any assigned request for another eligible desktop.
 
 A `series.metadata` event requests a Nyaa `.torrent` by numeric `listingId`. A `series.lookup` event requests a listing page by `listingId` or an RSS search by `query` and optional `uploader`. Short-lived request IDs are bound to the selected room session. When `reportFailure` is set, the desktop can send `series.failed` with that `requestId` and an optional `retryAfterMs`. The coordinator tries connected desktops sequentially, once per observed IP address for each request in a round. The cooldown starts at one minute once the round is exhausted. Preview requests with the lookup header can receive `lookupPending: true` while a desktop is working.
+
+`X-WatchPair-Series-Interactive: 1` on a preview requests the device-first route. The coordinator uses the requesting member’s eligible live socket on the same observed network and holds the HTTP response until it can return the verified preview or a bounded error. It gives the requesting device a two-second head start before starting a VPS request. New desktop lookup events may include `timeoutMs`. Old clients retain the pending response and poll flow.
+
+Season review sends `exactWatched: true` with the selected `entryId` and `malId`. The starting listing must match the original torrent info hash, episode and release group. Confirmation checks that the entry is still in Watched. Resuming a stopped follow preserves its cursor and episode ledger, subject to the existing one-live-rule limit.
 
 `X-WatchPair-Series-Events: 1` on the WebSocket subscribes to `series.changed` independently of that device’s fallback eligibility. The event carries the same committed follow list as `GET /series`. Added episodes arrive in the ordinary queue snapshot and use the room's usual download rules.
 

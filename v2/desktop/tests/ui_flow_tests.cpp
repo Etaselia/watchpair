@@ -16,6 +16,7 @@
 #include <QStatusBar>
 #include <QToolButton>
 #include <QSurfaceFormat>
+#include <QTableWidget>
 #include <QTemporaryDir>
 #include <QtTest>
 #include <libtorrent/bencode.hpp>
@@ -68,6 +69,88 @@ void chooseOption(QComboBox *box, int index) {
 class UiFlowTests final : public QObject {
   Q_OBJECT
 private slots:
+  void followsTheSeasonFromWatchedAndRestartsAStoppedRule() {
+    QTemporaryDir tmp;
+    QVERIFY(tmp.isValid());
+    wp::test::Coordinator server;
+    server.start(tmp.filePath(QStringLiteral("server.sqlite")), true);
+    wp::AppServices services(tmp.filePath(QStringLiteral("profile")), nullptr, true, false);
+    services.rooms.setSeriesFallbackEnabled(false);
+    services.store.setSetting(QStringLiteral("acquisitionPolicy"), QStringLiteral("Never"));
+    QSignalSpy entered(&services.rooms, &wp::RoomClient::entered);
+    services.rooms.create(server.url(), QStringLiteral("Season review"), QStringLiteral("Host"));
+    QTRY_COMPARE_WITH_TIMEOUT(entered.size(), 1, 5000);
+    const auto room = entered.first()[1].toString();
+    QTRY_VERIFY_WITH_TIMEOUT(services.rooms.connected(room), 5000);
+    const auto hash = QStringLiteral("2de4432a3db4367d8f643224fa761f353c2dd0ea");
+    const QJsonObject source{{QStringLiteral("id"), QStringLiteral("fixture-torrent")},
+                             {QStringLiteral("kind"), QStringLiteral("torrent")},
+                             {QStringLiteral("label"), QStringLiteral("Test Anime")},
+                             {QStringLiteral("uri"), QStringLiteral("magnet:?xt=urn:btih:") + hash},
+                             {QStringLiteral("identity"), QStringLiteral("bt:") + hash}};
+    const QJsonObject file{{QStringLiteral("mediaId"), QStringLiteral("fixture-episode")},
+                           {QStringLiteral("path"), QStringLiteral("[Origin] Test Anime - 07 (1080p).mkv")},
+                           {QStringLiteral("label"), QStringLiteral("Test Anime 7")},
+                           {QStringLiteral("fileIndex"), 0}, {QStringLiteral("size"), 123},
+                           {QStringLiteral("selected"), true}};
+    services.rooms.command(room, {{QStringLiteral("type"), QStringLiteral("queue.add")},
+                                  {QStringLiteral("source"), source}, {QStringLiteral("files"), QJsonArray{file}}});
+    const auto entries = [&] { return services.rooms.room(room).value(QStringLiteral("entries")).toArray(); };
+    QTRY_COMPARE_WITH_TIMEOUT(entries().size(), 1, 5000);
+    const auto entryId = entries().first().toObject().value(QStringLiteral("id"));
+    services.rooms.command(room, {{QStringLiteral("type"), QStringLiteral("history.mark")},
+                                  {QStringLiteral("ids"), QJsonArray{entryId}}, {QStringLiteral("watched"), true}});
+    QTRY_VERIFY_WITH_TIMEOUT(entries().first().toObject().value(QStringLiteral("watchedAt")).isDouble(), 5000);
+    wp::ui::MainWindow window(services);
+    window.show();
+    window.showRoom(room);
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    auto *tabs = window.findChild<QTabBar *>(QStringLiteral("QueueTabs"));
+    auto *seasonButton = window.findChild<QPushButton *>(QStringLiteral("QueueFollowSeason"));
+    QVERIFY(tabs && seasonButton);
+    QVERIFY(!seasonButton->isVisible());
+    tabs->setCurrentIndex(1);
+    QTRY_VERIFY_WITH_TIMEOUT(seasonButton->isVisible() && seasonButton->isEnabled(), 5000);
+    QTest::mouseClick(seasonButton, Qt::LeftButton);
+    auto *dialog = window.findChild<QDialog *>(QStringLiteral("SeasonFollowDialog"));
+    QVERIFY(dialog);
+    auto *table = dialog->findChild<QTableWidget *>(QStringLiteral("SeasonFollowTable"));
+    auto *confirm = dialog->findChild<QPushButton *>(QStringLiteral("ConfirmSeasonFollows"));
+    QVERIFY(table && confirm);
+    QTRY_VERIFY_WITH_TIMEOUT(confirm->isEnabled(), 5000);
+    QCOMPARE(table->rowCount(), 1);
+    QCOMPARE(table->item(0, 1)->text(), QStringLiteral("7"));
+    QVERIFY(table->item(0, 2)->text().contains(QStringLiteral("Next episode 8")));
+    QTest::mouseClick(confirm, Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(table->item(0, 2)->text().contains(QStringLiteral("Follow saved")), 5000);
+    QCOMPARE(entries().size(), 1);
+    dialog->reject();
+    QVERIFY(server.checkSeries());
+    QJsonObject stopped;
+    services.rooms.loadSeriesFollows(room, &window, [&](const QJsonObject &response, const QString &error) {
+      QVERIFY(error.isEmpty());
+      const auto rule = response.value(QStringLiteral("items")).toArray().first().toObject();
+      services.rooms.seriesFollowAction(room, rule.value(QStringLiteral("id")).toString(),
+          {{QStringLiteral("action"), QStringLiteral("stop")}, {QStringLiteral("revision"), rule.value(QStringLiteral("revision"))}},
+          &window, [&](const QJsonObject &result, const QString &failure) {
+            QVERIFY(failure.isEmpty());
+            stopped = result.value(QStringLiteral("item")).toObject();
+          });
+    });
+    QTRY_COMPARE_WITH_TIMEOUT(stopped.value(QStringLiteral("status")).toString(), QStringLiteral("stopped"), 5000);
+    window.findChild<QPushButton *>(QStringLiteral("RoomSeriesFollows"))->click();
+    auto *manager = window.findChild<QDialog *>(QStringLiteral("SeriesManagerDialog"));
+    QVERIFY(manager);
+    QTRY_VERIFY_WITH_TIMEOUT(button(*manager, QStringLiteral("Follow again")) &&
+                            button(*manager, QStringLiteral("Follow again"))->isEnabled(), 5000);
+    QTest::mouseClick(button(*manager, QStringLiteral("Follow again")), Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(button(*manager, QStringLiteral("Pause")) &&
+                            button(*manager, QStringLiteral("Pause"))->isEnabled(), 5000);
+    QCOMPARE(manager->findChild<QListWidget *>(QStringLiteral("SeriesFollowList"))->count(), 1);
+    window.prepareToQuit();
+    services.shutdown();
+  }
+
   void followSeriesFromRoomAndApproveAlternate() {
     try {
       QTemporaryDir tmp;
@@ -75,6 +158,7 @@ private slots:
       wp::test::Coordinator server;
       server.start(tmp.filePath(QStringLiteral("server.sqlite")), true);
       wp::AppServices services(tmp.filePath(QStringLiteral("profile")), nullptr, true, false);
+      services.rooms.setSeriesFallbackEnabled(false);
       services.store.setSetting(QStringLiteral("acquisitionPolicy"), QStringLiteral("Never"));
       QSignalSpy entered(&services.rooms, &wp::RoomClient::entered);
       services.rooms.create(server.url(), QStringLiteral("Series room"), QStringLiteral("Host"));
@@ -188,6 +272,7 @@ private slots:
       wp::test::Coordinator server;
       server.start(tmp.filePath(QStringLiteral("server.sqlite")), true);
       wp::AppServices services(tmp.filePath(QStringLiteral("profile")), nullptr, true, false);
+      services.rooms.setSeriesFallbackEnabled(false);
       services.store.setSetting(QStringLiteral("acquisitionPolicy"), QStringLiteral("Never"));
       QSignalSpy entered(&services.rooms, &wp::RoomClient::entered);
       services.rooms.create(server.url(), QStringLiteral("Existing episode"), QStringLiteral("Host"));

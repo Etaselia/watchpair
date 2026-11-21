@@ -11,6 +11,7 @@ class QLineEdit;
 class QListWidget;
 class QPushButton;
 class QSpinBox;
+class QTableWidget;
 class QToolButton;
 
 namespace wp::ui {
@@ -71,5 +72,27 @@ private:
   QTimer timer_;
   quint64 refreshGeneration_ = 0;
   bool busy_ = false, loading_ = false, enabled_ = false;
+};
+
+class SeasonFollowDialog final : public QDialog {
+  Q_OBJECT
+public:
+  explicit SeasonFollowDialog(RoomClient &rooms, QString room, QWidget *parent = nullptr);
+
+private:
+  void load();
+  void verifyNext();
+  void saveNext();
+  void updateActions();
+  void reviewCurrent();
+  void setRowState(int row, const QString &text);
+  RoomClient &rooms_;
+  const QString room_;
+  QTableWidget *table_;
+  QLabel *feedback_;
+  QPushButton *review_, *confirm_;
+  QList<int> toSave_;
+  int verifying_ = 0, saved_ = 0, failed_ = 0;
+  bool loading_ = true, saving_ = false;
 };
 } // namespace wp::ui

@@ -14,6 +14,19 @@ When a VPS request to Nyaa times out, WatchPair can try connected room desktops 
 
 Any room member can create, edit, pause, resume, or stop a follow. The current room host approves a one-time release from another group. Each rule covers one confirmed season or part. A later season or separately listed part needs its own follow. Stopping a rule keeps its already added episodes and history.
 
+### Device-first Nyaa lookup and season review
+
+In 2.0.4, a slow VPS request can consume 10 seconds before the coordinator asks a desktop. Desktops are chosen in connection order, so the device that started the search may wait behind another room member. A silent desktop can hold its turn for 25 seconds. Even when a desktop answers immediately, the preview dialog waits for its next 6.5-second poll. Listing lookup, RSS search, and torrent verification can incur these delays independently. A scheduled check can also wait for the coordinator’s next 15-second tick. [Provider timeout](../v2/coordinator/src/series-provider.ts) · [Fallback rounds](../v2/coordinator/src/series-metadata.ts) · [Desktop selection](../v2/coordinator/src/server.ts) · [Preview dialog](../v2/desktop/series_dialog.cpp)
+
+In the 21 November room check, the first preview took about 17 seconds across the VPS attempt and the desktop retry. Direct RSS queries from the workstation took about 80–120 ms, and the original torrent files came back in about half a second.
+
+1. In 2.0.5 searches started in the dialog try the requesting desktop first when it has allowed Nyaa requests. The coordinator identifies it by its authenticated room connection and observed network. The VPS can start after a two-second head start. The coordinator shares identical in-flight queries and respects `Retry-After` and cooldowns.
+2. Scheduled checks reuse a desktop that recently succeeded when the VPS has timed out. A verified desktop response wakes a waiting scheduled check. The VPS remains available for rooms without connected desktops.
+3. Interactive previews return on the original HTTP request as soon as the verified result is available. Older clients retain the pending and poll behavior. Confirmed follows can still verify torrent metadata in the background.
+4. **Follow this season from Watched** chooses the highest watched episode per unambiguous MAL season match. It verifies the original release by info hash and shows its edition and next episode for review. Ambiguous matches can be opened individually. Existing rules remain listed in **Series follows**, where **Follow again** resumes a stopped rule.
+
+Measure time to first desktop request and time from validated response to visible preview. For an opted-in requesting desktop that is already online, aim to start the local request within one second and display the result within one second of verification. Cover two clients behind one IP, HTTP 429 and `Retry-After`, late responses, opt-out during a request, and rooms with no connected desktops.
+
 ```mermaid
 flowchart TD
     A[Enter a title or paste a Nyaa release] --> B[Confirm season, group and starting episode]

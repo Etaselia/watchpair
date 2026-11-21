@@ -62,6 +62,7 @@ class FixtureProvider implements SeriesProvider {
 
   async searchCatalog(_query: string) { return [this.entry]; }
   async catalog(_id: number) { ++this.catalogCalls; return this.entry; }
+  async season() { return [this.entry]; }
   async listing(id: number) { this.beforeListing?.(); return this.records.get(id)!.listing; }
   async searchReleases(query: string, uploader?: string) {
     this.beforeSearch?.();
@@ -176,19 +177,93 @@ test('a Nyaa link and its torrent fall back in order, skipping desktops behind t
       payload: { draftId: draft.id } });
     assert.equal(confirmed.json().item.pending, 'setup');
     await f.series!.runOnce();
-    const firstTorrent = await first.take();
-    assert.equal(firstTorrent.type, 'series.metadata');
-    assert.equal((await first.submit('metadata', firstTorrent.requestId, Buffer.from('wrong torrent'))).statusCode, 422);
-    assert.equal((await first.submit('metadata', firstTorrent.requestId, seed.bytes)).statusCode, 404);
-    const lastTorrent = await last.take();
+    const preferredTorrent = await last.take();
+    assert.equal(preferredTorrent.type, 'series.metadata');
+    assert.equal((await last.submit('metadata', preferredTorrent.requestId, Buffer.from('wrong torrent'))).statusCode, 422);
+    assert.equal((await last.submit('metadata', preferredTorrent.requestId, seed.bytes)).statusCode, 404);
+    const fallbackTorrent = await first.take();
     assert.equal(duplicate.jobs.length, 0);
-    assert.equal((await last.submit('metadata', lastTorrent.requestId, seed.bytes)).statusCode, 200);
+    assert.equal((await first.submit('metadata', fallbackTorrent.requestId, seed.bytes)).statusCode, 200);
     await f.series!.runOnce();
     assert.equal(f.engine.snapshot(f.room.roomId).entries.length, 1);
     assert.equal(f.rules()[0]!.pending, null);
   } finally {
     for (const desktop of [first, duplicate, second, last]) desktop.ws.terminate();
   }
+});
+
+test('interactive preview tries the requesting desktop before the VPS or another room member', async t => {
+  const f = await fixture(t, true);
+  await f.app.listen({ host: '127.0.0.1', port: 0 });
+  const other = await attachDesktop(f, f.guest.token, '203.0.113.10');
+  const requester = await attachDesktop(f, f.room.token, '203.0.113.11');
+  try {
+    let vpsCalls = 0;
+    f.provider.beforeSearch = () => { ++vpsCalls; };
+    const preview = () => f.app.inject({ method: 'POST', url: `${f.path}/series/preview`,
+      headers: { ...auth(f.room.token), 'x-forwarded-for': '203.0.113.11', 'x-watchpair-series-interactive': '1' },
+      payload: { input: 'Test Anime' } });
+    const first = preview(), duplicate = preview();
+    const job = await requester.take();
+    assert.equal(job.kind, 'search');
+    assert.equal(other.jobs.length, 0);
+    assert.equal(vpsCalls, 0);
+    const seed = f.provider.records.get(100)!;
+    assert.equal((await requester.submit('lookup', job.requestId, rss(seed.listing))).statusCode, 200);
+    for (const result of await Promise.all([first, duplicate])) {
+      assert.equal(result.statusCode, 200, result.body);
+      assert.equal(result.json().releases[0].id, 100);
+      assert.equal(result.json().lookupPending, undefined);
+    }
+    assert.equal(vpsCalls, 0);
+    assert.equal(requester.jobs.length, 0);
+    await requester.prefer(false);
+    const optedOut = await f.app.inject({ method: 'POST', url: `${f.path}/series/preview`,
+      headers: { ...auth(f.room.token), 'x-forwarded-for': '203.0.113.11', 'x-watchpair-series-interactive': '1' },
+      payload: { input: 'Different anime query' } });
+    assert.equal(optedOut.statusCode, 200);
+    assert.equal(vpsCalls, 1);
+    assert.equal(requester.jobs.length, 0);
+  } finally { requester.ws.terminate(); other.ws.terminate(); }
+});
+
+test('interactive preview hedges a silent desktop and ignores its answer after the VPS wins', async t => {
+  const f = await fixture(t, true);
+  await f.app.listen({ host: '127.0.0.1', port: 0 });
+  const requester = await attachDesktop(f, f.room.token, '203.0.113.11');
+  try {
+    let vpsCalls = 0;
+    f.provider.beforeSearch = () => { ++vpsCalls; };
+    const preview = f.app.inject({ method: 'POST', url: `${f.path}/series/preview`,
+      headers: { ...auth(f.room.token), 'x-forwarded-for': '203.0.113.11', 'x-watchpair-series-interactive': '1' },
+      payload: { input: 'Test Anime' } });
+    const job = await requester.take();
+    assert.equal(vpsCalls, 0);
+    const answer = await preview;
+    assert.equal(answer.statusCode, 200, answer.body);
+    assert.equal(vpsCalls, 1);
+    assert.equal((await requester.submit('lookup', job.requestId, rss(f.provider.records.get(100)!.listing))).statusCode, 404);
+  } finally { requester.ws.terminate(); }
+});
+
+test('interactive preview honours a desktop Retry-After before probing another route', async t => {
+  const f = await fixture(t, true);
+  await f.app.listen({ host: '127.0.0.1', port: 0 });
+  const requester = await attachDesktop(f, f.room.token, '203.0.113.10');
+  const other = await attachDesktop(f, f.guest.token, '203.0.113.11');
+  try {
+    let vpsCalls = 0;
+    f.provider.beforeSearch = () => { ++vpsCalls; };
+    const preview = () => f.app.inject({ method: 'POST', url: `${f.path}/series/preview`,
+      headers: { ...auth(f.room.token), 'x-forwarded-for': '203.0.113.10', 'x-watchpair-series-interactive': '1' },
+      payload: { input: 'Test Anime' } });
+    const pending = preview();
+    requester.fail((await requester.take()).requestId, 90_000);
+    assert.equal((await pending).statusCode, 503);
+    assert.equal((await preview()).statusCode, 503);
+    assert.equal(vpsCalls, 0);
+    assert.equal(other.jobs.length, 0);
+  } finally { requester.ws.terminate(); other.ws.terminate(); }
 });
 
 test('opting out hands off an active Nyaa request while the room stays connected', async t => {
@@ -272,9 +347,60 @@ test('scheduled follows resume from desktop RSS and add the verified next episod
     assert.equal((await desktop.submit('lookup', request.requestId, rss(episode.listing))).statusCode, 200);
     f.now = f.rules()[0]!.nextCheckAt!;
     await f.series!.runOnce();
+    const torrent = await desktop.take();
+    assert.equal(torrent.type, 'series.metadata');
+    assert.equal((await desktop.submit('metadata', torrent.requestId, episode.bytes)).statusCode, 200);
+    await f.series!.runOnce();
     assert.equal(f.rules()[0]!.nextEpisode, 9);
     assert.equal(f.store.getSeriesEpisode(f.room.roomId, f.provider.entry.id, 8)!.listingId, episode.listing.id);
   } finally { desktop.ws.terminate(); }
+});
+
+test('season review picks the latest watched episode and follows its exact scene-style torrent', async t => {
+  const f = await fixture(t);
+  f.provider.entry = { ...f.provider.entry, title: "Demons' Crest", alternativeTitles: ["Devils' Crest"],
+    broadcastDayJapan: null, broadcastTimeJapan: null };
+  const { room, engine } = f;
+  const command = (payload: object) => engine.command(room.roomId, room.memberId, { operationId: randomUUID(),
+    queueRevision: engine.snapshot(room.roomId).queueRevision, command: payload });
+  for (const episode of [3, 4, 5]) {
+    const number = String(episode).padStart(2, '0');
+    const row = f.provider.put(200 + episode, `[ToonsHub] Devils Crest S01E${number} 1080p WEB-DL`, start, 'ToonsHub',
+      `Devils.Crest.S01E${number}.1080p.AMZN.WEB-DL.DUAL.DDP2.0.H.264.MSubs-ToonsHub.mkv`);
+    const manifest = verifySeriesMetainfo(row.bytes, row.listing, ["Demons' Crest", "Devils' Crest"]);
+    command({ type: 'queue.add', source: { ...manifest.source, uri: `magnet:?xt=urn:btih:${row.listing.infoHash}` },
+      files: [manifest.file] });
+    if (episode !== 5) command({ type: 'history.mark', ids: [engine.snapshot(room.roomId).entries.at(-1)!.id], watched: true });
+  }
+  const season = () => f.app.inject({ url: `${f.path}/series/season?year=2026&season=fall`, headers: auth(room.token) });
+  const planned = await season();
+  assert.equal(planned.statusCode, 200, planned.body);
+  const rows = planned.json().items;
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].episode, 4);
+  assert.equal(rows[0].status, 'ready');
+  const preview = await f.app.inject({ method: 'POST', url: `${f.path}/series/preview`, headers: auth(room.token),
+    payload: { input: '', entryId: rows[0].entryId, malId: f.provider.entry.id, exactWatched: true } });
+  assert.equal(preview.statusCode, 200, preview.body);
+  assert.equal(preview.json().draft.anchorListingId, 204);
+  const apply = await f.app.inject({ method: 'POST', url: `${f.path}/series`, headers: auth(room.token),
+    payload: { draftId: preview.json().draft.id, expectedAirAt: air } });
+  assert.equal(apply.statusCode, 200, apply.body);
+  assert.equal(apply.json().item.nextEpisode, 5);
+  assert.equal(engine.snapshot(room.roomId).entries.length, 3);
+  const rule = apply.json().item;
+  const stopped = await f.action(rule.id, { action: 'stop', revision: rule.revision });
+  assert.equal(stopped.statusCode, 200, stopped.body);
+  assert.equal((await season()).json().items[0].status, 'followed');
+  const restarted = await f.action(rule.id, { action: 'resume', revision: stopped.json().item.revision }, f.guest.token);
+  assert.equal(restarted.statusCode, 200, restarted.body);
+  assert.equal(restarted.json().item.status, 'active');
+  assert.equal(restarted.json().item.nextEpisode, 5);
+  assert.equal(f.rules().length, 1);
+  const fifth = engine.snapshot(room.roomId).entries[2]!;
+  const linked = await f.action(rule.id, { action: 'link-existing', revision: restarted.json().item.revision, entryId: fifth.id });
+  assert.equal(linked.statusCode, 200, linked.body);
+  assert.equal(linked.json().item.expectedAirAt, air + 7 * 24 * 60 * 60_000);
 });
 
 test('one click saves a pending follow even when metadata is down, and the VPS retries without a desktop', async t => {
