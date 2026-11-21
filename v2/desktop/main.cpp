@@ -45,6 +45,9 @@ int main(int argc, char **argv) {
     args.addOption({option, QStringLiteral("Private installer/recovery helper"), QStringLiteral("root")});
   args.addOption({QStringLiteral("wait-pid"), QStringLiteral("Wait for the previous application process"),
                   QStringLiteral("pid")});
+  args.addOption({QStringLiteral("automatic-update"), QStringLiteral("Apply a signed background update")});
+  args.addOption({QStringLiteral("apply-only"), QStringLiteral("Apply the update without opening a window")});
+  args.addOption({QStringLiteral("skip-staged-update"), QStringLiteral("Open the selected version directly")});
   args.addPositionalArgument(QStringLiteral("link"), QStringLiteral("Room invite or recovery link"),
                              QStringLiteral("[link]"));
   args.process(app);
@@ -60,11 +63,23 @@ int main(int argc, char **argv) {
                            QStringLiteral("The previous process id is invalid."));
       wp::delivery::waitForProcess(pid);
       const auto root = args.value(action);
-      if (action == QStringLiteral("activate-update"))
-        wp::delivery::activate(root);
+      const bool automatic = args.isSet(QStringLiteral("automatic-update"));
+      if (action == QStringLiteral("activate-update")) {
+        try {
+          wp::delivery::activate(root, automatic);
+        } catch (const wp::AppError &e) {
+          if (!automatic || args.isSet(QStringLiteral("apply-only")))
+            throw;
+          qWarning("WatchPair could not apply the automatic update: %s", e.what());
+        }
+      }
+      if (args.isSet(QStringLiteral("apply-only")))
+        return 0;
       if (action == QStringLiteral("recover-update"))
         wp::delivery::rollback(root);
       auto forwarded = args.positionalArguments();
+      if (automatic)
+        forwarded << QStringLiteral("--skip-staged-update");
       for (const auto &flag :
            {QStringLiteral("background"), QStringLiteral("local-only"), QStringLiteral("non-interactive")})
         if (args.isSet(flag))
@@ -88,6 +103,33 @@ int main(int argc, char **argv) {
     if (!instance.acquireOrForward(link))
       return 0;
     wp::AppServices services(profile, nullptr, args.isSet(QStringLiteral("local-only")));
+    auto startUpdateHelper = [](const QString &option, const QString &root, const QStringList &extra) {
+      auto exe = QCoreApplication::applicationFilePath();
+#ifndef Q_OS_WIN
+      const auto appRun = wp::delivery::bundleRoot() + QStringLiteral("/AppRun");
+      if (QFileInfo::exists(appRun))
+        exe = appRun;
+#endif
+      const QStringList command{option, root, QStringLiteral("--wait-pid"),
+                                QString::number(QCoreApplication::applicationPid())};
+      return QProcess::startDetached(exe, command + extra);
+    };
+    const bool automaticSession = !args.isSet(QStringLiteral("local-only")) &&
+                                  !args.isSet(QStringLiteral("exit-after")) &&
+                                  !args.isSet(QStringLiteral("screenshot")) &&
+                                  !args.isSet(QStringLiteral("page"));
+    const QString activateUpdate = QStringLiteral("--activate-update");
+    const QStringList automaticHelper{QStringLiteral("--automatic-update"),
+                                      QStringLiteral("--non-interactive")};
+    if (automaticSession && !args.isSet(QStringLiteral("skip-staged-update"))) {
+      auto extra = automaticHelper;
+      if (args.isSet(QStringLiteral("background")))
+        extra << QStringLiteral("--background");
+      extra.append(args.positionalArguments());
+      const auto root = services.releases.automaticActivationRoot();
+      if (!root.isEmpty() && startUpdateHelper(activateUpdate, root, extra))
+        return 0;
+    }
     services.restore();
     if (!wp::delivery::runningRoot().isEmpty() &&
         services.store.setting(QStringLiteral("installationIntegrationPending")).toBool()) {
@@ -103,24 +145,19 @@ int main(int argc, char **argv) {
         services.store.setting(QStringLiteral("audioDevice"), QStringLiteral("auto")).toString());
     services.player.setSubtitleScale(services.store.setting(QStringLiteral("subtitleScale"), 1).toDouble());
     wp::ui::MainWindow window(services);
+    bool restarting = false;
     QObject::connect(
         &services.releases, &wp::ReleaseManager::restartRequested, &window,
         [&](const QString &root, const QString &action) {
           services.perform([&] {
-            const auto option = action == QStringLiteral("activate")   ? QStringLiteral("--activate-update")
+            const auto option = action == QStringLiteral("activate")   ? activateUpdate
                                 : action == QStringLiteral("rollback") ? QStringLiteral("--recover-update")
                                                                        : QStringLiteral("--launch-installed");
-            auto exe = QCoreApplication::applicationFilePath();
-#ifndef Q_OS_WIN
-            const auto appRun = wp::delivery::bundleRoot() + QStringLiteral("/AppRun");
-            if (QFileInfo::exists(appRun))
-              exe = appRun;
-#endif
-            if (!QProcess::startDetached(exe, {option, root, QStringLiteral("--wait-pid"),
-                                               QString::number(QCoreApplication::applicationPid())}))
+            if (!startUpdateHelper(option, root, {}))
               throw wp::AppError(
                   QStringLiteral("INSTALL_HELPER"),
                   QStringLiteral("Could not prepare the installer. This session is still open."));
+            restarting = true;
             app.quit();
           });
         });
@@ -132,9 +169,23 @@ int main(int argc, char **argv) {
         window.openLink(link);
     });
     QObject::connect(&app, &QApplication::aboutToQuit, &window, [&] {
+      services.releases.stopAutomaticUpdates();
       window.prepareToQuit();
       services.shutdown();
+      if (automaticSession && !restarting) {
+        const auto root = services.releases.automaticActivationRoot();
+        if (!root.isEmpty()) {
+          auto options = automaticHelper;
+          options << QStringLiteral("--apply-only");
+          startUpdateHelper(activateUpdate, root, options);
+        }
+      }
     });
+    if (automaticSession)
+      services.releases.startAutomaticUpdates([&] {
+        return !services.playback.joined() && !services.playback.local() &&
+               !services.transfers.hasActiveMediaTransfers();
+      });
     QTimer::singleShot(2000, &window, [&] { services.perform([] { wp::delivery::markHealthy(); }); });
     if (!args.positionalArguments().isEmpty())
       QTimer::singleShot(0, &window, [&] { window.openLink(args.positionalArguments().first()); });

@@ -58,6 +58,7 @@ RoomClient::RoomClient(LocalStore &store, QObject *parent) : QObject(parent), st
   clock_.start();
   epoch_ = QDateTime::currentMSecsSinceEpoch();
   commandSequence_ = store_.setting(QStringLiteral("commandSequence"), 0).toInteger();
+  seriesFallbackEnabled_ = store_.setting(QStringLiteral("seriesFallbackEnabled"), true).toBool();
   connect(&timer_, &QTimer::timeout, this, &RoomClient::tick);
   timer_.start(500);
 }
@@ -235,6 +236,28 @@ void RoomClient::seriesFollowAction(const QString &key, const QString &id, const
   seriesRequest(key, QStringLiteral("/") + id + QStringLiteral("/actions"), &body, context,
                 std::move(callback));
 }
+void RoomClient::setSeriesFallbackEnabled(bool enabled) {
+  if (seriesFallbackEnabled_ == enabled)
+    return;
+  store_.setSetting(QStringLiteral("seriesFallbackEnabled"), enabled);
+  seriesFallbackEnabled_ = enabled;
+  for (auto &[_, connection] : connections_)
+    syncSeriesPreference(*connection);
+  if (!enabled)
+    for (auto *reply : seriesMetadataJobs_.values())
+      reply->abort();
+}
+void RoomClient::syncSeriesPreference(Connection &connection) {
+  if (stopping_ || !connection.seriesPreferenceSupported ||
+      connection.seriesAdvertised == seriesFallbackEnabled_ ||
+      !connection.socket || connection.socket->state() != QAbstractSocket::ConnectedState)
+    return;
+  const QJsonObject message{{QStringLiteral("type"), QStringLiteral("series.preference")},
+                            {QStringLiteral("enabled"), seriesFallbackEnabled_}};
+  const auto bytes = QJsonDocument(message).toJson(QJsonDocument::Compact);
+  if (connection.socket->sendTextMessage(QString::fromUtf8(bytes)) > 0)
+    connection.seriesAdvertised = seriesFallbackEnabled_;
+}
 void RoomClient::provideSeriesResponse(const QString &key, quint64 epoch, const QJsonObject &event) {
   constexpr qint64 maxResponse = 2 * 1024 * 1024;
   const auto requestId = event.value(QStringLiteral("requestId")).toString();
@@ -252,7 +275,7 @@ void RoomClient::provideSeriesResponse(const QString &key, quint64 epoch, const 
       it->second->socket->sendTextMessage(QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact)));
     }
   };
-  if (seriesMetadataJobs_.size() >= 2) {
+  if (!seriesFallbackEnabled_ || seriesMetadataJobs_.size() >= 2) {
     failed();
     return;
   }
@@ -292,8 +315,8 @@ void RoomClient::provideSeriesResponse(const QString &key, quint64 epoch, const 
   request.setRawHeader("User-Agent", "WatchPair/2 series follows");
   request.setTransferTimeout(12000);
   request.setPriority(QNetworkRequest::LowPriority);
-  seriesMetadataJobs_.insert(requestId);
   auto *reply = network_.get(request);
+  seriesMetadataJobs_.insert(requestId, reply);
   connect(reply, &QNetworkReply::readyRead, this, [reply] {
     if (reply->bytesAvailable() > maxResponse)
       reply->abort();
@@ -305,7 +328,8 @@ void RoomClient::provideSeriesResponse(const QString &key, quint64 epoch, const 
   connect(reply, &QNetworkReply::finished, this, [this, reply, key, epoch, requestId, metadata, failed] {
     reply->deleteLater();
     const auto it = connections_.find(key);
-    if (stopping_ || it == connections_.end() || it->second->epoch != epoch || !connected(key) ||
+    if (stopping_ || !seriesFallbackEnabled_ || it == connections_.end() || it->second->epoch != epoch ||
+        !connected(key) ||
         reply->error() != QNetworkReply::NoError ||
         reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() != 200 ||
         reply->bytesAvailable() <= 0 || reply->bytesAvailable() > maxResponse) {
@@ -323,6 +347,7 @@ void RoomClient::provideSeriesResponse(const QString &key, quint64 epoch, const 
                                                                     : QStringLiteral("application/vnd.watchpair.nyaa"));
     deliver.setTransferTimeout(12000);
     auto *submission = network_.post(deliver, reply->readAll());
+    seriesMetadataJobs_.insert(requestId, submission);
     connect(submission, &QNetworkReply::finished, this, [this, submission, requestId, failed] {
       submission->deleteLater();
       seriesMetadataJobs_.remove(requestId);
@@ -511,8 +536,13 @@ void RoomClient::begin(const QString &key) {
   url.setScheme(url.scheme() == QStringLiteral("https") ? QStringLiteral("wss") : QStringLiteral("ws"));
   QNetworkRequest request(url);
   request.setRawHeader("X-WatchPair-Protocol", "2");
-  request.setRawHeader("X-WatchPair-Series-Metadata", "1");
-  request.setRawHeader("X-WatchPair-Series-Lookup", "1");
+  request.setRawHeader("X-WatchPair-Series-Events", "1");
+  c.seriesPreferenceSupported = false;
+  c.seriesAdvertised = seriesFallbackEnabled_;
+  if (c.seriesAdvertised) {
+    request.setRawHeader("X-WatchPair-Series-Metadata", "1");
+    request.setRawHeader("X-WatchPair-Series-Lookup", "1");
+  }
   request.setRawHeader("Authorization",
                        "Bearer " + c.credential.value(QStringLiteral("token")).toString().toLatin1());
   connect(c.socket.get(), &QWebSocket::connected, this, [this, key, epoch] {
@@ -623,6 +653,10 @@ void RoomClient::message(const QString &key, quint64 epoch, const QString &text)
     if (type == QStringLiteral("snapshot")) {
       if (c.fresh && revision < previous)
         return;
+      if (event.value(QStringLiteral("seriesPreference")).toBool()) {
+        c.seriesPreferenceSupported = true;
+        syncSeriesPreference(c);
+      }
       apply(key, data, true);
       c.online = true;
       c.fresh = true;

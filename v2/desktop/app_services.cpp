@@ -13,6 +13,8 @@ AppServices::AppServices(const QString &profile, QObject *parent, bool localOnly
     log(code, text);
     emit issue(code, text);
   });
+  connect(&releases, &ReleaseManager::backgroundProblem, this,
+          [this](const QString &text) { log(QStringLiteral("APPLICATION_DELIVERY"), text); });
   connect(&storage, &StorageManager::problem, this, [this](const QString &code, const QString &text) {
     log(code, text);
     emit issue(code, text);

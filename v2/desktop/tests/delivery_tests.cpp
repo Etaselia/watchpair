@@ -262,6 +262,84 @@ private slots:
     QCOMPARE(problems.size(), 1);
     QVERIFY(updates.status().contains(QStringLiteral("HTTP 404")));
     QVERIFY(!updates.available());
+    QSignalSpy backgroundProblems(&updates, &wp::ReleaseManager::backgroundProblem);
+    updates.check(QUrl(QStringLiteral("http://127.0.0.1:%1/missing.json").arg(server.serverPort())), true);
+    QTRY_VERIFY_WITH_TIMEOUT(!updates.busy(), 10000);
+    QCOMPARE(backgroundProblems.size(), 1);
+    QCOMPARE(problems.size(), 1);
+  }
+  void automaticUpdatesDefaultToEnabledAndRespectAnExplicitFeed() {
+    QTemporaryDir tmp;
+    wp::LocalStore store(tmp.path());
+    wp::TransferEngine transfers(store, nullptr, true);
+    wp::ReleaseManager updates(store, transfers);
+    QVERIFY(updates.automaticUpdatesEnabled());
+    QVERIFY(updates.configuredFeed().isEmpty());
+    store.put(QStringLiteral("room-private"), QStringLiteral("room"),
+              {{QStringLiteral("server"), QStringLiteral("https://joined.test:8443")}});
+    QCOMPARE(updates.configuredFeed(), QUrl(QStringLiteral("https://joined.test:8443/downloads/release.json")));
+    store.setSetting(QStringLiteral("defaultServer"), QStringLiteral("https://rooms.test:8443/"));
+    QCOMPARE(updates.configuredFeed(), QUrl(QStringLiteral("https://rooms.test:8443/downloads/release.json")));
+    store.setSetting(QStringLiteral("updateFeed"), QStringLiteral("https://feed.test/stable.json"));
+    QCOMPARE(updates.configuredFeed(), QUrl(QStringLiteral("https://feed.test/stable.json")));
+    updates.setAutomaticUpdatesEnabled(false);
+    wp::ReleaseManager reopened(store, transfers);
+    QVERIFY(!reopened.automaticUpdatesEnabled());
+  }
+  void automaticActivationRequiresSignedStageAndSkipsARevertedRelease() {
+    QTemporaryDir tmp;
+    const auto profile = tmp.filePath(QStringLiteral("profile"));
+    const auto root = tmp.filePath(QStringLiteral("runtime"));
+    { wp::LocalStore store(profile); }
+    const auto first = bundle(tmp.path(), QStringLiteral("one"), QStringLiteral("2.0.0"));
+    const auto second = bundle(tmp.path(), QStringLiteral("two"), QStringLiteral("2.1.0"));
+    wp::delivery::installBundle(first, root, profile);
+    wp::delivery::installBundle(second, root, profile);
+    QVERIFY(wp::delivery::automaticUpdateVersion(root).isEmpty());
+    QVERIFY_EXCEPTION_THROWN(wp::delivery::activate(root, true), wp::AppError);
+    wp::delivery::installBundle(second, root, profile, true);
+    QCOMPARE(wp::delivery::automaticUpdateVersion(root), QStringLiteral("2.1.0"));
+    const auto stageFile = root + QStringLiteral("/staged.json");
+    const auto originalStage = read(stageFile);
+    wp::delivery::activate(root, true);
+    QVERIFY(!QFileInfo::exists(stageFile));
+    write(stageFile, originalStage);
+    QCOMPARE(wp::delivery::installationState(root).value(QStringLiteral("version")).toString(),
+             QStringLiteral("2.1.0"));
+    QVERIFY(wp::delivery::automaticUpdateVersion(root).isEmpty());
+    wp::delivery::rollback(root);
+    wp::delivery::installBundle(second, root, profile, true);
+    QVERIFY(wp::delivery::automaticUpdateVersion(root).isEmpty());
+    QVERIFY_EXCEPTION_THROWN(wp::delivery::activate(root, true), wp::AppError);
+    const auto third = bundle(tmp.path(), QStringLiteral("three"), QStringLiteral("2.2.0"));
+    wp::delivery::installBundle(third, root, profile, true);
+    QCOMPARE(wp::delivery::automaticUpdateVersion(root), QStringLiteral("2.2.0"));
+    wp::delivery::activate(root, true);
+    QCOMPARE(wp::delivery::installationState(root).value(QStringLiteral("version")).toString(),
+             QStringLiteral("2.2.0"));
+  }
+  void automaticHelperAppliesTheUpdateWithoutOpeningAWindow() {
+    const auto helper = qEnvironmentVariable("WATCHPAIR_AUTOMATIC_HELPER");
+    if (helper.isEmpty())
+      QSKIP("Set WATCHPAIR_AUTOMATIC_HELPER to the newly built WatchPair executable");
+    QTemporaryDir tmp;
+    const auto profile = tmp.filePath(QStringLiteral("profile"));
+    const auto root = tmp.filePath(QStringLiteral("runtime"));
+    { wp::LocalStore store(profile); }
+    wp::delivery::installBundle(bundle(tmp.path(), QStringLiteral("one"), QStringLiteral("2.0.0")), root,
+                                profile);
+    wp::delivery::installBundle(bundle(tmp.path(), QStringLiteral("two"), QStringLiteral("2.1.0")), root,
+                                profile, true);
+    QProcess activation;
+    activation.start(helper,
+                     {QStringLiteral("--activate-update"), root, QStringLiteral("--automatic-update"),
+                      QStringLiteral("--apply-only"), QStringLiteral("--non-interactive")});
+    QVERIFY(activation.waitForFinished(30000));
+    QCOMPARE(activation.exitStatus(), QProcess::NormalExit);
+    QVERIFY2(activation.exitCode() == 0, activation.readAllStandardError().constData());
+    QCOMPARE(wp::delivery::installationState(root).value(QStringLiteral("version")).toString(),
+             QStringLiteral("2.1.0"));
+    QVERIFY(QFileInfo::exists(root + QStringLiteral("/pending.txt")));
   }
   void damagedRecoveryKeepsTheCurrentSessionOpen_data() {
     QTest::addColumn<QString>("damage");
@@ -517,6 +595,7 @@ private slots:
     QVERIFY2(problems.isEmpty(), qPrintable(updates.status()));
     QVERIFY(updates.staged());
     const auto staged = QJsonDocument::fromJson(read(root + QStringLiteral("/staged.json"))).object();
+    QVERIFY(staged.value(QStringLiteral("signedUpdate")).toBool());
     const auto manifest = wp::delivery::verifyBundle(root + QStringLiteral("/versions/") +
                                                      staged.value(QStringLiteral("to")).toString());
     QCOMPARE(wp::delivery::compareVersions(manifest.value(QStringLiteral("version")).toString(),

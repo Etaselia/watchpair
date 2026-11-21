@@ -14,7 +14,7 @@ import { SeriesService } from './series.js';
 import { MAX_SERIES_METADATA_BYTES, type SeriesProvider } from './series-provider.js';
 
 const name = z.string().trim().min(1).max(100).refine(v => !/[\x00-\x1f\x7f]/.test(v));
-const VERSION = '2.0.3';
+const VERSION = '2.0.4';
 const MAX_COMMAND_BYTES = 12 * 1024 * 1024;
 const capability = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const createBody = z.object({ name, memberName: name, retryKey: capability }).strict();
@@ -34,7 +34,7 @@ const seriesAction = z.object({ revision: z.number().int().min(1).max(Number.MAX
   expectedAirAt: seriesAirtime.optional(), finalEpisode: episodeNumber.nullable().optional(), alternativeId: z.string().uuid().optional(),
   draftId: z.string().uuid().optional(), entryId: seriesEntryId.optional() }).strict();
 type Socket = { ws: WebSocket; roomId: string; memberId: string; token: string; connectionId: string;
-  helpsSeries: boolean; helpsLookup: boolean; network: string | null };
+  helpsSeries: boolean; helpsLookup: boolean; seriesEvents: boolean; network: string | null };
 
 function networkAddress(address: string) {
   const ip = address.toLowerCase().split('%', 1)[0]!;
@@ -198,7 +198,9 @@ export async function buildServer(options: ServerOptions = {}) {
     for (const old of sockets) if (old.roomId === id && old.memberId === memberId) old.ws.close(4001, 'Connected from another session');
     const connection: Socket = { ws, roomId: id, memberId, token: credential, connectionId,
       helpsSeries: request.headers['x-watchpair-series-metadata'] === '1',
-      helpsLookup: request.headers['x-watchpair-series-lookup'] === '1', network: networkAddress(request.ip) };
+      helpsLookup: request.headers['x-watchpair-series-lookup'] === '1',
+      seriesEvents: request.headers['x-watchpair-series-events'] === '1' || request.headers['x-watchpair-series-metadata'] === '1',
+      network: networkAddress(request.ip) };
     sockets.add(connection);
     let windowAt = engine.now(), messages = 0;
     ws.on('message', bytes => {
@@ -211,6 +213,12 @@ export async function buildServer(options: ServerOptions = {}) {
           engine.ping(id, memberId, connectionId); send(ws, { type: 'pong', clientTime: message.clientTime, serverTime: engine.now() });
         } else if (message.type === 'series.failed') {
           series?.desktopFailed(id, memberId, connectionId, message.requestId, message.retryAfterMs);
+        } else if (message.type === 'series.preference') {
+          if (engine.authenticate(id, credential).live?.connectionId !== connectionId) return;
+          if (connection.helpsSeries === message.enabled && connection.helpsLookup === message.enabled) return;
+          connection.helpsSeries = connection.helpsLookup = message.enabled;
+          if (message.enabled) series?.desktopOnline(id);
+          else series?.desktopOffline(connectionId);
         } else engine.status(id, memberId, connectionId, message);
       } catch (error) {
         if(error instanceof DomainError&&error.code==='CONNECTION_REPLACED'){
@@ -229,7 +237,7 @@ export async function buildServer(options: ServerOptions = {}) {
       try { engine.disconnect(id, memberId, connectionId); } catch (error) { app.log.error({ err: error }, 'Could not checkpoint a disconnection'); }
     });
     ws.on('error', () => ws.close());
-    send(ws, { type: 'snapshot', revision: engine.room(id).revision, data: engine.snapshot(id) });
+    send(ws, { type: 'snapshot', revision: engine.room(id).revision, data: engine.snapshot(id), seriesPreference: !!series });
     if (connection.helpsSeries || connection.helpsLookup) series?.desktopOnline(id);
   });
   const change = (event: Change) => {
@@ -243,7 +251,7 @@ export async function buildServer(options: ServerOptions = {}) {
   const seriesChanged = (id: string) => {
     if (!series) return;
     let event: { type: 'series.changed'; data: ReturnType<SeriesService['list']> } | undefined;
-    for (const connection of sockets) if (connection.roomId === id && connection.helpsSeries) {
+    for (const connection of sockets) if (connection.roomId === id && connection.seriesEvents) {
       try { engine.authenticate(id, connection.token); }
       catch { continue; }
       event ??= { type: 'series.changed', data: series.list(id) };

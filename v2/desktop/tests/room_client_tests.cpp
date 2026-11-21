@@ -104,6 +104,22 @@ QJsonObject status(wp::RoomClient &client, const QString &key) {
 class RoomClients final : public QObject {
   Q_OBJECT
 private slots:
+  void seriesFallbackDefaultsOnAndIsStoredPerDevice() {
+    QTemporaryDir tmp;
+    wp::LocalStore store(tmp.filePath(QStringLiteral("client")));
+    wp::LocalStore other(tmp.filePath(QStringLiteral("other")));
+    {
+      wp::RoomClient client(store);
+      QVERIFY(client.seriesFallbackEnabled());
+      client.setSeriesFallbackEnabled(false);
+      QVERIFY(!client.seriesFallbackEnabled());
+    }
+    wp::RoomClient reopened(store), otherDevice(other);
+    QVERIFY(!reopened.seriesFallbackEnabled());
+    QVERIFY(otherDevice.seriesFallbackEnabled());
+    reopened.setSeriesFallbackEnabled(true);
+    QVERIFY(reopened.seriesFallbackEnabled());
+  }
   void expiredLiveSessionReconnectsAndDeletedRoomIsForgotten() {
     QTemporaryDir tmp;
     wp::test::Coordinator server;

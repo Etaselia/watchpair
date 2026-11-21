@@ -1,6 +1,7 @@
 #pragma once
 #include "local_store.h"
 #include <QElapsedTimer>
+#include <QHash>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QObject>
@@ -46,6 +47,8 @@ public:
   bool seriesFollowsAvailable(const QString &key) const;
   bool seriesFollowFromEntryAvailable(const QString &key) const;
   bool seriesPendingFollowsAvailable(const QString &key) const;
+  bool seriesFallbackEnabled() const { return seriesFallbackEnabled_; }
+  void setSeriesFallbackEnabled(bool enabled);
   void loadSeriesFollows(const QString &key, QObject *context, SeriesReply callback);
   void previewSeriesFollow(const QString &key, const QJsonObject &body, QObject *context,
                            SeriesReply callback);
@@ -83,6 +86,7 @@ private:
     bool online = false, fresh = false, terminal = false, requesting = false, refreshing = false;
     bool seriesAvailable = false, seriesEntryAvailable = false, seriesPendingAvailable = false,
          seriesProbePending = false;
+    bool seriesPreferenceSupported = false, seriesAdvertised = false;
     qint64 seriesProbeAfter = 0;
     QString state = QStringLiteral("Connecting…");
   };
@@ -92,6 +96,7 @@ private:
   void seriesRequest(const QString &key, const QString &suffix, const QJsonObject *body, QObject *context,
                      SeriesReply callback);
   void provideSeriesResponse(const QString &key, quint64 epoch, const QJsonObject &event);
+  void syncSeriesPreference(Connection &connection);
   void begin(const QString &key);
   void tick();
   void message(const QString &key, quint64 epoch, const QString &text);
@@ -108,8 +113,9 @@ private:
   qint64 commandSequence_ = 0;
   quint64 connectionEpoch_ = 0;
   bool stopping_ = false;
+  bool seriesFallbackEnabled_ = true;
   QSet<QString> entering_;
-  QSet<QString> seriesMetadataJobs_;
+  QHash<QString, QNetworkReply *> seriesMetadataJobs_;
   std::map<QString, std::unique_ptr<Connection>> connections_;
 };
 } // namespace wp

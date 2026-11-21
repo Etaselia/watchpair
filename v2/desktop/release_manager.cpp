@@ -346,7 +346,8 @@ void extractArchive(const QString &source, const QString &destination) {
   if (result != ARCHIVE_EOF)
     fail(QStringLiteral("The archive ended unexpectedly."));
 }
-QJsonObject installBundle(const QString &bundle, const QString &directory, const QString &profilePath) {
+QJsonObject installBundle(const QString &bundle, const QString &directory, const QString &profilePath,
+                          bool signedUpdate) {
   const auto manifest = verifyBundle(bundle);
   const auto profileName = normalized(profilePath);
   if (profileName.contains(QLatin1Char('\n')) || profileName.contains(QLatin1Char('\r')))
@@ -428,6 +429,7 @@ QJsonObject installBundle(const QString &bundle, const QString &directory, const
                                    {QStringLiteral("from"), current(root)},
                                    {QStringLiteral("to"), name},
                                    {QStringLiteral("nonce"), nonce},
+                                   {QStringLiteral("signedUpdate"), signedUpdate},
                                    {QStringLiteral("backup"),
                                     QStringLiteral("backups/") + nonce + QStringLiteral(".sqlite")}})
              .toJson());
@@ -455,20 +457,50 @@ QJsonObject installationState(const QString &directory) {
   if (QFileInfo::exists(root + QStringLiteral("/staged.json"))) {
     const auto staged = json(root + QStringLiteral("/staged.json"));
     const auto nonce = staged.value(QStringLiteral("nonce")).toString();
+    const auto from = staged.value(QStringLiteral("from")).toString();
+    const auto target = staged.value(QStringLiteral("to")).toString();
     if (staged.value(QStringLiteral("format")).toInt() != 1 ||
-        staged.value(QStringLiteral("from")).toString() != installed || !key(nonce) ||
-        staged.value(QStringLiteral("to")).toString() == installed ||
+        !key(from) || !key(nonce) || target == from ||
         staged.value(QStringLiteral("backup")).toString() !=
             QStringLiteral("backups/") + nonce + QStringLiteral(".sqlite"))
       fail(QStringLiteral("The staged update no longer matches this installation. Download it again."));
-    const auto target = staged.value(QStringLiteral("to")).toString();
+    // A shutdown can stop the helper after switching versions but before removing the stage.
+    if (target == installed)
+      return result;
+    if (from != installed)
+      fail(QStringLiteral("The staged update no longer matches this installation. Download it again."));
     const auto targetVersion = versionFor(target);
     result.insert(QStringLiteral("stagedVersion"), targetVersion);
     result.insert(QStringLiteral("stagedKey"), target);
+    result.insert(QStringLiteral("stagedSigned"), staged.value(QStringLiteral("signedUpdate")).toBool());
     result.insert(QStringLiteral("stagedObsolete"),
                   compareVersions(targetVersion, result.value(QStringLiteral("version")).toString()) < 0);
   }
   return result;
+}
+namespace {
+bool recoveredRelease(const QString &root, const QJsonObject &state, const QString &version) {
+  const auto path = root + QStringLiteral("/recovery-notice.json");
+  if (!QFileInfo::exists(path))
+    return false;
+  const auto notice = json(path);
+  const auto replaced = notice.value(QStringLiteral("replacedKey")).toString();
+  if (notice.value(QStringLiteral("restoredKey")) != state.value(QStringLiteral("key")) || !key(replaced))
+    return false;
+  // Installation keys carry the version even after the replaced bundle is removed.
+  static const QRegularExpression installedKey(QStringLiteral("^(.+)-[0-9a-f]{12}(?:-[0-9a-f]{8})?$"));
+  const auto match = installedKey.match(replaced);
+  return match.hasMatch() && compareVersions(version, match.captured(1)) <= 0;
+}
+} // namespace
+QString automaticUpdateVersion(const QString &root) {
+  const auto state = installationState(root);
+  const auto staged = state.value(QStringLiteral("stagedVersion")).toString();
+  if (!state.value(QStringLiteral("stagedSigned")).toBool() || staged.isEmpty() ||
+      compareVersions(staged, state.value(QStringLiteral("version")).toString()) <= 0 ||
+      recoveredRelease(root, state, staged))
+    return {};
+  return staged;
 }
 QString prepareRestart(const QString &runningBundle, const QString &directory, const QString &profilePath) {
   const auto root = normalized(directory);
@@ -504,7 +536,7 @@ QString prepareRestart(const QString &runningBundle, const QString &directory, c
         "The installed version is older than this copy. Install this copy before restarting."));
   return activateUpdate ? QStringLiteral("activate") : QStringLiteral("installed");
 }
-void activate(const QString &directory) {
+void activate(const QString &directory, bool automatic) {
   const auto root = normalized(directory), profileName = profile(root);
   QLockFile installationLock(root + QStringLiteral("/install.lock"));
   if (!installationLock.tryLock())
@@ -512,6 +544,8 @@ void activate(const QString &directory) {
   QLockFile lock(profileName + QStringLiteral("/instance.lock"));
   if (!lock.tryLock())
     fail(QStringLiteral("Another WatchPair process still uses this profile. Close it and retry."));
+  if (automatic && automaticUpdateVersion(root).isEmpty())
+    fail(QStringLiteral("No verified update is ready to apply automatically."));
   auto staged = json(root + QStringLiteral("/staged.json"));
   const auto from = staged.value(QStringLiteral("from")).toString(),
              to = staged.value(QStringLiteral("to")).toString(),
@@ -666,6 +700,8 @@ namespace wp {
 ReleaseManager::ReleaseManager(LocalStore &store, TransferEngine &transfers, QObject *parent)
     : QObject(parent), store_(store), transfers_(transfers) {
   pool_.setMaxThreadCount(1);
+  automaticTimer_.setSingleShot(true);
+  connect(&automaticTimer_, &QTimer::timeout, this, &ReleaseManager::pollAutomaticUpdates);
   route_ = transfers_.configuration();
   connect(&transfers_, &TransferEngine::changed, this, [this] {
     const auto next = transfers_.configuration();
@@ -720,6 +756,113 @@ bool ReleaseManager::canRollback() const {
 bool ReleaseManager::staged() const {
   return !root().isEmpty() && QFileInfo::exists(root() + QStringLiteral("/staged.json"));
 }
+QUrl ReleaseManager::configuredFeed() const {
+  const auto explicitFeed = store_.setting(QStringLiteral("updateFeed")).toString().trimmed();
+  if (!explicitFeed.isEmpty())
+    return QUrl(explicitFeed);
+  auto feed = QUrl(store_.setting(QStringLiteral("defaultServer")).toString());
+  if (feed.isEmpty()) {
+    for (const auto room : store_.all(QStringLiteral("room-private"))) {
+      const QUrl saved(room.toObject().value(QStringLiteral("server")).toString());
+      if (saved.scheme() == QStringLiteral("https") && !saved.host().isEmpty()) {
+        feed = saved;
+        break;
+      }
+    }
+  }
+  if (feed.host().isEmpty())
+    return {};
+  feed.setPath(QStringLiteral("/downloads/release.json"));
+  feed.setQuery(QString());
+  feed.setFragment(QString());
+  return feed;
+}
+bool ReleaseManager::automaticUpdatesEnabled() const {
+  return store_.setting(QStringLiteral("automaticUpdates"), true).toBool();
+}
+void ReleaseManager::setAutomaticUpdatesEnabled(bool enabled) {
+  store_.setSetting(QStringLiteral("automaticUpdates"), enabled);
+  if (enabled && idle_)
+    automaticTimer_.start(std::chrono::seconds(1));
+  if (!enabled) {
+    automaticTimer_.stop();
+    if (backgroundJob_)
+      cancel();
+  }
+  emit changed();
+}
+QString ReleaseManager::automaticInstallationRoot() const {
+  const auto directory = delivery::runningRoot();
+  if (directory.isEmpty() || !canUpdate())
+    return {};
+  try {
+    if (delivery::profile(directory) == delivery::normalized(store_.profile()))
+      return directory;
+  } catch (const AppError &) {
+    // Only the owning profile can update this installation in the background.
+  }
+  return {};
+}
+QString ReleaseManager::automaticActivationRoot() const {
+  if (!automaticUpdatesEnabled() || !staged())
+    return {};
+  const auto directory = automaticInstallationRoot();
+  if (directory.isEmpty())
+    return {};
+  try {
+    return delivery::automaticUpdateVersion(directory).isEmpty() ? QString() : directory;
+  } catch (const AppError &) {
+    return {};
+  }
+}
+void ReleaseManager::startAutomaticUpdates(std::function<bool()> idle) {
+  if (automaticInstallationRoot().isEmpty())
+    return;
+  idle_ = std::move(idle);
+  if (automaticUpdatesEnabled())
+    automaticTimer_.start(std::chrono::seconds(30));
+}
+void ReleaseManager::stopAutomaticUpdates() {
+  automaticTimer_.stop();
+  idle_ = {};
+  if (backgroundJob_)
+    cancel();
+}
+void ReleaseManager::pollAutomaticUpdates() {
+  if (!idle_ || !automaticUpdatesEnabled())
+    return;
+  const auto feed = configuredFeed();
+  if (busy_) {
+    automaticTimer_.start(std::chrono::seconds(30));
+    return;
+  }
+  automaticTimer_.start(std::chrono::hours(6));
+  if (feed.isEmpty() || transfers_.configuration().value(QStringLiteral("offline")).toBool()) {
+    automaticTimer_.start(std::chrono::minutes(15));
+    return;
+  }
+  try {
+    const auto directory = delivery::runningRoot();
+    const auto state = delivery::installationState(directory);
+    const auto staged = state.value(QStringLiteral("stagedVersion")).toString();
+    if (!available() || releaseFeed_ != feed) {
+      check(feed, true);
+      return;
+    }
+    if ((!staged.isEmpty() && delivery::compareVersions(release_.version, staged) <= 0) ||
+        delivery::recoveredRelease(directory, state, release_.version)) {
+      releaseFeed_.clear();
+      return;
+    }
+    if (idle_())
+      download(true);
+    else
+      automaticTimer_.start(std::chrono::seconds(30));
+  } catch (const AppError &e) {
+    emit backgroundProblem(e.message());
+    automaticTimer_.start(std::chrono::minutes(15));
+  }
+}
 HttpOptions ReleaseManager::network(const QUrl &url) const {
   const auto c = transfers_.configuration();
   if (c.value(QStringLiteral("offline")).toBool())
@@ -734,29 +877,44 @@ HttpOptions ReleaseManager::network(const QUrl &url) const {
   options.allowPrivate = true;
   return options;
 }
-void ReleaseManager::task(const std::function<QString()> &work, const std::function<void()> &success) {
+void ReleaseManager::task(const std::function<QString()> &work, const std::function<void()> &success,
+                          bool background) {
   if (busy_)
     throw AppError(QStringLiteral("DELIVERY_BUSY"),
                    QStringLiteral("Wait for the current installation task or cancel its download."));
   busy_ = true;
+  backgroundJob_ = background;
   transfers_.setExternalTrafficFor(QStringLiteral("updates"), control_ ? 1 : 0);
   emit changed();
   auto *watcher = new QFutureWatcher<QString>(this);
-  connect(watcher, &QFutureWatcher<QString>::finished, this, [this, watcher, success] {
+  connect(watcher, &QFutureWatcher<QString>::finished, this, [this, watcher, success, background] {
     busy_ = false;
+    backgroundJob_ = false;
     transfers_.setExternalTrafficFor(QStringLiteral("updates"), 0);
-    const auto error = watcher->result();
+    auto error = watcher->result();
+    auto code = QStringLiteral("APPLICATION_DELIVERY");
+    const bool cancelled = control_ && control_->cancelled.load();
     watcher->deleteLater();
     if (error.isEmpty()) {
       try {
         success();
       } catch (const AppError &e) {
-        status_ = e.message();
-        emit problem(e.code(), status_);
+        error = e.message();
+        code = e.code();
       }
-    } else {
+    }
+    if (!error.isEmpty()) {
       status_ = error;
-      emit problem(QStringLiteral("APPLICATION_DELIVERY"), error);
+      if (background) {
+        release_ = {};
+        releaseFeed_.clear();
+        if (!cancelled)
+          emit backgroundProblem(error);
+        if (idle_ && automaticUpdatesEnabled())
+          automaticTimer_.start(std::chrono::minutes(15));
+      } else {
+        emit problem(code, error);
+      }
     }
     emit changed();
   });
@@ -787,7 +945,7 @@ void ReleaseManager::install(const QString &directory) {
         status_ = QStringLiteral("Installed. Restart to use this private installation.");
       });
 }
-void ReleaseManager::check(const QUrl &feed) {
+void ReleaseManager::check(const QUrl &feed, bool background) {
   if (busy_)
     throw AppError(QStringLiteral("DELIVERY_BUSY"),
                    QStringLiteral("Wait for the current installation task."));
@@ -805,6 +963,7 @@ void ReleaseManager::check(const QUrl &feed) {
   auto release = std::make_shared<delivery::Release>();
   const auto current = QCoreApplication::applicationVersion();
   release_ = {};
+  releaseFeed_.clear();
   status_ = QStringLiteral("Checking the signed release feed…");
   task(
       [options, release, current] {
@@ -820,16 +979,20 @@ void ReleaseManager::check(const QUrl &feed) {
                                         current, false);
         return QString();
       },
-      [this, release, current] {
+      [this, release, current, feed, background] {
         if (delivery::compareVersions(release->version, current) > 0) {
           release_ = *release;
+          releaseFeed_ = feed;
           status_ = QStringLiteral("Version %1 is available. %2").arg(release_.version, release_.notes);
+          if (background && idle_ && automaticUpdatesEnabled())
+            automaticTimer_.start(std::chrono::seconds(1));
         } else {
           status_ = QStringLiteral("You're up to date. Installed version: %1.").arg(current);
         }
-      });
+      },
+      background);
 }
-void ReleaseManager::download() {
+void ReleaseManager::download(bool background) {
   if (busy_)
     throw AppError(QStringLiteral("DELIVERY_BUSY"),
                    QStringLiteral("Wait for the current installation task."));
@@ -839,6 +1002,10 @@ void ReleaseManager::download() {
   control_ = std::make_shared<HttpControl>();
   control_->budget = transfers_.downloadBudget();
   auto options = network(release_.url);
+  if (background) {
+    control_->bytesPerSecond.store(2 * 1024 * 1024);
+    options.reserveMiB = transfers_.configuration().value(QStringLiteral("reserveMiB")).toInt(1024);
+  }
   const auto release = release_;
   const auto directory = root(), profile = store_.profile();
   status_ = QStringLiteral("Downloading and verifying version %1…").arg(release.version);
@@ -860,13 +1027,17 @@ void ReleaseManager::download() {
         const auto unpacked = temporary.filePath(QStringLiteral("unpacked"));
         delivery::extractArchive(options.destination, unpacked);
         delivery::verifyBundle(unpacked, release.version);
-        delivery::installBundle(unpacked, directory, profile);
+        if (options.control->cancelled.load())
+          return QStringLiteral("Update download cancelled.");
+        delivery::installBundle(unpacked, directory, profile, true);
         return QString();
       },
       [this] {
-        status_ =
-            QStringLiteral("The verified update is ready. Restart when you are ready to leave the watch.");
-      });
+        status_ = automaticUpdatesEnabled()
+                      ? QStringLiteral("The verified update is ready and will apply when WatchPair quits.")
+                      : QStringLiteral("The verified update is ready. Restart to apply it.");
+      },
+      background);
 }
 void ReleaseManager::cancel() {
   if (control_)

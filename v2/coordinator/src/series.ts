@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { Engine } from './engine.js';
 import { DomainError, requireThat, type Entry, type FileDescriptor, type Source } from './protocol.js';
 import {
-  episodeSearchTerms, parseSeriesTitle, releaseMatches, sameSeriesStem, seriesTitleParts, SeriesProviderError,
+  catalogSearchTerms, episodeSearchTerms, matchesCatalogTitle, parseSeriesTitle, sameSeriesStem, seriesTitleParts,
+  SeriesProviderError,
   type SeriesCatalog, type SeriesListing, type SeriesProvider, type SeriesRelease,
 } from './series-provider.js';
 import { canAskDesktop, retryableMetadata, SeriesLookupWaiting, SeriesMetadata, type AskDesktop } from './series-metadata.js';
@@ -245,12 +246,27 @@ export class SeriesService {
       const fallbackTitle = parts.title ? seriesTitleParts(parts.title).primary : inferredTitle?.alternate?.slice(0, 160);
       if (!catalog.length && fallbackTitle && fallbackTitle !== catalogQuery)
         catalog = await this.provider.searchCatalog(fallbackTitle);
-      const releases = listing ? [listing] : query || catalog[0] ? await this.metadata.searchReleases(roomId, query ?? catalog[0]!.title) : [];
-      const result = { catalog: catalog.slice(0, 12), releases: releases.flatMap(item => {
+      const selectedCatalog = malId ? catalog[0] : undefined;
+      const titles = selectedCatalog ? verifiedCatalogTitles(selectedCatalog) : undefined;
+      const firstQuery = query ?? catalog[0]?.title.slice(0, 160);
+      const candidates = (rows: SeriesListing[], useSelectedTitle = false) => rows.flatMap(item => {
         const match = eligible(item);
-        return match && sameEntryEpisode(knownRelease, match)
-          ? [{ id: item.id, title: item.title, episode: match.episode, group: match.group, edition: match.edition }] : [];
-      }).slice(0, 25) };
+        if (!match || !sameEntryEpisode(knownRelease, match)) return [];
+        if (useSelectedTitle && titles &&
+            !(knownRelease && sameSeriesStem(knownRelease, match)) &&
+            (!matchesCatalogTitle(match, match, titles) ||
+              (knownRelease?.season != null && match.season !== knownRelease.season))) return [];
+        return [{ id: item.id, title: item.title, episode: match.episode, group: match.group, edition: match.edition }];
+      }).slice(0, 25);
+      let releases = listing ? candidates([listing]) :
+        firstQuery ? candidates(await this.metadata.searchReleases(roomId, firstQuery), Boolean(knownRelease)) : [];
+      if (!listing && !releases.length && selectedCatalog) {
+        for (const term of catalogSearchTerms(selectedCatalog.title, knownRelease?.season ?? null, firstQuery)) {
+          releases = candidates(await this.metadata.searchReleases(roomId, term), true);
+          if (releases.length) break;
+        }
+      }
+      const result = { catalog: catalog.slice(0, 12), releases };
       if (!listing || !parsed || !malId || !catalog[0]) return result;
       const manifest = input.deferMetadata ? undefined : await this.metadata.resolve(roomId, listing, verifiedCatalogTitles(catalog[0]));
       const now = this.engine.now();
@@ -488,7 +504,7 @@ export class SeriesService {
           const listing = await this.metadata.listing(roomId, offer.listingId);
           requireThat(listing.infoHash === offer.infoHash, 'SERIES_ALTERNATE', 'This listing changed. Wait for the next check.', 409);
           const source = eligible(listing), anchor = parseSeriesTitle(follow.anchorTitle);
-          requireThat(source && anchor && sameSeriesStem(anchor, source) && source.episode === follow.nextEpisode,
+          requireThat(source && anchor && this.matchesSeries(follow, anchor, source) && source.episode === follow.nextEpisode,
             'SERIES_ALTERNATE', 'The alternative no longer matches the missing episode.', 409);
           manifest = await this.metadata.resolve(roomId, listing, follow.catalogTitles);
         } catch (error) {
@@ -604,12 +620,18 @@ export class SeriesService {
     return Math.max(60_000, Math.min(7 * DAY, error.retryAfterMs ?? fallback));
   }
 
-  private choose(listings: SeriesListing[], anchor: SeriesRelease, episode: number, matchGroup: boolean, now: number) {
+  private matchesSeries(follow: SeriesFollow, anchor: SeriesRelease, release: SeriesRelease) {
+    return sameSeriesStem(anchor, release) ||
+      matchesCatalogTitle(anchor, release, follow.catalogTitles ?? [follow.title]);
+  }
+
+  private choose(follow: SeriesFollow, listings: SeriesListing[], anchor: SeriesRelease, episode: number, matchGroup: boolean, now: number) {
     const found = new Map<string, { listing: SeriesListing; release: SeriesRelease }>();
     for (const item of listings) {
       if (item.publishedAt > now) continue;
       const release = eligible(item);
-      if (!release || release.episode !== episode || !sameSeriesStem(anchor, release) || (release.group === anchor.group) !== matchGroup) continue;
+      if (!release || release.episode !== episode || !this.matchesSeries(follow, anchor, release) ||
+          (release.group === anchor.group) !== matchGroup) continue;
       if (!found.has(item.infoHash)) found.set(item.infoHash, { listing: item, release });
     }
     return [...found.values()];
@@ -664,8 +686,19 @@ export class SeriesService {
     follow.error = null;
     try {
       const query = anchor.stem.slice(0, 120);
-      const preferred = await this.metadata.searchReleases(follow.roomId, query, follow.preferredUploader ?? undefined);
-      let broad = follow.preferredUploader ? null : preferred;
+      const catalogTerms = catalogSearchTerms(follow.title, anchor.season, query);
+      const searches = new Map<string, Promise<SeriesListing[]>>();
+      const search = (term: string, uploader?: string) => {
+        const key = JSON.stringify([term, uploader]);
+        let request = searches.get(key);
+        if (!request) {
+          request = this.metadata.searchReleases(follow.roomId, term, uploader);
+          searches.set(key, request);
+        }
+        return request;
+      };
+      const uploader = follow.preferredUploader ?? undefined;
+      const preferred = await search(query, uploader);
       for (let i = 0; i < MAX_CATCH_UP && follow.status === 'active' && !this.closing; ++i) {
         if (scopeReview(follow)) return;
         this.existing(follow.roomId, follow.id, revision);
@@ -674,22 +707,17 @@ export class SeriesService {
         if (this.engine.store.getSeriesEpisode(follow.roomId, follow.malId, record.episode)) {
           this.advance(follow, now); commit(); continue;
         }
-        let matches = this.choose(preferred, anchor, rawEpisode, true, now);
-        let exact = matches.filter(row => releaseMatches(anchor, row.release));
+        let matches = this.choose(follow, preferred, anchor, rawEpisode, true, now);
+        let exact = matches.filter(row => row.release.edition === anchor.edition);
         const due = i === 0 || follow.nextCheckAt !== null && follow.nextCheckAt <= now;
         const olderTerms = i === 0 && (follow.finishConfirmed || follow.expectedAirAt !== null && now - follow.expectedAirAt >= 2 * DAY)
           ? episodeSearchTerms(anchor, rawEpisode) : [];
-        const searchedBroadTerms = new Set<string>();
-        if (!exact.length) {
-          for (const term of olderTerms) {
+        if (!exact.length && due) {
+          for (const term of [...catalogTerms, ...olderTerms]) {
             this.existing(follow.roomId, follow.id, revision);
-            const older = await this.metadata.searchReleases(follow.roomId, term, follow.preferredUploader ?? undefined);
-            if (!follow.preferredUploader) {
-              broad = [...(broad ?? []), ...older];
-              searchedBroadTerms.add(term);
-            }
-            matches = this.choose([...matches.map(row => row.listing), ...older], anchor, rawEpisode, true, now);
-            exact = matches.filter(row => releaseMatches(anchor, row.release));
+            const rows = await search(term, uploader);
+            matches = this.choose(follow, [...matches.map(row => row.listing), ...rows], anchor, rawEpisode, true, now);
+            exact = matches.filter(row => row.release.edition === anchor.edition);
             if (exact.length) break;
           }
         }
@@ -729,15 +757,12 @@ export class SeriesService {
         } else {
           if (matches.length && follow.error === null) follow.error = 'The selected release group changed edition. Confirm a new source or approve a one-time alternative.';
           if (follow.dismissedAlternativeHashes.length < MAX_ALTERNATE_DISMISSALS) {
-            broad ??= await this.metadata.searchReleases(follow.roomId, query);
-            const eligibleAlternatives = (rows: SeriesListing[]) => this.choose(rows, anchor, rawEpisode, false, now)
-              .filter(item => !follow.dismissedAlternativeHashes.includes(item.listing.infoHash));
-            let alternatives = eligibleAlternatives(broad);
-            for (const term of olderTerms) {
-              if (alternatives.length) break;
-              if (searchedBroadTerms.has(term)) continue;
+            let alternatives: ReturnType<SeriesService['choose']> = [];
+            for (const term of [query, ...catalogTerms, ...olderTerms]) {
               this.existing(follow.roomId, follow.id, revision);
-              alternatives = eligibleAlternatives(await this.metadata.searchReleases(follow.roomId, term));
+              alternatives = this.choose(follow, await search(term), anchor, rawEpisode, false, now)
+                .filter(item => !follow.dismissedAlternativeHashes.includes(item.listing.infoHash));
+              if (alternatives.length) break;
             }
             alternatives.sort((a, b) => Number(b.release.edition === anchor.edition) - Number(a.release.edition === anchor.edition) ||
               (b.listing.seeders ?? 0) - (a.listing.seeders ?? 0) || b.listing.publishedAt - a.listing.publishedAt);

@@ -1173,6 +1173,16 @@ int TransferEngine::externalUpLimit() const {
 void TransferEngine::setExternalTraffic(int down, int up) {
   setExternalTrafficFor(QStringLiteral("http"), down, up);
 }
+bool TransferEngine::hasActiveMediaTransfers() const {
+  for (auto it = traffic_.cbegin(); it != traffic_.cend(); ++it)
+    if (it.key() != QStringLiteral("updates") && (it->first > 0 || it->second > 0))
+      return true;
+  const auto active = transfers();
+  return std::any_of(active.cbegin(), active.cend(), [](const TransferView &transfer) {
+    return transfer.downRate > 0 || transfer.upRate > 0 || transfer.moving ||
+           transfer.state == QStringLiteral("Downloading") || transfer.state == QStringLiteral("Checking");
+  });
+}
 void TransferEngine::setExternalTrafficFor(const QString &transport, int down, int up) {
   traffic_.insert(transport, {std::max(0, down), std::max(0, up)});
   down = 0;

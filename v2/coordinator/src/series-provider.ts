@@ -237,12 +237,27 @@ type Bencode = Buffer | number | Bencode[] | Map<string, Bencode>;
 
 function invalidTorrent(): never { throw new SeriesProviderError('The torrent metadata does not describe a verified single-file episode.', 422); }
 
-function matchesCatalogFilename(file: SeriesRelease, listing: SeriesRelease, catalogTitles: readonly string[]) {
-  if (!catalogTitles.length || file.season !== listing.season || file.style !== listing.style) return false;
-  const season = listing.season;
+function seasonTitleSuffix(season: number | null) {
   const roman = ['', 'i', 'ii', 'iii', 'iv', 'v', 'vi', 'vii', 'viii', 'ix', 'x'];
-  const suffix = season ? new RegExp(` (?:s0?${season}|season 0?${season}|0?${season}(?:(?:st|nd|rd|th) season)?${
-    roman[season] ? '|' + roman[season] : ''})$`, 'u') : null;
+  return season ? new RegExp(` (?:s0?${season}|season 0?${season}|0?${season}(?:(?:st|nd|rd|th) season)?${
+    roman[season] ? '|' + roman[season] : ''})$`, 'iu') : null;
+}
+
+export function catalogSearchTerms(title: string, season: number | null, firstQuery?: string) {
+  const suffix = seasonTitleSuffix(season);
+  const candidates = [title, ...(suffix && suffix.test(title) ? [title.replace(suffix, '')] : [])];
+  const seen = new Set(firstQuery ? [normalize(firstQuery)] : []);
+  return candidates.map(term => term.slice(0, 160).trim()).filter(term => {
+    const key = normalize(term);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+export function matchesCatalogTitle(file: SeriesRelease, listing: SeriesRelease, catalogTitles: readonly string[]) {
+  if (!catalogTitles.length || file.season !== listing.season || file.style !== listing.style) return false;
+  const season = listing.season, suffix = seasonTitleSuffix(season);
   const variants = (value: string) => {
     const normalized = normalize(value);
     const { primary, alternate } = seriesTitleParts(normalized);
@@ -315,7 +330,7 @@ export function verifySeriesMetainfo(data: Buffer, listing: SeriesListing, catal
   if (!path || /^[ .]|[ .]$/.test(path) || /[\/\\:%<>"?*|\x00-\x1f\x7f]/.test(path) || !VIDEO_SUFFIX.test(path)) invalidTorrent();
   const match = parseSeriesTitle(path), release = parseSeriesTitle(listing.title);
   if (!match || !release || match.episode !== release.episode || match.group !== release.group ||
-      (!sameSeriesStem(match, release) && !matchesCatalogFilename(match, release, catalogTitles))) invalidTorrent();
+      (!sameSeriesStem(match, release) && !matchesCatalogTitle(match, release, catalogTitles))) invalidTorrent();
   const length = info.get('length'), pieceLength = info.get('piece length'), pieces = info.get('pieces');
   if (typeof length !== 'number' || length <= 0 || typeof pieceLength !== 'number' || pieceLength <= 0
     || !Buffer.isBuffer(pieces) || pieces.length !== 20 * Math.ceil(length / pieceLength)) invalidTorrent();

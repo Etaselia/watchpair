@@ -47,6 +47,7 @@ class FixtureProvider implements SeriesProvider {
   records = new Map<number, ReturnType<typeof release>>();
   beforeListing?: () => void;
   beforeSearch?: () => void;
+  searchResults?: (query: string, listing: SeriesListing) => boolean;
   beforeMetadata?: (listing: SeriesListing) => Promise<void>;
 
   constructor() {
@@ -65,7 +66,8 @@ class FixtureProvider implements SeriesProvider {
   async searchReleases(query: string, uploader?: string) {
     this.beforeSearch?.();
     this.searches.push({ query, uploader });
-    return [...this.records.values()].map(record => record.listing).filter(listing => !uploader || listing.uploader === uploader);
+    return [...this.records.values()].map(record => record.listing).filter(listing =>
+      (!uploader || listing.uploader === uploader) && (this.searchResults?.(query, listing) ?? true));
   }
   async metadata(listing: SeriesListing, catalogTitles?: readonly string[]) {
     this.metadataCalls.push(listing.id);
@@ -106,20 +108,30 @@ async function fixture(t: TestContext, trustProxy = false) {
     room, guest, path, changes, preview, add, rules, action };
 }
 
-async function attachDesktop(f: Awaited<ReturnType<typeof fixture>>, token: string, address: string) {
+async function attachDesktop(f: Awaited<ReturnType<typeof fixture>>, token: string, address: string, enabled = true) {
   const server = f.app.server.address();
   assert.ok(server && typeof server !== 'string');
   const jobs: { type: string; requestId: string; kind?: string; listingId?: number; query?: string; uploader?: string }[] = [];
+  const events: string[] = [];
   const ws = new WebSocket(`ws://127.0.0.1:${server.port}${f.path}/events`, {
-    headers: { ...auth(token), 'x-watchpair-series-metadata': '1', 'x-watchpair-series-lookup': '1', 'x-forwarded-for': address },
+    headers: { ...auth(token), 'x-watchpair-series-events': '1', 'x-forwarded-for': address,
+      ...(enabled ? { 'x-watchpair-series-metadata': '1', 'x-watchpair-series-lookup': '1' } : {}) },
   });
-  ws.on('message', data => { const event = JSON.parse(data.toString()); if (event.requestId) jobs.push(event); });
+  ws.on('message', data => {
+    const event = JSON.parse(data.toString());
+    if (event.requestId) jobs.push(event);
+    events.push(event.type);
+  });
   await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
-  return { ws, jobs,
+  return { ws, jobs, events,
     async take() {
       for (let i = 0; i < 100 && !jobs.length; ++i) await delay(10);
       assert.ok(jobs.length, 'desktop received a fallback request');
       return jobs.shift()!;
+    },
+    prefer(enabled: boolean) {
+      ws.send(JSON.stringify({ type: 'series.preference', enabled }));
+      return new Promise<void>(resolve => { ws.once('pong', () => resolve()); ws.ping(); });
     },
     fail(requestId: string, retryAfterMs?: number) { ws.send(JSON.stringify({ type: 'series.failed', requestId, retryAfterMs })); },
     submit: (kind: 'lookup' | 'metadata', requestId: string, bytes: Buffer) => f.app.inject({ method: 'POST',
@@ -176,6 +188,39 @@ test('a Nyaa link and its torrent fall back in order, skipping desktops behind t
     assert.equal(f.rules()[0]!.pending, null);
   } finally {
     for (const desktop of [first, duplicate, second, last]) desktop.ws.terminate();
+  }
+});
+
+test('opting out hands off an active Nyaa request while the room stays connected', async t => {
+  const f = await fixture(t, true);
+  await f.app.listen({ host: '127.0.0.1', port: 0 });
+  const first = await attachDesktop(f, f.room.token, '203.0.113.10');
+  const second = await attachDesktop(f, f.guest.token, '203.0.113.11', false);
+  try {
+    const preview = (input: string) => f.app.inject({ method: 'POST', url: `${f.path}/series/preview`,
+      headers: { ...auth(f.room.token), 'x-watchpair-series-lookup': '1' }, payload: { input } });
+    f.provider.beforeSearch = () => { throw new SeriesProviderError('Gateway timeout', 504); };
+    const result = rss(f.provider.records.get(100)!.listing);
+    assert.deepEqual((await preview('Test Anime')).json(), { lookupPending: true });
+    const firstJob = await first.take();
+    assert.equal(second.jobs.length, 0);
+    await second.prefer(true);
+    await first.prefer(false);
+    const secondJob = await second.take();
+    assert.equal((await first.submit('lookup', firstJob.requestId, result)).statusCode, 404);
+    assert.equal((await second.submit('lookup', secondJob.requestId, result)).statusCode, 200);
+    assert.equal(first.ws.readyState, WebSocket.OPEN);
+    await f.add();
+    for (let i = 0; i < 100 && !first.events.includes('series.changed'); ++i) await delay(10);
+    assert.ok(first.events.includes('series.changed'));
+
+    await first.prefer(true);
+    await second.prefer(false);
+    assert.deepEqual((await preview('Another title')).json(), { lookupPending: true });
+    assert.equal((await first.take()).query, 'Another title');
+  } finally {
+    first.ws.terminate();
+    second.ws.terminate();
   }
 });
 
@@ -667,6 +712,54 @@ test('a room episode with a separate source can use a matching Nyaa reference an
   assert.equal(followed.json().item.nextEpisode, 8);
   assert.deepEqual(queue(), before);
   assert.equal(f.store.getSeriesEpisode(f.room.roomId, f.provider.entry.id, 7)?.entryId, entryId);
+});
+
+test('following an existing episode falls back to the selected MAL title and keeps the same season and episode', async t => {
+  const f = await fixture(t);
+  const title = 'Test Anime The Full Name';
+  const official = title + ' 2nd Season';
+  f.provider.entry = { ...f.provider.entry, title: official };
+  f.provider.put(101, `[Origin] ${title} - S02E07 (1080p)`, start);
+  f.provider.put(102, `[Origin] ${title} - S01E07 (1080p)`, start);
+  f.provider.put(103, `[Origin] ${title} - S02E08 (1080p)`, start);
+  f.provider.put(104, '[Origin] Unrelated Anime - S02E07 (1080p)', start);
+  f.provider.searchResults = (query, row) => query === title ? row.id > 100
+    : query === official ? row.id === 102 : row.id === 104;
+  const { engine, room } = f;
+  engine.command(room.roomId, room.memberId, { operationId: randomUUID(), queueRevision: 0,
+    command: { type: 'queue.add', source: { id: 'short-copy', kind: 'direct', uri: 'https://example.test/episode.mp4',
+      identity: 'short-copy', label: 'Imported episode' }, files: [
+      { mediaId: 'short-copy:episode', path: '[Origin] Test Anime - S02E07 (1080p).mkv',
+        label: 'Imported episode', fileIndex: 0, size: 1000, selected: true },
+    ] } });
+  const entryId = engine.snapshot(room.roomId).entries[0]!.id;
+  const preview = await f.app.inject({ method: 'POST', url: `${f.path}/series/preview`, headers: auth(room.token),
+    payload: { input: '', entryId, malId: f.provider.entry.id } });
+  assert.equal(preview.statusCode, 200, preview.body);
+  assert.deepEqual(f.provider.searches.map(row => row.query), ['test anime', official, title]);
+  assert.deepEqual(preview.json().releases.map((item: SeriesListing) => item.id), [101]);
+});
+
+test('a scheduled follow tries the saved MAL title when the short query only finds a different edition', async t => {
+  const f = await fixture(t);
+  const title = 'Test Anime The Full Name';
+  const official = title + ' 2nd Season';
+  f.provider.entry = { ...f.provider.entry, title: official };
+  f.provider.put(100, '[Origin] Test Anime - S02E07 (1080p)', air - 7 * 24 * 60 * 60 * 1000, 'Original');
+  const rule = await f.add();
+  f.provider.put(101, '[Origin] Test Anime - S02E08 (720p)', air, 'Original');
+  f.provider.put(102, `[Origin] ${title} - S02E08 (1080p)`, air, 'Original');
+  f.provider.put(103, `[Origin] ${title} - S01E08 (1080p)`, air, 'Original');
+  f.provider.put(104, `[Other] ${title} - S02E08 (1080p)`, air, 'Another');
+  f.provider.searchResults = (query, row) => query === official ? row.id >= 102 : row.id === 101;
+  f.now = air;
+  await f.series!.runOnce();
+  assert.deepEqual(f.provider.searches, [
+    { query: 'test anime', uploader: 'Original' }, { query: official, uploader: 'Original' },
+  ]);
+  assert.equal(f.rules()[0]!.id, rule.id);
+  assert.equal(f.rules()[0]!.nextEpisode, 9);
+  assert.equal(f.store.getSeriesEpisode(f.room.roomId, f.provider.entry.id, 8)?.listingId, 102);
 });
 
 test('a manifest conflict backs off the oldest due rule so another series can run', async t => {

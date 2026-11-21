@@ -202,6 +202,15 @@ SettingsPage::SettingsPage(AppServices &app, QWidget *parent) : QWidget(parent),
   member_->setMaxLength(80);
   form->addRow(tr("Default server"), server_);
   form->addRow(tr("Display name"), member_);
+  auto *seriesFallback = new QCheckBox(tr("Allow this device to help with Nyaa requests"));
+  seriesFallback->setObjectName(QStringLiteral("SeriesFallbackEnabled"));
+  seriesFallback->setToolTip(tr("When the room server cannot reach Nyaa, WatchPair can look up releases "
+                                 "and fetch torrent metadata from this device’s connection."));
+  seriesFallback->setChecked(app_.rooms.seriesFallbackEnabled());
+  form->addRow(seriesFallback);
+  connect(seriesFallback, &QCheckBox::toggled, this, [this](bool enabled) {
+    app_.perform([this, enabled] { app_.rooms.setSeriesFallbackEnabled(enabled); });
+  });
   formCard(tr("Desktop"), layout, form);
   closeToTray_ = new QCheckBox(tr("Keep WatchPair in the notification area when closing the window"));
   startup_ = new QCheckBox(tr("Start in the background when I sign in"));
@@ -217,6 +226,18 @@ SettingsPage::SettingsPage(AppServices &app, QWidget *parent) : QWidget(parent),
     });
   });
   formCard(tr("Application and updates"), layout, form);
+  auto *automaticUpdates = new QCheckBox(tr("Update WatchPair automatically"));
+  automaticUpdates->setObjectName(QStringLiteral("AutomaticUpdatesEnabled"));
+  automaticUpdates->setChecked(app_.releases.automaticUpdatesEnabled());
+  form->addRow(automaticUpdates);
+  auto *automaticHint = new QLabel(tr("Installed copies download updates in the background and apply "
+                                     "them when you quit WatchPair or next open it."));
+  automaticHint->setWordWrap(true);
+  automaticHint->setObjectName(QStringLiteral("muted"));
+  form->addRow(automaticHint);
+  connect(automaticUpdates, &QCheckBox::toggled, this, [this](bool enabled) {
+    app_.perform([this, enabled] { app_.releases.setAutomaticUpdatesEnabled(enabled); });
+  });
   auto *deliveryStatus = new QLabel(app_.releases.status());
   deliveryStatus->setObjectName(QStringLiteral("UpdateStatus"));
   deliveryStatus->setWordWrap(true);
@@ -231,10 +252,10 @@ SettingsPage::SettingsPage(AppServices &app, QWidget *parent) : QWidget(parent),
   installation->setWordWrap(true);
   installation->setTextInteractionFlags(Qt::TextSelectableByMouse);
   form->addRow(installation);
-  auto *feed = new QLineEdit(app_.store.setting(QStringLiteral("updateFeed")).toString());
-  feed->setObjectName(QStringLiteral("UpdateFeed"));
-  feed->setPlaceholderText(tr("https://your-server/downloads/release.json"));
-  form->addRow(tr("Signed release feed"), feed);
+  feed_ = new QLineEdit(app_.store.setting(QStringLiteral("updateFeed")).toString());
+  feed_->setObjectName(QStringLiteral("UpdateFeed"));
+  feed_->setPlaceholderText(tr("Use a saved room server’s update feed"));
+  form->addRow(tr("Signed release feed"), feed_);
   auto *deliveryButtons = new QWidget;
   auto *deliveryLayout = new QHBoxLayout(deliveryButtons);
   deliveryLayout->setContentsMargins(0, 0, 0, 0);
@@ -313,18 +334,15 @@ SettingsPage::SettingsPage(AppServices &app, QWidget *parent) : QWidget(parent),
       app_.releases.install(app_.releases.root().isEmpty() ? delivery::defaultRoot() : app_.releases.root());
     });
   });
-  connect(check, &QPushButton::clicked, this, [this, feed] {
-    app_.perform([this, feed] {
-      auto url = feed->text().trimmed();
-      if (url.isEmpty() && !server_->text().trimmed().isEmpty()) {
-        url = server_->text().trimmed();
-        if (url.endsWith(QLatin1Char('/')))
-          url.chop(1);
-        url += QStringLiteral("/downloads/release.json");
-        feed->setText(url);
+  connect(check, &QPushButton::clicked, this, [this] {
+    app_.perform([this] {
+      app_.store.setSetting(QStringLiteral("updateFeed"), feed_->text().trimmed());
+      auto feed = app_.releases.configuredFeed();
+      if (feed_->text().trimmed().isEmpty() && !server_->text().trimmed().isEmpty()) {
+        feed = RoomClient::validateServer(server_->text().trimmed());
+        feed.setPath(QStringLiteral("/downloads/release.json"));
       }
-      app_.store.setSetting(QStringLiteral("updateFeed"), url);
-      app_.releases.check(QUrl(url));
+      app_.releases.check(feed);
     });
   });
   connect(download, &QPushButton::clicked, this,
@@ -519,6 +537,7 @@ void SettingsPage::save() {
     app_.store.setSetting(QStringLiteral("startup"), startup_->isChecked());
     app_.store.setSetting(QStringLiteral("closeToTray"), closeToTray_->isChecked());
     app_.store.setSetting(QStringLiteral("defaultServer"), server);
+    app_.store.setSetting(QStringLiteral("updateFeed"), feed_->text().trimmed());
     app_.store.setSetting(QStringLiteral("displayName"), member_->text().trimmed());
     app_.store.setSetting(QStringLiteral("audioDevice"), audio_->currentData().toString());
     app_.store.setSetting(QStringLiteral("subtitleScale"), subtitleScale_->value());

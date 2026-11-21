@@ -91,6 +91,7 @@ public:
   // bandwidth lowers libtorrent's allocation instead of multiplying the cap.
   void setExternalTraffic(int downloads, int uploads = 0);
   void setExternalTrafficFor(const QString &transport, int downloads, int uploads = 0);
+  bool hasActiveMediaTransfers() const;
   std::shared_ptr<HttpBudget> downloadBudget() const { return downBudget_; }
   std::shared_ptr<HttpBudget> uploadBudget() const { return upBudget_; }
   int externalDownLimit() const;

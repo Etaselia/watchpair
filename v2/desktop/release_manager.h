@@ -3,6 +3,7 @@
 #include "local_store.h"
 #include <QFutureWatcher>
 #include <QThreadPool>
+#include <QTimer>
 #include <QUrl>
 namespace wp {
 class TransferEngine;
@@ -23,11 +24,13 @@ Release verifyFeed(const QByteArray &envelope, const QByteArray &publicKey, cons
                    bool requireNewer = true);
 QJsonObject verifyBundle(const QString &directory, const QString &expectedVersion = {});
 void extractArchive(const QString &archive, const QString &freshDirectory);
-QJsonObject installBundle(const QString &bundle, const QString &root, const QString &profile);
+QJsonObject installBundle(const QString &bundle, const QString &root, const QString &profile,
+                          bool signedUpdate = false);
 QJsonObject installationState(const QString &root);
+QString automaticUpdateVersion(const QString &root);
 QString prepareRestart(const QString &runningBundle, const QString &root, const QString &profile);
 void prepareRollback(const QString &root, const QString &profile);
-void activate(const QString &root);
+void activate(const QString &root, bool automatic = false);
 void rollback(const QString &root);
 void markHealthy();
 void waitForProcess(qint64 pid);
@@ -47,26 +50,39 @@ public:
   qint64 received() const { return control_ ? control_->received.load() : 0; }
   qint64 total() const { return control_ ? control_->total.load() : 0; }
   bool staged() const;
+  QUrl configuredFeed() const;
+  bool automaticUpdatesEnabled() const;
+  void setAutomaticUpdatesEnabled(bool enabled);
+  QString automaticActivationRoot() const;
+  void startAutomaticUpdates(std::function<bool()> idle);
+  void stopAutomaticUpdates();
   void install(const QString &root);
-  void check(const QUrl &feed);
-  void download();
+  void check(const QUrl &feed, bool background = false);
+  void download(bool background = false);
   void cancel();
   void restart(bool rollback = false);
 signals:
   void changed();
   void problem(QString code, QString message);
+  void backgroundProblem(QString message);
   void restartRequested(QString root, QString action);
 
 private:
-  void task(const std::function<QString()> &work, const std::function<void()> &success);
+  void task(const std::function<QString()> &work, const std::function<void()> &success,
+            bool background = false);
+  void pollAutomaticUpdates();
+  QString automaticInstallationRoot() const;
   HttpOptions network(const QUrl &url) const;
   LocalStore &store_;
   TransferEngine &transfers_;
   QThreadPool pool_;
   std::shared_ptr<HttpControl> control_;
   delivery::Release release_;
+  QUrl releaseFeed_;
+  QTimer automaticTimer_;
+  std::function<bool()> idle_;
   QString status_;
   QJsonObject route_;
-  bool busy_ = false;
+  bool busy_ = false, backgroundJob_ = false;
 };
 } // namespace wp
