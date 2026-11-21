@@ -290,7 +290,17 @@ void SeriesFollowDialog::lookup() {
   feedback_->setText(tr("Looking up releases…"));
   busy_ = true;
   updateActions();
-  rooms_.previewSeriesFollow(room_, body, this, [this](const QJsonObject &result, const QString &error) {
+  requestPreview(body);
+}
+
+void SeriesFollowDialog::requestPreview(const QJsonObject &body) {
+  rooms_.previewSeriesFollow(room_, body, this, [this, body](const QJsonObject &result, const QString &error) {
+    if (result.value(QStringLiteral("lookupPending")).toBool()) {
+      feedback_->setText(tr("Trying Nyaa from connected desktops…"));
+      updateActions();
+      QTimer::singleShot(6500, this, [this, body] { requestPreview(body); });
+      return;
+    }
     busy_ = false;
     if (error.isEmpty())
       acceptPreview(result);

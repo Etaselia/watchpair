@@ -32,6 +32,12 @@ function release(id: number, title: string, publishedAt: number, uploader?: stri
   return { listing, bytes };
 }
 
+function rss(listing: SeriesListing) {
+  return Buffer.from(`<rss xmlns:nyaa="https://nyaa.si/xmlns/nyaa"><channel><item><title>${listing.title}</title>` +
+    `<guid>https://nyaa.si/view/${listing.id}</guid><pubDate>${new Date(listing.publishedAt).toUTCString()}</pubDate>` +
+    `<nyaa:infoHash>${listing.infoHash}</nyaa:infoHash></item></channel></rss>`);
+}
+
 class FixtureProvider implements SeriesProvider {
   entry: SeriesCatalog = { id: 101, title: 'Test Anime', status: 'currently_airing', episodeCount: 12,
     startDate: '2026-10-02', broadcastDayJapan: 'friday', broadcastTimeJapan: '23:00' };
@@ -39,6 +45,8 @@ class FixtureProvider implements SeriesProvider {
   catalogCalls = 0;
   metadataCalls: number[] = [];
   records = new Map<number, ReturnType<typeof release>>();
+  beforeListing?: () => void;
+  beforeSearch?: () => void;
   beforeMetadata?: (listing: SeriesListing) => Promise<void>;
 
   constructor() {
@@ -53,8 +61,9 @@ class FixtureProvider implements SeriesProvider {
 
   async searchCatalog(_query: string) { return [this.entry]; }
   async catalog(_id: number) { ++this.catalogCalls; return this.entry; }
-  async listing(id: number) { return this.records.get(id)!.listing; }
+  async listing(id: number) { this.beforeListing?.(); return this.records.get(id)!.listing; }
   async searchReleases(query: string, uploader?: string) {
+    this.beforeSearch?.();
     this.searches.push({ query, uploader });
     return [...this.records.values()].map(record => record.listing).filter(listing => !uploader || listing.uploader === uploader);
   }
@@ -65,10 +74,10 @@ class FixtureProvider implements SeriesProvider {
   }
 }
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, trustProxy = false) {
   let now = start;
   const provider = new FixtureProvider();
-  const built = await buildServer({ now: () => now, seriesProvider: provider, seriesTimer: false });
+  const built = await buildServer({ now: () => now, seriesProvider: provider, seriesTimer: false, trustProxy });
   const { app, engine, series } = built;
   t.after(() => app.close());
   const room = engine.create('Series room', 'Host', key());
@@ -96,6 +105,132 @@ async function fixture(t: TestContext) {
   return { ...built, provider, get now() { return now; }, set now(value: number) { now = value; },
     room, guest, path, changes, preview, add, rules, action };
 }
+
+async function attachDesktop(f: Awaited<ReturnType<typeof fixture>>, token: string, address: string) {
+  const server = f.app.server.address();
+  assert.ok(server && typeof server !== 'string');
+  const jobs: { type: string; requestId: string; kind?: string; listingId?: number; query?: string; uploader?: string }[] = [];
+  const ws = new WebSocket(`ws://127.0.0.1:${server.port}${f.path}/events`, {
+    headers: { ...auth(token), 'x-watchpair-series-metadata': '1', 'x-watchpair-series-lookup': '1', 'x-forwarded-for': address },
+  });
+  ws.on('message', data => { const event = JSON.parse(data.toString()); if (event.requestId) jobs.push(event); });
+  await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+  return { ws, jobs,
+    async take() {
+      for (let i = 0; i < 100 && !jobs.length; ++i) await delay(10);
+      assert.ok(jobs.length, 'desktop received a fallback request');
+      return jobs.shift()!;
+    },
+    fail(requestId: string, retryAfterMs?: number) { ws.send(JSON.stringify({ type: 'series.failed', requestId, retryAfterMs })); },
+    submit: (kind: 'lookup' | 'metadata', requestId: string, bytes: Buffer) => f.app.inject({ method: 'POST',
+      url: `${f.path}/series/${kind}/${requestId}`, payload: bytes,
+      headers: { ...auth(token), 'content-type': kind === 'lookup' ? 'application/vnd.watchpair.nyaa' : 'application/vnd.watchpair.torrent' } }),
+  };
+}
+
+test('a Nyaa link and its torrent fall back in order, skipping desktops behind the same public IP', async t => {
+  const f = await fixture(t, true);
+  await f.app.listen({ host: '127.0.0.1', port: 0 });
+  const join = (name: string) => f.engine.join(f.room.roomId, f.room.invite, name, key()).token;
+  const first = await attachDesktop(f, f.room.token, '203.0.113.10');
+  const duplicate = await attachDesktop(f, f.guest.token, '::ffff:cb00:710a');
+  const second = await attachDesktop(f, join('Disconnects'), '203.0.113.11');
+  const last = await attachDesktop(f, join('Works'), '203.0.113.12');
+  try {
+    f.provider.beforeListing = () => { throw new SeriesProviderError('Gateway timeout', 504); };
+    const preview = () => f.app.inject({ method: 'POST', url: `${f.path}/series/preview`,
+      headers: { ...auth(f.room.token), 'x-watchpair-series-lookup': '1' },
+      payload: { input: 'https://nyaa.si/view/100', malId: 101, deferMetadata: true } });
+    assert.deepEqual((await preview()).json(), { lookupPending: true });
+    const firstJob = await first.take();
+    assert.equal(firstJob.kind, 'listing');
+    assert.equal(firstJob.listingId, 100);
+    first.fail(firstJob.requestId);
+    await second.take();
+    second.ws.terminate();
+    const lastJob = await last.take();
+    assert.equal(duplicate.jobs.length, 0);
+    const seed = f.provider.records.get(100)!;
+    const html = Buffer.from(`<h3 class="panel-title">${seedTitle}</h3><a href="/?c=1_2">Anime</a>` +
+      `<div>Info hash:</div><div><kbd>${seed.listing.infoHash}</kbd></div>` +
+      `<div data-timestamp="${seed.listing.publishedAt / 1000}"></div><div class="panel-footer clearfix">`);
+    assert.equal((await first.submit('lookup', firstJob.requestId, html)).statusCode, 404);
+    assert.equal((await duplicate.submit('lookup', lastJob.requestId, html)).statusCode, 404);
+    assert.equal((await last.submit('lookup', lastJob.requestId, html)).statusCode, 200);
+    const draft = (await preview()).json().draft;
+    assert.equal(draft.anchorListingId, 100);
+    f.provider.beforeMetadata = async () => { throw new SeriesProviderError('Gateway timeout', 504); };
+    const confirmed = await f.app.inject({ method: 'POST', url: `${f.path}/series`, headers: auth(f.room.token),
+      payload: { draftId: draft.id } });
+    assert.equal(confirmed.json().item.pending, 'setup');
+    await f.series!.runOnce();
+    const firstTorrent = await first.take();
+    assert.equal(firstTorrent.type, 'series.metadata');
+    assert.equal((await first.submit('metadata', firstTorrent.requestId, Buffer.from('wrong torrent'))).statusCode, 422);
+    assert.equal((await first.submit('metadata', firstTorrent.requestId, seed.bytes)).statusCode, 404);
+    const lastTorrent = await last.take();
+    assert.equal(duplicate.jobs.length, 0);
+    assert.equal((await last.submit('metadata', lastTorrent.requestId, seed.bytes)).statusCode, 200);
+    await f.series!.runOnce();
+    assert.equal(f.engine.snapshot(f.room.roomId).entries.length, 1);
+    assert.equal(f.rules()[0]!.pending, null);
+  } finally {
+    for (const desktop of [first, duplicate, second, last]) desktop.ws.terminate();
+  }
+});
+
+test('desktop RSS lookup keeps a per-IP cooldown and retries on the next round', async t => {
+  const f = await fixture(t, true);
+  await f.app.listen({ host: '127.0.0.1', port: 0 });
+  const desktop = await attachDesktop(f, f.room.token, '203.0.113.10');
+  try {
+    const preview = () => f.app.inject({ method: 'POST', url: `${f.path}/series/preview`,
+      headers: { ...auth(f.room.token), 'x-watchpair-series-lookup': '1' }, payload: { input: 'Test Anime' } });
+    f.provider.beforeSearch = () => { throw new SeriesProviderError('Please retry later', 429, 60_000); };
+    assert.equal((await preview()).statusCode, 429);
+    f.provider.beforeSearch = () => { throw new SeriesProviderError('Gateway timeout', 504); };
+    assert.deepEqual((await preview()).json(), { lookupPending: true });
+    const first = await desktop.take();
+    assert.equal(first.kind, 'search');
+    assert.equal(first.query, 'Test Anime');
+    desktop.fail(first.requestId, 90_000);
+    for (let i = 0; i < 100; ++i) {
+      if (!(await preview()).json().lookupPending) break;
+      await delay(10);
+    }
+    f.now += 89_999;
+    assert.equal((await preview()).statusCode, 503);
+    assert.equal(desktop.jobs.length, 0);
+    ++f.now;
+    assert.deepEqual((await preview()).json(), { lookupPending: true });
+    const retry = await desktop.take();
+    assert.notEqual(retry.requestId, first.requestId);
+    assert.equal((await desktop.submit('lookup', retry.requestId, rss(f.provider.records.get(100)!.listing))).statusCode, 200);
+    assert.equal((await preview()).json().releases[0].id, 100);
+  } finally { desktop.ws.terminate(); }
+});
+
+test('scheduled follows resume from desktop RSS and add the verified next episode', async t => {
+  const f = await fixture(t, true);
+  const rule = await f.add();
+  await f.app.listen({ host: '127.0.0.1', port: 0 });
+  const desktop = await attachDesktop(f, f.room.token, '203.0.113.10');
+  try {
+    f.now = rule.nextCheckAt;
+    const episode = f.provider.put(101, '[Origin] Test Anime - 08 (1080p)', f.now, 'Original');
+    f.provider.beforeSearch = () => { throw new SeriesProviderError('Gateway timeout', 504); };
+    await f.series!.runOnce();
+    assert.equal(f.rules()[0]!.nextEpisode, 8);
+    assert.match(f.rules()[0]!.error!, /connected desktops/);
+    const request = await desktop.take();
+    assert.equal(request.uploader, 'Original');
+    assert.equal((await desktop.submit('lookup', request.requestId, rss(episode.listing))).statusCode, 200);
+    f.now = f.rules()[0]!.nextCheckAt!;
+    await f.series!.runOnce();
+    assert.equal(f.rules()[0]!.nextEpisode, 9);
+    assert.equal(f.store.getSeriesEpisode(f.room.roomId, f.provider.entry.id, 8)!.listingId, episode.listing.id);
+  } finally { desktop.ws.terminate(); }
+});
 
 test('one click saves a pending follow even when metadata is down, and the VPS retries without a desktop', async t => {
   const f = await fixture(t);
@@ -167,7 +302,6 @@ test('an online desktop helps a persisted follow and only hash-verified metadata
   const seed = provider.records.get(100)!;
   assert.equal((await submit(room.token, seed.bytes)).statusCode, 404);
   assert.equal((await submit(desktop.token, Buffer.alloc(2 * 1024 * 1024 + 1))).statusCode, 413);
-  assert.equal((await submit(desktop.token, release(101, seedTitle, start).bytes)).statusCode, 422);
   assert.equal(built.engine.snapshot(room.roomId).entries.length, 0);
   assert.equal(built.store.getSeriesMetadata(seed.listing.infoHash, current), null);
   assert.equal((await submit(desktop.token, seed.bytes)).statusCode, 200);

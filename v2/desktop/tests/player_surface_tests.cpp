@@ -34,6 +34,7 @@
 #include <windows.h>
 #endif
 namespace {
+bool secondaryScreenTest() { return qEnvironmentVariableIsSet("WATCHPAIR_TEST_SECONDARY_SCREEN"); }
 bool clickPopupWidget(QWidget &widget, const QPoint &point, const QString &action);
 bool movePointer(QWidget &widget, const QPoint &point, Qt::MouseButtons buttons = Qt::NoButton) {
   if (!qEnvironmentVariableIsEmpty("WATCHPAIR_WAYLAND_POPUP_INPUT") && buttons == Qt::NoButton) {
@@ -43,7 +44,7 @@ bool movePointer(QWidget &widget, const QPoint &point, Qt::MouseButtons buttons 
     return moved;
   }
   const auto global = widget.mapToGlobal(point);
-  if (!QApplication::platformName().startsWith(QStringLiteral("wayland")))
+  if (!secondaryScreenTest() && !QApplication::platformName().startsWith(QStringLiteral("wayland")))
     QCursor::setPos(global);
   QMouseEvent event(QEvent::MouseMove, point, global, Qt::NoButton, buttons, Qt::NoModifier);
   QApplication::sendEvent(&widget, &event);
@@ -148,16 +149,28 @@ bool choosePopup(wp::ui::PlayerSurface &surface, QComboBox &combo, QWidget &host
   // reveal must not bypass the pointer policy when the player is elsewhere.
   if (!movePointer(surface, QPoint(2, surface.height() - 2)))
     return false;
-  surface.revealControls();
+  if (!secondaryScreenTest())
+    surface.revealControls();
   if (!QTest::qWaitFor([&] { return surface.controlsVisible(); }, 1000))
     return false;
   const auto originalIndex = combo.currentIndex();
   QSignalSpy activated(&combo, qOverload<int>(&QComboBox::activated));
   if (!clickPopupWidget(combo, QPoint(combo.width() - 10, combo.height() / 2)))
     return false;
-  if (!QTest::qWaitFor([&] { return combo.view()->isVisible(); }, 3000))
+  const auto popupView = [&] {
+    if (auto *playerCombo = qobject_cast<wp::ui::PlayerComboBox *>(&combo))
+      return playerCombo->popupView();
+    return combo.view();
+  };
+  if (!QTest::qWaitFor([&] { return popupView()->isVisible(); }, 3000))
     return false;
-  if (!QTest::qWaitForWindowExposed(combo.view()->window()))
+  auto *view = popupView();
+  auto *hostWindow = view->window();
+  const bool embedded = hostWindow == &host;
+  if (QApplication::platformName() == QStringLiteral("windows") && host.isFullScreen() &&
+      qobject_cast<wp::ui::PlayerComboBox *>(&combo) && !embedded)
+    return false;
+  if (!QTest::qWaitForWindowExposed(hostWindow))
     return false;
   if (openingDelivered && !QTest::qWaitFor(openingDelivered, 2000))
     return false;
@@ -168,27 +181,32 @@ bool choosePopup(wp::ui::PlayerSurface &surface, QComboBox &combo, QWidget &host
           << "initial/current index" << originalIndex << combo.currentIndex();
   if (!activated.isEmpty() || combo.currentIndex() != originalIndex)
     return false;
-  auto *popup = combo.view()->window();
-  if (!surface.controlsVisible() || !combo.view()->isVisible() ||
-      !popup->windowHandle() || !popup->windowHandle()->isExposed())
+  if (!surface.controlsVisible() || !view->isVisible() ||
+      !hostWindow->windowHandle() || !hostWindow->windowHandle()->isExposed())
+    return false;
+  if (embedded && (!surface.isAncestorOf(view) || QApplication::activePopupWidget() ||
+                   !surface.rect().contains(QRect(view->mapTo(&surface, QPoint()), view->size()))))
     return false;
   const auto index = combo.model()->index(row, 0);
-  const auto point = combo.view()->visualRect(index).center();
-  if (!combo.view()->viewport()->rect().contains(point))
+  const auto point = view->visualRect(index).center();
+  if (!view->viewport()->rect().contains(point))
     return false;
   if (qEnvironmentVariableIsEmpty("WATCHPAIR_WAYLAND_POPUP_INPUT")) {
-    const auto global = combo.view()->viewport()->mapToGlobal(point);
+    const auto global = view->viewport()->mapToGlobal(point);
     // Moving from the arrow into the list releases Qt's opening-click guard.
-    QTest::mouseMove(combo.view()->viewport(), point);
+    if (secondaryScreenTest())
+      movePointer(*view->viewport(), point);
+    else
+      QTest::mouseMove(view->viewport(), point);
     QTest::qWait(150);
     auto *hit = QApplication::widgetAt(global);
-    if (!hit || (hit != combo.view()->viewport() && !combo.view()->isAncestorOf(hit)))
+    if (!hit || (hit != view->viewport() && !view->isAncestorOf(hit)))
       return false;
   }
-  capture(*popup, name + QStringLiteral("-popup"));
+  capture(embedded ? *view : *hostWindow, name + QStringLiteral("-popup"));
   const auto output = qEnvironmentVariable("WATCHPAIR_UI_OUTPUT");
   if (!output.isEmpty()) {
-    const auto bounds = QRect(host.mapToGlobal(QPoint()), host.size()).united(popup->frameGeometry());
+    const auto bounds = QRect(host.mapToGlobal(QPoint()), host.size()).united(hostWindow->frameGeometry());
     const auto screen = host.screen()->grabWindow(0, bounds.x(), bounds.y(), bounds.width(), bounds.height());
     if (!screen.isNull())
       screen.save(QDir(output).filePath(name + QStringLiteral("-screen.png")));
@@ -196,21 +214,19 @@ bool choosePopup(wp::ui::PlayerSurface &surface, QComboBox &combo, QWidget &host
              !compositorInput({QStringLiteral("capture"), QDir(output).filePath(name + QStringLiteral("-screen.png"))}))
       return false;
   }
-  qInfo() << name << "popup exposed" << popup->windowHandle()->isExposed()
-          << "transient parent matches" << (popup->windowHandle()->transientParent() == host.windowHandle());
-  if (popup->windowHandle()->transientParent() != host.windowHandle())
+  if (!embedded && hostWindow->windowHandle()->transientParent() != host.windowHandle())
     return false;
   // Wayland has no global widgetAt/warp API. Probe the actual native click's
   // receiver and row instead, including compositor-constrained popup placement.
-  PopupClickProbe clicked(*combo.view(), row);
-  if (!clickPopupWidget(*combo.view()->viewport(), point))
+  PopupClickProbe clicked(*view, row);
+  if (!clickPopupWidget(*view->viewport(), point))
     return false;
   const bool selected = QTest::qWaitFor([&] {
     return clicked.hit && activated.size() == 1 && activated.first().first().toInt() == row &&
-           combo.currentIndex() == row && !combo.view()->isVisible();
+           combo.currentIndex() == row && !view->isVisible();
   });
   qInfo() << name << "selected" << combo.currentIndex() << "expected" << row
-          << "clicked row hit" << clicked.hit << "popup visible" << combo.view()->isVisible();
+          << "clicked row hit" << clicked.hit << "popup visible" << view->isVisible();
   return selected;
 }
 
@@ -621,7 +637,23 @@ private slots:
     services.store.setSetting(QStringLiteral("closeToTray"), false);
     services.player.setVolume(0);
     wp::ui::MainWindow window(services);
+    QScreen *testScreen = nullptr;
+    if (secondaryScreenTest()) {
+      for (auto *screen : QGuiApplication::screens()) {
+        if (screen == QGuiApplication::primaryScreen()) continue;
+        testScreen = screen;
+        break;
+      }
+      QVERIFY2(testScreen, "A secondary screen is required when requested by the operator");
+      window.setAttribute(Qt::WA_ShowWithoutActivating);
+      window.winId();
+      window.windowHandle()->setScreen(testScreen);
+      window.move(testScreen->availableGeometry().center() - window.rect().center());
+      qInfo() << "Secondary player test screen" << testScreen->name() << testScreen->geometry();
+    }
     window.show();
+    if (testScreen)
+      QTRY_COMPARE(window.screen(), testScreen);
     window.pages()->setCurrentWidget(window.roomPage());
     QSignalSpy identified(&services.library, &wp::LibraryService::identified);
     services.library.identify(path);
@@ -667,16 +699,26 @@ private slots:
 #endif
     QVERIFY(click(QStringLiteral("PlayerFullscreen")));
     QTRY_VERIFY(window.isFullScreen());
+    if (testScreen)
+      QCOMPARE(window.screen(), testScreen);
 #ifdef Q_OS_WIN
-    QCOMPARE(frameStyle(window), LONG_PTR(WS_BORDER));
+    QCOMPARE(frameStyle(window), LONG_PTR(0));
 #endif
     QTRY_COMPARE(video->mapTo(&window, QPoint()), QPoint());
     QTRY_COMPARE(video->size(), window.size());
-    auto *subtitleChoice = surface->findChild<QComboBox *>(QStringLiteral("SharedSubtitles"));
-    auto *chapterChoice = surface->findChild<QComboBox *>(QStringLiteral("Chapters"));
+    auto *subtitleChoice = surface->findChild<wp::ui::PlayerComboBox *>(QStringLiteral("SharedSubtitles"));
+    auto *chapterChoice = surface->findChild<wp::ui::PlayerComboBox *>(QStringLiteral("Chapters"));
     QVERIFY(subtitleChoice);
     QVERIFY(chapterChoice);
     QTRY_VERIFY(subtitleChoice->count() > 1);
+#ifdef Q_OS_WIN
+    QVERIFY(movePointer(*surface, QPoint(surface->width() / 2, surface->height() * 4 / 5)));
+    subtitleChoice->showPopup();
+    QCOMPARE(subtitleChoice->popupView()->window(), &window);
+    QTest::keyClick(subtitleChoice->popupView(), Qt::Key_Escape);
+    QTRY_VERIFY(!subtitleChoice->popupView()->isVisible());
+    QVERIFY(window.isFullScreen());
+#endif
     const auto subtitleId = subtitleChoice->itemData(1).toString();
     QVERIFY2(choosePopup(*surface, *subtitleChoice, window, 1, QStringLiteral("native-room-fullscreen-subtitles")),
              "Room fullscreen accepts a subtitle selection on its first open");
@@ -693,6 +735,8 @@ private slots:
     QVERIFY(click(QStringLiteral("PopoutPlayer")));
     QTRY_VERIFY(video->window() != &window);
     auto *detached = video->window();
+    if (testScreen)
+      QTRY_COMPARE(detached->screen(), testScreen);
     QCOMPARE(detached->objectName(), QStringLiteral("DetachedPlayer"));
     QCOMPARE(services.player.native(), native);
     QCOMPARE(window.roomPage()->video(), video);
@@ -715,7 +759,7 @@ private slots:
     QTest::mouseRelease(video, Qt::LeftButton);
     QTRY_VERIFY(detached->isFullScreen());
 #ifdef Q_OS_WIN
-    QCOMPARE(frameStyle(*detached), LONG_PTR(WS_BORDER));
+    QCOMPARE(frameStyle(*detached), LONG_PTR(0));
 #endif
     QTRY_COMPARE(video->size(), detached->size());
     QVERIFY2(choosePopup(*surface, *subtitleChoice, *detached, 0,

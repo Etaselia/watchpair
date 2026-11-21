@@ -5,7 +5,7 @@ import {
   episodeSearchTerms, parseSeriesTitle, releaseMatches, sameSeriesStem, seriesTitleParts, SeriesProviderError,
   type SeriesCatalog, type SeriesListing, type SeriesProvider, type SeriesRelease,
 } from './series-provider.js';
-import { canAskDesktop, retryableMetadata, SeriesMetadata, type AskDesktop } from './series-metadata.js';
+import { canAskDesktop, retryableMetadata, SeriesLookupWaiting, SeriesMetadata, type AskDesktop } from './series-metadata.js';
 import { estimateAirtime, inferAnchorAirtime, retryAt, type SeriesEntryBinding, type SeriesEpisode,
   type SeriesFollow, type SeriesMetadataRetry } from './series-state.js';
 
@@ -158,7 +158,7 @@ export class SeriesService {
   private timer: ReturnType<typeof setInterval> | null = null;
   private readonly metadata: SeriesMetadata;
 
-  constructor(private readonly engine: Engine, private readonly provider: SeriesProvider, askDesktop: AskDesktop = () => []) {
+  constructor(private readonly engine: Engine, private readonly provider: SeriesProvider, askDesktop: AskDesktop = () => undefined) {
     this.metadata = new SeriesMetadata(provider, engine.store, () => engine.now(), askDesktop);
   }
 
@@ -173,6 +173,7 @@ export class SeriesService {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     await this.running?.catch(() => {});
+    this.metadata.close();
   }
 
   list(roomId: string) {
@@ -180,17 +181,25 @@ export class SeriesService {
   }
 
   desktopOnline(roomId: string) {
+    this.metadata.desktopOnline(roomId);
     for (const follow of this.engine.store.listSeries(roomId)) {
       const pending = follow.pendingSeed ?? follow.pendingRelease;
       if (follow.status === 'active' && pending?.desktopEligible &&
           !this.engine.store.getSeriesMetadata(pending.listing.infoHash, this.engine.now())) {
-        this.metadata.ask(roomId, pending.listing, follow.catalogTitles, pending.failures);
+        this.metadata.ask(roomId, pending.listing, follow.catalogTitles);
       }
     }
   }
 
-  acceptMetadata(roomId: string, memberId: string, requestId: string, bytes: Buffer) {
-    const hash = this.metadata.accept(roomId, memberId, requestId, bytes);
+  desktopOffline(connectionId: string) { this.metadata.desktopOffline(connectionId); }
+
+  desktopFailed(roomId: string, memberId: string, connectionId: string, requestId: string, retryAfterMs?: number) {
+    this.metadata.fail(roomId, memberId, connectionId, requestId, retryAfterMs);
+  }
+
+  acceptMetadata(roomId: string, memberId: string, connectionId: string, requestId: string, bytes: Buffer, lookup: boolean) {
+    const hash = this.metadata.accept(roomId, memberId, connectionId, requestId, bytes, lookup);
+    if (!hash) return { accepted: true };
     const now = this.engine.now();
     for (const follow of this.engine.store.listSeries(roomId)) {
       const pending = follow.pendingSeed ?? follow.pendingRelease;
@@ -210,7 +219,7 @@ export class SeriesService {
     if (this.drafts.size >= 128) this.drafts.delete(this.drafts.keys().next().value!);
   }
 
-  async preview(roomId: string, memberId: string, input: Preview) {
+  async preview(roomId: string, memberId: string, input: Preview, waitForLookup = false) {
     requireThat(this.previews < 2, 'SERIES_BUSY', 'Series search is busy. Try again in a moment.', 429);
     ++this.previews;
     try {
@@ -219,10 +228,10 @@ export class SeriesService {
       const parts = inputParts(input.input);
       const listingId = input.listingId ?? parts.listingId;
       const malId = input.malId ?? parts.malId;
-      let listing = listingId ? await this.provider.listing(listingId) : null;
+      let listing = listingId ? await this.metadata.listing(roomId, listingId) : null;
       if (!listing && entry && !parts.title) {
         const source = this.engine.room(roomId).sources.find(item => item.id === entry.sourceId);
-        listing = await this.findEntryListing(source, knownRelease);
+        listing = await this.findEntryListing(roomId, source, knownRelease);
       }
       const parsed = listing && eligible(listing);
       if (listing) requireThat(parsed, 'SERIES_UNSUPPORTED_TITLE', 'This release does not identify a single episode and edition. Choose a clearer Nyaa release.', 422);
@@ -236,7 +245,7 @@ export class SeriesService {
       const fallbackTitle = parts.title ? seriesTitleParts(parts.title).primary : inferredTitle?.alternate?.slice(0, 160);
       if (!catalog.length && fallbackTitle && fallbackTitle !== catalogQuery)
         catalog = await this.provider.searchCatalog(fallbackTitle);
-      const releases = listing ? [listing] : query || catalog[0] ? await this.provider.searchReleases(query ?? catalog[0]!.title) : [];
+      const releases = listing ? [listing] : query || catalog[0] ? await this.metadata.searchReleases(roomId, query ?? catalog[0]!.title) : [];
       const result = { catalog: catalog.slice(0, 12), releases: releases.flatMap(item => {
         const match = eligible(item);
         return match && sameEntryEpisode(knownRelease, match)
@@ -256,16 +265,17 @@ export class SeriesService {
         anchorEpisode: parsed.episode, nextEpisode: parsed.episode + 1, episodeCount: draft.catalog.episodeCount,
         expectedAirAt: seed === null ? null : estimateAirtime(seed, parsed.episode + 1, parsed.episode, draft.catalog) } };
     } catch (error) {
+      if (waitForLookup && error instanceof SeriesLookupWaiting && error.pending) return { lookupPending: true };
       if (error instanceof SeriesProviderError) throw providerError(error);
       throw error;
     } finally { --this.previews; }
   }
 
-  private async findEntryListing(source: Source | undefined, knownRelease: SeriesRelease | null) {
+  private async findEntryListing(roomId: string, source: Source | undefined, knownRelease: SeriesRelease | null) {
     const id = sourceListingId(source);
     if (!id) return null;
     try {
-      const listing = await this.provider.listing(id);
+      const listing = await this.metadata.listing(roomId, id);
       const release = eligible(listing);
       return release && sameEntryEpisode(knownRelease, release) && source?.identity === `bt:${listing.infoHash}` ? listing : null;
     } catch (error) {
@@ -475,7 +485,7 @@ export class SeriesService {
           follow.alternative = null; break;
         }
         try {
-          const listing = await this.provider.listing(offer.listingId);
+          const listing = await this.metadata.listing(roomId, offer.listingId);
           requireThat(listing.infoHash === offer.infoHash, 'SERIES_ALTERNATE', 'This listing changed. Wait for the next check.', 409);
           const source = eligible(listing), anchor = parseSeriesTitle(follow.anchorTitle);
           requireThat(source && anchor && sameSeriesStem(anchor, source) && source.episode === follow.nextEpisode,
@@ -530,7 +540,7 @@ export class SeriesService {
     const { anchor, listing } = pending;
     try {
       if (anchor) this.checkAnchor(follow.roomId, anchor);
-      const manifest = await this.metadata.resolve(follow.roomId, listing, follow.catalogTitles, pending.failures);
+      const manifest = await this.metadata.resolve(follow.roomId, listing, follow.catalogTitles);
       if (this.closing) return;
       this.existing(follow.roomId, follow.id, original.revision);
       if (anchor) this.checkAnchor(follow.roomId, anchor);
@@ -623,7 +633,7 @@ export class SeriesService {
       const record = this.episode(follow, follow.nextEpisode, 'added', pending.listing.id);
       try {
         const manifest = this.engine.store.getSeriesEpisode(follow.roomId, follow.malId, record.episode)
-          ? undefined : await this.metadata.resolve(follow.roomId, pending.listing, follow.catalogTitles, pending.failures);
+          ? undefined : await this.metadata.resolve(follow.roomId, pending.listing, follow.catalogTitles);
         if (this.closing) return;
         this.advance(follow, now);
         commit(manifest ? record : undefined, manifest);
@@ -654,7 +664,7 @@ export class SeriesService {
     follow.error = null;
     try {
       const query = anchor.stem.slice(0, 120);
-      const preferred = await this.provider.searchReleases(query, follow.preferredUploader ?? undefined);
+      const preferred = await this.metadata.searchReleases(follow.roomId, query, follow.preferredUploader ?? undefined);
       let broad = follow.preferredUploader ? null : preferred;
       for (let i = 0; i < MAX_CATCH_UP && follow.status === 'active' && !this.closing; ++i) {
         if (scopeReview(follow)) return;
@@ -673,7 +683,7 @@ export class SeriesService {
         if (!exact.length) {
           for (const term of olderTerms) {
             this.existing(follow.roomId, follow.id, revision);
-            const older = await this.provider.searchReleases(term, follow.preferredUploader ?? undefined);
+            const older = await this.metadata.searchReleases(follow.roomId, term, follow.preferredUploader ?? undefined);
             if (!follow.preferredUploader) {
               broad = [...(broad ?? []), ...older];
               searchedBroadTerms.add(term);
@@ -719,7 +729,7 @@ export class SeriesService {
         } else {
           if (matches.length && follow.error === null) follow.error = 'The selected release group changed edition. Confirm a new source or approve a one-time alternative.';
           if (follow.dismissedAlternativeHashes.length < MAX_ALTERNATE_DISMISSALS) {
-            broad ??= await this.provider.searchReleases(query);
+            broad ??= await this.metadata.searchReleases(follow.roomId, query);
             const eligibleAlternatives = (rows: SeriesListing[]) => this.choose(rows, anchor, rawEpisode, false, now)
               .filter(item => !follow.dismissedAlternativeHashes.includes(item.listing.infoHash));
             let alternatives = eligibleAlternatives(broad);
@@ -727,7 +737,7 @@ export class SeriesService {
               if (alternatives.length) break;
               if (searchedBroadTerms.has(term)) continue;
               this.existing(follow.roomId, follow.id, revision);
-              alternatives = eligibleAlternatives(await this.provider.searchReleases(term));
+              alternatives = eligibleAlternatives(await this.metadata.searchReleases(follow.roomId, term));
             }
             alternatives.sort((a, b) => Number(b.release.edition === anchor.edition) - Number(a.release.edition === anchor.edition) ||
               (b.listing.seeders ?? 0) - (a.listing.seeders ?? 0) || b.listing.publishedAt - a.listing.publishedAt);
@@ -740,6 +750,13 @@ export class SeriesService {
       }
     } catch (error) {
       if (!(error instanceof SeriesProviderError)) throw error;
+      if (error instanceof SeriesLookupWaiting) {
+        follow.error = error.message;
+        follow.manualCheck = manual;
+        follow.nextCheckAt = error.checkAt;
+        if (!this.closing) commit();
+        return;
+      }
       this.nyaaBackoff = now + this.providerDelay(error, 30 * 60_000);
       follow.manualCheck = manual;
       follow.nextCheckAt = Math.max(this.nyaaBackoff, follow.finishConfirmed ? 0 : follow.expectedAirAt ?? 0);

@@ -22,7 +22,7 @@ This specification records product decisions finalized on 28 October 2026. Build
 | Local sharing | Sharing local files and folders so others download their own copies is required at launch. |
 | Transfer fallback | A separate encrypted relay may carry file transfers when direct connectivity fails. Participants still receive their own copies. |
 | Progressive playback | Playback while the episode is still downloading is required at launch. |
-| Watched history | Move an episode to Watched after 90% distinct coverage, with manual watched and unwatched actions, relative timestamps, and rewatching. |
+| Watched history | Move an episode to Watched after more than 50% distinct coverage or when switching away at or beyond 80% of its timeline. Support manual watched and unwatched actions, relative timestamps, and rewatching. |
 | Watched authority | Shared timeline coverage from a designated active reporter, with reporter handoff. Every member may mark watched or unwatched manually. |
 | Current episode deselection | Stop playback immediately and move to the next selected unwatched episode, subject to the readiness gate. |
 | Transfer interface | Follow qBittorrent's sidebar, dense transfer table, and bottom detail tabs. Prioritize queue order, speed limits, and storage controls. |
@@ -52,7 +52,7 @@ The following launch scope implements those decisions. Carrying a capability for
 | Playback synchronization | Coordinator-authoritative timeline, measured clock offset, readiness barriers, drift correction, serialized conflicting commands, reconnect snapshots, buffering recovery, and visible per-participant reasons for waiting. |
 | Audio and subtitles | Shared audio and subtitle choices and subtitle delay; multiple tracks, language preferences, embedded and external subtitles, SRT, VTT, ASS/SSA with attached fonts, and chapters. Distribute external subtitle assets through the sharing mechanism so a shared choice resolves to the same content. Keep volume and accessibility appearance local. Validate multichannel audio and image subtitles before release. |
 | Progressive torrent playback | Prioritize verified bytes needed to open the container, decode ahead, and seek. Fetch required headers and indexes even when they occur near the end of a file. Prefetch upcoming episodes without starving current playback. |
-| Watched history | Distinct played intervals, automatic 90% threshold, manual episode and folder actions, watched timestamps, search, Watch again, and preservation when a source is removed from the active queue. |
+| Watched history | Distinct played intervals, automatic completion during playback or on switching episodes, manual episode and folder actions, watched timestamps, search, Watch again, and preservation when a source is removed from the active queue. |
 | Storage | Download directory selection, per-transfer location and moves, library roots, cache accounting, pins, age and capacity policies, free-space reserve, cleanup preview, and restart-safe filesystem operations. |
 | Application lifecycle | Tray behavior, startup preferences, protocol links, single-instance handling, install and update flows, interrupted-update recovery, and graceful shutdown with persisted transfer state. |
 | Diagnostics | Structured error codes and operation IDs, bounded activity logs, progress and wait reasons, retry and repair actions, redacted diagnostic export, and effective resource and network settings. |
@@ -99,7 +99,7 @@ Audio track, subtitle track, and subtitle delay are shared room commands, alongs
 
 Coverage counts the distinct room-timeline intervals actually played. Seeking forward or replaying the same interval does not inflate coverage. The coordinator accepts coverage from a designated active player, preferring the host when it is watching. The reporter and playback generation are explicit so reporter handoff preserves valid coverage and rejects stale reports. Every member can mark watched or unwatched manually.
 
-At 90%, the episode moves out of the upcoming queue into Watched. Its current playback continues to the end, and Now playing remains visible. Marking it watched must not cancel the remaining download: progressive playback may still need those bytes. A completion stores an absolute timestamp and displays relative age. Manual actions record their method, and Watch again creates a new viewing while retaining earlier completions.
+When distinct viewing exceeds 50%, the episode moves from Upcoming to Watched. The current playback and download continue, and Now playing stays visible. An episode also moves to Watched when the room switches away at or beyond 80% of its timeline. A completion stores an absolute timestamp and displays relative age. Manual actions record their method, and Watch again creates a new viewing while retaining earlier completions.
 
 Watched state, queue inclusion, download selection, and file retention are separate decisions. Marking watched never means deleting files. Proposed behavior is to offer skipping already watched episodes when adding a pack, while leaving existing transfers under explicit local control.
 
@@ -261,7 +261,7 @@ Acceptance is organized around complete user workflows, not screen-by-screen fea
 | Shared torrent reuse | Two rooms and different selections use one physical transfer; one room's removal does not invalidate the other. |
 | Matching and mismatch | Matching torrent entries bind consistently; wrong episodes, file-index errors, different cuts, and wrong local copies produce an actionable mismatch instead of silent playback. |
 | Media compatibility | Validate the agreed codec, audio, subtitle/font, chapter, GPU, Windows path, X11, and Wayland matrix on packaged apps. |
-| Watch history | Distinct 90% coverage moves the episode to Watched without stopping the current stream or its download; timestamps and rewatch history survive restarts. |
+| Watch history | More than 50% distinct coverage moves the episode to Watched while the current stream and download continue. Switching away at or beyond 80% of the timeline also archives it. Timestamps and rewatch history survive restarts. |
 | Disconnection | Pause for required watchers, show the reason, accept an explicit host override, and rejoin from a current snapshot. |
 | Storage interruption | Disk full, moved or missing files, a destination collision, and a restart during a move or cleanup yield recoverable state without deleting unrelated files. |
 | Application update | Preserve v2 state, reject incompatible protocols with a clear update action, and recover from an interrupted update. |

@@ -15,7 +15,7 @@ Open **Settings → Application and updates → Install this copy** for a privat
 3. Use **Transfers** for file choices, pause/resume, ordering, rate and seeding limits, storage, trackers, peers and network settings. A manual pause or refusal always wins over automatic playback priority. Metadata retrieval itself does not select video payload.
 4. Select an episode and press **Join watch**. Room membership alone never blocks playback. Required watchers pause the shared timeline when they disconnect or underrun; the host can explicitly continue without someone. Everyone can control playback and edit the queue.
 5. Audio, subtitle and subtitle-delay choices are shared. Volume, audio output and subtitle size are local. An unavailable shared track pauses with an explanation.
-6. Distinct shared viewing coverage reaches **90%** to move an episode to **Watched**, with a relative timestamp. Any member can mark watched/unwatched or watch again. Automatic marking does not stop the currently playing episode or its download.
+6. An episode moves to **Watched** after the room plays more than **50%** of its distinct duration, or when the room switches away at **80%** or later on its timeline. Any member can mark watched or unwatched, or watch again. Watched entries have relative timestamps, and marking an episode during playback lets the episode and its download continue.
 
 Local publication hashes original files and transfers verified chunks into recipients' own copies. The original is never managed cleanup data. Torrent and shared-file playback can start before completion. Direct HTTP files wait for complete SHA-256 verification; the UI states this limitation. Releases with different edits are not automatically aligned.
 

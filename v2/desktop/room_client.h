@@ -91,7 +91,7 @@ private:
   void request(const QUrl &url, const QByteArray &token, const QJsonObject *body, Reply callback);
   void seriesRequest(const QString &key, const QString &suffix, const QJsonObject *body, QObject *context,
                      SeriesReply callback);
-  void provideSeriesMetadata(const QString &key, quint64 epoch, const QJsonObject &event);
+  void provideSeriesResponse(const QString &key, quint64 epoch, const QJsonObject &event);
   void begin(const QString &key);
   void tick();
   void message(const QString &key, quint64 epoch, const QString &text);

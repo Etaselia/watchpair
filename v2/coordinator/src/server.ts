@@ -4,6 +4,7 @@ import rateLimit from '@fastify/rate-limit';
 import { WebSocket } from 'ws';
 import { z, ZodError } from 'zod';
 import { randomBytes, randomUUID } from 'node:crypto';
+import { isIP } from 'node:net';
 import { performance } from 'node:perf_hooks';
 import { issueTicket } from './relay.js';
 import { Store } from './store.js';
@@ -13,7 +14,7 @@ import { SeriesService } from './series.js';
 import { MAX_SERIES_METADATA_BYTES, type SeriesProvider } from './series-provider.js';
 
 const name = z.string().trim().min(1).max(100).refine(v => !/[\x00-\x1f\x7f]/.test(v));
-const VERSION = '2.0.0';
+const VERSION = '2.0.3';
 const MAX_COMMAND_BYTES = 12 * 1024 * 1024;
 const capability = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const createBody = z.object({ name, memberName: name, retryKey: capability }).strict();
@@ -32,7 +33,19 @@ const seriesAction = z.object({ revision: z.number().int().min(1).max(Number.MAX
   action: z.enum(['pause', 'resume', 'stop', 'check', 'skip', 'approve-alternate', 'dismiss-alternate', 'set-airtime', 'set-finale', 'replace-source', 'link-existing']),
   expectedAirAt: seriesAirtime.optional(), finalEpisode: episodeNumber.nullable().optional(), alternativeId: z.string().uuid().optional(),
   draftId: z.string().uuid().optional(), entryId: seriesEntryId.optional() }).strict();
-type Socket = { ws: WebSocket; roomId: string; memberId: string; token: string; connectionId: string; helpsSeries: boolean };
+type Socket = { ws: WebSocket; roomId: string; memberId: string; token: string; connectionId: string;
+  helpsSeries: boolean; helpsLookup: boolean; network: string | null };
+
+function networkAddress(address: string) {
+  const ip = address.toLowerCase().split('%', 1)[0]!;
+  const version = isIP(ip);
+  if (version !== 6) return version === 4 ? ip : null;
+  const normalized = new URL(`http://[${ip}]`).hostname.slice(1, -1);
+  const mapped = /^::ffff:([\da-f]{1,4}):([\da-f]{1,4})$/.exec(normalized);
+  if (!mapped) return normalized;
+  const upper = parseInt(mapped[1]!, 16), lower = parseInt(mapped[2]!, 16);
+  return [upper >> 8, upper & 255, lower >> 8, lower & 255].join('.');
+}
 export type ServerOptions = { database?: string; now?: () => number; logger?: boolean; trustProxy?: boolean; relayUrl?:string; relayKey?:Buffer;
   seriesProvider?: SeriesProvider; seriesTimer?: boolean };
 
@@ -60,29 +73,22 @@ export async function buildServer(options: ServerOptions = {}) {
   const sockets = new Set<Socket>();
   let closing = false;
   const send = (ws: WebSocket, value: unknown) => {
-    if (ws.readyState !== WebSocket.OPEN) return;
-    if (ws.bufferedAmount > 4 * 1024 * 1024) { ws.close(1013, 'Reconnect for a fresh snapshot'); return; }
+    if (ws.readyState !== WebSocket.OPEN) return false;
+    if (ws.bufferedAmount > 4 * 1024 * 1024) { ws.close(1013, 'Reconnect for a fresh snapshot'); return false; }
     ws.send(JSON.stringify(value));
+    return true;
   };
-  const series = options.seriesProvider ? new SeriesService(engine, options.seriesProvider, (room, request, sent, attempt) => {
-    const eligible: Socket[] = [];
+  const series = options.seriesProvider ? new SeriesService(engine, options.seriesProvider, (room, request, tried) => {
     for (const connection of sockets) {
-      if (connection.roomId !== room || connection.ws.readyState !== WebSocket.OPEN || !connection.helpsSeries ||
-          sent.has(connection.memberId)) continue;
+      const { memberId, connectionId, network } = connection;
+      if (connection.roomId !== room || !network || tried.has(network) ||
+          (request.type === 'series.lookup' ? !connection.helpsLookup : !connection.helpsSeries)) continue;
       try {
-        if (engine.authenticate(room, connection.token).live?.connectionId === connection.connectionId) eligible.push(connection);
+        if (engine.authenticate(room, connection.token).live?.connectionId !== connectionId) continue;
       }
       catch { continue; }
+      if (send(connection.ws, { ...request, reportFailure: true })) return { memberId, connectionId, network };
     }
-    const delivered: string[] = [];
-    const count = Math.min(2 - sent.size, eligible.length);
-    const start = eligible.length ? (2 * attempt) % eligible.length : 0;
-    for (let i = 0; i < count; ++i) {
-      const connection = eligible[(start + i) % eligible.length]!;
-      send(connection.ws, request);
-      delivered.push(connection.memberId);
-    }
-    return delivered;
   }) : null;
   const token = (request: FastifyRequest) => {
     const value = request.headers.authorization;
@@ -143,7 +149,8 @@ export async function buildServer(options: ServerOptions = {}) {
   });
   app.post('/v2/rooms/:roomId/series/preview', { config: { rateLimit: { max: 12, timeWindow: '1 minute' } }, onRequest: requireMember }, async request => {
     const member = auth(request);
-    const result = await requireSeries().preview(roomId(request), member.id, seriesPreview.parse(request.body));
+    const result = await requireSeries().preview(roomId(request), member.id, seriesPreview.parse(request.body),
+      request.headers['x-watchpair-series-lookup'] === '1');
     auth(request);
     return result;
   });
@@ -151,18 +158,20 @@ export async function buildServer(options: ServerOptions = {}) {
     const member = auth(request);
     return requireSeries().add(roomId(request), member.id, seriesConfirm.parse(request.body));
   });
-  app.addContentTypeParser('application/vnd.watchpair.torrent', { parseAs: 'buffer' },
+  app.addContentTypeParser(['application/vnd.watchpair.torrent', 'application/vnd.watchpair.nyaa'], { parseAs: 'buffer' },
     (_request, body, done) => done(null, body));
-  app.post('/v2/rooms/:roomId/series/metadata/:requestId', {
-    config: { rateLimit: { max: 30, timeWindow: '1 minute' } }, bodyLimit: MAX_SERIES_METADATA_BYTES,
-    onRequest: async request => { auth(request); requireSeries(); },
-  }, async request => {
-    const member = auth(request);
-    const id = z.string().uuid().parse((request.params as { requestId: string }).requestId);
-    if (!Buffer.isBuffer(request.body))
-      throw new DomainError('SERIES_METADATA_INVALID', 'Send torrent metadata as a binary file.', 415);
-    return requireSeries().acceptMetadata(roomId(request), member.id, id, request.body);
-  });
+  for (const kind of ['metadata', 'lookup'] as const) {
+    app.post(`/v2/rooms/:roomId/series/${kind}/:requestId`, {
+      config: { rateLimit: { max: 30, timeWindow: '1 minute' } }, bodyLimit: MAX_SERIES_METADATA_BYTES,
+      onRequest: async request => { auth(request); requireSeries(); },
+    }, async request => {
+      const member = auth(request);
+      const id = z.string().uuid().parse((request.params as { requestId: string }).requestId);
+      if (!Buffer.isBuffer(request.body))
+        throw new DomainError('SERIES_METADATA_INVALID', 'Send the Nyaa response as a binary body.', 415);
+      return requireSeries().acceptMetadata(roomId(request), member.id, member.live?.connectionId ?? '', id, request.body, kind === 'lookup');
+    });
+  }
   app.post('/v2/rooms/:roomId/series/:seriesId/actions', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } }, onRequest: requireMember }, async request => {
     const member = auth(request);
     const id = z.string().uuid().parse((request.params as { seriesId: string }).seriesId);
@@ -188,7 +197,8 @@ export async function buildServer(options: ServerOptions = {}) {
     const connectionId = engine.connect(id, memberId);
     for (const old of sockets) if (old.roomId === id && old.memberId === memberId) old.ws.close(4001, 'Connected from another session');
     const connection: Socket = { ws, roomId: id, memberId, token: credential, connectionId,
-      helpsSeries: request.headers['x-watchpair-series-metadata'] === '1' };
+      helpsSeries: request.headers['x-watchpair-series-metadata'] === '1',
+      helpsLookup: request.headers['x-watchpair-series-lookup'] === '1', network: networkAddress(request.ip) };
     sockets.add(connection);
     let windowAt = engine.now(), messages = 0;
     ws.on('message', bytes => {
@@ -199,6 +209,8 @@ export async function buildServer(options: ServerOptions = {}) {
         const message = socketMessageSchema.parse(JSON.parse(bytes.toString()));
         if (message.type === 'ping') {
           engine.ping(id, memberId, connectionId); send(ws, { type: 'pong', clientTime: message.clientTime, serverTime: engine.now() });
+        } else if (message.type === 'series.failed') {
+          series?.desktopFailed(id, memberId, connectionId, message.requestId, message.retryAfterMs);
         } else engine.status(id, memberId, connectionId, message);
       } catch (error) {
         if(error instanceof DomainError&&error.code==='CONNECTION_REPLACED'){
@@ -213,11 +225,12 @@ export async function buildServer(options: ServerOptions = {}) {
     ws.on('close', () => {
       sockets.delete(connection);
       if (closing) return;
+      series?.desktopOffline(connectionId);
       try { engine.disconnect(id, memberId, connectionId); } catch (error) { app.log.error({ err: error }, 'Could not checkpoint a disconnection'); }
     });
     ws.on('error', () => ws.close());
     send(ws, { type: 'snapshot', revision: engine.room(id).revision, data: engine.snapshot(id) });
-    if (connection.helpsSeries) series?.desktopOnline(id);
+    if (connection.helpsSeries || connection.helpsLookup) series?.desktopOnline(id);
   });
   const change = (event: Change) => {
     for (const connection of sockets) if (connection.roomId === event.roomId) {

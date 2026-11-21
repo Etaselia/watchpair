@@ -484,9 +484,23 @@ export class Engine extends EventEmitter {
       }
     }
     if (queueChanged) {
-      ++room.queueRevision; plan.queue = true;
+      plan.queue = true;
       if (p.entryId && !this.entry(room, p.entryId).enabled) this.next(room);
     }
+    let archivedOnSwitch = false;
+    if (c.type !== 'queue.clear' && original.playback.entryId !== p.entryId) {
+      const prior = original.entries.find(entry => entry.id === original.playback.entryId);
+      if (prior?.duration && prior.watchedAt === null && this.position(original) >= prior.duration * 0.8) {
+        const retained = room.entries.find(entry => entry.id === prior.id);
+        const history = this.complete(original, retained ?? { ...prior }, 'automatic');
+        if (history) {
+          plan.history!.push(history);
+          if (retained && !queueChanged) plan.entries!.push(retained);
+          archivedOnSwitch = true;
+        }
+      }
+    }
+    if (queueChanged || archivedOnSwitch) ++room.queueRevision;
     this.reporter(room); this.reconcile(room); ++room.revision;
     if (plan.queue || plan.metadata) this.requireManifestCapacity(room);
     plan.operation = { memberId, id: env.operationId, hash: digest, revision: room.revision };
@@ -519,7 +533,7 @@ export class Engine extends EventEmitter {
         live.coveragePosition !== null && elapsed > 0 && status.position >= live.coveragePosition &&
         status.position - live.coveragePosition <= elapsed * p.rate + 0.5 && Math.abs(status.position - this.position(room, now)) <= 1.5 && entry.duration) {
         entry.coverage = mergeCoverage(entry.coverage, live.coveragePosition, status.position, entry.duration);
-        if (entry.watchedAt === null && coverageSeconds(entry.coverage) / entry.duration >= 0.9) {
+        if (entry.watchedAt === null && coverageSeconds(entry.coverage) > entry.duration * 0.5) {
           const history = this.complete(room, entry, 'automatic'); if (history) plan.history!.push(history);
           ++room.queueRevision; changed = true;
         }

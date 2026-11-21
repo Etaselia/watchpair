@@ -65,7 +65,7 @@ void installTheme() {
     QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit { background: #101b2b; border: 1px solid #30435e; border-radius: 6px; padding: 6px 8px; selection-background-color: #315c96; }
     QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus, QPlainTextEdit:focus { border-color: #74a7fa; }
     QComboBox::drop-down { width: 22px; border: none; }
-    QComboBox QAbstractItemView { background: #17263c; border: 1px solid #3b5377; selection-background-color: #2c5082; }
+    QComboBox QAbstractItemView, QListView#PlayerComboPopup { background: #17263c; border: 1px solid #3b5377; selection-background-color: #2c5082; }
     QCheckBox { spacing: 7px; padding: 3px; }
     QCheckBox::indicator { width: 16px; height: 16px; }
     QTableView, QTreeView { background: #111b29; alternate-background-color: #141f2f; border: 1px solid #27374f; border-radius: 5px; outline: 0; gridline-color: #233249; selection-background-color: #254b7e; selection-color: #f1f6ff; }

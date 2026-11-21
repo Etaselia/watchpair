@@ -213,11 +213,16 @@ export function parseNyaaRss(xml: string): SeriesListing[] {
 
 // Anchor lookups use the fixed view template. Ignore site links and user-written descriptions.
 export function parseNyaaListing(html: string, id: number): SeriesListing {
-  const heading = /<h3\b[^>]*\bclass\s*=\s*["']panel-title["'][^>]*>([^]*?)<\/h3\s*>/i.exec(html);
-  const footer = heading && /<div\b[^>]*\bclass\s*=\s*["']panel-footer clearfix["']/i.exec(html.slice(heading.index + heading[0].length));
-  if (!heading || !footer) throw new SeriesProviderError('The Nyaa listing could not be read.');
-  const panel = html.slice(heading.index + heading[0].length, heading.index + heading[0].length + footer.index);
-  const title = entityText(heading[1]!.replace(/<[^>]*>/g, '').trim(), true).trim();
+  // Desktop results are authenticated room submissions, so bound the template
+  // scan and parse only the first matching heading and its details panel.
+  const heading = /<h3\b[^<>]*\bclass\s*=\s*["']panel-title["'][^<>]*>/i.exec(html);
+  const details = heading ? html.slice(heading.index + heading[0].length, heading.index + heading[0].length + 64 * 1024) : '';
+  const end = /<\/h3\s*>/i.exec(details.slice(0, 4096));
+  const fields = end ? details.slice(end.index + end[0].length) : '';
+  const footer = /<div\b[^<>]*\bclass\s*=\s*["']panel-footer clearfix["']/i.exec(fields);
+  if (!end || !footer) throw new SeriesProviderError('The Nyaa listing could not be read.');
+  const panel = fields.slice(0, footer.index);
+  const title = entityText(details.slice(0, end.index).replace(/<[^<>]*>/g, '').trim(), true).trim();
   const category = /\bhref\s*=\s*["'](?:https:\/\/nyaa\.si)?\/\?c=1_2["']/i.test(panel);
   const hash = /\bInfo hash:\s*<\/div>\s*<div\b[^>]*>\s*<kbd>\s*([a-f0-9]{40}|[a-f0-9]{64})\s*<\/kbd>/i.exec(panel)?.[1]?.toLowerCase();
   const seconds = Number(/\bdata-timestamp\s*=\s*["'](\d{1,12})["']/i.exec(panel)?.[1]);

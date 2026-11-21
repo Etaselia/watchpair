@@ -71,6 +71,8 @@ export const statusSchema = z.object({
 }).strict();
 export const socketMessageSchema = z.discriminatedUnion('type', [
   statusSchema, z.object({ type: z.literal('ping'), clientTime: z.number().finite() }).strict(),
+  z.object({ type: z.literal('series.failed'), requestId: z.string().uuid(),
+    retryAfterMs: z.number().int().min(1000).max(30 * 60_000).optional() }).strict(),
 ]);
 export type Source = z.infer<typeof sourceSchema>;
 export type FileDescriptor = z.infer<typeof fileSchema>;

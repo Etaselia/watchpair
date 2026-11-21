@@ -24,9 +24,6 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <QWindow>
-#ifdef Q_OS_WIN
-#include <windows.h>
-#endif
 namespace wp::ui {
 namespace {
 QLabel *plain(const QString &text, const QString &name = {}) {
@@ -42,19 +39,6 @@ bool editing() {
                    qobject_cast<QPlainTextEdit *>(focus) || qobject_cast<QComboBox *>(focus) ||
                    qobject_cast<QAbstractItemView *>(focus) || qobject_cast<QAbstractButton *>(focus) ||
                    qobject_cast<QAbstractSlider *>(focus));
-}
-void showPlayerFullscreen(QWidget &window) {
-  window.showFullScreen();
-#ifdef Q_OS_WIN
-  if (QGuiApplication::platformName() != QStringLiteral("windows"))
-    return;
-  // Windows DWM can put native popups behind a fullscreen OpenGL window.
-  // Apply Qt's one-pixel border workaround after Qt sets the fullscreen style.
-  const auto hwnd = reinterpret_cast<HWND>(window.winId());
-  const auto style = GetWindowLongPtr(hwnd, GWL_STYLE);
-  if (!(style & WS_BORDER))
-    SetWindowLongPtr(hwnd, GWL_STYLE, style | WS_BORDER);
-#endif
 }
 } // namespace
 MainWindow::MainWindow(AppServices &app) : app_(app) {
@@ -557,7 +541,7 @@ void MainWindow::restoreWindow() {
     }
   }
   if (full_ && !playerWindow_)
-    showPlayerFullscreen(*this);
+    showFullScreen();
   else
     showNormal();
   raise();
@@ -829,6 +813,7 @@ void MainWindow::preview(const QJsonObject &file) {
 void MainWindow::toggleFullscreen() {
   if (!playerWindow_ && pages_->currentWidget() != room_)
     return;
+  room_->playerSurface()->dismissComboPopup();
   if (playerWindow_ && !full_)
     rememberPlayerGeometry();
   full_ = !full_;
@@ -847,7 +832,7 @@ void MainWindow::toggleFullscreen() {
       banner_->setVisible(bannerBeforeFullscreen_);
   }
   if (full_)
-    showPlayerFullscreen(*target);
+    target->showFullScreen();
   else {
     target->setWindowState(playerWindowState_);
     target->show();

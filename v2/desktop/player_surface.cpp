@@ -9,7 +9,9 @@
 #include <QGridLayout>
 #include <QHideEvent>
 #include <QKeyEvent>
+#include <QListView>
 #include <QMouseEvent>
+#include <QStyle>
 #include <QVBoxLayout>
 #include <QWindow>
 namespace wp::ui {
@@ -41,6 +43,85 @@ PlayerSurface::PlayerSurface(QWidget *video, QWidget *parent) : QWidget(parent),
   qApp->installEventFilter(this);
 }
 PlayerSurface::~PlayerSurface() { qApp->removeEventFilter(this); }
+void PlayerComboBox::showPopup() {
+  // A separate popup can be obscured by the fullscreen OpenGL window on Windows.
+  if (window()->isFullScreen() && QApplication::platformName() == QStringLiteral("windows")) {
+    if (count())
+      surface_.showComboPopup(*this);
+  } else
+    QComboBox::showPopup();
+}
+void PlayerComboBox::hidePopup() {
+  if (surface_.inlineCombo_ == this)
+    surface_.dismissComboPopup();
+  else
+    QComboBox::hidePopup();
+}
+QAbstractItemView *PlayerComboBox::popupView() const {
+  return surface_.inlineCombo_ == this ? surface_.inlinePopup_ : view();
+}
+void PlayerSurface::showComboPopup(PlayerComboBox &combo) {
+  dismissComboPopup();
+  if (!inlinePopup_) {
+    inlinePopup_ = new QListView(this);
+    inlinePopup_->setObjectName(QStringLiteral("PlayerComboPopup"));
+    inlinePopup_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    inlinePopup_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    inlinePopup_->setTextElideMode(Qt::ElideRight);
+    inlinePopup_->setTabKeyNavigation(false);
+    connect(inlinePopup_, &QListView::clicked, this, &PlayerSurface::selectComboItem);
+  }
+  inlineCombo_ = &combo;
+  inlinePopup_->setModel(combo.model());
+  inlinePopup_->setRootIndex(combo.rootModelIndex());
+  inlinePopup_->setModelColumn(combo.modelColumn());
+  inlinePopup_->setLayoutDirection(combo.layoutDirection());
+  inlinePopup_->setAccessibleName(combo.accessibleName());
+  inlinePopup_->ensurePolished();
+  const QRect anchor(combo.mapTo(this, QPoint()), combo.size());
+  const auto frame = 2 * inlinePopup_->frameWidth();
+  const auto scroll = style()->pixelMetric(QStyle::PM_ScrollBarExtent, nullptr, inlinePopup_);
+  const int popupWidth = qMin(width(), qMax(anchor.width(), inlinePopup_->sizeHintForColumn(combo.modelColumn()) + scroll + frame));
+  int popupHeight = frame;
+  for (int row = 0; row < qMin(combo.count(), combo.maxVisibleItems()); ++row)
+    popupHeight += qMax(1, inlinePopup_->sizeHintForRow(row));
+  popupHeight = qMin(anchor.top(), popupHeight);
+  const int left = combo.layoutDirection() == Qt::RightToLeft ? anchor.right() + 1 - popupWidth : anchor.left();
+  inlinePopup_->setGeometry(qBound(0, left, width() - popupWidth), anchor.top() - popupHeight, popupWidth, popupHeight);
+  showControls();
+  idle_.stop();
+  inlinePopup_->show();
+  inlinePopup_->raise();
+  const auto selected = combo.model()->index(combo.currentIndex(), combo.modelColumn(), combo.rootModelIndex());
+  inlinePopup_->setCurrentIndex(selected);
+  inlinePopup_->scrollTo(selected);
+  inlinePopup_->setFocus(Qt::PopupFocusReason);
+}
+void PlayerSurface::dismissComboPopup() {
+  if (!inlineCombo_)
+    return;
+  const auto combo = inlineCombo_;
+  inlineCombo_.clear();
+  inlinePopup_->hide();
+  inlinePopup_->setModel(nullptr);
+  combo->QComboBox::hidePopup();
+  refreshPointerLater();
+}
+void PlayerSurface::selectComboItem(const QModelIndex &index) {
+  if (!inlineCombo_ || !(index.flags() & Qt::ItemIsEnabled) || !(index.flags() & Qt::ItemIsSelectable))
+    return;
+  const auto combo = inlineCombo_;
+  const int row = index.row();
+  const auto text = combo->itemText(row);
+  dismissComboPopup();
+  combo->setFocus(Qt::PopupFocusReason);
+  combo->setCurrentIndex(row);
+  if (combo) {
+    emit combo->activated(row);
+    if (combo)
+      emit combo->textActivated(text);
+  }
+}
 void PlayerSurface::setBlockingOverlay(QWidget *overlay) {
   layers_->addWidget(overlay, 0, 0);
   controls_->raise();
@@ -60,13 +141,13 @@ bool PlayerSurface::controlsVisible() const { return !controls_->isHidden(); }
 bool PlayerSurface::controlsInUse() const {
   auto *popup = QApplication::activePopupWidget();
   auto *focus = QApplication::focusWidget();
-  return (popup && contains(popup)) || pressedControl_ ||
+  return inlineCombo_ || (popup && contains(popup)) || pressedControl_ ||
       (keyboardControls_ && focus && (focus == controls_ || controls_->isAncestorOf(focus)));
 }
 void PlayerSurface::showControls() {
   controls_->show();
   auto *popup = QApplication::activePopupWidget();
-  if (!popup || !contains(popup))
+  if (!inlineCombo_ && (!popup || !contains(popup)))
     controls_->raise();
   unsetCursor();
   video_->unsetCursor();
@@ -140,6 +221,7 @@ void PlayerSurface::hideIdleControls() {
   hideControls();
 }
 void PlayerSurface::hideEvent(QHideEvent *event) {
+  dismissComboPopup();
   openingCombo_.clear();
   openingTimestamp_ = 0;
   pressedControl_.clear();
@@ -154,6 +236,43 @@ void PlayerSurface::hideEvent(QHideEvent *event) {
 bool PlayerSurface::eventFilter(QObject *object, QEvent *event) {
   auto *widget = qobject_cast<QWidget *>(object);
   const bool owned = contains(widget);
+  if (inlineCombo_) {
+    const bool inPopup = widget && (widget == inlinePopup_ || inlinePopup_->isAncestorOf(widget));
+    const auto type = event->type();
+    if (widget == inlineCombo_ && type == QEvent::MouseButtonPress) {
+      dismissComboPopup();
+      return true;
+    }
+    if (type == QEvent::ApplicationDeactivate ||
+        (widget == inlineCombo_ && (type == QEvent::Hide || (type == QEvent::EnabledChange && !widget->isEnabled()))) ||
+        (widget == this && type == QEvent::Resize) ||
+        (widget && widget != inlineCombo_ && !inPopup && type == QEvent::MouseButtonPress)) {
+      dismissComboPopup();
+    } else if (inPopup && (type == QEvent::ShortcutOverride || type == QEvent::KeyPress)) {
+      auto *key = static_cast<QKeyEvent *>(event);
+      switch (key->key()) {
+      case Qt::Key_Return: case Qt::Key_Enter: case Qt::Key_Space:
+      case Qt::Key_Escape: case Qt::Key_Tab: case Qt::Key_Backtab:
+        key->accept();
+        if (type == QEvent::KeyPress) {
+          keyboardControls_ = true;
+          if (key->key() == Qt::Key_Return || key->key() == Qt::Key_Enter || key->key() == Qt::Key_Space) {
+            selectComboItem(inlinePopup_->currentIndex());
+          } else {
+            const auto combo = inlineCombo_;
+            dismissComboPopup();
+            combo->setFocus(Qt::TabFocusReason);
+            if (key->key() != Qt::Key_Escape) {
+              QKeyEvent tab(QEvent::KeyPress, key->key(), key->modifiers());
+              QApplication::sendEvent(combo, &tab);
+            }
+          }
+        }
+        return true;
+      default: break;
+      }
+    }
+  }
   if (event->type() == QEvent::ApplicationDeactivate) {
     pressedControl_.clear();
     ++controlPressGeneration_;

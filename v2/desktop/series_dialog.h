@@ -23,6 +23,7 @@ public:
 
 private:
   void lookup();
+  void requestPreview(const QJsonObject &body);
   void acceptPreview(const QJsonObject &result);
   void invalidatePreview();
   void updateActions();

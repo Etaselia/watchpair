@@ -377,16 +377,37 @@ test('room creation and its private retry mapping are one database transaction',
   assert.deepEqual(engine.create('Room', 'Host', retryKey), created);
 });
 
-test('90% distinct shared coverage archives without stopping current playback or deselecting its download', t => {
+test('more than half of distinct shared coverage archives during playback and keeps its download selected', t => {
   const f = fixture(); t.after(() => f.store.close()); f.start();
   const currentId = f.room().playback.entryId!;
-  for (let i = 0; i < 95; ++i) { f.advance(1000); f.status(); f.engine.ping(f.host.roomId, f.guest.memberId, f.guestConnection); f.engine.tick(); }
+  f.advance(500); f.status();
+  for (let i = 0; i < 50; ++i) { f.advance(1000); f.status(); f.engine.ping(f.host.roomId, f.guest.memberId, f.guestConnection); f.engine.tick(); }
+  assert.equal(coverageSeconds(f.room().entries[0]!.coverage), 50);
+  assert.equal(f.room().entries[0]!.watchedAt, null);
+  f.advance(10); f.status();
   const entry = f.room().entries.find(e => e.id === currentId)!;
   assert.notEqual(entry.watchedAt, null); assert.equal(entry.enabled, true); assert.equal(f.room().playback.entryId, currentId); assert.equal(f.room().playback.paused, false);
   assert.equal(f.store.history(f.host.roomId).length, 1); assert.equal(f.store.history(f.host.roomId)[0]!.method, 'automatic');
   f.command({ type: 'history.mark', ids: [currentId], watched: false }, f.guest.memberId);
   assert.equal(f.room().entries.find(e => e.id === currentId)!.watchedAt, null); assert.equal(f.store.history(f.host.roomId).length, 1);
   f.command({ type: 'history.mark', ids: [currentId], watched: true }, f.guest.memberId); assert.equal(f.store.history(f.host.roomId).length, 2);
+});
+
+test('an episode archives on a switch at 80% of its timeline, even with less than half played', t => {
+  const f = fixture(); t.after(() => f.store.close()); f.start();
+  const [first, second, third] = f.room().entries;
+  f.command({ type: 'playback.seek', position: 79.99 });
+  f.command({ type: 'playback.choose', entryId: second!.id });
+  assert.equal(f.room().entries[0]!.watchedAt, null);
+  f.command({ type: 'playback.seek', position: 80 });
+  assert.equal(f.room().entries[1]!.watchedAt, null);
+  f.command({ type: 'playback.next' });
+  assert.equal(f.room().playback.entryId, third!.id);
+  assert.equal(f.room().entries[1]!.watchedAt, f.now());
+  const history = f.store.history(f.host.roomId);
+  assert.equal(history.length, 1);
+  assert.equal(history[0]!.entryId, second!.id);
+  assert.equal(history[0]!.coverage, 0);
 });
 
 test('seeking forward is not viewed coverage; removing the current episode advances and invalidates pending work', t => {
@@ -398,6 +419,7 @@ test('seeking forward is not viewed coverage; removing the current episode advan
   const generation = f.room().playback.generation;
   f.command({ type: 'queue.remove', ids: [current.id] }, f.guest.memberId);
   assert.notEqual(f.room().playback.entryId, current.id); assert.equal(f.room().playback.position, 0); assert.equal(f.room().playback.paused, true); assert.ok(f.room().playback.generation > generation);
+  assert.ok(f.store.history(f.host.roomId)[0]!.coverage < 10);
 });
 
 test('recovery retries survive restart, revoke old host credentials, and durable state resumes paused', t => {

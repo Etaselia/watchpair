@@ -427,7 +427,8 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   state_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
   state_->setProperty("muted", true);
   state_->setMinimumWidth(0);
-  rate_ = new QComboBox;
+  rate_ = new PlayerComboBox(*surface_);
+  rate_->setAccessibleName(tr("Playback speed"));
   for (double rate : {0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0})
     rate_->addItem(QString::number(rate) + QStringLiteral("×"), rate);
   rate_->setFixedWidth(79);
@@ -468,10 +469,12 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   trackControls_ = new QWidget;
   auto *tracks = new QHBoxLayout(trackControls_);
   tracks->setContentsMargins(0, 0, 0, 0);
-  audio_ = new QComboBox;
+  audio_ = new PlayerComboBox(*surface_);
   audio_->setObjectName(QStringLiteral("SharedAudio"));
-  subtitles_ = new QComboBox;
+  audio_->setAccessibleName(tr("Audio track"));
+  subtitles_ = new PlayerComboBox(*surface_);
   subtitles_->setObjectName(QStringLiteral("SharedSubtitles"));
+  subtitles_->setAccessibleName(tr("Subtitle track"));
   for (auto *combo : {audio_, subtitles_}) {
     combo->setMinimumContentsLength(11);
     combo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
@@ -483,8 +486,9 @@ RoomPage::RoomPage(AppServices &app, QWidget *parent)
   subtitleDelay_->setSuffix(tr(" s"));
   subtitleDelay_->setToolTip(tr("Shared subtitle delay"));
   subtitleDelay_->setMaximumWidth(95);
-  chapters_ = new QComboBox;
+  chapters_ = new PlayerComboBox(*surface_);
   chapters_->setObjectName(QStringLiteral("Chapters"));
+  chapters_->setAccessibleName(tr("Chapters"));
   chapters_->setMinimumContentsLength(8);
   chapters_->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
   auto *addSub = button(QString(), QStringLiteral("plus"));
@@ -1200,9 +1204,10 @@ void RoomPage::updateTracks() {
     const QSignalBlocker resetDelay(subtitleDelay_);
     audio_->hidePopup();
     subtitles_->hidePopup();
+    chapters_->hidePopup();
     subtitleDelay_->clearFocus();
   }
-  if (audio_->view()->isVisible() || subtitles_->view()->isVisible() || chapters_->view()->isVisible() ||
+  if (audio_->popupView()->isVisible() || subtitles_->popupView()->isVisible() || chapters_->popupView()->isVisible() ||
       subtitleDelay_->hasFocus())
     return;
   const auto identity = local || room_.isEmpty() ? QJsonValue() :
@@ -1339,7 +1344,7 @@ void RoomPage::updateTracks() {
   audio_->setCurrentIndex(std::max(0, audio_->findData(currentAudio)));
   subtitles_->setCurrentIndex(std::max(0, subtitles_->findData(currentSub)));
   subtitleDelay_->setValue(app_.playback.subtitleDelay());
-  if (!chapters_->view()->isVisible()) {
+  if (!chapters_->popupView()->isVisible()) {
     chapters_->clear();
     chapters_->addItem(tr("Chapters"), -1);
     if (chapterMetadataReady())

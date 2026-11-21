@@ -124,7 +124,8 @@ private:
   SeekSlider *seek_;
   SeekPreview *seekPreview_;
   QSlider *volume_;
-  QComboBox *policy_, *rate_, *audio_, *subtitles_, *chapters_;
+  QComboBox *policy_;
+  PlayerComboBox *rate_, *audio_, *subtitles_, *chapters_;
   QDoubleSpinBox *subtitleDelay_;
   QTimer refresh_;
   QTimer seriesRefresh_;

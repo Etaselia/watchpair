@@ -39,6 +39,20 @@ bool capability(const QString &value) {
 bool roomId(const QString &value) {
   return !QUuid(value).isNull();
 }
+qint64 seriesRetryDelay(const QNetworkReply &reply) {
+  const auto status = reply.attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+  if (status != 429 && status != 503)
+    return 0;
+  const auto header = reply.rawHeader("Retry-After");
+  bool numeric;
+  const auto seconds = header.toLongLong(&numeric);
+  if (numeric)
+    return 1000 * std::clamp<qint64>(seconds, 1, 1800);
+  const auto date = QDateTime::fromString(QString::fromLatin1(header), Qt::RFC2822Date);
+  if (date.isValid())
+    return std::clamp<qint64>(QDateTime::currentDateTimeUtc().msecsTo(date), 1000, 30 * 60000);
+  return status == 429 ? 60000 : 0;
+}
 } // namespace
 RoomClient::RoomClient(LocalStore &store, QObject *parent) : QObject(parent), store_(store), network_(this) {
   clock_.start();
@@ -97,7 +111,10 @@ void RoomClient::request(const QUrl &url, const QByteArray &token, const QJsonOb
   request.setRawHeader("X-WatchPair-Protocol", "2");
   request.setRawHeader("Accept", "application/json");
   request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
-  request.setTransferTimeout(15000);
+  const bool seriesPreview = url.path().endsWith(QStringLiteral("/series/preview"));
+  if (seriesPreview)
+    request.setRawHeader("X-WatchPair-Series-Lookup", "1");
+  request.setTransferTimeout(seriesPreview ? 25000 : 15000);
   if (!token.isEmpty())
     request.setRawHeader("Authorization", "Bearer " + token);
   QNetworkReply *reply;
@@ -218,58 +235,99 @@ void RoomClient::seriesFollowAction(const QString &key, const QString &id, const
   seriesRequest(key, QStringLiteral("/") + id + QStringLiteral("/actions"), &body, context,
                 std::move(callback));
 }
-void RoomClient::provideSeriesMetadata(const QString &key, quint64 epoch, const QJsonObject &event) {
-  constexpr qint64 maxMetadata = 2 * 1024 * 1024;
+void RoomClient::provideSeriesResponse(const QString &key, quint64 epoch, const QJsonObject &event) {
+  constexpr qint64 maxResponse = 2 * 1024 * 1024;
   const auto requestId = event.value(QStringLiteral("requestId")).toString();
   const auto requestUuid = QUuid(requestId);
-  const auto listingId = event.value(QStringLiteral("listingId")).toInteger();
   if (requestUuid.isNull() || requestUuid.toString(QUuid::WithoutBraces) != requestId ||
-      listingId < 1 || listingId > 999999999999LL ||
-      seriesMetadataJobs_.contains(requestId) || seriesMetadataJobs_.size() >= 2 || stopping_)
+      seriesMetadataJobs_.contains(requestId) || stopping_)
     return;
+  const auto failed = [this, key, epoch, requestId, report = event.value(QStringLiteral("reportFailure")).toBool()]
+      (qint64 retryAfter = 0) {
+    const auto it = connections_.find(key);
+    if (report && !stopping_ && it != connections_.end() && it->second->epoch == epoch && connected(key)) {
+      QJsonObject message{{QStringLiteral("type"), QStringLiteral("series.failed")}, {QStringLiteral("requestId"), requestId}};
+      if (retryAfter)
+        message.insert(QStringLiteral("retryAfterMs"), retryAfter);
+      it->second->socket->sendTextMessage(QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact)));
+    }
+  };
+  if (seriesMetadataJobs_.size() >= 2) {
+    failed();
+    return;
+  }
 
   // Only this fixed public origin can receive a fallback fetch. The room token
   // goes to the saved coordinator when we submit the response.
-  const QUrl url(QStringLiteral("https://nyaa.si/download/%1.torrent").arg(listingId));
+  const bool metadata = event.value(QStringLiteral("type")).toString() == QStringLiteral("series.metadata");
+  const auto kind = event.value(QStringLiteral("kind")).toString();
+  QUrl url;
+  QByteArray accept;
+  if (metadata || kind == QStringLiteral("listing")) {
+    const auto listingId = event.value(QStringLiteral("listingId")).toInteger();
+    if (listingId > 0 && listingId <= 999999999999LL) {
+      url = QUrl((metadata ? QStringLiteral("https://nyaa.si/download/%1.torrent")
+                          : QStringLiteral("https://nyaa.si/view/%1")).arg(listingId));
+      accept = metadata ? QByteArrayLiteral("application/x-bittorrent") : QByteArrayLiteral("text/html");
+    }
+  } else if (kind == QStringLiteral("search")) {
+    const auto query = event.value(QStringLiteral("query")).toString().trimmed();
+    const auto uploader = event.value(QStringLiteral("uploader")).toString();
+    static const QRegularExpression uploaderPattern(QStringLiteral("^[a-zA-Z0-9_-]{1,64}$"));
+    if (!query.isEmpty() && query.size() <= 160 && (uploader.isEmpty() || uploaderPattern.match(uploader).hasMatch())) {
+      url = QUrl(QStringLiteral("https://nyaa.si/?page=rss&c=1_2&q=") + QString::fromLatin1(QUrl::toPercentEncoding(query)) +
+                 (uploader.isEmpty() ? QString() : QStringLiteral("&u=") + uploader), QUrl::StrictMode);
+      accept = QByteArrayLiteral("application/rss+xml,application/xml");
+    }
+  }
+  if (url.isEmpty() || !url.isValid()) {
+    failed();
+    return;
+  }
   QNetworkRequest request(url);
   request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
   request.setAttribute(QNetworkRequest::CookieLoadControlAttribute, QNetworkRequest::Manual);
   request.setAttribute(QNetworkRequest::CookieSaveControlAttribute, QNetworkRequest::Manual);
-  request.setRawHeader("Accept", "application/x-bittorrent");
+  request.setRawHeader("Accept", accept);
   request.setRawHeader("User-Agent", "WatchPair/2 series follows");
   request.setTransferTimeout(12000);
   request.setPriority(QNetworkRequest::LowPriority);
   seriesMetadataJobs_.insert(requestId);
   auto *reply = network_.get(request);
   connect(reply, &QNetworkReply::readyRead, this, [reply] {
-    if (reply->bytesAvailable() > maxMetadata)
+    if (reply->bytesAvailable() > maxResponse)
       reply->abort();
   });
   QTimer::singleShot(18000, reply, [reply] {
     if (reply->isRunning())
       reply->abort();
   });
-  connect(reply, &QNetworkReply::finished, this, [this, reply, key, epoch, requestId] {
+  connect(reply, &QNetworkReply::finished, this, [this, reply, key, epoch, requestId, metadata, failed] {
     reply->deleteLater();
     const auto it = connections_.find(key);
     if (stopping_ || it == connections_.end() || it->second->epoch != epoch || !connected(key) ||
         reply->error() != QNetworkReply::NoError ||
         reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() != 200 ||
-        reply->bytesAvailable() <= 0 || reply->bytesAvailable() > maxMetadata) {
+        reply->bytesAvailable() <= 0 || reply->bytesAvailable() > maxResponse) {
       seriesMetadataJobs_.remove(requestId);
+      failed(seriesRetryDelay(*reply));
       return;
     }
     const auto &credential = it->second->credential;
-    QNetworkRequest deliver(endpoint(credential, QStringLiteral("/series/metadata/") + requestId));
+    const auto path = metadata ? QStringLiteral("/series/metadata/") : QStringLiteral("/series/lookup/");
+    QNetworkRequest deliver(endpoint(credential, path + requestId));
     deliver.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
     deliver.setRawHeader("X-WatchPair-Protocol", "2");
     deliver.setRawHeader("Authorization", "Bearer " + credential.value(QStringLiteral("token")).toString().toUtf8());
-    deliver.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/vnd.watchpair.torrent"));
+    deliver.setHeader(QNetworkRequest::ContentTypeHeader, metadata ? QStringLiteral("application/vnd.watchpair.torrent")
+                                                                    : QStringLiteral("application/vnd.watchpair.nyaa"));
     deliver.setTransferTimeout(12000);
     auto *submission = network_.post(deliver, reply->readAll());
-    connect(submission, &QNetworkReply::finished, this, [this, submission, requestId] {
+    connect(submission, &QNetworkReply::finished, this, [this, submission, requestId, failed] {
       submission->deleteLater();
       seriesMetadataJobs_.remove(requestId);
+      if (submission->error() != QNetworkReply::NoError)
+        failed();
     });
   });
 }
@@ -454,6 +512,7 @@ void RoomClient::begin(const QString &key) {
   QNetworkRequest request(url);
   request.setRawHeader("X-WatchPair-Protocol", "2");
   request.setRawHeader("X-WatchPair-Series-Metadata", "1");
+  request.setRawHeader("X-WatchPair-Series-Lookup", "1");
   request.setRawHeader("Authorization",
                        "Bearer " + c.credential.value(QStringLiteral("token")).toString().toLatin1());
   connect(c.socket.get(), &QWebSocket::connected, this, [this, key, epoch] {
@@ -547,9 +606,9 @@ void RoomClient::message(const QString &key, quint64 epoch, const QString &text)
       deleted(key);
       return;
     }
-    if (type == QStringLiteral("series.metadata")) {
+    if (type == QStringLiteral("series.metadata") || type == QStringLiteral("series.lookup")) {
       if (c.fresh)
-        provideSeriesMetadata(key, epoch, event);
+        provideSeriesResponse(key, epoch, event);
       return;
     }
     if (type == QStringLiteral("series.changed")) {
